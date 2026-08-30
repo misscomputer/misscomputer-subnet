@@ -17,5 +17,8 @@ preparation, restart recovery, and the optional synthetic campaign
 (`misscomputer.runtime.v1`, `pkg/runtimeapi`) to whichever authenticated
 front-end an operator runs in front of it. `cmd/miner-agent` is the miner's Go
 agent. The Python distribution provides the miner and validator neurons,
-checkpoint verification, weight execution, and the one-shot
-`misscomputer-python-boundary` / `misscomputer-checkpoint-boundary` commands.
+checkpoint verification, weight execution, the online
+`misscomputer-assignment-probe` public-validator liveness check of signed
+active-assignment manifests (see `docs/public-validator-live-probe.md`), and
+the one-shot `misscomputer-python-boundary` /
+`misscomputer-checkpoint-boundary` commands.

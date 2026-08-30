@@ -12,6 +12,24 @@ from typing import Any, Final
 
 from pydantic import BaseModel
 
+from .assignment_probe import (
+    ActiveAssignmentManifest,
+    ActiveDeploymentAssignment,
+    AssignedReplica,
+    AssignmentManifestChainState,
+    AssignmentManifestSignatureEnvelope,
+    AssignmentManifestTrustPolicy,
+    TrustedManifestKey,
+    advance_manifest_chain_state,
+    build_active_assignment_manifest,
+    build_active_deployment_assignment,
+    build_assigned_replica,
+    build_assignment_manifest_trust_policy,
+    build_initial_manifest_chain_state,
+    build_manifest_signature_envelope,
+    manifest_signature_message,
+    verify_active_assignment_manifest,
+)
 from .checkpoint_score_contracts import CanonicalScoreReport
 from .score_checkpoint_relay import (
     CentralScoreCheckpoint,
@@ -148,8 +166,72 @@ def execute(request: dict[str, object]) -> dict[str, object]:
             "relay_plan": _document(result.relay_plan),
             "verification_report": _document(result.verification_report),
         }
+    if operation == "build_manifest_trust_policy":
+        arguments = dict(arguments)
+        arguments["trusted_keys"] = [
+            _model(TrustedManifestKey, item) for item in arguments["trusted_keys"]
+        ]
+        manifest_policy = build_assignment_manifest_trust_policy(**arguments)
+        return {"value": _document(manifest_policy)}
+    if operation == "build_manifest_initial_state":
+        manifest_state = build_initial_manifest_chain_state(
+            _model(AssignmentManifestTrustPolicy, arguments["trust_policy"])
+        )
+        return {"value": _document(manifest_state)}
+    if operation == "build_assigned_replica":
+        return {"value": _document(build_assigned_replica(**arguments))}
+    if operation == "build_deployment_assignment":
+        arguments = dict(arguments)
+        arguments["replicas"] = [_model(AssignedReplica, item) for item in arguments["replicas"]]
+        return {"value": _document(build_active_deployment_assignment(**arguments))}
+    if operation == "build_assignment_manifest":
+        manifest = build_active_assignment_manifest(
+            _model(AssignmentManifestTrustPolicy, arguments["trust_policy"]),
+            deployments=[
+                _model(ActiveDeploymentAssignment, item) for item in arguments["deployments"]
+            ],
+            **arguments["parameters"],
+        )
+        return {"value": _document(manifest)}
+    if operation == "manifest_signature_message":
+        manifest_message = manifest_signature_message(
+            _model(ActiveAssignmentManifest, arguments["manifest"])
+        )
+        return {"value_base64": base64.b64encode(manifest_message).decode("ascii")}
+    if operation == "build_manifest_signature_envelope":
+        manifest_envelope = build_manifest_signature_envelope(
+            _model(ActiveAssignmentManifest, arguments["manifest"]),
+            signer_key_id=arguments["signer_key_id"],
+            signature_base64=arguments["signature_base64"],
+        )
+        return {"value": _document(manifest_envelope)}
+    if operation == "advance_manifest_state":
+        next_manifest_state, reprobe = advance_manifest_chain_state(
+            _model(AssignmentManifestChainState, arguments["state"]),
+            _model(ActiveAssignmentManifest, arguments["manifest"]),
+            _model(AssignmentManifestTrustPolicy, arguments["trust_policy"]),
+        )
+        return {"reprobe": reprobe, "value": _document(next_manifest_state)}
+    if operation == "verify_manifest":
+        verification = verify_active_assignment_manifest(
+            _model(ActiveAssignmentManifest, arguments["manifest"]),
+            [_model(AssignmentManifestSignatureEnvelope, item) for item in arguments["signatures"]],
+            _model(AssignmentManifestTrustPolicy, arguments["trust_policy"]),
+            _model(AssignmentManifestChainState, arguments["prior_chain_state"]),
+            evaluation_epoch=arguments["evaluation_epoch"],
+        )
+        return {
+            "next_chain_state": _document(verification.next_chain_state),
+            "reprobe": verification.reprobe,
+            "verified_roles": list(verification.verified_roles),
+            "verified_signer_key_ids": list(verification.verified_signer_key_ids),
+        }
     if operation == "validate":
         models: dict[str, type[BaseModel]] = {
+            "active_assignment_manifest": ActiveAssignmentManifest,
+            "assignment_manifest_chain_state": AssignmentManifestChainState,
+            "assignment_manifest_signature_envelope": AssignmentManifestSignatureEnvelope,
+            "assignment_manifest_trust_policy": AssignmentManifestTrustPolicy,
             "central_score_checkpoint": CentralScoreCheckpoint,
             "checkpoint_chain_state": CheckpointChainState,
             "checkpoint_signature_envelope": CheckpointSignatureEnvelope,

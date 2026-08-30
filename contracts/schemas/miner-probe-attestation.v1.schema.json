@@ -1,0 +1,111 @@
+{
+  "additionalProperties": false,
+  "description": "Miner service-key statement binding one probe nonce to one served payload.",
+  "properties": {
+    "algorithm": {
+      "const": "ed25519",
+      "title": "Algorithm",
+      "type": "string"
+    },
+    "assignment_nonce": {
+      "pattern": "^[0-9a-f]{32}$",
+      "title": "Assignment Nonce",
+      "type": "string"
+    },
+    "deployment_id": {
+      "maxLength": 63,
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "endpoint_id": {
+      "maxLength": 320,
+      "minLength": 3,
+      "title": "Endpoint Id",
+      "type": "string"
+    },
+    "generation": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Generation",
+      "type": "integer"
+    },
+    "miner_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Miner Hotkey",
+      "type": "string"
+    },
+    "miner_service_public_key": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Miner Service Public Key",
+      "type": "string"
+    },
+    "miner_uid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Miner Uid",
+      "type": "integer"
+    },
+    "probe_nonce": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Probe Nonce",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "miner_probe_response_attestation_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "response_body_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Response Body Sha256",
+      "type": "string"
+    },
+    "response_status": {
+      "const": 200,
+      "title": "Response Status",
+      "type": "integer"
+    },
+    "route_host": {
+      "maxLength": 253,
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+      "title": "Route Host",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/miner-probe-attestation",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "signature_hex": {
+      "pattern": "^[0-9a-f]{128}$",
+      "title": "Signature Hex",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "algorithm",
+    "probe_nonce",
+    "route_host",
+    "deployment_id",
+    "generation",
+    "assignment_nonce",
+    "endpoint_id",
+    "miner_uid",
+    "miner_hotkey",
+    "miner_service_public_key",
+    "response_status",
+    "response_body_sha256",
+    "signature_hex"
+  ],
+  "title": "MinerProbeAttestation",
+  "type": "object"
+}
