@@ -1,0 +1,49 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "caller_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Caller Hotkey",
+      "type": "string"
+    },
+    "current_block": {
+      "minimum": 0,
+      "title": "Current Block",
+      "type": "integer"
+    },
+    "deployment_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "endpoint_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Endpoint Id",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "default": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id",
+    "current_block",
+    "caller_hotkey",
+    "endpoint_id",
+    "deployment_id"
+  ],
+  "title": "DeactivateSynapse",
+  "type": "object"
+}

@@ -1,0 +1,60 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "algorithm": {
+      "const": "ed25519",
+      "title": "Algorithm",
+      "type": "string"
+    },
+    "checkpoint_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Checkpoint Digest Sha256",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "central_score_checkpoint_weight_relay_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/score-checkpoint-signature-envelope",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "signature_base64": {
+      "maxLength": 88,
+      "minLength": 88,
+      "title": "Signature Base64",
+      "type": "string"
+    },
+    "signed_message_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Signed Message Digest Sha256",
+      "type": "string"
+    },
+    "signer_key_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+      "title": "Signer Key Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "algorithm",
+    "signer_key_id",
+    "checkpoint_digest_sha256",
+    "signed_message_digest_sha256",
+    "signature_base64"
+  ],
+  "title": "CheckpointSignatureEnvelope",
+  "type": "object"
+}

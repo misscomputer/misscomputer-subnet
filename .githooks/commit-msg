@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+message_file=$1
+author_ident=$(git var GIT_AUTHOR_IDENT)
+committer_ident=$(git var GIT_COMMITTER_IDENT)
+
+if printf '%s\n%s\n' "$author_ident" "$committer_ident" | grep -Eiq 'claude|anthropic'; then
+    echo 'refusing commit: Claude/Anthropic may not be an author or committer' >&2
+    exit 1
+fi
+
+if grep -Eiq 'claude|anthropic' "$message_file"; then
+    echo 'refusing commit: Claude/Anthropic attribution is not permitted in commit messages' >&2
+    exit 1
+fi

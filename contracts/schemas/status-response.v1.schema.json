@@ -1,0 +1,278 @@
+{
+  "$defs": {
+    "Receipt": {
+      "additionalProperties": false,
+      "properties": {
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "assignment_seen": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Assignment Seen",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "error": {
+          "default": "",
+          "title": "Error",
+          "type": "string"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "health_passed": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Health Passed",
+          "type": "string"
+        },
+        "image_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Image Digest",
+          "type": "string"
+        },
+        "manifest_key": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Manifest Key",
+          "type": "string"
+        },
+        "miner_id": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Id",
+          "type": "string"
+        },
+        "pull_completed": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Pull Completed",
+          "type": "string"
+        },
+        "pull_started": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Pull Started",
+          "type": "string"
+        },
+        "replica_id": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Replica Id",
+          "type": "string"
+        },
+        "route_host": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Route Host",
+          "type": "string"
+        },
+        "runtime_started": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Runtime Started",
+          "type": "string"
+        },
+        "signature": {
+          "pattern": "^(?:0x)?[0-9a-f]{128}$",
+          "title": "Signature",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "accepted",
+            "ready",
+            "failed"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "subnet": {
+          "$ref": "#/$defs/SubnetBinding"
+        },
+        "version": {
+          "const": "deployment.v2",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "deployment_id",
+        "generation",
+        "assignment_nonce",
+        "miner_id",
+        "replica_id",
+        "endpoint_id",
+        "image_digest",
+        "manifest_key",
+        "route_host",
+        "stage",
+        "assignment_seen",
+        "pull_started",
+        "pull_completed",
+        "runtime_started",
+        "health_passed",
+        "subnet",
+        "signature"
+      ],
+      "title": "Receipt",
+      "type": "object"
+    },
+    "SubnetBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "chain_block": {
+          "minimum": 0,
+          "title": "Chain Block",
+          "type": "integer"
+        },
+        "epoch": {
+          "minimum": 0,
+          "title": "Epoch",
+          "type": "integer"
+        },
+        "expires_at_block": {
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "miner_axon_url": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Axon Url"
+        },
+        "miner_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Uid"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Network",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Validator Hotkey",
+          "type": "string"
+        },
+        "validator_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Validator Service Public Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "network",
+        "netuid",
+        "validator_hotkey",
+        "miner_hotkey",
+        "chain_block",
+        "epoch",
+        "expires_at_block",
+        "validator_service_public_key",
+        "miner_service_public_key"
+      ],
+      "title": "SubnetBinding",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "subnet-synapse.v1",
+      "default": "subnet-synapse.v1",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "receipt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Receipt"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "absent",
+        "processing",
+        "accepted",
+        "ready",
+        "failed",
+        "deactivated"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id",
+    "status"
+  ],
+  "title": "StatusResponse",
+  "type": "object"
+}

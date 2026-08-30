@@ -1,0 +1,37 @@
+version = 1
+SPDX-PackageName = "misscomputer-subnet"
+SPDX-PackageSupplier = "Miss Computer"
+SPDX-PackageDownloadLocation = "https://github.com/misscomputer/misscomputer-subnet"
+
+[[annotations]]
+path = [
+  ".github/**",
+  ".githooks/**",
+  ".dockerignore",
+  ".gitignore",
+  "README.md",
+  "CONTRIBUTING.md",
+  "IANA-DATA-NOTICE.md",
+  "THIRD_PARTY_NOTICES.md",
+  "sbom.spdx.json",
+  "contracts/**",
+  "configs/**",
+  "cmd/**",
+  "docs/**",
+  "pkg/**",
+  "pyproject.toml",
+  "scripts/**",
+  "src/**",
+  "tests/**",
+  "go.mod",
+  "go.sum",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Miss Computer"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+[[annotations]]
+path = ["pkg/netpolicy/iana-special-purpose.v1.json"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Miss Computer; derived from IANA Special-Purpose Address Registry data"
+SPDX-License-Identifier = "AGPL-3.0-only"

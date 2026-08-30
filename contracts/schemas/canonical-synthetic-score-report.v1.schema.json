@@ -1,0 +1,433 @@
+{
+  "$defs": {
+    "MinerScoreRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_score_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Canonical Score Ppm",
+          "type": "integer"
+        },
+        "component_totals": {
+          "$ref": "#/$defs/ScoreComponentTotals"
+        },
+        "eligibility_status": {
+          "enum": [
+            "eligible",
+            "ineligible"
+          ],
+          "title": "Eligibility Status",
+          "type": "string"
+        },
+        "evidence_content_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Evidence Content Digest Sha256",
+          "type": "string"
+        },
+        "failure_penalty_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Failure Penalty Ppm",
+          "type": "integer"
+        },
+        "latency_component_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Latency Component Ppm",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "raw_score_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Raw Score Ppm",
+          "type": "integer"
+        },
+        "reason_codes": {
+          "items": {
+            "enum": [
+              "authority_mismatch",
+              "campaign_binding_mismatch",
+              "chain_binding_mismatch",
+              "correlated_artifact_reuse",
+              "correlated_challenge_reuse",
+              "correlated_route_reuse",
+              "correlated_workload_reuse",
+              "eligible",
+              "equivocation_detected",
+              "future_evidence",
+              "insufficient_epoch_deployments",
+              "insufficient_independent_deployments",
+              "insufficient_scored_observations",
+              "insufficient_targeted_assignments",
+              "late_completion",
+              "miner_identity_churn",
+              "missing_observation",
+              "noncanonical_target_assignment",
+              "noncompleted_disposition",
+              "policy_binding_mismatch",
+              "repeated_triad_concentration",
+              "replay_detected",
+              "selective_omission",
+              "self_selection_detected",
+              "stale_evidence",
+              "unexpected_evidence",
+              "window_binding_mismatch"
+            ],
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Reason Codes",
+          "type": "array"
+        },
+        "record_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Record Digest Sha256",
+          "type": "string"
+        },
+        "reliability_component_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Reliability Component Ppm",
+          "type": "integer"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/synthetic-miner-score-record",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "success_component_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Success Component Ppm",
+          "type": "integer"
+        },
+        "throughput_component_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Throughput Component Ppm",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "miner_uid",
+        "miner_hotkey",
+        "eligibility_status",
+        "reason_codes",
+        "evidence_content_digest_sha256",
+        "component_totals",
+        "success_component_ppm",
+        "latency_component_ppm",
+        "throughput_component_ppm",
+        "reliability_component_ppm",
+        "failure_penalty_ppm",
+        "raw_score_ppm",
+        "canonical_score_ppm",
+        "record_digest_sha256"
+      ],
+      "title": "MinerScoreRecord",
+      "type": "object"
+    },
+    "ScoreComponentTotals": {
+      "additionalProperties": false,
+      "properties": {
+        "distinct_deployment_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Distinct Deployment Count",
+          "type": "integer"
+        },
+        "distinct_replica_triad_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Distinct Replica Triad Count",
+          "type": "integer"
+        },
+        "expected_assignment_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Expected Assignment Count",
+          "type": "integer"
+        },
+        "failure_penalty_total_ppm": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "title": "Failure Penalty Total Ppm",
+          "type": "integer"
+        },
+        "late_completion_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Late Completion Count",
+          "type": "integer"
+        },
+        "latency_component_total_ppm": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "title": "Latency Component Total Ppm",
+          "type": "integer"
+        },
+        "matched_evidence_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Matched Evidence Count",
+          "type": "integer"
+        },
+        "maximum_triad_concentration_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Maximum Triad Concentration Ppm",
+          "type": "integer"
+        },
+        "missing_observation_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Missing Observation Count",
+          "type": "integer"
+        },
+        "reliability_component_total_ppm": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "title": "Reliability Component Total Ppm",
+          "type": "integer"
+        },
+        "replica_failure_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Replica Failure Count",
+          "type": "integer"
+        },
+        "replica_success_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Replica Success Count",
+          "type": "integer"
+        },
+        "scored_observation_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Scored Observation Count",
+          "type": "integer"
+        },
+        "success_component_total_ppm": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "title": "Success Component Total Ppm",
+          "type": "integer"
+        },
+        "success_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Success Count",
+          "type": "integer"
+        },
+        "target_failure_count": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Target Failure Count",
+          "type": "integer"
+        },
+        "throughput_component_total_ppm": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "title": "Throughput Component Total Ppm",
+          "type": "integer"
+        },
+        "weighted_component_total_ppm": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "title": "Weighted Component Total Ppm",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expected_assignment_count",
+        "matched_evidence_count",
+        "scored_observation_count",
+        "success_count",
+        "target_failure_count",
+        "replica_success_count",
+        "replica_failure_count",
+        "missing_observation_count",
+        "late_completion_count",
+        "distinct_deployment_count",
+        "distinct_replica_triad_count",
+        "maximum_triad_concentration_ppm",
+        "success_component_total_ppm",
+        "latency_component_total_ppm",
+        "throughput_component_total_ppm",
+        "reliability_component_total_ppm",
+        "failure_penalty_total_ppm",
+        "weighted_component_total_ppm"
+      ],
+      "title": "ScoreComponentTotals",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "central_authority_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Central Authority Fingerprint Sha256",
+      "type": "string"
+    },
+    "eligible_miner_count": {
+      "maximum": 1000000,
+      "minimum": 0,
+      "title": "Eligible Miner Count",
+      "type": "integer"
+    },
+    "finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Finalized Block Hash",
+      "type": "string"
+    },
+    "finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Height",
+      "type": "integer"
+    },
+    "global_reason_codes": {
+      "items": {
+        "enum": [
+          "authority_mismatch",
+          "campaign_binding_mismatch",
+          "chain_binding_mismatch",
+          "correlated_artifact_reuse",
+          "correlated_challenge_reuse",
+          "correlated_route_reuse",
+          "correlated_workload_reuse",
+          "eligible",
+          "equivocation_detected",
+          "future_evidence",
+          "insufficient_epoch_deployments",
+          "insufficient_independent_deployments",
+          "insufficient_scored_observations",
+          "insufficient_targeted_assignments",
+          "late_completion",
+          "miner_identity_churn",
+          "missing_observation",
+          "noncanonical_target_assignment",
+          "noncompleted_disposition",
+          "policy_binding_mismatch",
+          "repeated_triad_concentration",
+          "replay_detected",
+          "selective_omission",
+          "self_selection_detected",
+          "stale_evidence",
+          "unexpected_evidence",
+          "window_binding_mismatch"
+        ],
+        "type": "string"
+      },
+      "maxItems": 32,
+      "title": "Global Reason Codes",
+      "type": "array"
+    },
+    "ineligible_miner_count": {
+      "maximum": 1000000,
+      "minimum": 0,
+      "title": "Ineligible Miner Count",
+      "type": "integer"
+    },
+    "input_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "miner_scores": {
+      "items": {
+        "$ref": "#/$defs/MinerScoreRecord"
+      },
+      "maxItems": 4096,
+      "title": "Miner Scores",
+      "type": "array"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Policy Digest Sha256",
+      "type": "string"
+    },
+    "report_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Report Digest Sha256",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/canonical-synthetic-score-report",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "score_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Score Vector Digest Sha256",
+      "type": "string"
+    },
+    "window_ended_at": {
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]{1,9})?Z$",
+      "title": "Window Ended At",
+      "type": "string"
+    },
+    "window_started_at": {
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]{1,9})?Z$",
+      "title": "Window Started At",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "policy_digest_sha256",
+    "input_snapshot_digest_sha256",
+    "central_authority_fingerprint_sha256",
+    "network",
+    "netuid",
+    "finalized_height",
+    "finalized_block_hash",
+    "window_started_at",
+    "window_ended_at",
+    "eligible_miner_count",
+    "ineligible_miner_count",
+    "global_reason_codes",
+    "miner_scores",
+    "score_vector_digest_sha256",
+    "report_digest_sha256"
+  ],
+  "title": "CanonicalScoreReport",
+  "type": "object"
+}

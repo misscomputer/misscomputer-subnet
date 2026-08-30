@@ -1,0 +1,34 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "features": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Features",
+      "type": "array"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "service_public_key": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Service Public Key",
+      "type": "string"
+    },
+    "weights_enabled": {
+      "title": "Weights Enabled",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "protocol",
+    "service_public_key",
+    "features",
+    "weights_enabled"
+  ],
+  "title": "ControlCapabilities",
+  "type": "object"
+}

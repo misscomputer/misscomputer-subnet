@@ -1,0 +1,107 @@
+{
+  "$comment": "Offline public-key revocation metadata. The verifier requires its exact digest as an independent local trust anchor.",
+  "$defs": {
+    "RevokedReleaseKey": {
+      "additionalProperties": false,
+      "properties": {
+        "key_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Key Id",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "compromise",
+            "policy_violation",
+            "retired",
+            "superseded"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "revoked_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Revoked At Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key_id",
+        "revoked_at_epoch",
+        "reason"
+      ],
+      "title": "RevokedReleaseKey",
+      "type": "object"
+    }
+  },
+  "$id": "https://miss.computer/contracts/release-revocation-list.v1.schema.json",
+  "additionalProperties": false,
+  "description": "A locally approved, digest-pinned view of release-key revocations.",
+  "properties": {
+    "digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Digest Sha256",
+      "type": "string"
+    },
+    "expires_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Expires At Epoch",
+      "type": "integer"
+    },
+    "issued_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Issued At Epoch",
+      "type": "integer"
+    },
+    "live_actions": {
+      "const": false,
+      "title": "Live Actions",
+      "type": "boolean"
+    },
+    "policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Policy Digest Sha256",
+      "type": "string"
+    },
+    "revoked_keys": {
+      "items": {
+        "$ref": "#/$defs/RevokedReleaseKey"
+      },
+      "maxItems": 16,
+      "title": "Revoked Keys",
+      "type": "array"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/release-revocation-list",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "sequence": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Sequence",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "policy_digest_sha256",
+    "sequence",
+    "issued_at_epoch",
+    "expires_at_epoch",
+    "revoked_keys",
+    "live_actions",
+    "digest_sha256"
+  ],
+  "title": "Release revocation list v1",
+  "type": "object"
+}

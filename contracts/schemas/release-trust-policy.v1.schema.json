@@ -1,0 +1,147 @@
+{
+  "$comment": "Public-key metadata only; this contract has no private-key material.",
+  "$defs": {
+    "TrustedReleaseKey": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "ed25519",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "key_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Key Id",
+          "type": "string"
+        },
+        "public_key_base64": {
+          "maxLength": 44,
+          "minLength": 44,
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "title": "Public Key Base64",
+          "type": "string"
+        },
+        "public_key_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Public Key Sha256",
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "enum": [
+              "operations_owner",
+              "release_manager",
+              "security_reviewer"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Roles",
+          "type": "array"
+        },
+        "valid_from_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid From Epoch",
+          "type": "integer"
+        },
+        "valid_until_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid Until Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key_id",
+        "algorithm",
+        "public_key_base64",
+        "public_key_sha256",
+        "roles",
+        "valid_from_epoch",
+        "valid_until_epoch"
+      ],
+      "title": "TrustedReleaseKey",
+      "type": "object"
+    }
+  },
+  "$id": "https://miss.computer/contracts/release-trust-policy.v1.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Digest Sha256",
+      "type": "string"
+    },
+    "policy_id": {
+      "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+      "title": "Policy Id",
+      "type": "string"
+    },
+    "required_roles": {
+      "items": {
+        "enum": [
+          "operations_owner",
+          "release_manager",
+          "security_reviewer"
+        ],
+        "type": "string"
+      },
+      "maxItems": 3,
+      "minItems": 3,
+      "title": "Required Roles",
+      "type": "array"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/release-trust-policy",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "threshold": {
+      "maximum": 16,
+      "minimum": 2,
+      "title": "Threshold",
+      "type": "integer"
+    },
+    "trusted_keys": {
+      "items": {
+        "$ref": "#/$defs/TrustedReleaseKey"
+      },
+      "maxItems": 16,
+      "minItems": 3,
+      "title": "Trusted Keys",
+      "type": "array"
+    },
+    "valid_from_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Valid From Epoch",
+      "type": "integer"
+    },
+    "valid_until_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Valid Until Epoch",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "policy_id",
+    "threshold",
+    "required_roles",
+    "trusted_keys",
+    "valid_from_epoch",
+    "valid_until_epoch",
+    "digest_sha256"
+  ],
+  "title": "Release trust policy v1",
+  "type": "object"
+}

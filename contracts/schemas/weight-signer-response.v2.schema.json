@@ -1,0 +1,99 @@
+{
+  "$id": "https://miss.computer/contracts/weight-signer-response.v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "error_code": {
+          "type": "null"
+        },
+        "extrinsic_ref": {
+          "type": "string"
+        },
+        "status": {
+          "const": "confirmed"
+        }
+      }
+    },
+    {
+      "properties": {
+        "error_code": {
+          "type": "string"
+        },
+        "extrinsic_ref": {
+          "type": "null"
+        },
+        "status": {
+          "const": "rejected"
+        }
+      }
+    },
+    {
+      "properties": {
+        "error_code": {
+          "type": "string"
+        },
+        "extrinsic_ref": {
+          "type": "null"
+        },
+        "status": {
+          "const": "ambiguous"
+        }
+      }
+    }
+  ],
+  "properties": {
+    "error_code": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "pattern": "^[a-z0-9_]{1,64}$",
+          "type": "string"
+        }
+      ]
+    },
+    "extrinsic_ref": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[!-~]+$",
+          "type": "string"
+        }
+      ]
+    },
+    "request_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/weight-signer-response"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "status": {
+      "enum": [
+        "ambiguous",
+        "confirmed",
+        "rejected"
+      ]
+    }
+  },
+  "required": [
+    "error_code",
+    "extrinsic_ref",
+    "request_id",
+    "schema",
+    "schema_version",
+    "status"
+  ],
+  "title": "Purpose-restricted weight signer response v2",
+  "type": "object"
+}

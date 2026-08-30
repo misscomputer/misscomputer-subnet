@@ -1,0 +1,65 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "features": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Features",
+      "type": "array"
+    },
+    "max_body_bytes": {
+      "title": "Max Body Bytes",
+      "type": "integer"
+    },
+    "miner_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Miner Hotkey",
+      "type": "string"
+    },
+    "miner_uid": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Miner Uid"
+    },
+    "netuid": {
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Network",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v1",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "service_public_key": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Service Public Key",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "network",
+    "netuid",
+    "miner_hotkey",
+    "service_public_key",
+    "features",
+    "max_body_bytes"
+  ],
+  "title": "LocalCapabilities",
+  "type": "object"
+}

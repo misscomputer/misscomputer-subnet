@@ -1,0 +1,146 @@
+{
+  "$comment": "The digest and canonical bytes are semantic checks. A consistent current row is evidence only and never proves inclusion or authorizes retry.",
+  "$id": "https://miss.computer/contracts/weight-reconciliation-report.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "alert_required": {
+      "type": "boolean"
+    },
+    "attempt_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "attempt_status": {
+      "enum": [
+        "in_progress",
+        "confirmed",
+        "failed",
+        "ambiguous"
+      ]
+    },
+    "audit_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "conclusion": {
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "block": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expected_row_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "observed_row_digest_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "relation": {
+          "enum": [
+            "consistent",
+            "different",
+            "unavailable"
+          ]
+        },
+        "target_identity_status": {
+          "enum": [
+            "exact",
+            "changed",
+            "validator_missing"
+          ]
+        },
+        "validator_uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "block",
+        "expected_row_digest_sha256",
+        "observed_row_digest_sha256",
+        "relation",
+        "target_identity_status",
+        "validator_uid"
+      ],
+      "type": "object"
+    },
+    "netuid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[!-~]+$",
+      "type": "string"
+    },
+    "retry_disposition": {
+      "enum": [
+        "eligible_pre_send",
+        "blocked_requires_operator"
+      ]
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/weight-reconciliation-report"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "submission_started": {
+      "type": "boolean"
+    },
+    "validator_hotkey": {
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[!-~]+$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "alert_required",
+    "attempt_id",
+    "attempt_status",
+    "audit_digest_sha256",
+    "conclusion",
+    "digest_sha256",
+    "evidence",
+    "netuid",
+    "network",
+    "retry_disposition",
+    "schema",
+    "schema_version",
+    "submission_started",
+    "validator_hotkey"
+  ],
+  "title": "Weight reconciliation report v1",
+  "type": "object"
+}

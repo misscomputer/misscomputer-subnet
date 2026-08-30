@@ -1,0 +1,456 @@
+{
+  "$defs": {
+    "AttestationPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_measurements": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Allowed Measurements",
+          "type": "array"
+        },
+        "kbs_grant_id": {
+          "default": "",
+          "title": "Kbs Grant Id",
+          "type": "string"
+        },
+        "technology": {
+          "default": "",
+          "title": "Technology",
+          "type": "string"
+        }
+      },
+      "title": "AttestationPolicy",
+      "type": "object"
+    },
+    "HealthSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "consecutive_failure": {
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Consecutive Failure",
+          "type": "integer"
+        },
+        "expected_status": {
+          "maximum": 599,
+          "minimum": 100,
+          "title": "Expected Status",
+          "type": "integer"
+        },
+        "interval_millis": {
+          "maximum": 300000,
+          "minimum": 1,
+          "title": "Interval Millis",
+          "type": "integer"
+        },
+        "path": {
+          "maxLength": 1024,
+          "pattern": "^/",
+          "title": "Path",
+          "type": "string"
+        },
+        "timeout_millis": {
+          "maximum": 900000,
+          "minimum": 1,
+          "title": "Timeout Millis",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "expected_status",
+        "interval_millis",
+        "timeout_millis",
+        "consecutive_failure"
+      ],
+      "title": "HealthSpec",
+      "type": "object"
+    },
+    "ResourceLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_millis": {
+          "maximum": 128000,
+          "minimum": 1,
+          "title": "Cpu Millis",
+          "type": "integer"
+        },
+        "disk_mb": {
+          "maximum": 10485760,
+          "minimum": 16,
+          "title": "Disk Mb",
+          "type": "integer"
+        },
+        "memory_mb": {
+          "maximum": 1048576,
+          "minimum": 16,
+          "title": "Memory Mb",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpu_millis",
+        "memory_mb",
+        "disk_mb"
+      ],
+      "title": "ResourceLimits",
+      "type": "object"
+    },
+    "ServiceKeyBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "challenge": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Challenge",
+          "type": "string"
+        },
+        "expires_at_block": {
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Network",
+          "type": "string"
+        },
+        "protocol": {
+          "const": "service-binding.v1",
+          "default": "service-binding.v1",
+          "title": "Protocol",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "validator",
+            "miner"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Service Public Key",
+          "type": "string"
+        },
+        "signature": {
+          "default": "",
+          "title": "Signature",
+          "type": "string"
+        },
+        "uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uid"
+        },
+        "valid_from_block": {
+          "minimum": 0,
+          "title": "Valid From Block",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role",
+        "network",
+        "netuid",
+        "hotkey",
+        "service_public_key",
+        "generation",
+        "valid_from_block",
+        "expires_at_block",
+        "challenge"
+      ],
+      "title": "ServiceKeyBinding",
+      "type": "object"
+    },
+    "SubnetBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "chain_block": {
+          "minimum": 0,
+          "title": "Chain Block",
+          "type": "integer"
+        },
+        "epoch": {
+          "minimum": 0,
+          "title": "Epoch",
+          "type": "integer"
+        },
+        "expires_at_block": {
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "miner_axon_url": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Axon Url"
+        },
+        "miner_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Uid"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Network",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Validator Hotkey",
+          "type": "string"
+        },
+        "validator_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Validator Service Public Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "network",
+        "netuid",
+        "validator_hotkey",
+        "miner_hotkey",
+        "chain_block",
+        "epoch",
+        "expires_at_block",
+        "validator_service_public_key",
+        "miner_service_public_key"
+      ],
+      "title": "SubnetBinding",
+      "type": "object"
+    },
+    "Ticket": {
+      "additionalProperties": false,
+      "properties": {
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "attestation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttestationPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "challenge_path": {
+          "maxLength": 1024,
+          "pattern": "^/",
+          "title": "Challenge Path",
+          "type": "string"
+        },
+        "challenge_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Challenge Sha256",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "encrypted_image_key": {
+          "default": "",
+          "title": "Encrypted Image Key",
+          "type": "string"
+        },
+        "expires_at": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Expires At",
+          "type": "string"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "health": {
+          "$ref": "#/$defs/HealthSpec"
+        },
+        "image_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Image Digest",
+          "type": "string"
+        },
+        "issued_at": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Issued At",
+          "type": "string"
+        },
+        "manifest_key": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Manifest Key",
+          "type": "string"
+        },
+        "miner_id": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Id",
+          "type": "string"
+        },
+        "resources": {
+          "$ref": "#/$defs/ResourceLimits"
+        },
+        "route_host": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Route Host",
+          "type": "string"
+        },
+        "signature": {
+          "pattern": "^(?:0x)?[0-9a-f]{128}$",
+          "title": "Signature",
+          "type": "string"
+        },
+        "subnet": {
+          "$ref": "#/$defs/SubnetBinding"
+        },
+        "version": {
+          "const": "deployment.v2",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "deployment_id",
+        "generation",
+        "image_digest",
+        "manifest_key",
+        "miner_id",
+        "route_host",
+        "assignment_nonce",
+        "challenge_path",
+        "challenge_sha256",
+        "resources",
+        "health",
+        "issued_at",
+        "expires_at",
+        "subnet",
+        "signature"
+      ],
+      "title": "Ticket",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "caller_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Caller Hotkey",
+      "type": "string"
+    },
+    "current_block": {
+      "minimum": 0,
+      "title": "Current Block",
+      "type": "integer"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v1",
+      "default": "subnet-synapse.v1",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    },
+    "ticket": {
+      "$ref": "#/$defs/Ticket"
+    },
+    "validator_binding": {
+      "$ref": "#/$defs/ServiceKeyBinding"
+    }
+  },
+  "required": [
+    "request_id",
+    "current_block",
+    "caller_hotkey",
+    "validator_binding",
+    "ticket"
+  ],
+  "title": "DeploySynapse",
+  "type": "object"
+}

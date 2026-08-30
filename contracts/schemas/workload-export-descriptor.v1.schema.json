@@ -1,0 +1,65 @@
+{
+  "additionalProperties": false,
+  "description": "Canonical immutable descriptor accepted instead of workload export bytes.",
+  "properties": {
+    "artifact_id": {
+      "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+      "title": "Artifact Id",
+      "type": "string"
+    },
+    "byte_length": {
+      "exclusiveMinimum": 0,
+      "maximum": 17179869184,
+      "title": "Byte Length",
+      "type": "integer"
+    },
+    "container_artifact_id": {
+      "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+      "title": "Container Artifact Id",
+      "type": "string"
+    },
+    "container_manifest_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "title": "Container Manifest Digest",
+      "type": "string"
+    },
+    "content_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Content Sha256",
+      "type": "string"
+    },
+    "mutable_tag": {
+      "const": null,
+      "default": null,
+      "title": "Mutable Tag",
+      "type": "null"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/workload-export-descriptor",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "workload_kind": {
+      "const": "synthetic_http_v1",
+      "title": "Workload Kind",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "artifact_id",
+    "workload_kind",
+    "container_artifact_id",
+    "container_manifest_digest",
+    "content_sha256",
+    "byte_length"
+  ],
+  "title": "WorkloadExportDescriptor",
+  "type": "object"
+}

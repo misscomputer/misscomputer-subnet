@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "misscomputer-subnet"
+version = "0.2.0"
+description = "Public miner, validator, and verification software for the Miss Computer subnet"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = "==3.12.*"
+dependencies = [
+  "bittensor==11.1.0",
+  "cryptography==50.0.0",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "pydantic==2.13.4",
+  "uvicorn==0.52.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "jsonschema==4.25.1",
+  "mypy==2.3.1",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.16.4",
+]
+
+[project.scripts]
+misscomputer-miner = "misscomputer_subnet.miner:main"
+misscomputer-validator = "misscomputer_subnet.validator:main"
+misscomputer-weight-executor = "misscomputer_subnet.weight_executor:main"
+misscomputer-weight-reconcile = "misscomputer_subnet.weight_reconciliation:main"
+misscomputer-score-checkpoint-relay = "misscomputer_subnet.score_checkpoint_relay_cli:main"
+misscomputer-release-verify = "misscomputer_subnet.production_release_verifier:main"
+misscomputer-python-boundary = "misscomputer_subnet.process_boundary:main"
+misscomputer-checkpoint-boundary = "misscomputer_subnet.checkpoint_boundary:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/misscomputer_subnet"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"pkg/netpolicy/iana-special-purpose.v1.json" = "misscomputer_subnet/iana-special-purpose.v1.json"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
+ignore = ["ASYNC109", "S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["misscomputer_subnet"]
+warn_unreachable = true

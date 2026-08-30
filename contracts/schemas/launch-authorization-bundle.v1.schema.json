@@ -1,0 +1,1060 @@
+{
+  "$comment": "Offline envelope only. A signature_verification_state of verified must come from a separate cryptographic verifier; model validation is not proof.",
+  "$defs": {
+    "DependencyInput": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 17179869184,
+          "title": "Byte Length",
+          "type": "integer"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "dependency_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Dependency Id",
+          "type": "string"
+        },
+        "ecosystem": {
+          "enum": [
+            "container",
+            "go",
+            "python"
+          ],
+          "title": "Ecosystem",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dependency_id",
+        "ecosystem",
+        "path",
+        "content_sha256",
+        "byte_length"
+      ],
+      "title": "DependencyInput",
+      "type": "object"
+    },
+    "GoBinary": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "binary_name": {
+          "enum": [
+            "control-api",
+            "miner-agent",
+            "workload"
+          ],
+          "title": "Binary Name",
+          "type": "string"
+        },
+        "build_mode": {
+          "const": "trimpath_cgo_disabled",
+          "title": "Build Mode",
+          "type": "string"
+        },
+        "byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 17179869184,
+          "title": "Byte Length",
+          "type": "integer"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Path",
+          "type": "string"
+        },
+        "target": {
+          "enum": [
+            "linux_amd64",
+            "linux_arm64"
+          ],
+          "title": "Target",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "binary_name",
+        "path",
+        "target",
+        "build_mode",
+        "content_sha256",
+        "byte_length"
+      ],
+      "title": "GoBinary",
+      "type": "object"
+    },
+    "OCIImage": {
+      "additionalProperties": false,
+      "properties": {
+        "archive_path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Archive Path",
+          "type": "string"
+        },
+        "artifact_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 68719476736,
+          "title": "Byte Length",
+          "type": "integer"
+        },
+        "config_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Config Digest",
+          "type": "string"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "image_name": {
+          "enum": [
+            "neuron",
+            "workload"
+          ],
+          "title": "Image Name",
+          "type": "string"
+        },
+        "manifest_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Manifest Digest",
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux/amd64",
+            "linux/arm64"
+          ],
+          "title": "Platform",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "image_name",
+        "platform",
+        "manifest_digest",
+        "config_digest",
+        "archive_path",
+        "content_sha256",
+        "byte_length"
+      ],
+      "title": "OCIImage",
+      "type": "object"
+    },
+    "OfflineSignatureEnvelope": {
+      "$comment": "Canonical signature metadata only; cryptographic verification is separate.",
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "ed25519",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Expires At Epoch",
+          "type": "integer"
+        },
+        "issued_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Issued At Epoch",
+          "type": "integer"
+        },
+        "payload_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Payload Digest Sha256",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/offline-signature-envelope",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "signature_base64": {
+          "maxLength": 88,
+          "minLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$",
+          "title": "Signature Base64",
+          "type": "string"
+        },
+        "signer_key_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Signer Key Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "signer_key_id",
+        "algorithm",
+        "payload_digest_sha256",
+        "signature_base64",
+        "issued_at_epoch",
+        "expires_at_epoch"
+      ],
+      "title": "Offline signature envelope v1",
+      "type": "object"
+    },
+    "ProductionReleaseManifest": {
+      "$comment": "Offline metadata only. Parsing this document does not verify builds, artifacts, signatures, or authorize launch.",
+      "additionalProperties": false,
+      "properties": {
+        "artifact_verification_state": {
+          "enum": [
+            "not_performed",
+            "verified"
+          ],
+          "title": "Artifact Verification State",
+          "type": "string"
+        },
+        "build_recomputation_state": {
+          "enum": [
+            "not_performed",
+            "verified"
+          ],
+          "title": "Build Recomputation State",
+          "type": "string"
+        },
+        "completeness_state": {
+          "const": "complete",
+          "title": "Completeness State",
+          "type": "string"
+        },
+        "container_images": {
+          "items": {
+            "$ref": "#/$defs/OCIImage"
+          },
+          "maxItems": 8,
+          "minItems": 2,
+          "title": "Container Images",
+          "type": "array"
+        },
+        "created_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Created At Epoch",
+          "type": "integer"
+        },
+        "dependency_inputs": {
+          "items": {
+            "$ref": "#/$defs/DependencyInput"
+          },
+          "maxItems": 64,
+          "minItems": 3,
+          "title": "Dependency Inputs",
+          "type": "array"
+        },
+        "digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Digest Sha256",
+          "type": "string"
+        },
+        "expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Expires At Epoch",
+          "type": "integer"
+        },
+        "go_binaries": {
+          "items": {
+            "$ref": "#/$defs/GoBinary"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "title": "Go Binaries",
+          "type": "array"
+        },
+        "live_actions": {
+          "const": false,
+          "title": "Live Actions",
+          "type": "boolean"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "provenance_references": {
+          "items": {
+            "$ref": "#/$defs/SupplyChainReference"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Provenance References",
+          "type": "array"
+        },
+        "python_distributions": {
+          "items": {
+            "$ref": "#/$defs/PythonDistribution"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "title": "Python Distributions",
+          "type": "array"
+        },
+        "release_channel": {
+          "const": "production",
+          "title": "Release Channel",
+          "type": "string"
+        },
+        "release_files": {
+          "items": {
+            "$ref": "#/$defs/ReleaseFile"
+          },
+          "maxItems": 256,
+          "minItems": 3,
+          "title": "Release Files",
+          "type": "array"
+        },
+        "release_id": {
+          "pattern": "^[a-z0-9][a-z0-9.-]{0,126}[a-z0-9]$",
+          "title": "Release Id",
+          "type": "string"
+        },
+        "release_version": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]{0,126}[A-Za-z0-9]$",
+          "title": "Release Version",
+          "type": "string"
+        },
+        "rollback_bytes": {
+          "items": {
+            "$ref": "#/$defs/RollbackBytes"
+          },
+          "maxItems": 512,
+          "minItems": 1,
+          "title": "Rollback Bytes",
+          "type": "array"
+        },
+        "sbom_references": {
+          "items": {
+            "$ref": "#/$defs/SupplyChainReference"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Sbom References",
+          "type": "array"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/production-release-manifest",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceRevision"
+        },
+        "target_network": {
+          "const": "finney",
+          "title": "Target Network",
+          "type": "string"
+        },
+        "toolchains": {
+          "items": {
+            "$ref": "#/$defs/ToolchainInput"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "title": "Toolchains",
+          "type": "array"
+        },
+        "uniqueness_state": {
+          "const": "unique",
+          "title": "Uniqueness State",
+          "type": "string"
+        },
+        "workload_artifacts": {
+          "items": {
+            "$ref": "#/$defs/WorkloadArtifact"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Workload Artifacts",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "release_id",
+        "release_version",
+        "release_channel",
+        "target_network",
+        "netuid",
+        "source",
+        "created_at_epoch",
+        "expires_at_epoch",
+        "toolchains",
+        "dependency_inputs",
+        "python_distributions",
+        "go_binaries",
+        "container_images",
+        "workload_artifacts",
+        "release_files",
+        "sbom_references",
+        "provenance_references",
+        "rollback_bytes",
+        "completeness_state",
+        "uniqueness_state",
+        "build_recomputation_state",
+        "artifact_verification_state",
+        "live_actions",
+        "digest_sha256"
+      ],
+      "title": "Production release manifest v1",
+      "type": "object"
+    },
+    "PythonDistribution": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 17179869184,
+          "title": "Byte Length",
+          "type": "integer"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "distribution_kind": {
+          "enum": [
+            "sdist",
+            "wheel"
+          ],
+          "title": "Distribution Kind",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Path",
+          "type": "string"
+        },
+        "requires_python": {
+          "const": "==3.12.*",
+          "title": "Requires Python",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "distribution_kind",
+        "path",
+        "content_sha256",
+        "byte_length",
+        "requires_python"
+      ],
+      "title": "PythonDistribution",
+      "type": "object"
+    },
+    "ReleaseFile": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 1073741824,
+          "title": "Byte Length",
+          "type": "integer"
+        },
+        "category": {
+          "enum": [
+            "config",
+            "contract_schema",
+            "systemd_unit"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "category",
+        "path",
+        "content_sha256",
+        "byte_length"
+      ],
+      "title": "ReleaseFile",
+      "type": "object"
+    },
+    "ReleaseTrustPolicy": {
+      "$comment": "Public-key metadata only; this contract has no private-key material.",
+      "additionalProperties": false,
+      "properties": {
+        "digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Digest Sha256",
+          "type": "string"
+        },
+        "policy_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Policy Id",
+          "type": "string"
+        },
+        "required_roles": {
+          "items": {
+            "enum": [
+              "operations_owner",
+              "release_manager",
+              "security_reviewer"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "title": "Required Roles",
+          "type": "array"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/release-trust-policy",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "threshold": {
+          "maximum": 16,
+          "minimum": 2,
+          "title": "Threshold",
+          "type": "integer"
+        },
+        "trusted_keys": {
+          "items": {
+            "$ref": "#/$defs/TrustedReleaseKey"
+          },
+          "maxItems": 16,
+          "minItems": 3,
+          "title": "Trusted Keys",
+          "type": "array"
+        },
+        "valid_from_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid From Epoch",
+          "type": "integer"
+        },
+        "valid_until_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid Until Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "policy_id",
+        "threshold",
+        "required_roles",
+        "trusted_keys",
+        "valid_from_epoch",
+        "valid_until_epoch",
+        "digest_sha256"
+      ],
+      "title": "Release trust policy v1",
+      "type": "object"
+    },
+    "RollbackBytes": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "replacement_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Replacement Sha256",
+          "type": "string"
+        },
+        "rollback_byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 68719476736,
+          "title": "Rollback Byte Length",
+          "type": "integer"
+        },
+        "rollback_path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Rollback Path",
+          "type": "string"
+        },
+        "rollback_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Rollback Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "replacement_sha256",
+        "rollback_path",
+        "rollback_sha256",
+        "rollback_byte_length"
+      ],
+      "title": "RollbackBytes",
+      "type": "object"
+    },
+    "SourceRevision": {
+      "additionalProperties": false,
+      "properties": {
+        "commit_oid": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Commit Oid",
+          "type": "string"
+        },
+        "object_format": {
+          "const": "sha1",
+          "title": "Object Format",
+          "type": "string"
+        },
+        "repository": {
+          "const": "misscomputer/misscomputer-subnet",
+          "title": "Repository",
+          "type": "string"
+        },
+        "source_archive_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Archive Sha256",
+          "type": "string"
+        },
+        "tree_oid": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Tree Oid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository",
+        "object_format",
+        "commit_oid",
+        "tree_oid",
+        "source_archive_sha256"
+      ],
+      "title": "SourceRevision",
+      "type": "object"
+    },
+    "SupplyChainReference": {
+      "additionalProperties": false,
+      "properties": {
+        "byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 4294967296,
+          "title": "Byte Length",
+          "type": "integer"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "format": {
+          "enum": [
+            "slsa_provenance_v1",
+            "spdx_json"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Path",
+          "type": "string"
+        },
+        "reference_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Reference Id",
+          "type": "string"
+        },
+        "subject_artifact_ids": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Subject Artifact Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "reference_id",
+        "format",
+        "path",
+        "content_sha256",
+        "byte_length",
+        "subject_artifact_ids"
+      ],
+      "title": "SupplyChainReference",
+      "type": "object"
+    },
+    "ToolchainInput": {
+      "additionalProperties": false,
+      "properties": {
+        "component": {
+          "enum": [
+            "container_builder",
+            "go",
+            "python"
+          ],
+          "title": "Component",
+          "type": "string"
+        },
+        "distribution_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Distribution Sha256",
+          "type": "string"
+        },
+        "platform": {
+          "pattern": "^[a-z0-9][a-z0-9_/-]{0,62}[a-z0-9]$",
+          "title": "Platform",
+          "type": "string"
+        },
+        "toolchain_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Toolchain Id",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]{0,126}[A-Za-z0-9]$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "toolchain_id",
+        "component",
+        "version",
+        "platform",
+        "distribution_sha256"
+      ],
+      "title": "ToolchainInput",
+      "type": "object"
+    },
+    "TrustedReleaseKey": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "ed25519",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "key_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Key Id",
+          "type": "string"
+        },
+        "public_key_base64": {
+          "maxLength": 44,
+          "minLength": 44,
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "title": "Public Key Base64",
+          "type": "string"
+        },
+        "public_key_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Public Key Sha256",
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "enum": [
+              "operations_owner",
+              "release_manager",
+              "security_reviewer"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Roles",
+          "type": "array"
+        },
+        "valid_from_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid From Epoch",
+          "type": "integer"
+        },
+        "valid_until_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid Until Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key_id",
+        "algorithm",
+        "public_key_base64",
+        "public_key_sha256",
+        "roles",
+        "valid_from_epoch",
+        "valid_until_epoch"
+      ],
+      "title": "TrustedReleaseKey",
+      "type": "object"
+    },
+    "WorkloadArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Artifact Id",
+          "type": "string"
+        },
+        "byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 17179869184,
+          "title": "Byte Length",
+          "type": "integer"
+        },
+        "container_artifact_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Container Artifact Id",
+          "type": "string"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "descriptor_path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Descriptor Path",
+          "type": "string"
+        },
+        "descriptor_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Descriptor Sha256",
+          "type": "string"
+        },
+        "workload_kind": {
+          "const": "synthetic_http_v1",
+          "title": "Workload Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "workload_kind",
+        "container_artifact_id",
+        "descriptor_path",
+        "descriptor_sha256",
+        "content_sha256",
+        "byte_length"
+      ],
+      "title": "WorkloadArtifact",
+      "type": "object"
+    }
+  },
+  "$id": "https://miss.computer/contracts/launch-authorization-bundle.v1.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "authorization_payload_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Authorization Payload Digest Sha256",
+      "type": "string"
+    },
+    "authorization_state": {
+      "enum": [
+        "authorized",
+        "expired",
+        "pending_signature_verification",
+        "rejected"
+      ],
+      "title": "Authorization State",
+      "type": "string"
+    },
+    "bundle_id": {
+      "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+      "title": "Bundle Id",
+      "type": "string"
+    },
+    "completeness_state": {
+      "const": "complete",
+      "title": "Completeness State",
+      "type": "string"
+    },
+    "digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Digest Sha256",
+      "type": "string"
+    },
+    "evaluated_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Evaluated At Epoch",
+      "type": "integer"
+    },
+    "expires_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Expires At Epoch",
+      "type": "integer"
+    },
+    "issued_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Issued At Epoch",
+      "type": "integer"
+    },
+    "launch_authorized": {
+      "title": "Launch Authorized",
+      "type": "boolean"
+    },
+    "live_actions": {
+      "const": false,
+      "title": "Live Actions",
+      "type": "boolean"
+    },
+    "release_manifest": {
+      "$ref": "#/$defs/ProductionReleaseManifest"
+    },
+    "release_manifest_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Release Manifest Digest Sha256",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/launch-authorization-bundle",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "signature_verification_state": {
+      "enum": [
+        "failed",
+        "not_performed",
+        "verified"
+      ],
+      "title": "Signature Verification State",
+      "type": "string"
+    },
+    "signatures": {
+      "items": {
+        "$ref": "#/$defs/OfflineSignatureEnvelope"
+      },
+      "maxItems": 16,
+      "minItems": 2,
+      "title": "Signatures",
+      "type": "array"
+    },
+    "trust_policy": {
+      "$ref": "#/$defs/ReleaseTrustPolicy"
+    },
+    "trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Trust Policy Digest Sha256",
+      "type": "string"
+    },
+    "uniqueness_state": {
+      "const": "unique",
+      "title": "Uniqueness State",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "bundle_id",
+    "release_manifest",
+    "release_manifest_digest_sha256",
+    "trust_policy",
+    "trust_policy_digest_sha256",
+    "issued_at_epoch",
+    "expires_at_epoch",
+    "evaluated_at_epoch",
+    "authorization_payload_digest_sha256",
+    "signatures",
+    "completeness_state",
+    "uniqueness_state",
+    "signature_verification_state",
+    "authorization_state",
+    "launch_authorized",
+    "live_actions",
+    "digest_sha256"
+  ],
+  "title": "Launch authorization bundle v1",
+  "type": "object"
+}

@@ -1,0 +1,266 @@
+{
+  "$defs": {
+    "ServiceKeyBinding": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "validator"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport": {
+                "const": "local"
+              },
+              "transport_certificate_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "miner"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport": {
+                "enum": [
+                  "https",
+                  "http"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "transport": {
+                "const": "https"
+              }
+            },
+            "required": [
+              "transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport_certificate_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "transport": {
+                "enum": [
+                  "local",
+                  "http"
+                ]
+              }
+            },
+            "required": [
+              "transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport_certificate_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "challenge": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Challenge",
+          "type": "string"
+        },
+        "expires_at_block": {
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Network",
+          "type": "string"
+        },
+        "protocol": {
+          "const": "service-binding.v2",
+          "default": "service-binding.v2",
+          "title": "Protocol",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "validator",
+            "miner"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Service Public Key",
+          "type": "string"
+        },
+        "signature": {
+          "default": "",
+          "title": "Signature",
+          "type": "string"
+        },
+        "transport": {
+          "enum": [
+            "local",
+            "https",
+            "http"
+          ],
+          "title": "Transport",
+          "type": "string"
+        },
+        "transport_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Transport Certificate Sha256"
+        },
+        "uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uid"
+        },
+        "valid_from_block": {
+          "minimum": 0,
+          "title": "Valid From Block",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role",
+        "transport",
+        "transport_certificate_sha256",
+        "network",
+        "netuid",
+        "hotkey",
+        "service_public_key",
+        "generation",
+        "valid_from_block",
+        "expires_at_block",
+        "challenge"
+      ],
+      "title": "ServiceKeyBinding",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "block": {
+      "minimum": 0,
+      "title": "Block",
+      "type": "integer"
+    },
+    "epoch": {
+      "minimum": 0,
+      "title": "Epoch",
+      "type": "integer"
+    },
+    "netuid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Network",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "tempo": {
+      "minimum": 1,
+      "title": "Tempo",
+      "type": "integer"
+    },
+    "validator_binding": {
+      "$ref": "#/$defs/ServiceKeyBinding"
+    },
+    "validator_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Validator Hotkey",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "network",
+    "netuid",
+    "block",
+    "epoch",
+    "tempo",
+    "validator_hotkey",
+    "validator_binding"
+  ],
+  "title": "ChainState",
+  "type": "object"
+}

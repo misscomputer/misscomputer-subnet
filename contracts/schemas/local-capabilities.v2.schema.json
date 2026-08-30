@@ -1,0 +1,128 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "transport": {
+            "const": "https"
+          }
+        },
+        "required": [
+          "transport"
+        ]
+      },
+      "then": {
+        "properties": {
+          "transport_certificate_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "transport": {
+            "const": "http"
+          }
+        },
+        "required": [
+          "transport"
+        ]
+      },
+      "then": {
+        "properties": {
+          "transport_certificate_sha256": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "features": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Features",
+      "type": "array"
+    },
+    "max_body_bytes": {
+      "title": "Max Body Bytes",
+      "type": "integer"
+    },
+    "miner_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Miner Hotkey",
+      "type": "string"
+    },
+    "miner_uid": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Miner Uid"
+    },
+    "netuid": {
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Network",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "service_public_key": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Service Public Key",
+      "type": "string"
+    },
+    "transport": {
+      "enum": [
+        "https",
+        "http"
+      ],
+      "title": "Transport",
+      "type": "string"
+    },
+    "transport_certificate_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Transport Certificate Sha256"
+    }
+  },
+  "required": [
+    "protocol",
+    "network",
+    "netuid",
+    "miner_hotkey",
+    "service_public_key",
+    "transport",
+    "transport_certificate_sha256",
+    "features",
+    "max_body_bytes"
+  ],
+  "title": "LocalCapabilities",
+  "type": "object"
+}

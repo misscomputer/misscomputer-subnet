@@ -1,0 +1,393 @@
+{
+  "$comment": "Offline verification evidence only. launch_authorized does not apply, publish, install, start, or activate anything.",
+  "$defs": {
+    "VerifiedLocalInput": {
+      "additionalProperties": false,
+      "properties": {
+        "bound_content_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bound Content Sha256"
+        },
+        "category": {
+          "enum": [
+            "dependency_input",
+            "go_binary",
+            "oci_archive",
+            "provenance",
+            "python_distribution",
+            "release_file",
+            "rollback_bytes",
+            "sbom",
+            "source_archive",
+            "workload_descriptor"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "expected_byte_length": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 68719476736,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Byte Length"
+        },
+        "expected_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Expected Sha256",
+          "type": "string"
+        },
+        "input_id": {
+          "maxLength": 84,
+          "pattern": "^(?:source_archive|(?:dependency_input|go_binary|oci_archive|provenance|python_distribution|release_file|rollback_bytes|sbom|workload_descriptor)_(?:[a-z][a-z0-9_]{0,62}[a-z0-9]|[a-z]))$",
+          "title": "Input Id",
+          "type": "string"
+        },
+        "observed_byte_length": {
+          "exclusiveMinimum": 0,
+          "maximum": 68719476736,
+          "title": "Observed Byte Length",
+          "type": "integer"
+        },
+        "observed_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observed Sha256",
+          "type": "string"
+        },
+        "recomputed_byte_length": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 68719476736,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recomputed Byte Length"
+        },
+        "recomputed_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recomputed Sha256"
+        },
+        "relative_path": {
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._+/-]{0,510}[A-Za-z0-9])?$",
+          "title": "Relative Path",
+          "type": "string"
+        },
+        "verification_state": {
+          "const": "verified",
+          "title": "Verification State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_id",
+        "category",
+        "relative_path",
+        "expected_sha256",
+        "observed_sha256",
+        "observed_byte_length",
+        "verification_state"
+      ],
+      "title": "VerifiedLocalInput",
+      "type": "object"
+    },
+    "VerifiedReleaseSignature": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "ed25519",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "roles": {
+          "items": {
+            "enum": [
+              "operations_owner",
+              "release_manager",
+              "security_reviewer"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Roles",
+          "type": "array"
+        },
+        "signature_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Signature Sha256",
+          "type": "string"
+        },
+        "signer_key_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+          "title": "Signer Key Id",
+          "type": "string"
+        },
+        "verification_state": {
+          "const": "verified",
+          "title": "Verification State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "signer_key_id",
+        "algorithm",
+        "roles",
+        "signature_sha256",
+        "verification_state"
+      ],
+      "title": "VerifiedReleaseSignature",
+      "type": "object"
+    }
+  },
+  "$id": "https://miss.computer/contracts/launch-authorization-report.v1.schema.json",
+  "additionalProperties": false,
+  "description": "Canonical output of the offline verifier; never an activation action.",
+  "properties": {
+    "approved_revocation_list_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Approved Revocation List Digest Sha256",
+      "type": "string"
+    },
+    "approved_trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Approved Trust Policy Digest Sha256",
+      "type": "string"
+    },
+    "artifact_verification_state": {
+      "const": "verified",
+      "title": "Artifact Verification State",
+      "type": "string"
+    },
+    "authorization_state": {
+      "const": "authorized",
+      "title": "Authorization State",
+      "type": "string"
+    },
+    "build_recomputation_state": {
+      "const": "verified",
+      "title": "Build Recomputation State",
+      "type": "string"
+    },
+    "bundle_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Bundle Digest Sha256",
+      "type": "string"
+    },
+    "bundle_id": {
+      "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+      "title": "Bundle Id",
+      "type": "string"
+    },
+    "digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Digest Sha256",
+      "type": "string"
+    },
+    "evaluated_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Evaluated At Epoch",
+      "type": "integer"
+    },
+    "launch_authorized": {
+      "const": true,
+      "title": "Launch Authorized",
+      "type": "boolean"
+    },
+    "live_actions": {
+      "const": false,
+      "title": "Live Actions",
+      "type": "boolean"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "release_manifest_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Release Manifest Digest Sha256",
+      "type": "string"
+    },
+    "required_roles": {
+      "items": {
+        "enum": [
+          "operations_owner",
+          "release_manager",
+          "security_reviewer"
+        ],
+        "type": "string"
+      },
+      "maxItems": 3,
+      "minItems": 3,
+      "title": "Required Roles",
+      "type": "array"
+    },
+    "required_signature_threshold": {
+      "maximum": 16,
+      "minimum": 2,
+      "title": "Required Signature Threshold",
+      "type": "integer"
+    },
+    "revocation_list_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Revocation List Digest Sha256",
+      "type": "string"
+    },
+    "revocation_verification_state": {
+      "const": "verified",
+      "title": "Revocation Verification State",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/launch-authorization-report",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "signature_algorithm": {
+      "const": "ed25519",
+      "title": "Signature Algorithm",
+      "type": "string"
+    },
+    "signature_domain": {
+      "const": "miss.computer/misscomputer-subnet/launch-authorization/v1",
+      "title": "Signature Domain",
+      "type": "string"
+    },
+    "signature_purpose": {
+      "const": "production_mainnet_launch_authorization",
+      "title": "Signature Purpose",
+      "type": "string"
+    },
+    "signature_verification_state": {
+      "const": "verified",
+      "title": "Signature Verification State",
+      "type": "string"
+    },
+    "source_commit_oid": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Source Commit Oid",
+      "type": "string"
+    },
+    "source_tree_oid": {
+      "pattern": "^[0-9a-f]{40}$",
+      "title": "Source Tree Oid",
+      "type": "string"
+    },
+    "target_network": {
+      "const": "finney",
+      "title": "Target Network",
+      "type": "string"
+    },
+    "trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Trust Policy Digest Sha256",
+      "type": "string"
+    },
+    "verified_input_set_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Verified Input Set Digest Sha256",
+      "type": "string"
+    },
+    "verified_inputs": {
+      "items": {
+        "$ref": "#/$defs/VerifiedLocalInput"
+      },
+      "maxItems": 1024,
+      "minItems": 1,
+      "title": "Verified Inputs",
+      "type": "array"
+    },
+    "verified_signature_set_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Verified Signature Set Digest Sha256",
+      "type": "string"
+    },
+    "verified_signatures": {
+      "items": {
+        "$ref": "#/$defs/VerifiedReleaseSignature"
+      },
+      "maxItems": 16,
+      "minItems": 2,
+      "title": "Verified Signatures",
+      "type": "array"
+    },
+    "verifier_id": {
+      "const": "misscomputer-release-verifier-v1",
+      "title": "Verifier Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "verifier_id",
+    "signature_algorithm",
+    "signature_purpose",
+    "signature_domain",
+    "bundle_id",
+    "bundle_digest_sha256",
+    "release_manifest_digest_sha256",
+    "trust_policy_digest_sha256",
+    "approved_trust_policy_digest_sha256",
+    "revocation_list_digest_sha256",
+    "approved_revocation_list_digest_sha256",
+    "source_commit_oid",
+    "source_tree_oid",
+    "target_network",
+    "netuid",
+    "evaluated_at_epoch",
+    "verified_inputs",
+    "verified_input_set_digest_sha256",
+    "verified_signatures",
+    "verified_signature_set_digest_sha256",
+    "required_signature_threshold",
+    "required_roles",
+    "artifact_verification_state",
+    "build_recomputation_state",
+    "signature_verification_state",
+    "revocation_verification_state",
+    "authorization_state",
+    "launch_authorized",
+    "live_actions",
+    "digest_sha256"
+  ],
+  "title": "Launch authorization report v1",
+  "type": "object"
+}
