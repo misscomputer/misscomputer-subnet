@@ -179,6 +179,16 @@ See [`signed-score-checkpoint-relay-runbook.md`](signed-score-checkpoint-relay-r
 for the complete operator procedure, ledger continuity rules, backup/restore,
 and fork/rollback response.
 
+## Companion online liveness check
+
+The checkpoint relay verifies central scoring offline. The separate
+[`public-validator-live-probe.md`](public-validator-live-probe.md) flow lets
+the same validator independently check, online and within pinned bounds, that
+the deployments the central scheduler publishes as active really serve their
+hidden challenge right now. Its report carries the manifest, assignment,
+ticket, and receipt digests needed to cross-reference an archived probe with a
+later checkpoint; it is not a score input and never touches the relay ledger.
+
 ## Versioned contracts
 
 The version-1 schemas and canonical fixtures cover:

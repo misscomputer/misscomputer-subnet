@@ -1,0 +1,140 @@
+{
+  "additionalProperties": false,
+  "description": "Append-only acceptance state shared by the central producer and each validator.",
+  "properties": {
+    "accepted_manifest_count": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Accepted Manifest Count",
+      "type": "integer"
+    },
+    "central_authority_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Central Authority Fingerprint Sha256",
+      "type": "string"
+    },
+    "last_expires_at_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Expires At Epoch"
+    },
+    "last_finalized_block_hash": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Finalized Block Hash"
+    },
+    "last_finalized_height": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Finalized Height"
+    },
+    "last_issued_at_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Issued At Epoch"
+    },
+    "last_manifest_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Manifest Digest Sha256"
+    },
+    "last_sequence": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Last Sequence",
+      "type": "integer"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "active_assignment_manifest_publication_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/assignment-manifest-chain-state",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "state_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "State Digest Sha256",
+      "type": "string"
+    },
+    "trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Trust Policy Digest Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "central_authority_fingerprint_sha256",
+    "trust_policy_digest_sha256",
+    "accepted_manifest_count",
+    "last_sequence",
+    "last_finalized_height",
+    "last_finalized_block_hash",
+    "last_issued_at_epoch",
+    "last_expires_at_epoch",
+    "last_manifest_digest_sha256",
+    "state_digest_sha256"
+  ],
+  "title": "AssignmentManifestChainState",
+  "type": "object"
+}

@@ -40,6 +40,13 @@ _SMALL_ORDER_ED25519_ENCODINGS: Final = frozenset(
 )
 
 
+def _validate_ed25519_public_key_bytes(public_bytes: bytes) -> bytes:
+    sign_cleared = public_bytes[:31] + bytes((public_bytes[31] & 0x7F,))
+    if sign_cleared in _SMALL_ORDER_ED25519_ENCODINGS:
+        raise Ed25519PublicKeyValidationError("ed25519_public_key_small_order")
+    return public_bytes
+
+
 def decode_ed25519_public_key_base64(value: str) -> bytes:
     """Decode one canonical padded-base64 Ed25519 public key and reject torsion."""
 
@@ -51,7 +58,18 @@ def decode_ed25519_public_key_base64(value: str) -> bytes:
         raise Ed25519PublicKeyValidationError("ed25519_public_key_encoding_invalid") from exc
     if len(public_bytes) != 32 or base64.b64encode(public_bytes).decode("ascii") != value:
         raise Ed25519PublicKeyValidationError("ed25519_public_key_encoding_invalid")
-    sign_cleared = public_bytes[:31] + bytes((public_bytes[31] & 0x7F,))
-    if sign_cleared in _SMALL_ORDER_ED25519_ENCODINGS:
-        raise Ed25519PublicKeyValidationError("ed25519_public_key_small_order")
-    return public_bytes
+    return _validate_ed25519_public_key_bytes(public_bytes)
+
+
+def decode_ed25519_public_key_hex(value: str) -> bytes:
+    """Decode one canonical lowercase-hex Ed25519 public key and reject torsion."""
+
+    try:
+        if not isinstance(value, str):
+            raise TypeError
+        public_bytes = bytes.fromhex(value)
+    except (TypeError, ValueError) as exc:
+        raise Ed25519PublicKeyValidationError("ed25519_public_key_encoding_invalid") from exc
+    if len(public_bytes) != 32 or public_bytes.hex() != value:
+        raise Ed25519PublicKeyValidationError("ed25519_public_key_encoding_invalid")
+    return _validate_ed25519_public_key_bytes(public_bytes)
