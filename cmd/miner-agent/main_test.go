@@ -73,6 +73,13 @@ func TestCapabilitiesExposeExactConfiguredTransportIdentity(t *testing.T) {
 				(test.pin == "") != (capabilities.TransportCertificateSHA256 == nil) {
 				t.Fatalf("capabilities transport identity = %#v", capabilities)
 			}
+			attested := false
+			for _, feature := range capabilities.Features {
+				attested = attested || feature == neuron.FeatureProbeAttestationV1
+			}
+			if !attested {
+				t.Fatalf("capabilities do not advertise mandatory %s: %v", neuron.FeatureProbeAttestationV1, capabilities.Features)
+			}
 		})
 	}
 }

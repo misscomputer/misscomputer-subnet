@@ -35,6 +35,7 @@ from misscomputer_subnet.protocol import (
 )
 from misscomputer_subnet.validator import (
     MAX_PERSISTED_PUBLICATIONS,
+    PROBE_ATTESTATION_FEATURE,
     RemoteMiner,
     ValidatorNeuron,
     _AmbiguousMinerRegistration,
@@ -89,7 +90,7 @@ class DendriteSim:
                 request_id=synapse.request_id,
                 miner_hotkey=peer.hotkey,
                 miner_uid=peer.uid,
-                features=["scheduler"],
+                features=["scheduler", PROBE_ATTESTATION_FEATURE],
                 max_body_bytes=1 << 20,
                 service_binding=binding,
             )

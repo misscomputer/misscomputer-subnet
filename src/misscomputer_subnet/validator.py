@@ -83,6 +83,10 @@ from .weight_plan import (
 
 LOGGER = logging.getLogger("misscomputer_subnet.validator")
 DISCOVERY_FAILURE_LOG_LIMIT = 8
+# Mandatory miner capability: a miner agent that cannot emit the per-replica
+# probe attestation is never assignment-eligible. This is a fail-closed
+# admission invariant enforced at every capability handshake.
+PROBE_ATTESTATION_FEATURE = "probe-attestation-v1"
 PUBLICATION_LANE_SCHEMA_VERSION = 1
 PUBLICATION_RECORD_MAC_DOMAIN = "miss.computer/misscomputer-subnet/publication-record/v1"
 MAX_HISTORICAL_PUBLICATIONS = 512
@@ -2474,6 +2478,10 @@ class ValidatorNeuron:
         )
         if response.service_binding.uid != neuron.uid:
             raise ValueError("service binding UID mismatch")
+        if PROBE_ATTESTATION_FEATURE not in response.features:
+            raise ValueError(
+                "miner does not advertise the mandatory probe-attestation-v1 capability"
+            )
         return RemoteMiner(
             neuron=neuron,
             axon_url=axon_url,

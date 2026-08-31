@@ -195,7 +195,7 @@ func (a *api) capabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, neuron.LocalCapabilities{
 		Protocol: neuron.SynapseVersion, Network: a.network, NetUID: a.netuid, MinerHotkey: a.hotkey, MinerUID: a.uid,
 		ServicePublicKey: hex.EncodeToString(a.public), Transport: a.agent.MinerTransport, TransportCertificateSHA256: certificatePin,
-		Features: []string{"deploy", "status", "deactivate", "runtime-proxy"}, MaxBodyBytes: bridge.MaxBodyBytes,
+		Features: []string{"deploy", "status", "deactivate", "runtime-proxy", neuron.FeatureProbeAttestationV1}, MaxBodyBytes: bridge.MaxBodyBytes,
 	})
 }
 

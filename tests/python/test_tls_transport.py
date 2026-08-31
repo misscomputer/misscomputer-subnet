@@ -28,7 +28,7 @@ from misscomputer_subnet.protocol import (
     StatusSynapse,
 )
 from misscomputer_subnet.tls import tls_leaf_preflight
-from misscomputer_subnet.validator import ValidatorNeuron
+from misscomputer_subnet.validator import PROBE_ATTESTATION_FEATURE, ValidatorNeuron
 
 CertificateFactory = Callable[..., tuple[Path, Path, bytes, str]]
 ResponseFactory = Callable[[str, dict[str, str], bytes], tuple[int, dict[str, str], bytes]]
@@ -154,12 +154,19 @@ class MinerResponder:
         certificate_pin: str,
         signed_pin: str | None = None,
         tamper_to_pin: str | None = None,
+        features: tuple[str, ...] = (
+            "deploy",
+            "status",
+            "deactivate",
+            PROBE_ATTESTATION_FEATURE,
+        ),
     ) -> None:
         self.signer = signer
         self.uid = uid
         self.certificate_pin = certificate_pin
         self.signed_pin = signed_pin or certificate_pin
         self.tamper_to_pin = tamper_to_pin
+        self.features = features
         self.nonces = bt.http_auth.InMemoryNonceStore()
         self.verified_callers: list[str] = []
         self.redirect_status_to: str | None = None
@@ -203,7 +210,7 @@ class MinerResponder:
                 request_id=request["request_id"],
                 miner_hotkey=str(self.signer.ss58_address),
                 miner_uid=self.uid,
-                features=["deploy", "status", "deactivate"],
+                features=list(self.features),
                 max_body_bytes=1 << 20,
                 service_binding=binding,
             )
@@ -362,6 +369,38 @@ async def test_relay_or_tampered_signed_fingerprint_is_rejected(
 
         with pytest.raises(ValueError, match="transport mismatch|signature is invalid"):
             await neuron._handshake(snapshot, record)
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_miner_without_probe_attestation_capability_is_never_eligible(
+    certificate_factory: CertificateFactory,
+    tmp_path: Path,
+) -> None:
+    """Missing probe-attestation-v1 is a fail-closed admission invariant."""
+
+    cert, key, _, pin = certificate_factory("no-attestation")
+    signer = MockPeer("//Miner", 1, None, False, 10).keypair
+    responder = MinerResponder(
+        signer,
+        uid=1,
+        certificate_pin=pin,
+        features=("deploy", "status", "deactivate"),
+    )
+    server = LoopbackTLSServer(cert, key, responder)
+    port = await server.start()
+    try:
+        neuron, chain, miner_peer, _ = live_validator(tmp_path, port=port)
+        snapshot = await chain.sync()
+        record = snapshot.by_hotkey(miner_peer.hotkey)
+        assert record is not None
+
+        with pytest.raises(ValueError, match="mandatory probe-attestation-v1"):
+            await neuron._handshake(snapshot, record)
+
+        discovered = await neuron._discover_miners(snapshot)
+        assert discovered == {}
     finally:
         await server.close()
 

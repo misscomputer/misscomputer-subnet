@@ -3,14 +3,19 @@
 package miner
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -528,9 +533,27 @@ func (a *Agent) RecoverCleanup(ctx context.Context) error {
 	return nil
 }
 
+// maxProbeChallengeResponseBytes strictly bounds the only response the agent
+// ever buffers: the hidden challenge body, whose correct form is a 64-byte
+// digest string. Anything larger fails the probe closed before more is read.
+const maxProbeChallengeResponseBytes = 64 << 10
+
+var errProbeResponseRejected = errors.New("probe challenge response rejected")
+
+// probeInterception carries the already-admitted scheduler-derived assignment
+// binding for exactly one challenge probe between request admission and
+// response attestation.
+type probeInterception struct {
+	nonce  string
+	ticket protocol.Ticket
+}
+
 // ProxyRuntime resolves only the scheduler-derived endpoint ID retained in
 // private agent state. No miner-provided container/runtime identifier crosses
-// this boundary.
+// this boundary. A request carrying the public probe nonce header is admitted
+// only as the exact active assignment challenge request and, when the served
+// bytes match the signed challenge digest, leaves with exactly one
+// miner-signed attestation header; the workload can never supply one.
 func (a *Agent) ProxyRuntime(w http.ResponseWriter, req *http.Request, endpointID string) {
 	a.mu.Lock()
 	rawURL := a.instanceURLs[endpointID]
@@ -539,16 +562,122 @@ func (a *Agent) ProxyRuntime(w http.ResponseWriter, req *http.Request, endpointI
 		http.Error(w, "endpoint is inactive", http.StatusNotFound)
 		return
 	}
+	var probe *probeInterception
+	if nonces := req.Header.Values(protocol.ProbeNonceHeader); len(nonces) > 0 {
+		interception, status, err := a.admitProbe(req, endpointID, nonces)
+		if err != nil {
+			http.Error(w, err.Error(), status)
+			return
+		}
+		probe = interception
+	}
 	target, err := url.Parse(rawURL)
 	if err != nil {
 		http.Error(w, "endpoint target invalid", http.StatusBadGateway)
 		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(writer http.ResponseWriter, _ *http.Request, _ error) {
+	upstreamDirector := proxy.Director
+	proxy.Director = func(request *http.Request) {
+		upstreamDirector(request)
+		// The nonce is edge/agent probe protocol and only this agent may ever
+		// produce the attestation header; neither crosses into the workload.
+		request.Header.Del(protocol.ProbeNonceHeader)
+		request.Header.Del(protocol.ProbeAttestationHeader)
+	}
+	proxy.ModifyResponse = func(response *http.Response) error {
+		// A workload-supplied attestation header is always a spoof.
+		response.Header.Del(protocol.ProbeAttestationHeader)
+		if probe == nil {
+			return nil
+		}
+		return a.attestProbeResponse(response, probe)
+	}
+	proxy.ErrorHandler = func(writer http.ResponseWriter, _ *http.Request, proxyErr error) {
+		if errors.Is(proxyErr, errProbeResponseRejected) {
+			http.Error(writer, "probe challenge response rejected", http.StatusBadGateway)
+			return
+		}
 		http.Error(writer, "runtime unavailable", http.StatusBadGateway)
 	}
 	proxy.ServeHTTP(w, req)
+}
+
+// admitProbe admits exactly one canonical challenge probe against the retained
+// scheduler-derived assignment identity. Every malformed or duplicate nonce,
+// inactive, stale, or substituted ticket, restart or key-rotation
+// inconsistency, and non-exact challenge request fails closed before the
+// workload is contacted.
+func (a *Agent) admitProbe(req *http.Request, endpointID string, nonces []string) (*probeInterception, int, error) {
+	if len(nonces) != 1 || !protocol.CanonicalProbeNonce(nonces[0]) {
+		return nil, http.StatusBadRequest, errors.New("probe nonce header must appear exactly once with 64 lowercase hex characters")
+	}
+	if a.State == nil {
+		return nil, http.StatusConflict, errors.New("probe attestation requires durable miner state")
+	}
+	ticket, status, exists, err := a.State.AssignmentTicket(req.Context(), endpointID)
+	if err != nil {
+		return nil, http.StatusInternalServerError, errors.New("probe assignment state is unavailable")
+	}
+	if !exists || status != string(protocol.StageReady) {
+		return nil, http.StatusConflict, errors.New("probe endpoint has no ready assignment")
+	}
+	if protocol.EndpointID(ticket) != endpointID {
+		return nil, http.StatusConflict, errors.New("probe assignment identity mismatch")
+	}
+	if err := a.ValidateSubnetTransport(ticket); err != nil {
+		return nil, http.StatusConflict, errors.New("probe assignment transport identity mismatch")
+	}
+	binding := ticket.Subnet
+	if binding.MinerHotkey != a.MinerID || ticket.MinerID != a.MinerID ||
+		binding.MinerServicePublicKey != hex.EncodeToString(a.PublicKey()) {
+		return nil, http.StatusConflict, errors.New("probe assignment service identity mismatch")
+	}
+	validatorKey, err := hex.DecodeString(binding.ValidatorServicePublicKey)
+	if err != nil || len(validatorKey) != ed25519.PublicKeySize {
+		return nil, http.StatusConflict, errors.New("probe assignment validator key is invalid")
+	}
+	if err := protocol.VerifyTicketSignature(ticket, ed25519.PublicKey(validatorKey)); err != nil {
+		return nil, http.StatusConflict, errors.New("probe assignment ticket signature is invalid")
+	}
+	if req.Method != http.MethodGet || req.URL.Path != ticket.ChallengePath ||
+		req.URL.RawQuery != "" || req.URL.Fragment != "" {
+		return nil, http.StatusConflict, errors.New("probe request is not the exact assignment challenge request")
+	}
+	return &probeInterception{nonce: nonces[0], ticket: ticket}, 0, nil
+}
+
+// attestProbeResponse buffers the admitted challenge response within a strict
+// small bound, requires status 200 and the ticket's exact signed challenge
+// digest, and sets exactly one canonical miner-signed attestation header. Any
+// status, size, digest, build, or signing mismatch fails the exchange closed.
+func (a *Agent) attestProbeResponse(response *http.Response, probe *probeInterception) error {
+	if response.StatusCode != http.StatusOK {
+		return errProbeResponseRejected
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxProbeChallengeResponseBytes+1))
+	closeErr := response.Body.Close()
+	if err != nil || closeErr != nil || len(body) > maxProbeChallengeResponseBytes {
+		return errProbeResponseRejected
+	}
+	digest := sha256.Sum256(body)
+	attestation, err := protocol.BuildProbeAttestation(probe.ticket, probe.nonce, hex.EncodeToString(digest[:]))
+	if err != nil {
+		return errProbeResponseRejected
+	}
+	if err := protocol.SignProbeAttestation(&attestation, a.SigningKey); err != nil {
+		return errProbeResponseRejected
+	}
+	header, err := protocol.EncodeProbeAttestationHeader(attestation)
+	if err != nil {
+		return errProbeResponseRejected
+	}
+	response.Header.Set(protocol.ProbeAttestationHeader, header)
+	response.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	response.ContentLength = int64(len(body))
+	response.TransferEncoding = nil
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	return nil
 }
 
 // cleanupEndpoint is deliberately independent of the assignment context: a

@@ -109,8 +109,11 @@ Epoch = Annotated[int, Field(ge=0, le=MAX_EPOCH)]
 PositiveEpoch = Annotated[int, Field(ge=1, le=MAX_EPOCH)]
 Port = Annotated[int, Field(ge=1, le=65_535)]
 ManifestRole = Literal["assignment_auditor", "assignment_issuer", "assignment_security"]
-AttestationRequirement = Literal["none", "miner_service_key_v1"]
-AttestationStatus = Literal["not_presented", "not_required", "rejected", "verified"]
+# Mainnet attestation is mandatory: the only requirement a published
+# finney/netuid-24 deployment may declare is the miner service-key statement.
+# A manifest permitting or declaring "none" fails model validation.
+AttestationRequirement = Literal["miner_service_key_v1"]
+AttestationStatus = Literal["not_presented", "rejected", "verified"]
 ProbeOutcome = Literal["failed", "serving"]
 ReportStatus = Literal["degraded", "serving"]
 TransportFailureCode = Literal[
@@ -585,6 +588,7 @@ class ProbeObservation(_StrictFrozenModel):
             self.response_status != 200
             or self.response_body_sha256 is None
             or not self.build_id_header_verified
+            or self.attestation_status != "verified"
         ):
             raise ValueError("observation_serving_invalid")
         if (self.attestation_status == "verified") != (self.attestation is not None):
@@ -1276,15 +1280,15 @@ def evaluate_probe_response(
 
     ``serving`` requires status 200, the exact expected body digest, the exact
     ``X-Build-ID`` header, an allow-listed edge leaf certificate when pins are
-    configured, and a verified miner attestation when the manifest requires
-    one.  Everything else fails closed with one stable failure code.
+    configured, and a verified miner attestation.  Attestation is mandatory
+    for every published deployment; everything else fails closed with one
+    stable failure code.
     """
 
     deployment = _revalidate(deployment, ActiveDeploymentAssignment)
     policy = _revalidate(trust_policy, AssignmentManifestTrustPolicy)
     if not isinstance(probe_nonce, str) or len(probe_nonce) != 64:
         raise ValueError("probe_nonce_invalid")
-    required = deployment.attestation_requirement != "none"
     document: dict[str, object] = {
         "deployment_id": deployment.deployment_id,
         "route_host": deployment.route_host,
@@ -1299,7 +1303,7 @@ def evaluate_probe_response(
         "response_body_sha256": None,
         "build_id_header_verified": False,
         "tls_leaf_certificate_sha256": result.tls_leaf_certificate_sha256,
-        "attestation_status": "not_presented" if required else "not_required",
+        "attestation_status": "not_presented",
         "attestation": None,
     }
     if isinstance(result, ProbeTransportFailure):
@@ -1334,10 +1338,7 @@ def evaluate_probe_response(
 
     presented = _header_values(result.headers, PROBE_ATTESTATION_HEADER)
     if not presented:
-        if required:
-            document["failure_code"] = "attestation_missing"
-        else:
-            document["outcome"] = "serving"
+        document["failure_code"] = "attestation_missing"
         return _seal_observation(document)
     if len(presented) != 1:
         document["attestation_status"] = "rejected"

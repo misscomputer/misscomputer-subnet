@@ -132,7 +132,9 @@ Each observation records the deployment, route host, challenge path, the
 published `assignment_digest_sha256`, the fresh probe nonce, latency, status,
 byte count, body digest, `X-Build-ID` verification, the observed edge leaf
 digest, and the attestation status. `serving` means the exact published
-challenge digest and build ID were served over verified TLS within bounds.
+challenge digest and build ID were served over verified TLS within bounds and
+the mandatory miner attestation verified, attributing the response to one
+exact published replica.
 Failure codes are deliberately specific: `body_digest_mismatch`,
 `build_id_header_mismatch`, `unexpected_status`, `redirect_rejected`,
 `response_oversized`, `timeout`, `connection_failed`, `tls_handshake_failed`,

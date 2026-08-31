@@ -23,6 +23,10 @@ const (
 	TransportLocal        = "local"
 	TransportHTTPS        = "https"
 	TransportHTTP         = "http"
+	// FeatureProbeAttestationV1 advertises the mandatory miner-signed public
+	// probe attestation. Mainnet validators refuse assignment eligibility to
+	// any miner whose capability handshake does not carry it.
+	FeatureProbeAttestationV1 = "probe-attestation-v1"
 )
 
 type LocalCapabilities struct {
