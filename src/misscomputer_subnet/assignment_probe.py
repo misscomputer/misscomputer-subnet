@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from .ed25519_trust import (
     Ed25519PublicKeyValidationError,
     decode_ed25519_public_key_base64,
+    decode_ed25519_public_key_hex,
 )
 
 MANIFEST_SCHEMA: Final = "miss.computer/misscomputer-subnet/active-assignment-manifest"
@@ -261,6 +262,7 @@ class AssignedReplica(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_replica(self) -> Self:
+        decode_ed25519_public_key_hex(self.miner_service_public_key)
         if self.expires_at_block <= self.chain_block:
             raise ValueError("replica_block_window_invalid")
         if self.ticket_expires_at_epoch <= self.ticket_issued_at_epoch:
@@ -1248,7 +1250,8 @@ def verify_miner_probe_attestation(
     replica = matches[0]
     signature = _decode_hex_signature(attestation.signature_hex)
     try:
-        Ed25519PublicKey.from_public_bytes(bytes.fromhex(replica.miner_service_public_key)).verify(
+        public_key = decode_ed25519_public_key_hex(replica.miner_service_public_key)
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
             signature, miner_probe_attestation_message(attestation)
         )
     except (InvalidSignature, ValueError) as exc:

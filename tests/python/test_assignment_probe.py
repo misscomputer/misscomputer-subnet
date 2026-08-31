@@ -37,9 +37,11 @@ from assignment_probe_context import (
     sign_manifest,
     signer_keys,
 )
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+import misscomputer_subnet.assignment_probe as assignment_probe_module
 from misscomputer_subnet.assignment_probe import (
     MANIFEST_CHAIN_STATE_SCHEMA,
     MANIFEST_SCHEMA,
@@ -49,6 +51,7 @@ from misscomputer_subnet.assignment_probe import (
     PROBE_REPORT_SCHEMA,
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
+    AssignedReplica,
     AssignmentManifestChainState,
     AssignmentManifestSignatureEnvelope,
     AssignmentManifestTrustPolicy,
@@ -77,6 +80,7 @@ from misscomputer_subnet.assignment_probe import (
     parse_validator_probe_report,
     validator_probe_report_bytes,
     verify_active_assignment_manifest,
+    verify_miner_probe_attestation,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -541,6 +545,76 @@ def failure_response(deployment: Any, **changes: Any) -> ProbeResponse:
     }
     values.update(changes)
     return ProbeResponse(**values)
+
+
+def test_assignment_admission_rejects_every_small_order_miner_service_key(
+    small_order_ed25519_public_key: bytes,
+) -> None:
+    valid = build_replica("fixture-alpha", 10, "MinerA")
+    document = valid.model_dump(mode="json", by_alias=True)
+    document["miner_service_public_key"] = small_order_ed25519_public_key.hex()
+    with pytest.raises(ValidationError, match="ed25519_public_key_small_order"):
+        AssignedReplica.model_validate(document)
+
+    assert AssignedReplica.model_validate(valid.model_dump(mode="json", by_alias=True)) == valid
+
+
+def test_identity_key_message_independent_attestation_forgery_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = make_context()
+    deployment = context.manifest.deployments[0]
+    valid_replica = deployment.replicas[0]
+    identity_key = "01" + "00" * 31
+    forged_signature = (
+        "5866666666666666666666666666666666666666666666666666666666666666"
+        "0100000000000000000000000000000000000000000000000000000000000000"
+    )
+
+    backend_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(identity_key))
+    backend_key.verify(bytes.fromhex(forged_signature), b"first unrelated message")
+    backend_key.verify(bytes.fromhex(forged_signature), b"second unrelated message")
+
+    forged_replica = valid_replica.model_copy(update={"miner_service_public_key": identity_key})
+    forged_deployment = deployment.model_copy(update={"replicas": [forged_replica]})
+    forged_attestation = context.attestation.model_copy(
+        update={
+            "miner_service_public_key": identity_key,
+            "signature_hex": forged_signature,
+        }
+    )
+
+    with pytest.raises(ValueError, match="ed25519_public_key_small_order"):
+        verify_miner_probe_attestation(
+            forged_attestation,
+            forged_deployment,
+            probe_nonce=FIXTURE_PROBE_NONCE,
+            response_body_sha256=deployment.challenge_sha256,
+        )
+
+    monkeypatch.setattr(
+        assignment_probe_module,
+        "_revalidate",
+        lambda value, _model_type: value,
+    )
+    with pytest.raises(ValueError, match="attestation_signature_invalid"):
+        verify_miner_probe_attestation(
+            forged_attestation,
+            forged_deployment,
+            probe_nonce=FIXTURE_PROBE_NONCE,
+            response_body_sha256=deployment.challenge_sha256,
+        )
+    observation = evaluate_probe_response(
+        forged_deployment,
+        context.policy,
+        probe_nonce=FIXTURE_PROBE_NONCE,
+        result=serving_response(forged_deployment, attestation=forged_attestation),
+    )
+    assert (observation.outcome, observation.failure_code, observation.attestation_status) == (
+        "failed",
+        "attestation_invalid",
+        "rejected",
+    )
 
 
 def test_probe_evaluation_fail_closed_matrix() -> None:
