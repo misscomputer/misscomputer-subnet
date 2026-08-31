@@ -61,6 +61,10 @@ def _rfc3339nano_instant(value: str) -> int:
     if parts["hour"] > 23 or parts["minute"] > 59 or parts["second"] > 59:
         raise ValueError("timestamp time is out of range")
 
+    fraction = match.group("fraction") or ""
+    if fraction.endswith("0"):
+        raise ValueError("timestamp must use canonical Go RFC3339Nano format")
+
     zone = match.group("zone")
     offset_seconds = 0
     if zone != "Z":
@@ -69,10 +73,11 @@ def _rfc3339nano_instant(value: str) -> int:
         if offset_hours > 23 or offset_minutes > 59:
             raise ValueError("timestamp UTC offset is out of range")
         offset_seconds = (offset_hours * 60 + offset_minutes) * 60
+        if offset_seconds == 0:
+            raise ValueError("timestamp must use canonical Go RFC3339Nano format")
         if zone[0] == "-":
             offset_seconds = -offset_seconds
 
-    fraction = match.group("fraction") or ""
     nanoseconds = int(fraction.ljust(9, "0")) if fraction else 0
     local_seconds = (
         _civil_day(parts["year"], month, parts["day"]) * 86_400
