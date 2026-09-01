@@ -17,6 +17,12 @@ Bittensor v11 no longer ships the legacy Axon/Dendrite/Synapse networking classe
 - `StatusSynapse`: endpoint-incarnation status owned by the assigning validator
 - `DeactivateSynapse`: idempotent endpoint cleanup owned by the assigning validator
 
+The miner capability feature list must advertise `probe-attestation-v1`: the Go
+miner agent emits the mandatory per-replica `miner-probe-attestation` v1 header
+for public assignment probes, and a validator refuses assignment eligibility to
+any miner whose handshake omits the feature. This is a fail-closed admission
+invariant, not a negotiation.
+
 Remote requests use the SDK’s `bittensor.http_auth` btauth/1 signatures. The signed material binds the sender hotkey, receiver hotkey, nonce/timestamp, HTTP method, path, and exact body. Miners additionally require an active metagraph record, validator permit, configured minimum TAO stake, and rate/priority admission. HTTP is available only when both sides explicitly select the local/mock policy; live startup never silently downgrades.
 
 Transport retries are bounded. A retry obtains a fresh btauth nonce while preserving the semantic request/ticket identity. Redirects and environment proxies are disabled. The Go agent returns a cached signed ready result only for the same durable endpoint incarnation; a different assignment nonce cannot reuse it.

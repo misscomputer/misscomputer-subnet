@@ -441,6 +441,49 @@ async def test_runtime_proxy_allows_exact_response_limit_and_filters_headers(
 
 
 @pytest.mark.asyncio
+async def test_runtime_proxy_forwards_probe_nonces_and_returns_attestation_header(
+    tmp_path: Path,
+) -> None:
+    nonce = "ab" * 32
+    forwarded: list[list[str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request.headers.get_list("x-miss-probe-nonce"))
+        return httpx.Response(
+            200,
+            stream=ChunkedResponse([b"challenge-value"]),
+            headers={
+                "Content-Type": "text/plain",
+                "X-Build-ID": "build",
+                "X-Miss-Probe-Attestation": "c2lnbmVk",
+                "X-Untrusted": "drop-me",
+            },
+        )
+
+    neuron = runtime_neuron(tmp_path, httpx.MockTransport(handler))
+    transport = httpx.ASGITransport(app=neuron.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://miner") as client:
+        attested = await client.get(
+            "/runtime/endpoint/__challenge/x",
+            headers=[("X-Miss-Probe-Nonce", nonce)],
+        )
+        duplicated = await client.get(
+            "/runtime/endpoint/__challenge/x",
+            headers=[("X-Miss-Probe-Nonce", nonce), ("X-Miss-Probe-Nonce", nonce)],
+        )
+        plain = await client.get("/runtime/endpoint/__challenge/x")
+    # Every nonce occurrence crosses the bridge verbatim so the Go agent can
+    # fail duplicates closed, and the agent-set attestation header is the only
+    # extra header allowed back out.
+    assert forwarded == [[nonce], [nonce, nonce], []]
+    assert attested.status_code == 200
+    assert attested.headers["x-miss-probe-attestation"] == "c2lnbmVk"
+    assert "x-untrusted" not in attested.headers
+    assert duplicated.headers["x-miss-probe-attestation"] == "c2lnbmVk"
+    assert plain.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_runtime_proxy_rejects_declared_oversized_response(tmp_path: Path) -> None:
     stream = ChunkedResponse([b"must-not-be-read"])
 

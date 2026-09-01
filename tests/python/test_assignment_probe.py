@@ -188,8 +188,10 @@ def test_happy_path_verifies_probes_and_seals_an_archivable_report() -> None:
     assert (alpha.attestation.miner_uid, alpha.attestation.miner_hotkey) == (10, "MinerA")
     assert alpha.attestation.probe_nonce == FIXTURE_PROBE_NONCE
     assert alpha.build_id_header_verified is True
-    assert beta.attestation_status == "not_required"
-    assert beta.attestation is None
+    assert beta.attestation_status == "verified"
+    assert beta.attestation is not None
+    assert (beta.attestation.miner_uid, beta.attestation.miner_hotkey) == (12, "MinerC")
+    assert beta.attestation.probe_nonce == label_digest("fixture-beta-probe-nonce")
     assert beta.outcome == "serving"
     assert beta.assignment_digest_sha256 == context.manifest.deployments[1].assignment_digest_sha256
     second = verify(context)
@@ -629,7 +631,9 @@ def test_probe_evaluation_fail_closed_matrix() -> None:
         )
         return observation.outcome, observation.failure_code
 
-    assert outcome(beta, serving_response(beta)) == ("serving", None)
+    beta_attested = sign_attestation(beta, beta.replicas[0], probe_nonce=nonce)
+    assert outcome(beta, serving_response(beta, attestation=beta_attested)) == ("serving", None)
+    assert outcome(beta, serving_response(beta)) == ("failed", "attestation_missing")
     assert outcome(beta, failure_response(beta, status=500)) == ("failed", "unexpected_status")
     assert outcome(beta, failure_response(beta, status=302, body=b"")) == (
         "failed",
@@ -669,9 +673,14 @@ def test_probe_evaluation_fail_closed_matrix() -> None:
     pinned = build_policy(
         context.keys, pinned_edge_leaf_certificate_sha256=(label_digest("edge-leaf"),)
     )
+    attested_headers = serving_response(beta, attestation=beta_attested).headers
     assert outcome(
         beta,
-        failure_response(beta, tls_leaf_certificate_sha256=label_digest("edge-leaf")),
+        failure_response(
+            beta,
+            headers=attested_headers,
+            tls_leaf_certificate_sha256=label_digest("edge-leaf"),
+        ),
         policy_value=pinned,
     ) == ("serving", None)
     assert outcome(
@@ -719,11 +728,6 @@ def test_probe_evaluation_fail_closed_matrix() -> None:
         beta, headers=(*serving_response(beta).headers, ("X-Miss-Probe-Attestation", "!!!"))
     )
     assert outcome(beta, garbage) == ("failed", "attestation_invalid")
-    beta_attested = sign_attestation(beta, beta.replicas[0], probe_nonce=nonce)
-    volunteer = evaluate_probe_response(
-        beta, policy, probe_nonce=nonce, result=serving_response(beta, attestation=beta_attested)
-    )
-    assert (volunteer.outcome, volunteer.attestation_status) == ("serving", "verified")
     duplicated = failure_response(
         alpha,
         headers=(
@@ -946,7 +950,64 @@ def test_golden_fixtures_are_reproducible_and_verify_with_external_signatures() 
         (FIXTURES / "miner-probe-attestation.v1.json").read_bytes()
     )
     assert challenge_value("fixture-alpha") != challenge_value("fixture-beta")
-    assert fixture_deployments()[0].attestation_requirement == "miner_service_key_v1"
+    assert all(
+        deployment.attestation_requirement == "miner_service_key_v1"
+        for deployment in fixture_deployments()
+    )
+
+
+def test_mainnet_contract_rejects_any_none_attestation_requirement() -> None:
+    deployment_document = fixture_deployments()[1].model_dump(mode="json", by_alias=True)
+    deployment_document["attestation_requirement"] = "none"
+    with pytest.raises(ValidationError, match="miner_service_key_v1"):
+        ActiveDeploymentAssignment.model_validate(deployment_document)
+
+    manifest_document = json.loads((FIXTURES / "active-assignment-manifest.v1.json").read_bytes())
+    manifest_document["deployments"][1]["attestation_requirement"] = "none"
+    with pytest.raises(ValidationError, match="miner_service_key_v1"):
+        ActiveAssignmentManifest.model_validate(manifest_document)
+    rendered = (
+        json.dumps(
+            manifest_document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    with pytest.raises(ValueError, match="document_invalid"):
+        parse_active_assignment_manifest(rendered)
+
+    manifest_schema = json.loads(
+        (SCHEMAS / "active-assignment-manifest.v1.schema.json").read_bytes()
+    )
+    requirement = manifest_schema["$defs"]["ActiveDeploymentAssignment"]["properties"][
+        "attestation_requirement"
+    ]
+    assert requirement == {
+        "const": "miner_service_key_v1",
+        "title": "Attestation Requirement",
+        "type": "string",
+    }
+
+
+def test_observation_contract_requires_verified_attestation_for_serving() -> None:
+    report_document = json.loads((FIXTURES / "validator-probe-report.v1.json").read_bytes())
+    observation = dict(report_document["observations"][0])
+    observation.pop("observation_digest_sha256")
+    unattested = {**observation, "attestation": None, "attestation_status": "not_presented"}
+    with pytest.raises(ValidationError, match="observation_serving_invalid"):
+        assignment_probe_module.ProbeObservation.model_validate(
+            {**unattested, "observation_digest_sha256": digest(unattested)}
+        )
+    retired = {**observation, "attestation_status": "not_required"}
+    with pytest.raises(ValidationError):
+        assignment_probe_module.ProbeObservation.model_validate(
+            {**retired, "observation_digest_sha256": digest(retired)}
+        )
+    report_schema = json.loads((SCHEMAS / "validator-probe-report.v1.schema.json").read_bytes())
+    statuses = report_schema["$defs"]["ProbeObservation"]["properties"]["attestation_status"]
+    assert statuses["enum"] == ["not_presented", "rejected", "verified"]
 
 
 def test_source_has_only_public_offline_pure_capabilities() -> None:

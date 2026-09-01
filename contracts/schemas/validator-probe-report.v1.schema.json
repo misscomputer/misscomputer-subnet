@@ -132,7 +132,6 @@
         "attestation_status": {
           "enum": [
             "not_presented",
-            "not_required",
             "rejected",
             "verified"
           ],

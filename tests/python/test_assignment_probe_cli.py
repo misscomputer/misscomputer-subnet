@@ -319,12 +319,15 @@ def configure_routes(
     alpha_mode: str = "serving",
     beta_mode: str = "serving",
     alpha_attest: str | None = "MinerA",
+    beta_attest: str | None = "MinerC",
     beta_build_id_header: bool = True,
 ) -> None:
     alpha, beta = manifest.deployments
     fixture.server.state.routes = {
         alpha.challenge_path: RouteBehavior(alpha, alpha_mode, attest_with=alpha_attest),
-        beta.challenge_path: RouteBehavior(beta, beta_mode, build_id_header=beta_build_id_header),
+        beta.challenge_path: RouteBehavior(
+            beta, beta_mode, attest_with=beta_attest, build_id_header=beta_build_id_header
+        ),
     }
 
 
@@ -425,7 +428,9 @@ def test_probe_reports_serving_over_local_tls_and_advances_state(
     assert alpha.attestation is not None
     assert alpha.attestation.miner_hotkey == "MinerA"
     assert alpha.tls_leaf_certificate_sha256 == tls_server.leaf_sha256
-    assert beta.attestation_status == "not_required"
+    assert beta.attestation_status == "verified"
+    assert beta.attestation is not None
+    assert beta.attestation.miner_hotkey == "MinerC"
     assert beta.response_bytes == 64
     rendered = Path(config.report_output).read_bytes()
     assert parse_validator_probe_report(rendered) == report

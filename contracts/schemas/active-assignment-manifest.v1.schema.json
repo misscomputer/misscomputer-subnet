@@ -10,10 +10,7 @@
           "type": "string"
         },
         "attestation_requirement": {
-          "enum": [
-            "none",
-            "miner_service_key_v1"
-          ],
+          "const": "miner_service_key_v1",
           "title": "Attestation Requirement",
           "type": "string"
         },

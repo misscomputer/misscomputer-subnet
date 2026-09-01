@@ -132,9 +132,10 @@ deployment is `serving` only when **all** of the following hold:
 - the body is within the policy byte ceiling and its SHA-256 equals the
   published `challenge_sha256` — HTTP 200 alone is never sufficient;
 - exactly one `X-Build-ID` header is present and equals the published build ID;
-- when the deployment requires `miner_service_key_v1`, a valid miner attestation
-  is presented (below). A presented-but-invalid attestation fails the
-  observation even when it was not required.
+- exactly one valid miner attestation is presented (below). Attestation is
+  mandatory for every published deployment: a missing header is
+  `attestation_missing` and a malformed, duplicated, or unverifiable header is
+  `attestation_invalid`.
 
 Transport failures are recorded, never raised: `timeout`, `connection_failed`,
 `tls_handshake_failed`, `tls_certificate_invalid`, `response_oversized`, and
@@ -143,10 +144,12 @@ byte count, body digest, header verification, observed leaf digest, attestation
 status, and the exact published assignment digest it was judged against.
 
 Because the central edge round-robins an untargeted public request across the
-deployment's healthy replicas, an un-attested `serving` observation proves that
-the **deployment route** serves the exact hidden challenge; it does not by
-itself attribute the response to one replica. Attribution comes only from a
-verified attestation.
+deployment's healthy replicas, only the mandatory verified attestation
+attributes the response to the replica that actually answered. Every `serving`
+observation therefore both proves that the **deployment route** serves the
+exact hidden challenge and names the exact responding replica. One public
+request attributes one responder; proving all replicas takes repeated probes,
+not targeted selection.
 
 ## Miner attestation contract
 
@@ -163,10 +166,28 @@ generation, nonce, endpoint), and the Ed25519 signature to verify under the
 published miner service public key. A verified attestation attributes the
 observation to that miner and is archived inside the report.
 
-Manifests select the requirement per deployment (`attestation_requirement`).
-`none` keeps the route-level proof; `miner_service_key_v1` fails closed with
-`attestation_missing` or `attestation_invalid` when the header is absent or
-wrong.
+The Go miner agent is the only producer. Its runtime proxy intercepts exactly
+the active assignment challenge request that carries one canonical
+`X-Miss-Probe-Nonce` header, binds the retained scheduler-signed ticket
+(deployment, generation, assignment nonce, endpoint, route host, UID/hotkey,
+service key), buffers the response within a strict small bound, requires
+status 200 and the ticket's exact signed `challenge_sha256`, signs the
+canonical statement with its persistent Ed25519 service key, and sets exactly
+one header. It strips every workload-supplied `X-Miss-Probe-Attestation`
+header on every response and fails closed on malformed or duplicate nonce
+headers, inactive/stale/substituted tickets or endpoint identities, wrong
+path/status/body, oversized responses, and restart or key-rotation
+inconsistencies. The producer can never sign a body digest other than the
+ticket's signed challenge digest, so it is not a general signing oracle. The
+central edge forwards the fresh nonce and the miner-produced header but holds
+no miner service key and cannot forge either.
+
+Attestation is mandatory: `attestation_requirement` is the constant
+`miner_service_key_v1` for every `finney`/netuid-24 manifest deployment, and
+the contract rejects a manifest that permits or declares `none`. Miner agents
+advertise the `probe-attestation-v1` capability feature; a validator refuses
+assignment eligibility to any miner whose capability handshake does not carry
+it. Both are fail-closed admission invariants, not compatibility hints.
 
 ## Report
 
@@ -221,15 +242,12 @@ operations are exposed to the central producer through the
 
 ## Known limitations
 
-- Miner agents do not yet emit `miner-probe-attestation` headers. Central
-  manifests must publish `attestation_requirement: "none"` until the miner
-  side implements the contract; the verifier, schema, fixtures, and local test
-  server already exercise the full attested path.
 - Probes run sequentially with one request per deployment; very large
   manifests take proportionally long. Bounded concurrency is a possible v2
   refinement and does not change the contracts.
-- An un-attested `serving` observation is route-level evidence. It cannot
-  distinguish which healthy replica answered; only the central targeted probe
-  (internal, credentialed) or a verified attestation can.
+- One public request attributes exactly the replica that answered it; covering
+  all replicas of a deployment takes repeated round-robin probes. Public
+  targeted-replica selection is deliberately not offered; only the central
+  targeted probe (internal, credentialed) names a replica in advance.
 - The probe verifies serving behaviour, not exact binary execution; that
   remains deferred to the TEE phase, as for the central probes.

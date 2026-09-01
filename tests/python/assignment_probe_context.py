@@ -228,7 +228,7 @@ def build_deployment(
     miners: Sequence[tuple[int, str]],
     *,
     campaign_sequence: int,
-    attestation_requirement: AttestationRequirement = "none",
+    attestation_requirement: AttestationRequirement = "miner_service_key_v1",
     route_suffix: str = ROUTE_SUFFIX,
 ) -> ActiveDeploymentAssignment:
     return build_active_deployment_assignment(
@@ -400,6 +400,11 @@ def make_context(
     )
     alpha = manifest.deployments[0]
     attestation = sign_attestation(alpha, alpha.replicas[0], probe_nonce=FIXTURE_PROBE_NONCE)
+    beta = manifest.deployments[1]
+    beta_probe_nonce = label_digest("fixture-beta-probe-nonce")
+    # A different replica answers the beta probe, so the committed fixtures
+    # demonstrate per-replica attribution of the actual responder.
+    beta_attestation = sign_attestation(beta, beta.replicas[1], probe_nonce=beta_probe_nonce)
     observations = [
         evaluate_probe_response(
             alpha,
@@ -408,10 +413,10 @@ def make_context(
             result=serving_response(alpha, attestation=attestation),
         ),
         evaluate_probe_response(
-            manifest.deployments[1],
+            beta,
             policy,
-            probe_nonce=label_digest("fixture-beta-probe-nonce"),
-            result=serving_response(manifest.deployments[1], latency_millis=57),
+            probe_nonce=beta_probe_nonce,
+            result=serving_response(beta, attestation=beta_attestation, latency_millis=57),
         ),
     ]
     report = build_validator_probe_report(

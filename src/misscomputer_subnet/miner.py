@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from .assignment_probe import PROBE_ATTESTATION_HEADER, PROBE_NONCE_HEADER
 from .auth import (
     BRIDGE_MAX_BODY,
     BridgeClient,
@@ -474,6 +475,13 @@ class MinerNeuron:
             # Never let HTTPX transparently inflate an attacker-controlled
             # runtime response before the public-path size bound is applied.
             headers["Accept-Encoding"] = "identity"
+            # Forward every probe-nonce occurrence verbatim. The Go agent is
+            # the only attestation policy point; it must observe duplicated or
+            # malformed nonce headers exactly as sent so it can fail closed.
+            header_items: list[tuple[str, str]] = list(headers.items())
+            header_items.extend(
+                (PROBE_NONCE_HEADER, value) for value in request.headers.getlist(PROBE_NONCE_HEADER)
+            )
             async with httpx.AsyncClient(
                 base_url=self.bridge.base_url,
                 timeout=self.bridge.timeout,
@@ -482,7 +490,7 @@ class MinerNeuron:
                 trust_env=False,
             ) as client:
                 async with client.stream(
-                    request.method, target, content=body, headers=headers
+                    request.method, target, content=body, headers=header_items
                 ) as upstream:
                     content_encoding = upstream.headers.get("content-encoding", "").strip().lower()
                     if content_encoding and content_encoding != "identity":
@@ -513,10 +521,19 @@ class MinerNeuron:
                         chunks.append(chunk)
                     content = b"".join(chunks)
                     status_code = upstream.status_code
+                    # The agent-signed probe attestation is the only extra
+                    # header allowed back out; the Go agent already stripped
+                    # any workload-supplied occurrence and set at most one.
                     safe_headers = {
                         key: value
                         for key, value in upstream.headers.items()
-                        if key.lower() in {"content-type", "cache-control", "x-build-id"}
+                        if key.lower()
+                        in {
+                            "content-type",
+                            "cache-control",
+                            "x-build-id",
+                            PROBE_ATTESTATION_HEADER,
+                        }
                     }
             return Response(
                 content=content,
