@@ -46,6 +46,7 @@ from pathlib import Path
 
 names = (
     "S3_SECRET_ACCESS_KEY",
+    "S3_READ_SECRET_ACCESS_KEY",
     "AWS_SECRET_ACCESS_KEY",
     "MINIO_ROOT_PASSWORD",
     "MINIO_SECRET_KEY",
