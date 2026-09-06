@@ -168,12 +168,21 @@ func parseConfiguration(arguments []string) (configuration, error) {
 
 type runtime struct {
 	server       *runtimeapi.Server
-	plane        *controlplane.Plane
+	plane        runtimePlane
 	listener     net.Listener
 	edgeListener net.Listener
 	edgeServer   *http.Server
 	socketPath   string
 	logger       *slog.Logger
+	// beforePlaneJoin is an internal lifecycle test barrier. Production
+	// construction leaves it nil.
+	beforePlaneJoin func()
+}
+
+type runtimePlane interface {
+	Run(context.Context) error
+	Close(context.Context) error
+	CampaignEnabled() bool
 }
 
 func newRuntime(config configuration, logger *slog.Logger) (instance *runtime, err error) {
@@ -232,6 +241,12 @@ func newRuntime(config configuration, logger *slog.Logger) (instance *runtime, e
 	if err != nil {
 		return nil, err
 	}
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		// Successful shutdown removes the pathname explicitly. Keeping automatic
+		// unlink disabled lets a failed Plane.Close retain the ownership marker
+		// alongside the state-directory flock.
+		unixListener.SetUnlinkOnClose(false)
+	}
 	defer func() {
 		if err != nil {
 			_ = listener.Close()
@@ -263,9 +278,14 @@ func (r *runtime) serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	failures := make(chan error, 3)
+	planeDone := make(chan error, 1)
 	go func() { failures <- normalizeListenerError(r.server.Serve(r.listener)) }()
 	go func() { failures <- normalizeListenerError(r.edgeServer.Serve(r.edgeListener)) }()
-	go func() { failures <- r.plane.Run(ctx) }()
+	go func() {
+		err := r.plane.Run(ctx)
+		planeDone <- err
+		failures <- err
+	}()
 	r.logger.Info("public runtime ready", "socket", r.socketPath, "edge_bind", r.edgeAddress(), "campaign", r.plane.CampaignEnabled())
 	var first error
 	select {
@@ -274,13 +294,44 @@ func (r *runtime) serve(ctx context.Context) error {
 	}
 	cancel()
 	_ = r.listener.Close()
-	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer shutdownCancel()
-	if err := r.edgeServer.Shutdown(shutdownContext); first == nil {
+	runtimeShutdownContext, stopRuntimeShutdown := context.WithTimeout(context.Background(), 20*time.Second)
+	runtimeShutdownErr := r.server.Shutdown(runtimeShutdownContext)
+	stopRuntimeShutdown()
+	if runtimeShutdownErr != nil && first == nil {
+		first = runtimeShutdownErr
+	}
+	edgeShutdownContext, stopEdgeShutdown := context.WithTimeout(context.Background(), 20*time.Second)
+	edgeShutdownErr := r.edgeServer.Shutdown(edgeShutdownContext)
+	if edgeShutdownErr != nil && first == nil {
+		first = edgeShutdownErr
+	}
+	stopEdgeShutdown()
+	// Plane.Run owns and joins the periodic prober. Do not close the gateway or
+	// durable store underneath it: wait for the lifecycle to finish before
+	// Plane.Close releases either resource.
+	if r.beforePlaneJoin != nil {
+		r.beforePlaneJoin()
+	}
+	if err := <-planeDone; first == nil {
 		first = err
 	}
-	if err := r.plane.Close(shutdownContext); first == nil {
-		first = err
+	if runtimeShutdownErr != nil || edgeShutdownErr != nil {
+		// A live socket/edge handler can still be inside the control plane. Do
+		// not close its gateway, store, or replay journal beneath it. Process
+		// exit will reclaim them; a caller embedding serve receives the explicit
+		// join failure instead of a use-after-close race.
+		return first
+	}
+	planeCloseContext, stopPlaneClose := context.WithTimeout(context.Background(), 20*time.Second)
+	planeCloseErr := r.plane.Close(planeCloseContext)
+	stopPlaneClose()
+	if planeCloseErr != nil {
+		// Plane.Close deliberately leaves its gateway/store owned when a
+		// lifecycle worker has not drained. Retain the runtime journal, singleton
+		// state-directory flock, and socket pathname as well; releasing only the
+		// outer ownership would let a second runtime enter while the first plane
+		// still has live work against the same state.
+		return errors.Join(first, planeCloseErr)
 	}
 	if err := r.server.Close(); first == nil {
 		first = err

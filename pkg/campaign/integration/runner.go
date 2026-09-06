@@ -47,6 +47,7 @@ type Dependencies struct {
 
 type Runner struct {
 	mu            sync.Mutex
+	closeMu       sync.Mutex
 	config        RuntimeConfig
 	runtimeDigest string
 	environment   ActivationEnvironment
@@ -64,9 +65,30 @@ type Runner struct {
 	workerContext context.Context
 	cancelWorkers context.CancelFunc
 	wait          sync.WaitGroup
+	workerCount   int
+	workerIdle    chan struct{}
+	workersDone   chan struct{}
+	workersOnce   sync.Once
+
+	// afterShutdownSeal is an unexported deterministic test seam. Production
+	// never sets it. It runs after the terminal state is durable and admission
+	// is sealed, but before owned workers are cancelled.
+	afterShutdownSeal func()
+	// shutdownEvidence retains exact terminal evidence whose state transition
+	// already committed but whose separately installed evidence file is not yet
+	// proven durable. It includes both Shutdown-cancelled pending challenges and
+	// late running-worker completions. Shutdown joins every worker before its
+	// final retry, so no append can race the successful clear.
+	shutdownEvidence []campaign.Evidence
+	// evidenceErr is separate from fatal because this exact failure is
+	// recoverable: admissions stop, but Shutdown may retry the retained evidence
+	// and clear the error. Other fatal state remains terminal.
+	evidenceErr   error
 	fatal         error
 	runStarted    bool
 	closed        bool
+	workersSealed bool
+	storeClosed   bool
 }
 
 type synchronizedReader struct {
@@ -180,6 +202,7 @@ func NewRunner(config RuntimeConfig, runtimeDigest string, dependencies Dependen
 		scheduler: dependencies.Scheduler, artifacts: dependencies.Artifacts, miners: dependencies.Miners,
 		now: now, entropy: entropy, runs: runs, workers: make(map[uint64]context.CancelFunc),
 		cleaning: make(map[uint64]bool), workerContext: workerContext, cancelWorkers: cancelWorkers,
+		workersDone: make(chan struct{}),
 	}
 	runner.mu.Lock()
 	err = runner.recoverLocked(startedAt)
@@ -193,28 +216,55 @@ func NewRunner(config RuntimeConfig, runtimeDigest string, dependencies Dependen
 }
 
 func (runner *Runner) Close() error {
+	runner.closeMu.Lock()
+	defer runner.closeMu.Unlock()
 	runner.mu.Lock()
-	if runner.closed {
+	if runner.storeClosed {
 		runner.mu.Unlock()
 		return nil
 	}
 	runner.closed = true
+	runner.workersSealed = true
 	runner.cancelWorkers()
 	runner.mu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		runner.wait.Wait()
-		close(done)
-	}()
+	done := runner.terminalWorkersDone()
 	timer := time.NewTimer(time.Duration(runner.config.Artifacts.CleanupTimeoutMillis) * time.Millisecond)
 	defer timer.Stop()
-	var waitErr error
 	select {
 	case <-done:
 	case <-timer.C:
-		waitErr = context.DeadlineExceeded
+		// The worker still owns the state store. Keep it open and make Close
+		// retryable instead of allowing a late persistence operation to race a
+		// closed file descriptor.
+		return context.DeadlineExceeded
 	}
-	return errors.Join(waitErr, runner.store.Close())
+	if err := runner.persistShutdownEvidence(); err != nil {
+		return err
+	}
+	if err := runner.terminalWorkerFailure(); err != nil {
+		return err
+	}
+	err := runner.store.Close()
+	if err == nil {
+		runner.mu.Lock()
+		runner.storeClosed = true
+		runner.mu.Unlock()
+	}
+	return err
+}
+
+// terminalWorkersDone returns one cached join for the terminal worker set.
+// Callers must seal admission first so no later wait.Add can race this Wait.
+// Reusing the channel prevents one permanently stuck worker from accumulating
+// a fresh blocked waiter goroutine on every Close/Shutdown retry.
+func (runner *Runner) terminalWorkersDone() <-chan struct{} {
+	runner.workersOnce.Do(func() {
+		go func() {
+			runner.wait.Wait()
+			close(runner.workersDone)
+		}()
+	})
+	return runner.workersDone
 }
 
 func (runner *Runner) Run(ctx context.Context) error {
@@ -222,7 +272,7 @@ func (runner *Runner) Run(ctx context.Context) error {
 		return errors.New("campaign run context is required")
 	}
 	runner.mu.Lock()
-	if runner.closed || runner.runStarted {
+	if runner.closed || runner.workersSealed || runner.runStarted {
 		runner.mu.Unlock()
 		return errors.New("campaign runner lifecycle is unavailable")
 	}
@@ -258,14 +308,13 @@ func (runner *Runner) Tick(ctx context.Context) error {
 	now := runner.canonicalNow()
 	var started []campaign.Challenge
 	runner.mu.Lock()
-	if runner.closed {
+	if runner.closed || runner.workersSealed {
 		runner.mu.Unlock()
-		return errors.New("campaign runner is closed")
+		return errors.New("campaign runner lifecycle is unavailable")
 	}
-	if runner.fatal != nil {
-		err := runner.fatal
+	if failure := runner.runtimeFailureLocked(); failure != nil {
 		runner.mu.Unlock()
-		return err
+		return failure
 	}
 	if activationErr := ValidateActivation(runner.config, runner.environment, runner.readiness, now); activationErr != nil {
 		if !errors.Is(activationErr, ErrInvalidReadiness) {
@@ -387,12 +436,14 @@ func (runner *Runner) Drain() error {
 	}
 	err = runner.persistEvidence(evidence)
 	if err != nil {
-		runner.fail(err)
+		runner.retainEvidenceFailure(evidence, err)
 	}
 	return err
 }
 
 func (runner *Runner) Shutdown(ctx context.Context) error {
+	runner.closeMu.Lock()
+	defer runner.closeMu.Unlock()
 	if ctx == nil {
 		return errors.New("campaign shutdown context is required")
 	}
@@ -400,7 +451,46 @@ func (runner *Runner) Shutdown(ctx context.Context) error {
 		return err
 	}
 	runner.mu.Lock()
-	if lifecycleErr := runner.lifecycleErrorLocked(); lifecycleErr != nil {
+	if runner.closed {
+		storeClosed := runner.storeClosed
+		runner.cancelWorkers()
+		runner.mu.Unlock()
+		if storeClosed {
+			return nil
+		}
+		// Close may have sealed admission but returned before an owned worker
+		// joined. A Plane.Close retry must be able to finish that join instead of
+		// failing forever with "campaign runner is closed".
+		done := runner.terminalWorkersDone()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+			if err := runner.persistShutdownEvidence(); err != nil {
+				return err
+			}
+			return runner.terminalWorkerFailure()
+		}
+	}
+	if runner.workersSealed {
+		runner.cancelWorkers()
+		runner.mu.Unlock()
+		done := runner.terminalWorkersDone()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+			if err := runner.persistShutdownEvidence(); err != nil {
+				return err
+			}
+			if err := runner.terminalWorkerFailure(); err != nil {
+				return err
+			}
+			return runner.processCleanups(ctx, runner.canonicalNow())
+		}
+	}
+	if runner.fatal != nil {
+		lifecycleErr := runner.fatal
 		runner.cancelWorkers()
 		runner.mu.Unlock()
 		return lifecycleErr
@@ -408,6 +498,17 @@ func (runner *Runner) Shutdown(ctx context.Context) error {
 	evidence, err := runner.engine.Shutdown(runner.canonicalNowLocked())
 	if err == nil {
 		err = runner.persistLocked()
+		if err == nil {
+			err = runner.retainTerminalEvidenceLocked(evidence)
+			if err == nil {
+				runner.workersSealed = true
+			} else if runner.fatal == nil {
+				runner.fatal = err
+			}
+		}
+	}
+	if err == nil && runner.afterShutdownSeal != nil {
+		runner.afterShutdownSeal()
 	}
 	for _, cancel := range runner.workers {
 		cancel()
@@ -416,32 +517,59 @@ func (runner *Runner) Shutdown(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := runner.persistEvidence(evidence); err != nil {
-		runner.fail(err)
-		return err
-	}
-	done := make(chan struct{})
-	go func() {
-		runner.wait.Wait()
-		close(done)
-	}()
+	done := runner.terminalWorkersDone()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-done:
 	}
+	// Running workers can commit their own terminal transition only after
+	// cancellation. Join them before the final evidence install so a failed
+	// worker write cannot arrive after this retry and be silently cleared.
+	if err := runner.persistShutdownEvidence(); err != nil {
+		return err
+	}
+	if err := runner.terminalWorkerFailure(); err != nil {
+		return err
+	}
 	return runner.processCleanups(ctx, runner.canonicalNow())
+}
+
+func (runner *Runner) terminalWorkerFailure() error {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return runner.fatal
+}
+
+func (runner *Runner) persistShutdownEvidence() error {
+	runner.mu.Lock()
+	evidence := append([]campaign.Evidence(nil), runner.shutdownEvidence...)
+	runner.mu.Unlock()
+	if err := runner.persistEvidence(evidence); err != nil {
+		wrapped := fmt.Errorf("persist shutdown evidence: %w", err)
+		runner.mu.Lock()
+		runner.evidenceErr = wrapped
+		runner.mu.Unlock()
+		return wrapped
+	}
+	runner.mu.Lock()
+	runner.shutdownEvidence = nil
+	runner.evidenceErr = nil
+	runner.mu.Unlock()
+	return nil
 }
 
 func (runner *Runner) WaitIdle(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("campaign wait context is required")
 	}
-	done := make(chan struct{})
-	go func() {
-		runner.wait.Wait()
-		close(done)
-	}()
+	runner.mu.Lock()
+	if runner.workerCount == 0 {
+		runner.mu.Unlock()
+		return nil
+	}
+	done := runner.workerIdle
+	runner.mu.Unlock()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -459,7 +587,7 @@ func (runner *Runner) Status() (Status, error) {
 		return Status{}, err
 	}
 	status := Status{
-		Version: StatusVersion, Enabled: true, RuntimeHealthy: runner.fatal == nil, CampaignID: state.CampaignID,
+		Version: StatusVersion, Enabled: true, RuntimeHealthy: runner.fatal == nil && runner.evidenceErr == nil, CampaignID: state.CampaignID,
 		Network: runner.config.Campaign.Network, NetUID: runner.config.Campaign.NetUID, Domain: runner.config.Campaign.Domain,
 		Mode: state.Mode, StateRevision: revision, ConfigDigestSHA256: state.ConfigDigestSHA256,
 		StateDigestSHA256: state.StateDigestSHA256, ReadinessProofSHA256: runner.readiness.ProofDigestSHA256,
@@ -470,7 +598,7 @@ func (runner *Runner) Status() (Status, error) {
 		Cleanup: make([]CleanupView, 0),
 	}
 	status.ReadinessReady = ValidateActivation(runner.config, runner.environment, runner.readiness, runner.canonicalNow()) == nil
-	if runner.fatal != nil {
+	if runner.fatal != nil || runner.evidenceErr != nil {
 		status.RuntimeFailureCode = campaign.FailureInternal
 	}
 	for _, run := range runner.runs {
@@ -527,12 +655,21 @@ func (runner *Runner) Evidence(sequence uint64) (campaign.Evidence, error) {
 func (runner *Runner) launchLocked(challenge campaign.Challenge) {
 	workerContext, cancel := context.WithCancel(runner.workerContext)
 	runner.workers[challenge.Sequence] = cancel
+	if runner.workerCount == 0 {
+		runner.workerIdle = make(chan struct{})
+	}
+	runner.workerCount++
 	runner.wait.Add(1)
 	go func() {
 		defer runner.wait.Done()
 		defer func() {
 			runner.mu.Lock()
 			delete(runner.workers, challenge.Sequence)
+			runner.workerCount--
+			if runner.workerCount == 0 {
+				close(runner.workerIdle)
+				runner.workerIdle = nil
+			}
 			runner.mu.Unlock()
 		}()
 		runner.execute(workerContext, challenge)
@@ -756,9 +893,44 @@ func (runner *Runner) finish(sequence uint64, now time.Time, outcome campaign.Ou
 	}
 	err = runner.store.WriteEvidence(evidence)
 	if err != nil {
-		runner.fail(err)
+		runner.retainEvidenceFailure([]campaign.Evidence{evidence}, err)
 	}
 	return err
+}
+
+func (runner *Runner) retainEvidenceFailure(evidence []campaign.Evidence, cause error) {
+	if cause == nil {
+		return
+	}
+	runner.mu.Lock()
+	if retainErr := runner.retainTerminalEvidenceLocked(evidence); retainErr != nil && runner.fatal == nil {
+		runner.fatal = retainErr
+	}
+	runner.evidenceErr = fmt.Errorf("persist campaign evidence: %w", cause)
+	// Missing evidence is fail-closed for new work but remains recoverable by
+	// Shutdown, unlike a corrupt engine/state transition.
+	runner.cancelWorkers()
+	runner.mu.Unlock()
+}
+
+func (runner *Runner) retainTerminalEvidenceLocked(values []campaign.Evidence) error {
+	for _, item := range values {
+		duplicate := false
+		for _, retained := range runner.shutdownEvidence {
+			if retained.Sequence != item.Sequence {
+				continue
+			}
+			duplicate = true
+			if retained.EvidenceDigestSHA256 != item.EvidenceDigestSHA256 {
+				return fmt.Errorf("conflicting terminal evidence for sequence %d", item.Sequence)
+			}
+			break
+		}
+		if !duplicate {
+			runner.shutdownEvidence = append(runner.shutdownEvidence, item)
+		}
+	}
+	return nil
 }
 
 func (runner *Runner) updateRunPhase(sequence uint64, phase RunPhase) error {
@@ -1044,7 +1216,17 @@ func (runner *Runner) lifecycleErrorLocked() error {
 	if runner.closed {
 		return errors.New("campaign runner is closed")
 	}
-	return runner.fatal
+	if runner.workersSealed {
+		return errors.New("campaign runner lifecycle is unavailable")
+	}
+	return runner.runtimeFailureLocked()
+}
+
+func (runner *Runner) runtimeFailureLocked() error {
+	if runner.fatal != nil {
+		return runner.fatal
+	}
+	return runner.evidenceErr
 }
 
 func (runner *Runner) retainedBytesLocked() int64 {

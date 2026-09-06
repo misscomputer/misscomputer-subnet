@@ -28,7 +28,7 @@ func TestSharedContractFixtures(t *testing.T) {
 		{"miner-registration.v2.json", &MinerRegistration{}},
 		{"miner-set.v2.json", &MinerSet{}},
 		{"chain-state.v2.json", &ChainState{}},
-		{"health-observation.v2.json", &HealthObservation{}},
+		{"health-observation.v3.json", &HealthObservation{}},
 		{"recovery-response.v2.json", &RecoveryResponse{}},
 		{"bridge-deactivate.v2.json", &BridgeDeactivateRequest{}},
 	}

@@ -291,6 +291,16 @@ func (r *Router) ApplyRouteUpdate(ctx context.Context, update RouteUpdate, miner
 	if err := r.validateTransitionLocked(update, record); err != nil {
 		return err
 	}
+	if update.Action == RouteDeactivate {
+		// Deactivation is a fail-closed serving boundary, not merely a durable
+		// bookkeeping transition. Once the exact authoritative tombstone has
+		// passed identity/lifecycle validation, remove that incarnation from
+		// ordinary rotation before attempting fallible persistence. If the
+		// durable write fails, the scheduler retains cleanup ownership and may
+		// retry the same tombstone, while this process cannot keep sending public
+		// traffic to a route it has already decided to tear down.
+		r.suppressExactRouteLocked(record)
+	}
 	if r.store != nil {
 		var committed bool
 		committed, err = r.store.ApplyEdgeRouteTransition(ctx, "edge-route-update", replayKey, update.ExpiresAt, record)
@@ -307,6 +317,16 @@ func (r *Router) ApplyRouteUpdate(ctx context.Context, update RouteUpdate, miner
 	}
 	r.applyTransitionLocked(update, record, target, routeTransport)
 	return nil
+}
+
+func (r *Router) suppressExactRouteLocked(record RouteRecord) {
+	claim, exists := r.claims[record.EndpointID]
+	if !exists || claim.record.State != "active" || !sameRouteIdentity(claim.record, record) {
+		return
+	}
+	claim.replica.Healthy = false
+	r.claims[record.EndpointID] = claim
+	r.upsertRouteLocked(record.RouteHost, claim)
 }
 
 func (r *Router) validateTransitionLocked(update RouteUpdate, record RouteRecord) error {
@@ -549,6 +569,44 @@ func (r *Router) Replicas(host string) []Replica {
 		values = append(values, claim.replica)
 	}
 	return values
+}
+
+// SetTemporaryAvailability changes only the process-local serving circuit for
+// one exact active route incarnation. It deliberately does not alter the
+// signed route record, durable route state, scheduler eligibility, or economic
+// trust. The periodic prober uses this narrow seam to stop sending customer
+// traffic to an endpoint after incomplete transport evidence while it gathers
+// enough attributable evidence for a durable scheduler action.
+//
+// Targeted internal probes continue to address unavailable claims, so a
+// complete correct response can close the circuit again. False means the
+// supplied identities no longer name the same active incarnation or the
+// caller did not present this router's service authority. Requiring the
+// authority keeps arbitrary in-process Go consumers from suppressing routes
+// through this exported package seam.
+func (r *Router) SetTemporaryAvailability(routeHost, replicaID, endpointID, minerID string, available bool, key ed25519.PrivateKey) (matched, changed bool) {
+	if len(key) != ed25519.PrivateKeySize {
+		return false, false
+	}
+	// PrivateKey.Public merely returns key[32:] and therefore is not proof that
+	// the seed and public suffix form a real Ed25519 key. Verify the canonical
+	// expansion before accepting this as the process-local authority capability.
+	canonical := ed25519.NewKeyFromSeed(key[:ed25519.SeedSize])
+	if subtle.ConstantTimeCompare(canonical, key) != 1 || !r.IsAuthorizedFor(canonical.Public().(ed25519.PublicKey)) {
+		return false, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	claim, exists := r.claims[endpointID]
+	if !exists || claim.record.State != "active" || claim.record.RouteHost != routeHost ||
+		claim.record.ReplicaID != replicaID || claim.record.MinerID != minerID {
+		return false, false
+	}
+	changed = claim.replica.Healthy != available
+	claim.replica.Healthy = available
+	r.claims[endpointID] = claim
+	r.upsertRouteLocked(routeHost, claim)
+	return true, changed
 }
 
 // TicketFor returns the already-verified signed ticket only when every caller

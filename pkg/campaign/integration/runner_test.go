@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,50 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	"github.com/misscomputer/misscomputer-subnet/pkg/workload"
 )
+
+func TestRunnerCloseKeepsStoreOpenUntilWorkersJoin(t *testing.T) {
+	config := integrationConfig()
+	clock := newTestClock(integrationEpoch)
+	scheduler := &fakeCampaignScheduler{now: clock.Now, miners: []string{"MinerA", "MinerB", "MinerC"}}
+	runner := newTestRunner(t, config, clock, newMemoryArtifacts(), scheduler, t.TempDir())
+	runner.config.Artifacts.CleanupTimeoutMillis = 5
+	release := make(chan struct{})
+	runner.wait.Add(1)
+	go func() {
+		defer runner.wait.Done()
+		<-release
+	}()
+
+	if err := runner.Close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close did not surface an unjoined worker: %v", err)
+	}
+	joined := runner.terminalWorkersDone()
+	if err := runner.Close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close retry did not surface the same unjoined worker: %v", err)
+	}
+	if joined != runner.terminalWorkersDone() {
+		t.Fatal("Close retry allocated a second worker-join channel")
+	}
+	if _, _, _, err := runner.store.Current(); err != nil {
+		t.Fatalf("Close closed state beneath an unjoined worker: %v", err)
+	}
+	close(release)
+	if err := runner.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown retry after sealed Close: %v", err)
+	}
+	if err := runner.Close(); err != nil {
+		t.Fatalf("retry Close after worker join: %v", err)
+	}
+	if _, _, _, err := runner.store.Current(); !errors.Is(err, ErrAmbiguousState) {
+		t.Fatalf("joined Close did not close state store: %v", err)
+	}
+	if err := runner.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after completed Close is not idempotent: %v", err)
+	}
+	if err := runner.Close(); err != nil {
+		t.Fatalf("second completed Close is not idempotent: %v", err)
+	}
+}
 
 func TestRunnerEndToEndUniquenessFairnessCleanupAndScoringBoundary(t *testing.T) {
 	clock := newTestClock(integrationEpoch)
@@ -511,6 +556,176 @@ func TestRunnerExternalDrainResumeAndShutdown(t *testing.T) {
 	status, err = runner.Status()
 	if err != nil || status.Mode != campaign.ModeStopped {
 		t.Fatalf("shutdown status=%+v err=%v", status, err)
+	}
+	// Shutdown has already started the terminal WaitGroup join. Every admission
+	// seam must remain sealed so no later wait.Add can race that join or launch a
+	// worker against resources Plane.Close is about to release.
+	if err := runner.Tick(context.Background()); err == nil {
+		t.Fatal("tick admitted work after terminal worker join")
+	}
+	if err := runner.Resume(); err == nil {
+		t.Fatal("resume reopened a shutdown runner")
+	}
+	if err := runner.Pause(); err == nil {
+		t.Fatal("pause mutated a shutdown runner")
+	}
+	if err := runner.Drain(); err == nil {
+		t.Fatal("drain mutated a shutdown runner")
+	}
+}
+
+func TestRunnerShutdownRetriesTerminalEvidenceBeforeClosingStore(t *testing.T) {
+	config := integrationConfig()
+	clock := newTestClock(integrationEpoch)
+	directory := t.TempDir()
+	scheduler := &fakeCampaignScheduler{now: clock.Now, miners: []string{"MinerA", "MinerB", "MinerC"}}
+	runner := newTestRunner(t, config, clock, newMemoryArtifacts(), scheduler, directory)
+	defer runner.Close()
+
+	runner.mu.Lock()
+	decision, err := runner.engine.Schedule(clock.Now(), scheduler.Miners())
+	if err == nil {
+		err = runner.persistLocked()
+	}
+	runner.mu.Unlock()
+	if err != nil || decision.Challenge == nil {
+		t.Fatalf("schedule pending shutdown challenge: decision=%+v err=%v", decision, err)
+	}
+	sequence := decision.Challenge.Sequence
+
+	// A non-directory at the evidence path makes the terminal state save succeed
+	// while the separately installed evidence fails. Shutdown must retain the
+	// exact evidence and refuse terminal closure until a retry installs it.
+	evidencePath := filepath.Join(directory, evidenceDirectory)
+	if err := os.WriteFile(evidencePath, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Shutdown(context.Background()); err == nil {
+		t.Fatal("shutdown hid terminal evidence persistence failure")
+	}
+	if _, err := runner.Evidence(sequence); err == nil {
+		t.Fatal("evidence unexpectedly exists while its path is blocked")
+	}
+	if err := os.Remove(evidencePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(evidencePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Shutdown(context.Background()); err != nil {
+		t.Fatalf("retry terminal evidence: %v", err)
+	}
+	evidence, err := runner.Evidence(sequence)
+	if err != nil || evidence.Sequence != sequence || evidence.Outcome != campaign.OutcomeCancelled {
+		t.Fatalf("retried terminal evidence=%+v err=%v", evidence, err)
+	}
+}
+
+func TestRunnerShutdownRetriesLateWorkerEvidenceBeforeClosingStore(t *testing.T) {
+	config := integrationConfig()
+	clock := newTestClock(integrationEpoch)
+	directory := t.TempDir()
+	blocked := make(chan struct{})
+	scheduler := &fakeCampaignScheduler{
+		now: clock.Now, miners: []string{"MinerA", "MinerB", "MinerC"}, block: blocked,
+	}
+	runner := newTestRunner(t, config, clock, newMemoryArtifacts(), scheduler, directory)
+	defer runner.Close()
+	if err := runner.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForRequests(t, scheduler, 1)
+
+	// The challenge is already running, so Engine.Shutdown cannot produce its
+	// terminal evidence. Cancellation makes the owned worker complete it. A
+	// blocked evidence path must be retained and surfaced after that worker is
+	// joined rather than being lost when the state store closes.
+	evidencePath := filepath.Join(directory, evidenceDirectory)
+	if err := os.WriteFile(evidencePath, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Shutdown(context.Background()); err == nil {
+		t.Fatal("shutdown hid late worker evidence persistence failure")
+	}
+	if _, err := runner.Evidence(1); err == nil {
+		t.Fatal("late worker evidence unexpectedly exists while its path is blocked")
+	}
+	if err := os.Remove(evidencePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(evidencePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Shutdown(context.Background()); err != nil {
+		t.Fatalf("retry late worker evidence: %v", err)
+	}
+	evidence, err := runner.Evidence(1)
+	if err != nil || evidence.Sequence != 1 || evidence.Outcome != campaign.OutcomeFailed || evidence.FailureCode != campaign.FailureCancelled {
+		t.Fatalf("retried late worker evidence=%+v err=%v", evidence, err)
+	}
+	status, err := runner.Status()
+	if err != nil || !status.RuntimeHealthy || status.Mode != campaign.ModeStopped {
+		t.Fatalf("recovered shutdown status=%+v err=%v", status, err)
+	}
+}
+
+func TestRunnerShutdownSurfacesLateWorkerStateFailureBeforeClosingStore(t *testing.T) {
+	config := integrationConfig()
+	clock := newTestClock(integrationEpoch)
+	directory := t.TempDir()
+	blocked := make(chan struct{})
+	scheduler := &fakeCampaignScheduler{
+		now: clock.Now, miners: []string{"MinerA", "MinerB", "MinerC"}, block: blocked,
+	}
+	runner := newTestRunner(t, config, clock, newMemoryArtifacts(), scheduler, directory)
+	if err := runner.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForRequests(t, scheduler, 1)
+
+	// Shutdown first persists its own terminal transition and seals admission.
+	// Break the state path at the deterministic post-seal boundary so the
+	// cancellation-owned worker's later Complete transition—not Shutdown's
+	// transition—hits the failing state save.
+	var hookErr error
+	runner.afterShutdownSeal = func() {
+		statePath := StatePath(directory)
+		if err := os.Remove(statePath); err != nil {
+			hookErr = err
+			return
+		}
+		hookErr = os.Mkdir(statePath, 0o700)
+	}
+	shutdownErr := runner.Shutdown(context.Background())
+	if hookErr != nil {
+		t.Fatalf("install late worker state fault: %v", hookErr)
+	}
+	if shutdownErr == nil {
+		t.Fatal("shutdown hid a late worker state persistence failure")
+	}
+	runner.mu.Lock()
+	fatalErr := runner.fatal
+	storeClosed := runner.storeClosed
+	runner.mu.Unlock()
+	if fatalErr == nil || storeClosed {
+		t.Fatalf("late worker failure ownership fatal=%v store_closed=%t", fatalErr, storeClosed)
+	}
+	if err := runner.Shutdown(context.Background()); err == nil {
+		t.Fatal("sealed shutdown retry hid terminal late worker failure")
+	}
+	if err := runner.Close(); err == nil {
+		t.Fatal("close hid terminal late worker failure")
+	}
+	runner.store.mu.Lock()
+	lockStillOwned := runner.store.lock != nil
+	runner.store.mu.Unlock()
+	if !lockStillOwned {
+		t.Fatal("runner closed the state store after a late worker failure")
+	}
+	// The test has proved that Runner keeps ownership. Release the private test
+	// store directly so the temporary directory does not retain a file lock.
+	if err := runner.store.Close(); err != nil {
+		t.Fatalf("release test state store: %v", err)
 	}
 }
 

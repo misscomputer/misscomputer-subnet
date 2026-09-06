@@ -25,12 +25,16 @@ import (
 )
 
 func newAuthorizedTestRouter(t *testing.T, tunnels tunnel.Registry, probeToken string, authority ed25519.PublicKey, domain string) *edge.Router {
+	return newAuthorizedTestRouterWithStore(t, tunnels, probeToken, authority, domain, nil)
+}
+
+func newAuthorizedTestRouterWithStore(t *testing.T, tunnels tunnel.Registry, probeToken string, authority ed25519.PublicKey, domain string, store edge.RouteStateStore) *edge.Router {
 	t.Helper()
 	if domain == "" {
 		domain = "on.miss.computer"
 	}
 	router, err := edge.NewAuthorizedRouter(tunnels, probeToken, edge.RouterConfig{
-		AuthorityKey: authority, Domain: domain, AllowPrivateUpstreams: true,
+		AuthorityKey: authority, Store: store, Domain: domain, AllowPrivateUpstreams: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -100,10 +104,10 @@ func TestThreeMinerDeployment(t *testing.T) {
 		t.Fatal("m1 endpoint was not routed")
 	}
 	now := time.Now()
-	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", "m1", "vantage-a", false, false, false, now); err != nil || action.RemoveFromRouting {
+	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", removedEndpoint, "m1", "vantage-a", false, false, false, now); err != nil || action.RemoveFromRouting {
 		t.Fatalf("first failure action=%+v err=%v", action, err)
 	}
-	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", "m1", "vantage-a", false, false, false, now.Add(time.Second)); err != nil || !action.AssignReplacement {
+	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", removedEndpoint, "m1", "vantage-a", false, false, false, now.Add(time.Second)); err != nil || !action.AssignReplacement {
 		t.Fatalf("replacement action=%+v err=%v", action, err)
 	}
 	replicas := router.Replicas("abc.on.miss.computer")
@@ -366,6 +370,9 @@ func TestTargetedProbePreventsGoodReplicaMaskingBadCandidate(t *testing.T) {
 	}
 	if !contains(result.FailedMiners, "m2") || !contains(result.ReadyMiners, "m4") {
 		t.Fatalf("bad candidate was not replaced: %+v", result)
+	}
+	if trust := s.Ledger.Trust("m2"); trust != 0 {
+		t.Fatalf("complete replica-backed wrong content was not trust-zeroed: %v", trust)
 	}
 	for _, replica := range router.Replicas("masked.on.miss.computer") {
 		if replica.MinerID == "m2" {

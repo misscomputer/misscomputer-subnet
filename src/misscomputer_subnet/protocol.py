@@ -11,15 +11,17 @@ import re
 from datetime import datetime
 from typing import Annotated, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 SYNAPSE_VERSION: Final[Literal["subnet-synapse.v2"]] = "subnet-synapse.v2"
+HEALTH_OBSERVATION_VERSION: Final[Literal["subnet-synapse.v3"]] = "subnet-synapse.v3"
 BOUND_TICKET_VERSION: Final[Literal["deployment.v3"]] = "deployment.v3"
 SERVICE_BINDING_VERSION: Final[Literal["service-binding.v2"]] = "service-binding.v2"
 
 Hex64 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 HexSignature = Annotated[str, StringConstraints(pattern=r"^(?:0x)?[0-9a-f]{128}$")]
 NonEmpty = Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+EndpointID = Annotated[str, StringConstraints(min_length=3, max_length=320)]
 
 _RFC3339_NANO = re.compile(
     r"^(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})"
@@ -603,17 +605,50 @@ class ChainState(StrictModel):
 
 
 class HealthObservation(StrictModel):
-    protocol: Literal["subnet-synapse.v2"]
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {"properties": {"correct": {"const": True}}, "required": ["correct"]},
+                    "then": {"properties": {"reachable": {"const": True}}},
+                },
+                {
+                    "if": {
+                        "properties": {"fraudulent": {"const": True}},
+                        "required": ["fraudulent"],
+                    },
+                    "then": {
+                        "properties": {
+                            "correct": {"const": False},
+                            "reachable": {"const": True},
+                        }
+                    },
+                },
+            ]
+        },
+    )
+    protocol: Literal["subnet-synapse.v3"]
     deployment_id: NonEmpty
     replica_id: NonEmpty
+    endpoint_id: EndpointID
     miner_hotkey: NonEmpty
     vantage: NonEmpty
     reachable: bool
     correct: bool
     fraudulent: bool
-    latency_ms: int = Field(ge=0)
+    latency_ms: int = Field(ge=0, le=9_223_372_036_854_775_807)
     availability: float = Field(ge=0, le=1)
-    observed_at: datetime
+    observed_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_evidence_semantics(self) -> HealthObservation:
+        if self.correct and not self.reachable:
+            raise ValueError("a correct response must be reachable")
+        if self.fraudulent and (not self.reachable or self.correct):
+            raise ValueError("fraud evidence must be reachable and incorrect")
+        return self
 
 
 def utc_now() -> datetime:

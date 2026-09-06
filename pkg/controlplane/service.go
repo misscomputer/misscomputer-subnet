@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
@@ -88,13 +89,22 @@ type Config struct {
 // route table the private gateway replays into; Edge returns the public edge
 // origin handler.
 type Plane struct {
-	api      *api
-	store    *durable.Store
-	gateway  *edge.Gateway
-	campaign *campaignintegration.Runner
-	prober   *control.Prober
-	control  http.Handler
-	logger   *slog.Logger
+	api            *api
+	scheduler      *control.Scheduler
+	store          *durable.Store
+	gateway        *edge.Gateway
+	campaign       *campaignintegration.Runner
+	prober         *control.Prober
+	control        http.Handler
+	logger         *slog.Logger
+	runMu          sync.Mutex
+	runActive      bool
+	runDone        chan struct{}
+	closing        bool
+	requestMu      sync.Mutex
+	requestActive  int
+	requestDone    chan struct{}
+	requestClosing bool
 }
 
 func New(config Config) (plane *Plane, err error) {
@@ -210,7 +220,7 @@ func New(config Config) (plane *Plane, err error) {
 		startupRecovery:        startupRecovery,
 		tunnels:                registry,
 	}
-	plane = &Plane{api: serviceAPI, store: store, gateway: gateway, control: routes(serviceAPI), logger: logger}
+	plane = &Plane{api: serviceAPI, scheduler: scheduler, store: store, gateway: gateway, control: routes(serviceAPI), logger: logger}
 	if config.PeriodicProbeInterval > 0 {
 		prober := &control.Prober{
 			Scheduler: scheduler, Interval: config.PeriodicProbeInterval, Timeout: config.PeriodicProbeTimeout, Logger: logger,
@@ -298,9 +308,63 @@ func routes(serviceAPI *api) http.Handler {
 	return mux
 }
 
-func (p *Plane) Control() http.Handler { return p.control }
+func (p *Plane) Control() http.Handler { return p.admittedHandler(p.control) }
 
-func (p *Plane) Edge() http.Handler { return p.gateway }
+func (p *Plane) Edge() http.Handler { return p.admittedHandler(p.gateway) }
+
+// admittedHandler keeps Plane resource ownership around the whole HTTP
+// transaction, including API persistence that occurs after scheduler work has
+// completed. Scheduler.Drain alone cannot see that tail, so Close first seals
+// this admission gate and joins every admitted request.
+func (p *Plane) admittedHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if !p.beginRequest() {
+			http.Error(response, "control plane is closing", http.StatusServiceUnavailable)
+			return
+		}
+		defer p.endRequest()
+		next.ServeHTTP(response, request)
+	})
+}
+
+func (p *Plane) beginRequest() bool {
+	p.requestMu.Lock()
+	defer p.requestMu.Unlock()
+	if p.requestClosing {
+		return false
+	}
+	if p.requestActive == 0 {
+		p.requestDone = make(chan struct{})
+	}
+	p.requestActive++
+	return true
+}
+
+func (p *Plane) endRequest() {
+	p.requestMu.Lock()
+	p.requestActive--
+	if p.requestActive == 0 {
+		close(p.requestDone)
+	}
+	p.requestMu.Unlock()
+}
+
+func (p *Plane) closeRequestAdmission(ctx context.Context) error {
+	p.requestMu.Lock()
+	p.requestClosing = true
+	active := p.requestActive
+	done := p.requestDone
+	p.requestMu.Unlock()
+	if active == 0 {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("join admitted control-plane requests: %w", ctx.Err())
+	}
+}
 
 func (p *Plane) ServicePublicKey() ed25519.PublicKey {
 	return append(ed25519.PublicKey(nil), p.api.publicKey...)
@@ -311,6 +375,25 @@ func (p *Plane) CampaignEnabled() bool { return p.campaign != nil }
 // Run drives the synthetic campaign until ctx is cancelled. Without an enabled
 // campaign it simply waits for cancellation so callers have one lifecycle.
 func (p *Plane) Run(ctx context.Context) error {
+	p.runMu.Lock()
+	if p.closing {
+		p.runMu.Unlock()
+		return errors.New("control plane is closing")
+	}
+	if p.runActive {
+		p.runMu.Unlock()
+		return errors.New("control plane is already running")
+	}
+	p.runActive = true
+	p.runDone = make(chan struct{})
+	runDone := p.runDone
+	p.runMu.Unlock()
+	defer func() {
+		p.runMu.Lock()
+		p.runActive = false
+		close(runDone)
+		p.runMu.Unlock()
+	}()
 	// The prober owns no state the campaign needs and never returns before
 	// cancellation, so it runs beside the campaign rather than in sequence.
 	proberDone := make(chan struct{})
@@ -347,9 +430,48 @@ func (p *Plane) Run(ctx context.Context) error {
 // connections, and closes the durable store.
 func (p *Plane) Close(ctx context.Context) error {
 	var first error
+	p.runMu.Lock()
+	p.closing = true
+	runActive := p.runActive
+	runDone := p.runDone
+	p.runMu.Unlock()
+	if err := p.closeRequestAdmission(ctx); err != nil {
+		return err
+	}
 	if p.campaign != nil {
 		first = p.campaign.Shutdown(ctx)
-		p.campaign.Close()
+		if ctx.Err() != nil {
+			return errors.Join(first, ctx.Err())
+		}
+	}
+	if runActive {
+		select {
+		case <-runDone:
+		case <-ctx.Done():
+			return errors.Join(first, fmt.Errorf("join control-plane runner: %w", ctx.Err()))
+		}
+	}
+	if first != nil {
+		// Shutdown may have committed terminal campaign state while a durable
+		// evidence install or exact cleanup remains retryable. Keep every owned
+		// resource open so a later Close call can finish that terminal work.
+		return first
+	}
+	if p.campaign != nil {
+		if err := p.campaign.Close(); err != nil {
+			// Runner.Close leaves its store open when its workers have not joined,
+			// so a later Close call can safely retry without closing resources
+			// beneath a late campaign worker.
+			return errors.Join(first, err)
+		}
+	}
+	if p.scheduler != nil {
+		if err := p.scheduler.Drain(ctx); err != nil {
+			// Do not close the gateway/store beneath an assignment or exact
+			// cleanup worker which still owns them. A caller can retry Close with
+			// a fresh deadline after the late operation finishes.
+			return errors.Join(first, err)
+		}
 	}
 	p.gateway.Close()
 	if err := p.store.Close(); first == nil {

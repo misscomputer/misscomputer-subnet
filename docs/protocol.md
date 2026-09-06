@@ -6,7 +6,15 @@ Three deployment ticket versions coexist intentionally:
 - `deployment.v2` is retained as the pre-TLS neuron identity shape and is rejected on live network paths.
 - `deployment.v3` is mandatory across current neuron boundaries and adds the exact miner HTTPS identity and leaf-certificate pin.
 
-The current neuron API is `subnet-synapse.v2`; service-key attestations are `service-binding.v2`. The immutable `.v1` schemas/fixtures remain available only to identify legacy state and are not reinterpreted as the new shape. Unknown fields are rejected by both Pydantic and Go bridge decoders. Current `.v2` fixtures are consumed by both languages, and generated schemas are regenerated and diff-checked in CI.
+The current neuron API is `subnet-synapse.v2`; the endpoint-incarnation-bound
+health observation is the message-scoped `subnet-synapse.v3`; service-key
+attestations are `service-binding.v2`. Health v3 requires the exact endpoint ID
+and rejects v2 reports because a stable replica label can be replayed against a
+later generation. See [the API migration note](api-migrations.md). The
+immutable v1/v2 schemas and fixtures remain available only to identify legacy
+state and are not reinterpreted as the new shape. Unknown fields are rejected
+by both Pydantic and Go bridge decoders. Current fixtures are consumed by both
+languages, and generated schemas are regenerated and diff-checked in CI.
 
 ## Bittensor v11 transport
 

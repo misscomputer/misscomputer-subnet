@@ -4,6 +4,7 @@ package runtimeapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +13,28 @@ import (
 	"testing"
 	"time"
 )
+
+func TestShutdownJoinsAdmittedConnectionsAndRejectsNewOnes(t *testing.T) {
+	server := openServer(t)
+	if !server.beginConnection() {
+		t.Fatal("first connection was not admitted")
+	}
+	short, cancelShort := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	if err := server.Shutdown(short); err == nil {
+		cancelShort()
+		t.Fatal("shutdown returned while an admitted handler was live")
+	}
+	cancelShort()
+	if server.beginConnection() {
+		t.Fatal("connection admitted after shutdown began")
+	}
+	server.endConnection()
+	joined, cancelJoined := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoined()
+	if err := server.Shutdown(joined); err != nil {
+		t.Fatalf("shutdown did not join completed handler: %v", err)
+	}
+}
 
 func TestStateSurvivesRuntimeRecovery(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "state")

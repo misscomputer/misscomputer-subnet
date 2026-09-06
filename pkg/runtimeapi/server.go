@@ -5,6 +5,7 @@ package runtimeapi
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,6 +55,10 @@ type Server struct {
 	pruneWatermark   int
 	stateDir         string
 	lockFile         *os.File
+	serveMu          sync.Mutex
+	serveClosing     bool
+	serveWorkers     int
+	serveIdle        chan struct{}
 
 	// Control receives every typed control operation as an in-process HTTP
 	// request. The runtime command installs the control plane before serving;
@@ -140,7 +145,60 @@ func (s *Server) Serve(listener net.Listener) error {
 		if err != nil {
 			return err
 		}
-		go s.serveConnection(connection)
+		if !s.beginConnection() {
+			_ = connection.Close()
+			return net.ErrClosed
+		}
+		go func() {
+			defer s.endConnection()
+			s.serveConnection(connection)
+		}()
+	}
+}
+
+func (s *Server) beginConnection() bool {
+	s.serveMu.Lock()
+	defer s.serveMu.Unlock()
+	if s.serveClosing {
+		return false
+	}
+	if s.serveWorkers == 0 {
+		s.serveIdle = make(chan struct{})
+	}
+	s.serveWorkers++
+	return true
+}
+
+func (s *Server) endConnection() {
+	s.serveMu.Lock()
+	s.serveWorkers--
+	if s.serveWorkers == 0 && s.serveIdle != nil {
+		close(s.serveIdle)
+		s.serveIdle = nil
+	}
+	s.serveMu.Unlock()
+}
+
+// Shutdown rejects newly accepted runtime connections and joins all handlers
+// admitted before the listener was closed. Callers must not close the control
+// plane or replay journal after a failed join.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("runtime server shutdown context is required")
+	}
+	s.serveMu.Lock()
+	s.serveClosing = true
+	if s.serveWorkers == 0 {
+		s.serveMu.Unlock()
+		return nil
+	}
+	idle := s.serveIdle
+	s.serveMu.Unlock()
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("join runtime connections: %w", ctx.Err())
 	}
 }
 

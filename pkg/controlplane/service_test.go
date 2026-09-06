@@ -5,6 +5,9 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,8 +21,29 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
 	"github.com/misscomputer/misscomputer-subnet/pkg/control"
 	"github.com/misscomputer/misscomputer-subnet/pkg/durable"
+	"github.com/misscomputer/misscomputer-subnet/pkg/edge"
+	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
 	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
+	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
+	deployruntime "github.com/misscomputer/misscomputer-subnet/pkg/runtime"
+	"github.com/misscomputer/misscomputer-subnet/pkg/workload"
 )
+
+type planeBlockingAssigner struct {
+	id      string
+	key     ed25519.PublicKey
+	started chan struct{}
+	release chan struct{}
+}
+
+func (m *planeBlockingAssigner) ID() string                   { return m.id }
+func (m *planeBlockingAssigner) PublicKey() ed25519.PublicKey { return m.key }
+func (m *planeBlockingAssigner) Assign(context.Context, protocol.Ticket) (miner.Result, error) {
+	close(m.started)
+	<-m.release
+	return miner.Result{}, errors.New("released assignment")
+}
+func (*planeBlockingAssigner) Deactivate(context.Context, string) error { return nil }
 
 func testConfig(t *testing.T) Config {
 	t.Helper()
@@ -102,6 +126,142 @@ func TestNewRejectsIncompleteOrUnsafeConfiguration(t *testing.T) {
 	}
 }
 
+func TestPlaneCloseRefusesToCloseResourcesUnderLiveSchedulerWorker(t *testing.T) {
+	plane := newTestPlane(t, nil)
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := &planeBlockingAssigner{id: "blocked", key: publicKey, started: make(chan struct{}), release: make(chan struct{})}
+	plane.scheduler.Replicas = 1
+	plane.scheduler.SetMiners([]miner.Assigner{blocked})
+	spec, layer, err := workload.Generate("static", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := artifact.Publish(context.Background(), plane.api.artifacts, spec.Kind, [][]byte{layer}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployDone := make(chan error, 1)
+	go func() {
+		_, deployErr := plane.scheduler.Deploy(context.Background(), control.DeployRequest{
+			DeploymentID: "close-owned", Manifest: manifest, ManifestKey: artifact.ManifestKey(manifest.ImageDigest), Workload: spec, Timeout: 20 * time.Millisecond,
+		})
+		deployDone <- deployErr
+	}()
+	<-blocked.started
+	if err := <-deployDone; err == nil {
+		t.Fatal("timed out assignment succeeded")
+	}
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	if err := plane.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		cancelClose()
+		t.Fatalf("Plane.Close did not surface live scheduler ownership: %v", err)
+	}
+	cancelClose()
+	if _, err := plane.store.ActiveEndpoints(context.Background()); err != nil {
+		t.Fatalf("Plane.Close closed durable state after failed drain: %v", err)
+	}
+	close(blocked.release)
+	joined, cancelJoined := context.WithTimeout(context.Background(), time.Second)
+	if err := plane.scheduler.Drain(joined); err != nil {
+		cancelJoined()
+		t.Fatal(err)
+	}
+	cancelJoined()
+	finalCtx, cancelFinal := context.WithTimeout(context.Background(), time.Second)
+	if err := plane.Close(finalCtx); err != nil {
+		cancelFinal()
+		t.Fatalf("Plane.Close after lifecycle join: %v", err)
+	}
+	cancelFinal()
+}
+
+func TestPlaneCloseJoinsWholeAdmittedRequestBeforeClosingStore(t *testing.T) {
+	plane := newTestPlane(t, nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	handler := plane.admittedHandler(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	go func() {
+		defer close(finished)
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/health", nil))
+	}()
+	<-started
+
+	short, cancelShort := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	if err := plane.Close(short); !errors.Is(err, context.DeadlineExceeded) {
+		cancelShort()
+		t.Fatalf("Plane.Close did not surface admitted request ownership: %v", err)
+	}
+	cancelShort()
+	if _, err := plane.store.ActiveEndpoints(context.Background()); err != nil {
+		t.Fatalf("Plane.Close closed durable state beneath request tail: %v", err)
+	}
+	rejected := httptest.NewRecorder()
+	handler.ServeHTTP(rejected, httptest.NewRequest(http.MethodGet, "/v1/capabilities", nil))
+	if rejected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("new request entered sealed Plane: %d", rejected.Code)
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("admitted request did not finish")
+	}
+	joined, cancelJoined := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoined()
+	if err := plane.Close(joined); err != nil {
+		t.Fatalf("Plane.Close after request join: %v", err)
+	}
+	if err := plane.Close(context.Background()); err != nil {
+		t.Fatalf("second completed Plane.Close is not idempotent: %v", err)
+	}
+}
+
+func TestPlaneCloseRefusesResourcesUntilRunJoins(t *testing.T) {
+	plane := newTestPlane(t, nil)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- plane.Run(runCtx) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		plane.runMu.Lock()
+		active := plane.runActive
+		plane.runMu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Plane.Run did not enter its lifecycle")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	short, cancelShort := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	if err := plane.Close(short); !errors.Is(err, context.DeadlineExceeded) {
+		cancelShort()
+		t.Fatalf("Plane.Close did not refuse a live runner: %v", err)
+	}
+	cancelShort()
+	if _, err := plane.store.ActiveEndpoints(context.Background()); err != nil {
+		t.Fatalf("store closed beneath Plane.Run: %v", err)
+	}
+	cancelRun()
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
+	}
+	joined, cancelJoined := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoined()
+	if err := plane.Close(joined); err != nil {
+		t.Fatalf("Plane.Close after runner join: %v", err)
+	}
+}
+
 func TestControlPlaneServesTheProductionRouteTable(t *testing.T) {
 	plane := newTestPlane(t, nil)
 	handler := plane.Control()
@@ -142,6 +302,53 @@ func TestControlPlaneServesTheProductionRouteTable(t *testing.T) {
 	if health := call(t, handler, http.MethodPost, "/v1/health", `{"protocol":"wrong"}`); health.Code != http.StatusBadRequest {
 		t.Fatalf("invalid health observation accepted: %d", health.Code)
 	}
+	legacyHealth := neuron.HealthObservation{
+		Protocol: neuron.SynapseVersion, DeploymentID: "demo", ReplicaID: "demo-miner", EndpointID: "demo-miner-g1-old",
+		MinerHotkey: "miner", Vantage: "external", Reachable: true, Correct: true, LatencyMS: 1, Availability: 1, ObservedAt: time.Now().UTC(),
+	}
+	if health := call(t, handler, http.MethodPost, "/v1/health", legacyHealth); health.Code != http.StatusBadRequest {
+		t.Fatalf("legacy unbound health observation accepted: %d %s", health.Code, health.Body.String())
+	}
+	legacyHealth.Protocol = neuron.HealthObservationVersion
+	legacyHealth.EndpointID = ""
+	if health := call(t, handler, http.MethodPost, "/v1/health", legacyHealth); health.Code != http.StatusBadRequest {
+		t.Fatalf("v3 health observation without endpoint incarnation accepted: %d %s", health.Code, health.Body.String())
+	}
+	completeHealth := map[string]any{
+		"protocol": neuron.HealthObservationVersion, "deployment_id": "unknown", "replica_id": "unknown-miner",
+		"endpoint_id": "unknown-miner-g1-nonce", "miner_hotkey": "miner", "vantage": "external",
+		"reachable": true, "correct": true, "fraudulent": false, "latency_ms": int64(0),
+		"availability": float64(1), "observed_at": time.Now().UTC(),
+	}
+	if health := call(t, handler, http.MethodPost, "/v1/health", completeHealth); health.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("complete unknown health observation did not reach identity validation: %d %s", health.Code, health.Body.String())
+	}
+	for _, requiredScalar := range []string{"reachable", "correct", "fraudulent", "latency_ms", "availability"} {
+		missing := make(map[string]any, len(completeHealth))
+		for key, value := range completeHealth {
+			missing[key] = value
+		}
+		delete(missing, requiredScalar)
+		if health := call(t, handler, http.MethodPost, "/v1/health", missing); health.Code != http.StatusBadRequest {
+			t.Fatalf("health observation missing %s accepted: %d %s", requiredScalar, health.Code, health.Body.String())
+		}
+		nullValue := make(map[string]any, len(completeHealth))
+		for key, value := range completeHealth {
+			nullValue[key] = value
+		}
+		nullValue[requiredScalar] = nil
+		if health := call(t, handler, http.MethodPost, "/v1/health", nullValue); health.Code != http.StatusBadRequest {
+			t.Fatalf("health observation with null %s accepted: %d %s", requiredScalar, health.Code, health.Body.String())
+		}
+	}
+	unknownField := make(map[string]any, len(completeHealth)+1)
+	for key, value := range completeHealth {
+		unknownField[key] = value
+	}
+	unknownField["unreviewed_extension"] = true
+	if health := call(t, handler, http.MethodPost, "/v1/health", unknownField); health.Code != http.StatusBadRequest {
+		t.Fatalf("health observation with unknown field accepted: %d %s", health.Code, health.Body.String())
+	}
 	if missing := call(t, handler, http.MethodGet, "/v1/miners/absent", nil); missing.Code != http.StatusNotFound {
 		t.Fatalf("unknown miner readback: %d", missing.Code)
 	}
@@ -179,6 +386,107 @@ func TestDryRunWeightsAreComputedFromDurableObservations(t *testing.T) {
 	if decoded.Protocol != neuron.SynapseVersion || !decoded.DryRun || len(decoded.Weights) != 1 ||
 		decoded.Weights[0].MinerHotkey != "miner-a" || decoded.Weights[0].Weight <= 0 || decoded.Weights[0].Samples != 1 {
 		t.Fatalf("weights were not computed from the recorded observation: %s", weights.Body.String())
+	}
+}
+
+func TestHealthObservationInsertFailureLeavesAuthenticatedReportRetryable(t *testing.T) {
+	var statePath string
+	plane := newTestPlane(t, func(config *Config) {
+		statePath = config.StateDB
+	})
+	testRouter, err := edge.NewAuthorizedRouter(plane.api.tunnels, plane.scheduler.Validator.InternalProbeToken, edge.RouterConfig{
+		AuthorityKey: plane.ServicePublicKey(), Store: plane.store, Domain: "mock.local",
+		AllowPrivateUpstreams: true, AllowInsecureMockHTTP: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testGateway, err := edge.NewGateway(testRouter, edge.GatewayConfig{Domain: "mock.local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plane.gateway.Close()
+	plane.gateway = testGateway
+	plane.scheduler.Router = testRouter
+	edgeServer := httptest.NewServer(plane.Edge())
+	defer edgeServer.Close()
+	plane.scheduler.Validator.EdgeURL = edgeServer.URL
+	ownerPublic := plane.ServicePublicKey()
+	for _, minerID := range []string{"m1", "m2", "m3", "m4"} {
+		_, minerPrivate, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent := miner.NewAgent(minerID, ownerPublic, minerPrivate, plane.api.artifacts, deployruntime.NewLocalRuntime(), plane.api.tunnels)
+		plane.scheduler.Miners = append(plane.scheduler.Miners, agent)
+	}
+	spec, layer, err := workload.Generate("static", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := artifact.Publish(context.Background(), plane.api.artifacts, spec.Kind, [][]byte{[]byte("base"), layer}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := control.DeployRequest{
+		DeploymentID: "health-commit-retry", Manifest: manifest, ManifestKey: artifact.ManifestKey(manifest.ImageDigest), Workload: spec,
+	}
+	if _, err := plane.scheduler.Deploy(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := plane.scheduler.DeactivateDeployment(ctx, request.DeploymentID); err != nil {
+			t.Errorf("cleanup deployment: %v", err)
+		}
+	}()
+	target := plane.scheduler.ActiveReplicas(request.DeploymentID)[0]
+	input := neuron.HealthObservation{
+		Protocol: neuron.HealthObservationVersion, DeploymentID: request.DeploymentID,
+		ReplicaID: target.ReplicaID, EndpointID: target.EndpointID, MinerHotkey: target.MinerID,
+		Vantage: "authenticated-external", Reachable: true, Correct: true,
+		LatencyMS: 7, Availability: 1, ObservedAt: time.Now().UTC(),
+	}
+
+	triggerDB, err := sql.Open("sqlite", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer triggerDB.Close()
+	if _, err := triggerDB.ExecContext(context.Background(), `CREATE TRIGGER fail_health_observation
+BEFORE INSERT ON observations WHEN NEW.kind = 'health'
+BEGIN SELECT RAISE(FAIL, 'injected health observation failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	handler := plane.Control()
+	failed := call(t, handler, http.MethodPost, "/v1/health", input)
+	if failed.Code != http.StatusInternalServerError || !strings.Contains(failed.Body.String(), "state_error") {
+		t.Fatalf("durable observation failure was not retriable: %d %s", failed.Code, failed.Body.String())
+	}
+	if _, err := triggerDB.ExecContext(context.Background(), `DROP TRIGGER fail_health_observation`); err != nil {
+		t.Fatal(err)
+	}
+	retried := call(t, handler, http.MethodPost, "/v1/health", input)
+	if retried.Code != http.StatusOK {
+		t.Fatalf("identical authenticated retry was rejected: %d %s", retried.Code, retried.Body.String())
+	}
+	replayed := call(t, handler, http.MethodPost, "/v1/health", input)
+	if replayed.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("committed replay was not rejected: %d %s", replayed.Code, replayed.Body.String())
+	}
+	observations, err := plane.store.Observations(context.Background(), time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthSamples := 0
+	for _, observation := range observations {
+		if observation.Kind == "health" && observation.MinerHotkey == target.MinerID {
+			healthSamples++
+		}
+	}
+	if healthSamples != 1 {
+		t.Fatalf("health report persisted %d scoring samples, want exactly one", healthSamples)
 	}
 }
 
@@ -263,6 +571,17 @@ func TestNewRefusesProbeCadenceThatCanNeverEvict(t *testing.T) {
 		},
 		"cadence exceeds the health rapid window": func(c *Config) {
 			c.PeriodicProbeInterval, c.PeriodicProbeTimeout = 30*time.Second, time.Second
+		},
+		"duration addition overflows": func(c *Config) {
+			var err error
+			c.PeriodicProbeInterval, err = time.ParseDuration("2000000h")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.PeriodicProbeTimeout, err = time.ParseDuration("1000000h")
+			if err != nil {
+				t.Fatal(err)
+			}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
