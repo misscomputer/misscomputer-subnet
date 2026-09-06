@@ -1,0 +1,448 @@
+{
+  "$defs": {
+    "ProbeScoringPolicy": {
+      "additionalProperties": false,
+      "description": "Validator-local scoring parameters.\n\nThese are policy, not consensus: a validator may tune them without breaking\nanything, because each validator scores independently.",
+      "properties": {
+        "apply_coverage_penalty": {
+          "default": true,
+          "title": "Apply Coverage Penalty",
+          "type": "boolean"
+        },
+        "latency_target_millis": {
+          "default": 1000,
+          "maximum": 3600000,
+          "minimum": 1,
+          "title": "Latency Target Millis",
+          "type": "integer"
+        },
+        "min_attributions": {
+          "default": 1,
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Min Attributions",
+          "type": "integer"
+        }
+      },
+      "title": "ProbeScoringPolicy",
+      "type": "object"
+    },
+    "WeightDecisionPolicy": {
+      "additionalProperties": false,
+      "description": "Validator-local decision thresholds. Each validator decides independently.",
+      "properties": {
+        "activation_grace_seconds": {
+          "default": 1800,
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Activation Grace Seconds",
+          "type": "integer"
+        },
+        "max_assigned_drop_permille": {
+          "default": 500,
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Max Assigned Drop Permille",
+          "type": "integer"
+        },
+        "max_registered_height_gap": {
+          "default": 600,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Registered Height Gap",
+          "type": "integer"
+        },
+        "min_expected_attributions": {
+          "default": 3,
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Min Expected Attributions",
+          "type": "integer"
+        },
+        "min_verified_rounds": {
+          "default": 24,
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Min Verified Rounds",
+          "type": "integer"
+        }
+      },
+      "title": "WeightDecisionPolicy",
+      "type": "object"
+    },
+    "WeightDecisionRow": {
+      "additionalProperties": false,
+      "description": "One registered miner: its class, weight, and the evidence counts behind it.",
+      "properties": {
+        "attributions": {
+          "minimum": 0,
+          "title": "Attributions",
+          "type": "integer"
+        },
+        "classification": {
+          "enum": [
+            "assigned_in_grace",
+            "assigned_undersampled",
+            "assigned_unverified",
+            "unassigned",
+            "verified_serving"
+          ],
+          "title": "Classification",
+          "type": "string"
+        },
+        "expected_attributions_denominator": {
+          "minimum": 1,
+          "title": "Expected Attributions Denominator",
+          "type": "integer"
+        },
+        "expected_attributions_numerator": {
+          "minimum": 0,
+          "title": "Expected Attributions Numerator",
+          "type": "integer"
+        },
+        "first_seen_epoch": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "First Seen Epoch"
+        },
+        "hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "opportunities": {
+          "minimum": 0,
+          "title": "Opportunities",
+          "type": "integer"
+        },
+        "uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Uid",
+          "type": "integer"
+        },
+        "weight": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Weight",
+          "type": "number"
+        }
+      },
+      "required": [
+        "uid",
+        "hotkey",
+        "classification",
+        "weight",
+        "attributions",
+        "opportunities",
+        "expected_attributions_numerator",
+        "expected_attributions_denominator",
+        "first_seen_epoch"
+      ],
+      "title": "WeightDecisionRow",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Sealed, archivable outcome of one scoring window: abstain or submit.",
+  "properties": {
+    "abstain_reasons": {
+      "items": {
+        "enum": [
+          "coverage_insufficient",
+          "manifest_expired_at_close",
+          "manifest_invalid",
+          "manifest_unavailable",
+          "mass_unassignment_guard",
+          "no_positive_evidence",
+          "registered_set_unbound",
+          "rounds_insufficient"
+        ],
+        "type": "string"
+      },
+      "maxItems": 8,
+      "title": "Abstain Reasons",
+      "type": "array"
+    },
+    "decision": {
+      "enum": [
+        "abstain",
+        "submit"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "decision_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Decision Digest Sha256",
+      "type": "string"
+    },
+    "decision_policy": {
+      "$ref": "#/$defs/WeightDecisionPolicy"
+    },
+    "max_assigned_miner_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Max Assigned Miner Count",
+      "type": "integer"
+    },
+    "metagraph_identity_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Metagraph Identity Fingerprint Sha256",
+      "type": "string"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "observation_count": {
+      "minimum": 0,
+      "title": "Observation Count",
+      "type": "integer"
+    },
+    "purpose": {
+      "const": "public_validator_weight_decision_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "registered_finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Registered Finalized Block Hash",
+      "type": "string"
+    },
+    "registered_finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Registered Finalized Epoch",
+      "type": "integer"
+    },
+    "registered_finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Registered Finalized Height",
+      "type": "integer"
+    },
+    "registered_miner_count": {
+      "maximum": 4096,
+      "minimum": 1,
+      "title": "Registered Miner Count",
+      "type": "integer"
+    },
+    "round_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Round Count",
+      "type": "integer"
+    },
+    "rows": {
+      "items": {
+        "$ref": "#/$defs/WeightDecisionRow"
+      },
+      "maxItems": 4096,
+      "minItems": 1,
+      "title": "Rows",
+      "type": "array"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/validator-weight-decision",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "scoring_policy": {
+      "$ref": "#/$defs/ProbeScoringPolicy"
+    },
+    "scoring_window_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Scoring Window Digest Sha256"
+    },
+    "serving_observation_count": {
+      "minimum": 0,
+      "title": "Serving Observation Count",
+      "type": "integer"
+    },
+    "terminal_assigned_miner_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Terminal Assigned Miner Count",
+      "type": "integer"
+    },
+    "terminal_evaluated_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Terminal Evaluated At Epoch",
+      "type": "integer"
+    },
+    "terminal_finalized_height": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Height"
+    },
+    "terminal_manifest_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Digest Sha256"
+    },
+    "terminal_manifest_expires_at_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Expires At Epoch"
+    },
+    "terminal_manifest_rejection_code": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z0-9_]{1,64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Rejection Code"
+    },
+    "terminal_manifest_sequence": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Sequence"
+    },
+    "terminal_manifest_status": {
+      "enum": [
+        "rejected",
+        "unavailable",
+        "verified"
+      ],
+      "title": "Terminal Manifest Status",
+      "type": "string"
+    },
+    "validator_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Validator Hotkey",
+      "type": "string"
+    },
+    "validator_uid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Validator Uid",
+      "type": "integer"
+    },
+    "weight_plan_rows_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Weight Plan Rows Digest Sha256"
+    },
+    "window_end_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Window End Epoch",
+      "type": "integer"
+    },
+    "window_start_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Window Start Epoch",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "validator_uid",
+    "validator_hotkey",
+    "window_start_epoch",
+    "window_end_epoch",
+    "decision",
+    "abstain_reasons",
+    "decision_policy",
+    "scoring_policy",
+    "terminal_manifest_status",
+    "terminal_manifest_rejection_code",
+    "terminal_evaluated_at_epoch",
+    "terminal_manifest_digest_sha256",
+    "terminal_manifest_sequence",
+    "terminal_manifest_expires_at_epoch",
+    "terminal_finalized_height",
+    "round_count",
+    "observation_count",
+    "serving_observation_count",
+    "scoring_window_digest_sha256",
+    "max_assigned_miner_count",
+    "terminal_assigned_miner_count",
+    "registered_finalized_height",
+    "registered_finalized_block_hash",
+    "registered_finalized_epoch",
+    "registered_miner_count",
+    "metagraph_identity_fingerprint_sha256",
+    "rows",
+    "weight_plan_rows_digest_sha256",
+    "decision_digest_sha256"
+  ],
+  "title": "ValidatorWeightDecision",
+  "type": "object"
+}

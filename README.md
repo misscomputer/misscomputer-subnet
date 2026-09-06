@@ -24,4 +24,7 @@ the one-shot `misscomputer-python-boundary` /
 `misscomputer-checkpoint-boundary` commands.
 
 Protocol and Go API compatibility changes are recorded in
-[`docs/api-migrations.md`](docs/api-migrations.md).
+[`docs/api-migrations.md`](docs/api-migrations.md). The frozen
+active-assignment snapshot, manifest publication, and validator decision
+contracts are described in
+[`docs/contract-checkpoint-v1.md`](docs/contract-checkpoint-v1.md).

@@ -1,5 +1,38 @@
 # Public API migrations
 
+## Contract checkpoint v1 (additive)
+
+This release adds three versioned contracts and their pure verification code
+without changing any existing contract, schema, fixture, Go API, or boundary
+operation; see [`contract-checkpoint-v1.md`](contract-checkpoint-v1.md).
+
+### `misscomputer-checkpoint-boundary`
+
+Protocol `misscomputer.checkpoint-boundary.v1` gains the operations
+`build_snapshot_replica`, `build_snapshot_deployment`,
+`build_assignment_snapshot`, `project_snapshot_deployments`,
+`verify_snapshot_succession`, `verify_manifest_derived_from_snapshot`,
+`build_manifest_latest_pointer`, `verify_manifest_latest_pointer`,
+`bind_latest_pointer_to_manifest`, and `rebind_manifest_state_trust_policy`,
+and the `validate` operation accepts the models
+`active_assignment_snapshot` and `assignment_manifest_latest_pointer`. Every
+pre-existing operation, argument, and response shape is unchanged, so a
+producer pinned to the previous snapshot keeps working.
+
+### Go `pkg/assignment`
+
+New package; no existing Go package changed. `Seal`, `Parse`, `Marshal`,
+`Project`, `Validate`, and `CanonicalJSON` are the only exported functions.
+
+### `contracts/negative/`
+
+New directory convention for golden invalid documents. It is not read by
+`schema_inventory` and does not affect the public contract inventory digest
+of `contracts/fixtures` and `contracts/schemas`.
+
+No migration exports the hidden challenge, changes validator scoring, submits
+weights, or introduces multi-validator coordination.
+
 ## Periodic prober hardening and health-observation v3
 
 This release contains two intentional compatibility breaks needed to keep a

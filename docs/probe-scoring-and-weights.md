@@ -109,3 +109,11 @@ This module is the computation, and it is complete and tested. Deciding *when*
 a validator closes a window and submits — the epoch boundary policy in
 `checkpoint_boundary.py`, and the operator's opt-in to weighting from probe
 evidence at all — is a separate change against the neuron's run loop.
+
+The question of *whether* a closed window's vector may become a plan at all —
+abstain on an invalid or missing manifest, abstain on insufficient sampling,
+zero only under safe preconditions, no transaction without positive evidence,
+activation grace — is frozen separately in
+[`contract-checkpoint-v1.md`](contract-checkpoint-v1.md) and implemented by
+`validator_decision.decide_weight_submission`, whose sealed record is the only
+input the neuron will hand to `build_weight_plan`.

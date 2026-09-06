@@ -1,0 +1,303 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""Contract checkpoint v1: golden fixtures, negative fixtures, pins, and purity."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+from assignment_probe_context import challenge_value
+from contract_checkpoint_context import (
+    SCHEMA_MODELS,
+    fixture_documents,
+    negative_documents,
+    schema_bytes,
+)
+from jsonschema import Draft202012Validator
+from pydantic import ValidationError
+
+from misscomputer_subnet.assignment_snapshot import (
+    SNAPSHOT_SCHEMA,
+    ActiveAssignmentSnapshot,
+    parse_active_assignment_snapshot,
+)
+from misscomputer_subnet.manifest_publication import (
+    LATEST_POINTER_SCHEMA,
+    AssignmentManifestLatestPointer,
+    parse_assignment_manifest_latest_pointer,
+)
+from misscomputer_subnet.validator_decision import (
+    DECISION_SCHEMA,
+    ValidatorWeightDecision,
+    parse_validator_weight_decision,
+)
+
+ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = ROOT / "contracts" / "fixtures"
+SCHEMAS = ROOT / "contracts" / "schemas"
+NEGATIVE = ROOT / "contracts" / "negative"
+SOURCE = ROOT / "src" / "misscomputer_subnet"
+
+PARSERS: dict[str, Any] = {
+    "active-assignment-snapshot": parse_active_assignment_snapshot,
+    "assignment-manifest-latest-pointer": parse_assignment_manifest_latest_pointer,
+    "validator-weight-decision": parse_validator_weight_decision,
+}
+
+# The pre-existing manifest, probe, and weight-plan contracts are consumed by
+# the private producer byte-for-byte. This checkpoint extends around them and
+# must not move them; any change here is a compatibility event, not a fix.
+FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
+    "schemas/active-assignment-manifest.v1.schema.json": (
+        "9a4f4c1ebd5cf25c3ab7670579041c9b35093d5d3fc3fbd528bb13c38c4d4180"
+    ),
+    "schemas/assignment-manifest-trust-policy.v1.schema.json": (
+        "85394d7eb8efc70b16146cb4eca2ac44eafad0d6be5dbdbb1d913af459fa3ab9"
+    ),
+    "schemas/assignment-manifest-signature-envelope.v1.schema.json": (
+        "4545017e4a018b0c8eab812d2ae1a11826eea0b72cf700ca325a8a0eb6e4c7d5"
+    ),
+    "schemas/assignment-manifest-chain-state.v1.schema.json": (
+        "352933d09738b50511b6875c983db6c3c269705188123f36dd0177a4e3eaea7e"
+    ),
+    "schemas/miner-probe-attestation.v1.schema.json": (
+        "a32d5fd52081ca9442fa393d3449102f852a0ebb18bd515f322377c08235b328"
+    ),
+    "schemas/validator-probe-report.v1.schema.json": (
+        "29df0c5521ef1810339adf54e9197c522248921093d05b2e7540e7feb3f9da0b"
+    ),
+    "schemas/weight-plan.v1.schema.json": (
+        "d4fa8861c0683a05796834952363498cbae8afd6c0a9c80b64ef3cf888445b53"
+    ),
+    "fixtures/active-assignment-manifest.v1.json": (
+        "8d2ce1883d0081126af277266e48e38cfcabf6d4c89cd01fcc44a2eca9cb27ff"
+    ),
+    "fixtures/weight-plan.v1.json": (
+        "c73297fd0c2ed35bcae2dec304d9e8e4c288d30f697026b3e43c143bc28a117c"
+    ),
+}
+
+
+@pytest.mark.parametrize("stem", sorted(SCHEMA_MODELS))
+def test_generated_schema_and_canonical_fixture_are_pinned(stem: str) -> None:
+    schema = json.loads((SCHEMAS / f"{stem}.v1.schema.json").read_text())
+    Draft202012Validator.check_schema(schema)
+    fixture_bytes = (FIXTURES / f"{stem}.v1.json").read_bytes()
+    Draft202012Validator(schema).validate(json.loads(fixture_bytes))
+    parsed = PARSERS[stem](fixture_bytes)
+    assert isinstance(parsed, SCHEMA_MODELS[stem])
+    assert (SCHEMAS / f"{stem}.v1.schema.json").read_bytes() == schema_bytes(SCHEMA_MODELS[stem])
+    assert fixture_bytes == fixture_documents()[stem]
+    assert fixture_bytes.endswith(b"\n") and fixture_bytes.count(b"\n") == 1
+
+
+@pytest.mark.parametrize(("path", "expected"), sorted(FROZEN_CONTRACT_DIGESTS.items()))
+def test_pre_existing_contracts_are_untouched(path: str, expected: str) -> None:
+    assert hashlib.sha256((ROOT / "contracts" / path).read_bytes()).hexdigest() == expected
+
+
+def _negative_files() -> list[Path]:
+    return sorted(NEGATIVE.rglob("*.json"))
+
+
+def test_negative_fixture_tree_is_pinned_and_canonical() -> None:
+    on_disk = {
+        path.relative_to(NEGATIVE).with_suffix("").as_posix(): path.read_bytes()
+        for path in _negative_files()
+    }
+    assert on_disk == negative_documents()
+    for rendered in on_disk.values():
+        value = json.loads(rendered)
+        assert set(value) == {"case", "code", "contract", "document", "expect", "schema_version"}
+        assert value["schema_version"] == 1
+        assert value["expect"] in {"model", "schema"}
+        compact = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        assert rendered == compact.encode("ascii") + b"\n"
+
+
+@pytest.mark.parametrize("path", _negative_files(), ids=lambda path: path.stem)
+def test_negative_fixtures_are_rejected_for_the_pinned_reason(path: Path) -> None:
+    value = json.loads(path.read_bytes())
+    contract = value["contract"]
+    assert path.parent.name == f"{contract}.v1"
+    model = SCHEMA_MODELS[contract]
+    schema = json.loads((SCHEMAS / f"{contract}.v1.schema.json").read_text())
+    schema_valid = Draft202012Validator(schema).is_valid(value["document"])
+    with pytest.raises(ValidationError) as failure:
+        model.model_validate(value["document"])
+    if value["expect"] == "schema":
+        assert not schema_valid
+        assert any(error["type"] == value["code"] for error in failure.value.errors())
+    else:
+        # The point of a model-level case: JSON Schema alone would accept it.
+        assert schema_valid
+        assert value["code"] in str(failure.value)
+    rendered = json.dumps(
+        value["document"], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("ascii")
+    with pytest.raises(ValueError):
+        PARSERS[contract](rendered + b"\n")
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_schema"),
+    [
+        (ActiveAssignmentSnapshot, SNAPSHOT_SCHEMA),
+        (AssignmentManifestLatestPointer, LATEST_POINTER_SCHEMA),
+        (ValidatorWeightDecision, DECISION_SCHEMA),
+    ],
+)
+def test_checkpoint_contracts_are_extra_forbid_and_versioned(
+    model: Any, expected_schema: str
+) -> None:
+    schema = model.model_json_schema()
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["schema"]["const"] == expected_schema
+    assert schema["properties"]["schema_version"]["const"] == 1
+    for definition in schema.get("$defs", {}).values():
+        assert definition.get("additionalProperties") is False, definition.get("title")
+
+
+def test_snapshot_fixture_carries_only_public_safe_facts() -> None:
+    rendered = (FIXTURES / "active-assignment-snapshot.v1.json").read_bytes().decode("ascii")
+    for forbidden in (
+        "axon",
+        "challenge_value",
+        "credential",
+        "encrypted_image_key",
+        "manifest_key",
+        "private",
+        "provider",
+        "receipt_json",
+        "secret",
+        "seed",
+        "ticket_json",
+        "tls",
+        "token",
+        "tunnel",
+        "wallet",
+        "weight",
+    ):
+        assert forbidden not in rendered.lower(), forbidden
+    snapshot = parse_active_assignment_snapshot(rendered.encode("ascii"))
+    for deployment in snapshot.deployments:
+        assert challenge_value(deployment.deployment_id) not in rendered
+        assert (
+            hashlib.sha256(challenge_value(deployment.deployment_id).encode()).hexdigest()
+            == deployment.challenge_sha256
+        )
+
+
+def _scan(module: str) -> tuple[set[str], set[str], str]:
+    source = (SOURCE / f"{module}.py").read_text()
+    tree = ast.parse(source)
+    imported_roots: set[str] = set()
+    called_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_roots.update(alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_roots.add(node.module.split(".", maxsplit=1)[0])
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                called_names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                called_names.add(node.func.attr)
+    return imported_roots, called_names, source.lower()
+
+
+@pytest.mark.parametrize(
+    ("module", "allowed_imports"),
+    [
+        ("contract_codec", {"__future__", "collections", "hashlib", "json", "pydantic", "typing"}),
+        (
+            "assignment_snapshot",
+            {
+                "__future__",
+                "assignment_probe",
+                "collections",
+                "contract_codec",
+                "ed25519_trust",
+                "pydantic",
+                "typing",
+            },
+        ),
+        (
+            "manifest_publication",
+            {
+                "__future__",
+                "assignment_probe",
+                "collections",
+                "contract_codec",
+                "dataclasses",
+                "pydantic",
+                "typing",
+            },
+        ),
+        (
+            "validator_decision",
+            {
+                "__future__",
+                "assignment_probe",
+                "collections",
+                "contract_codec",
+                "dataclasses",
+                "fractions",
+                "probe_scoring",
+                "pydantic",
+                "typing",
+            },
+        ),
+    ],
+)
+def test_checkpoint_modules_are_pure_offline_cores(module: str, allowed_imports: set[str]) -> None:
+    imported_roots, called_names, lowered = _scan(module)
+    assert imported_roots <= allowed_imports, imported_roots - allowed_imports
+    assert not called_names & {
+        "Popen",
+        "connect",
+        "create_subprocess_exec",
+        "getenv",
+        "monotonic",
+        "now",
+        "open",
+        "request",
+        "run",
+        "set_weights",
+        "sign",
+        "submit",
+        "system",
+        "time",
+        "urlopen",
+        "write_bytes",
+        "write_text",
+    }
+    for forbidden in (
+        "ed25519privatekey",
+        "import bittensor",
+        "import datetime",
+        "import httpx",
+        "import os",
+        "import random",
+        "import requests",
+        "import socket",
+        "import subprocess",
+        "import time",
+        "os.environ",
+        ".sign(",
+        "wallet.",
+        "token_hex",
+    ):
+        assert forbidden not in lowered, forbidden
+
+
+def test_checkpoint_modules_are_discoverable_from_the_repository_root() -> None:
+    for module in ("contract_codec", "assignment_snapshot", "manifest_publication"):
+        assert (SOURCE / f"{module}.py").is_file()
+    assert (SOURCE / "validator_decision.py").is_file()
+    assert (ROOT / "docs" / "contract-checkpoint-v1.md").is_file()
