@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
 	"github.com/misscomputer/misscomputer-subnet/pkg/bridge"
@@ -141,7 +142,7 @@ func (a *api) campaignMinerIDs() []string {
 }
 
 func (a *api) capabilities(w http.ResponseWriter, _ *http.Request) {
-	features := []string{"scheduler", "replacement", "scoring", "dry-run-weights"}
+	features := []string{"scheduler", "replacement", "scoring", "dry-run-weights", "health-observation-v3"}
 	if a.campaign != nil {
 		features = append(features, "synthetic-campaign-v1")
 	}
@@ -771,23 +772,45 @@ func (a *api) health(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	if input.Protocol != neuron.SynapseVersion || input.ObservedAt.IsZero() || input.Vantage == "" ||
+	if input.Protocol != neuron.HealthObservationVersion || input.ObservedAt.IsZero() ||
+		!validRuneLength(input.DeploymentID, 1, 2048) ||
+		!validRuneLength(input.ReplicaID, 1, 2048) ||
+		!validRuneLength(input.EndpointID, 3, 320) ||
+		!validRuneLength(input.MinerHotkey, 1, 2048) ||
+		!validRuneLength(input.Vantage, 1, 2048) ||
 		input.LatencyMS < 0 || input.Availability < 0 || input.Availability > 1 ||
+		(input.Correct && !input.Reachable) || (input.Fraudulent && (!input.Reachable || input.Correct)) ||
 		input.ObservedAt.Before(now.Add(-5*time.Minute)) || input.ObservedAt.After(now.Add(30*time.Second)) {
 		bridge.WriteError(w, http.StatusBadRequest, "invalid_request", "invalid health observation", false)
 		return
 	}
 	scoringDisposition, _ := a.scheduler.DeploymentScoringDisposition(input.DeploymentID)
-	action, err := a.scheduler.HandleHealth(req.Context(), input.DeploymentID, input.ReplicaID, input.MinerHotkey, input.Vantage, input.Reachable, input.Correct, input.Fraudulent, input.ObservedAt)
+	var observationErr error
+	action, err := a.scheduler.HandleHealthWithCommit(
+		req.Context(), input.DeploymentID, input.ReplicaID, input.EndpointID, input.MinerHotkey,
+		input.Vantage, input.Reachable, input.Correct, input.Fraudulent, input.ObservedAt,
+		func() error {
+			observationErr = a.recordHealthObservation(scoringDisposition, input)
+			return observationErr
+		},
+	)
+	if observationErr != nil {
+		bridge.WriteError(w, http.StatusInternalServerError, "state_error", observationErr.Error(), true)
+		return
+	}
 	if err != nil {
 		bridge.WriteError(w, http.StatusUnprocessableEntity, "health_action_failed", err.Error(), false)
 		return
 	}
-	if err := a.recordHealthObservation(scoringDisposition, input); err != nil {
-		bridge.WriteError(w, http.StatusInternalServerError, "state_error", err.Error(), true)
-		return
+	writeJSON(w, http.StatusOK, map[string]any{"protocol": neuron.HealthObservationVersion, "action": action})
+}
+
+func validRuneLength(value string, minimum, maximum int) bool {
+	if !utf8.ValidString(value) {
+		return false
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"protocol": neuron.SynapseVersion, "action": action})
+	length := utf8.RuneCountInString(value)
+	return length >= minimum && length <= maximum
 }
 
 func (a *api) recordHealthObservation(disposition control.ScoringDisposition, input neuron.HealthObservation) error {

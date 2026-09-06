@@ -22,3 +22,6 @@ checkpoint verification, weight execution, the online
 active-assignment manifests (see `docs/public-validator-live-probe.md`), and
 the one-shot `misscomputer-python-boundary` /
 `misscomputer-checkpoint-boundary` commands.
+
+Protocol and Go API compatibility changes are recorded in
+[`docs/api-migrations.md`](docs/api-migrations.md).

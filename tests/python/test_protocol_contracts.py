@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parents[2]
         ("miner-registration.v2.json", MinerRegistration),
         ("miner-set.v2.json", MinerSet),
         ("chain-state.v2.json", ChainState),
-        ("health-observation.v2.json", HealthObservation),
+        ("health-observation.v3.json", HealthObservation),
         ("recovery-response.v2.json", RecoveryResponse),
         ("bridge-deactivate.v2.json", BridgeDeactivateRequest),
     ],
@@ -50,8 +50,49 @@ def test_shared_go_python_contract_fixtures(fixture: str, model: type[object]) -
     parsed = model.model_validate_json(payload)  # type: ignore[attr-defined]
     original = json.loads(payload)
     encoded = parsed.model_dump(mode="json", exclude_unset=True)  # type: ignore[attr-defined]
-    assert encoded["protocol"] == "subnet-synapse.v2"
+    expected_protocol = (
+        "subnet-synapse.v3" if fixture == "health-observation.v3.json" else "subnet-synapse.v2"
+    )
+    assert encoded["protocol"] == expected_protocol
     assert encoded == original
+
+
+def test_health_v3_schema_requires_exact_endpoint_incarnation() -> None:
+    schema = json.loads(
+        (ROOT / "contracts" / "schemas" / "health-observation.v3.schema.json").read_text()
+    )
+    assert HealthObservation.model_json_schema() == schema
+    fixture = json.loads(
+        (ROOT / "contracts" / "fixtures" / "health-observation.v3.json").read_text()
+    )
+    fixture["protocol"] = "subnet-synapse.v2"
+    fixture.pop("endpoint_id")
+    with pytest.raises(ValidationError):
+        HealthObservation.model_validate(fixture)
+
+
+@pytest.mark.parametrize(
+    ("reachable", "correct", "fraudulent"),
+    [(False, True, False), (False, False, True), (True, True, True)],
+)
+def test_health_v3_rejects_impossible_evidence_combinations(
+    reachable: bool, correct: bool, fraudulent: bool
+) -> None:
+    fixture = json.loads(
+        (ROOT / "contracts" / "fixtures" / "health-observation.v3.json").read_text()
+    )
+    fixture.update(reachable=reachable, correct=correct, fraudulent=fraudulent)
+    with pytest.raises(ValidationError):
+        HealthObservation.model_validate(fixture)
+
+
+def test_health_v3_rejects_timezone_naive_observation() -> None:
+    fixture = json.loads(
+        (ROOT / "contracts" / "fixtures" / "health-observation.v3.json").read_text()
+    )
+    fixture["observed_at"] = "2026-09-06T12:34:56"
+    with pytest.raises(ValidationError):
+        HealthObservation.model_validate(fixture)
 
 
 def test_v2_schemas_require_transport_identity_and_encode_role_policy() -> None:

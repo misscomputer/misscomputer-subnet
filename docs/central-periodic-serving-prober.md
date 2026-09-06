@@ -140,22 +140,42 @@ broken path would exhaust the clean pool.
 
 The prober therefore keeps a private, in-memory corroboration fence per
 deployment and endpoint incarnation. An unattributable failure can enter
-`policy.Monitor` only when it consumes fresh complete-success evidence from a
-strict majority of the deployment's current endpoints other than the failing
-one. A singleton deployment has no route-local witness, so it falls back to
-the same validator process's current endpoints in other deployments. This
-fallback protects a subnet containing many one-replica deployments from the
-same shared edge/token cascade; it does not coordinate with another validator.
+`policy.Monitor` only when it consumes fresh complete-success evidence from at
+least one current endpoint other than the failing one. One healthy witness is
+intentional: requiring a majority deadlocks a three-replica deployment when two
+miners genuinely fail, because the sole healthy replica can never supply two
+successes. Evidence is consumed independently per failed target, so that one
+healthy replica can justify availability removal of both dead peers but cannot
+be spent twice on consecutive failures of the same endpoint. A singleton
+deployment has no route-local witness, so it falls back to the same validator
+process's current endpoints in other deployments. This fallback protects a
+subnet containing many one-replica deployments from the same shared edge/token
+cascade; it does not coordinate with another validator.
 
 A later failure must consume newer peer evidence. Healthy evidence must also
 postdate any newer external health failure that the prober did not apply. The
-monitor exposes a versioned snapshot and atomically rejects the prober's result
-if health history changes between corroboration and mutation. During a common
+monitor exposes a versioned snapshot captured before probe network I/O and
+atomically rejects the prober's result if health history changes before the
+mutation. During a common
 outage, at most one earlier baseline-backed failure can have entered the
 monitor; no peer successes advance, so the destructive second failure is
 suppressed. If probing starts during the outage, even that baseline evidence is
 absent. Suppressed results remain in `ProbeOutcome` with
 `common_mode_suppressed=true` for alerting and diagnosis.
+
+Independently of economic and durable policy, the first incomplete transport
+or edge-generated failure opens a **process-local serving circuit** for that
+exact endpoint incarnation. The router stops selecting it for ordinary
+customer traffic, while targeted internal probes continue to reach it. A
+complete correct targeted response from this validator's in-process prober
+closes the circuit immediately. An external healthy report cannot reopen a
+circuit because it did not verify recovery through this validator's own edge
+path. This
+separates availability from guilt: two of three genuinely dead miners stop
+receiving traffic and can be replaced using the remaining healthy witness,
+while a subnet-wide edge outage temporarily suppresses already-failing routes
+without trust-zero, durable eviction, or consumption of the replacement pool.
+Circuit state is not persisted and cannot change ledger trust.
 
 Peer snapshots belong to individual in-flight observations and can complete
 out of order, so they never prune unrelated corroboration evidence. Cleanup is
@@ -173,6 +193,11 @@ pair in either order. Two corroborated periodic failures still evict an
 isolated endpoint, and two external failures retain the external health path's
 existing authority; multi-vantage consecutive evidence remains a separate
 policy input.
+
+For external reports, each `vantage` must be a stable label bound or derived by
+the authenticated private gateway. The public runtime cannot infer the gateway
+principal from its local socket; accepting arbitrary caller-selected vantage
+labels would let one credential impersonate multiple evidence sources.
 
 If the whole process has only one active endpoint, no independent endpoint can
 distinguish a miner failure from a path failure. There is also no subnet-wide
@@ -196,15 +221,31 @@ evidence, or permanent candidate exclusion after successful cleanup. If exact
 route/runtime cleanup itself fails, the scheduler retains that ticket and
 quarantines the candidate within the deployment until a later healthy signal
 retries cleanup; this ownership quarantine is evidence-neutral and never
-changes trust. When this happens during initial deployment, the failed
-deployment remains cleanup-only and blocks redeploy of that ID until explicit
-cleanup succeeds; it can never be half-opened into service behind the failed
-API call. An inconclusive replacement stops the candidate loop but leaves
-capacity debt derived from the desired, active, and reserved counts. Complete
-healthy observations repair one deficit at a time, so concurrent deficits
-cannot collapse into one boolean. If every route is absent, periodic
-reconciliation makes one bounded half-open recovery attempt instead. A
-complete marked wrong response and an invalid signed receipt remain
+changes trust. A request cancellation transfers every launched ticket into the
+same lease before returning. The candidate is not reusable until the original
+assignment worker has joined and the post-join exact route/miner/durable
+cleanup has succeeded. If either cleanup attempt fails, the exact lease remains
+quarantined for an explicit later retry. When this happens during initial
+deployment, the failed deployment remains cleanup-only and blocks redeploy of
+that ID until explicit cleanup succeeds; it
+can never be half-opened into service behind the failed API call. Initial and
+replacement admission traverse each currently eligible clean candidate at most
+once per operation after an inconclusive response, so a persistently silent
+candidate cannot prevent a later clean miner from being tried. If the bounded
+pool is exhausted, the remaining capacity debt stays derived from the desired,
+active, and reserved counts, and successfully cleaned inconclusive candidates
+become retryable on a later operation without an economic penalty. Candidate
+selection also rotates globally after every reservation so separate operations
+do not always begin at the same miner.
+Cleanup leases and deployment deficits use separate round-robin cursors and do
+at most one unit of each per trigger; one permanent low-ID failure therefore
+cannot block process-wide recovery. Complete healthy observations repair one
+deficit at a time, so concurrent deficits cannot collapse into one boolean. If
+every route is absent, periodic reconciliation makes one bounded half-open
+recovery attempt instead. The five-second probe timeout applies only to a
+single HTTP probe; assignment/provisioning uses the deployment lifecycle budget
+(two minutes by default). A complete marked wrong response and an invalid signed
+receipt remain
 economically punishable.
 
 Observations that lose a race with the scheduler — the deployment was torn down,
@@ -215,8 +256,11 @@ from a real policy or cleanup failure.
 
 Parent cancellation is checked again after every probe and before any of these
 mutations. `Run` joins all endpoint loops, `Plane.Run` joins the prober, and the
-runtime joins `Plane.Run` before `Plane.Close` closes the gateway or store, so
-shutdown cancellation is never counted as miner-health evidence.
+runtime joins `Plane.Run` before `Plane.Close`. The scheduler then drains every
+owned assignment/cleanup worker before the gateway or store is closed. A drain
+deadline is returned as a shutdown error and leaves those resources open for a
+later retry; shutdown cancellation is never counted as miner-health evidence
+and no late worker can use a resource that was closed underneath it.
 
 ## Cadence and the rapid window
 

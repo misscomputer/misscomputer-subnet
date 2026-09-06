@@ -288,9 +288,16 @@ func (r *runtime) serve(ctx context.Context) error {
 	}
 	cancel()
 	_ = r.listener.Close()
+	runtimeShutdownContext, stopRuntimeShutdown := context.WithTimeout(context.Background(), 20*time.Second)
+	runtimeShutdownErr := r.server.Shutdown(runtimeShutdownContext)
+	stopRuntimeShutdown()
+	if runtimeShutdownErr != nil && first == nil {
+		first = runtimeShutdownErr
+	}
 	edgeShutdownContext, stopEdgeShutdown := context.WithTimeout(context.Background(), 20*time.Second)
-	if err := r.edgeServer.Shutdown(edgeShutdownContext); first == nil {
-		first = err
+	edgeShutdownErr := r.edgeServer.Shutdown(edgeShutdownContext)
+	if edgeShutdownErr != nil && first == nil {
+		first = edgeShutdownErr
 	}
 	stopEdgeShutdown()
 	// Plane.Run owns and joins the periodic prober. Do not close the gateway or
@@ -301,6 +308,13 @@ func (r *runtime) serve(ctx context.Context) error {
 	}
 	if err := <-planeDone; first == nil {
 		first = err
+	}
+	if runtimeShutdownErr != nil || edgeShutdownErr != nil {
+		// A live socket/edge handler can still be inside the control plane. Do
+		// not close its gateway, store, or replay journal beneath it. Process
+		// exit will reclaim them; a caller embedding serve receives the explicit
+		// join failure instead of a use-after-close race.
+		return first
 	}
 	planeCloseContext, stopPlaneClose := context.WithTimeout(context.Background(), 20*time.Second)
 	if err := r.plane.Close(planeCloseContext); first == nil {

@@ -3,10 +3,13 @@
 package policy
 
 import (
+	"errors"
 	"math"
 	"sync"
 	"time"
 )
+
+const maxExternalVantagesAtOneInstant = 256
 
 type Action struct {
 	RemoveFromRouting bool `json:"remove_from_routing"`
@@ -15,12 +18,14 @@ type Action struct {
 }
 
 type state struct {
-	version          uint64
-	rapidFailures    [2]int
-	rapidLastFailure [2]time.Time
-	vantages         map[string]struct{}
-	consecutive      int
-	lastFailure      time.Time
+	version                uint64
+	rapidFailures          [2]int
+	rapidLastFailure       [2]time.Time
+	lastObserved           [2]time.Time
+	externalVantagesAtLast map[string]struct{}
+	vantages               map[string]struct{}
+	consecutive            int
+	lastFailure            time.Time
 }
 
 type observationClass uint8
@@ -56,6 +61,65 @@ func (m *Monitor) Observe(endpointID, vantage string, reachable, correct, fraudu
 	return m.observeClass(endpointID, vantage, reachable, correct, fraudulent, at, externalObservation)
 }
 
+// ObserveExternalIfNewer rejects endpoint-global reordered liveness reports
+// before they can advance rapid-failure counters. Distinct bounded vantages
+// may report at the same newest instant, while a duplicate vantage cannot.
+// Definitive attributable fault
+// evidence is never discarded merely because a newer liveness report arrived
+// first; the scheduler's exact-active-incarnation check makes its replay
+// idempotent after the first removal.
+func (m *Monitor) ObserveExternalIfNewer(endpointID, vantage string, reachable, correct, fraudulent bool, at time.Time) (Action, bool) {
+	action, applied, _ := m.ObserveExternalIfNewerWithCommit(endpointID, vantage, reachable, correct, fraudulent, at, nil)
+	return action, applied
+}
+
+// ObserveExternalIfNewerWithCommit runs commit after replay/order validation
+// but before changing monitor state. A failed durable scoring write therefore
+// leaves the report retryable instead of consuming its replay fence and losing
+// the sample permanently. The callback must not call back into this Monitor.
+func (m *Monitor) ObserveExternalIfNewerWithCommit(endpointID, vantage string, reachable, correct, fraudulent bool, at time.Time, commit func() error) (Action, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.states[endpointID]
+	if s == nil {
+		s = &state{vantages: make(map[string]struct{}), externalVantagesAtLast: make(map[string]struct{})}
+	}
+	definitiveFault := fraudulent || (reachable && !correct)
+	last := s.lastObserved[externalObservation]
+	latestLiveness := last
+	if s.lastObserved[internalPeriodicObservation].After(latestLiveness) {
+		latestLiveness = s.lastObserved[internalPeriodicObservation]
+	}
+	if !definitiveFault {
+		switch {
+		case at.Before(latestLiveness):
+			return Action{}, false, nil
+		case at.Equal(last):
+			if _, duplicate := s.externalVantagesAtLast[vantage]; duplicate || len(s.externalVantagesAtLast) >= maxExternalVantagesAtOneInstant {
+				return Action{}, false, nil
+			}
+		}
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			return Action{}, false, errors.Join(errors.New("commit external health observation"), err)
+		}
+	}
+	if m.states[endpointID] == nil {
+		m.states[endpointID] = s
+	}
+	if s.version < math.MaxUint64 {
+		s.version++
+	}
+	if at.After(last) {
+		s.lastObserved[externalObservation] = at
+		s.externalVantagesAtLast = map[string]struct{}{vantage: {}}
+	} else if at.Equal(last) && len(s.externalVantagesAtLast) < maxExternalVantagesAtOneInstant {
+		s.externalVantagesAtLast[vantage] = struct{}{}
+	}
+	return m.observe(s, vantage, reachable, correct, fraudulent, at, externalObservation), true, nil
+}
+
 // ObserveInternal applies an in-process periodic-prober observation. Routing
 // removal needs two rapid failures from one source class, so a shared-path
 // failure cannot become destructive merely by interleaving one internal result
@@ -71,12 +135,16 @@ func (m *Monitor) observeClass(endpointID, vantage string, reachable, correct, f
 	if s.version < math.MaxUint64 {
 		s.version++
 	}
+	s.lastObserved[class] = at
 	return m.observe(s, vantage, reachable, correct, fraudulent, at, class)
 }
 
 // ObserveIfVersion applies an observation only when no other internal or
-// external observation has changed this endpoint's health history since the
-// caller took its snapshot. At version exhaustion it fails closed.
+// external liveness observation has changed this endpoint's health history
+// since the caller took its snapshot. Definitive reachable wrong/fraud
+// evidence remains actionable against the still-active exact incarnation even
+// after a newer liveness report; otherwise repeated healthy posts could mask
+// cryptographic fault evidence. At version exhaustion it fails closed.
 func (m *Monitor) ObserveIfVersion(endpointID, vantage string, reachable, correct, fraudulent bool, at time.Time, expectedVersion uint64) (Action, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -85,13 +153,17 @@ func (m *Monitor) ObserveIfVersion(endpointID, vantage string, reachable, correc
 	if s != nil {
 		currentVersion = s.version
 	}
-	if currentVersion != expectedVersion || currentVersion == math.MaxUint64 {
+	definitiveFault := fraudulent || (reachable && !correct)
+	if (currentVersion != expectedVersion && !definitiveFault) || currentVersion == math.MaxUint64 {
 		return Action{}, false
 	}
 	if s == nil {
 		s = m.state(endpointID)
 	}
 	s.version++
+	if at.After(s.lastObserved[internalPeriodicObservation]) {
+		s.lastObserved[internalPeriodicObservation] = at
+	}
 	return m.observe(s, vantage, reachable, correct, fraudulent, at, internalPeriodicObservation), true
 }
 
@@ -109,8 +181,11 @@ func (m *Monitor) Snapshot(endpointID string) ObservationSnapshot {
 func (m *Monitor) state(endpointID string) *state {
 	s := m.states[endpointID]
 	if s == nil {
-		s = &state{vantages: make(map[string]struct{})}
+		s = &state{vantages: make(map[string]struct{}), externalVantagesAtLast: make(map[string]struct{})}
 		m.states[endpointID] = s
+	}
+	if s.externalVantagesAtLast == nil {
+		s.externalVantagesAtLast = make(map[string]struct{})
 	}
 	return s
 }
@@ -131,7 +206,9 @@ func (m *Monitor) observe(s *state, vantage string, reachable, correct, fraudule
 	s.lastFailure = at
 	s.rapidFailures[class]++
 	s.consecutive++
-	s.vantages[vantage] = struct{}{}
+	if len(s.vantages) < 2 {
+		s.vantages[vantage] = struct{}{}
+	}
 	a := Action{}
 	if s.rapidFailures[class] >= 2 {
 		a.RemoveFromRouting = true

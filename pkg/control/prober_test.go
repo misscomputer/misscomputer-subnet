@@ -4,6 +4,7 @@ package control
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net/http"
@@ -155,6 +156,15 @@ func activeMinerIDs(scheduler *Scheduler, deploymentID string) []string {
 	return ids
 }
 
+func routedHealthy(scheduler *Scheduler, deploymentID, minerID string) bool {
+	for _, replica := range scheduler.Router.Replicas(scheduler.states[deploymentID].routeHost) {
+		if replica.MinerID == minerID {
+			return replica.Healthy
+		}
+	}
+	return false
+}
+
 func newSingletonProbeHarness(t *testing.T) (*schedulerHarness, *scriptedProber, *Prober, []string) {
 	t.Helper()
 	h := newSchedulerHarness(t, []string{"m1", "m2", "m3", "m4"}, 1)
@@ -283,6 +293,261 @@ func TestProberEvictsReplicaThatGoesDark(t *testing.T) {
 	}
 }
 
+func TestTemporaryRoutingCircuitSuppressesAndRestoresWithoutEconomicPenalty(t *testing.T) {
+	h, probe, prober, _ := newProbedHarness(t)
+	defer h.cleanup(t)
+	if baseline := prober.Sweep(context.Background()); baseline.Failed() != 0 {
+		t.Fatalf("healthy baseline failed: %+v", baseline.Outcomes)
+	}
+	probe.setDark("m1")
+	failed := prober.Sweep(context.Background())
+	if failed.Removed() != 0 || routedHealthy(h.scheduler, h.request.DeploymentID, "m1") {
+		t.Fatalf("first transport failure was not temporarily removed from traffic: %+v", failed.Outcomes)
+	}
+	if !contains(activeMinerIDs(h.scheduler, h.request.DeploymentID), "m1") || h.scheduler.Ledger.Trust("m1") == 0 {
+		t.Fatal("temporary availability circuit changed scheduler eligibility or economic trust")
+	}
+	probe.setHealthy("m1")
+	recovered := prober.Sweep(context.Background())
+	if !routedHealthy(h.scheduler, h.request.DeploymentID, "m1") {
+		t.Fatalf("complete correct targeted probe did not restore traffic: %+v", recovered.Outcomes)
+	}
+	var restored bool
+	for _, outcome := range recovered.Outcomes {
+		if outcome.MinerID == "m1" {
+			restored = outcome.RoutingRestored
+		}
+	}
+	if !restored {
+		t.Fatal("routing restoration was not surfaced to operators")
+	}
+}
+
+func TestProbeStateIsRetiredWithEveryDeploymentIncarnation(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1", "m2", "m3", "m4"}, 3)
+	for cycle := 0; cycle < 3; cycle++ {
+		request := h.request
+		request.DeploymentID = fmt.Sprintf("probe-retirement-%d", cycle)
+		if _, err := h.scheduler.Deploy(context.Background(), request); err != nil {
+			t.Fatalf("deploy cycle %d: %v", cycle, err)
+		}
+		replicas := h.scheduler.ActiveReplicas(request.DeploymentID)
+		byReplica := make(map[string]string, len(replicas))
+		for _, replica := range replicas {
+			byReplica[replica.ReplicaID] = replica.MinerID
+		}
+		prober := &Prober{Scheduler: h.scheduler, probe: newScriptedProber(byReplica), Vantage: "periodic-test"}
+		if result := prober.Sweep(context.Background()); result.Failed() != 0 {
+			t.Fatalf("healthy cycle %d failed: %+v", cycle, result.Outcomes)
+		}
+		h.scheduler.mu.Lock()
+		circuitCount := len(h.scheduler.circuitVersions)
+		h.scheduler.mu.Unlock()
+		if circuitCount != len(replicas) {
+			t.Fatalf("cycle %d circuit records=%d want=%d", cycle, circuitCount, len(replicas))
+		}
+		if err := h.scheduler.DeactivateDeployment(context.Background(), request.DeploymentID); err != nil {
+			t.Fatalf("deactivate cycle %d: %v", cycle, err)
+		}
+		h.scheduler.mu.Lock()
+		circuitCount = len(h.scheduler.circuitVersions)
+		h.scheduler.mu.Unlock()
+		if circuitCount != 0 {
+			t.Fatalf("cycle %d retained %d circuit records", cycle, circuitCount)
+		}
+		for _, replica := range replicas {
+			if snapshot := h.scheduler.monitor().Snapshot(replica.EndpointID); snapshot != (policy.ObservationSnapshot{}) {
+				t.Fatalf("cycle %d retained monitor state for %s: %+v", cycle, replica.EndpointID, snapshot)
+			}
+		}
+	}
+}
+
+func TestTemporaryCircuitCASRejectsOlderSuccessAndUnauthorizedMutation(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	replica := h.scheduler.ActiveReplicas(h.request.DeploymentID)[0]
+	changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
+		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, 0,
+	)
+	if err != nil || !applied || !changed {
+		t.Fatalf("current failure did not suppress route: changed=%v applied=%v err=%v", changed, applied, err)
+	}
+	if action, accepted, _, err := h.scheduler.handleEndpointHealthVersioned(
+		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+		"older-success", true, true, false, time.Now().UTC(), 0, 0,
+	); accepted || !errors.Is(err, errHealthObservationChanged) || action != (policy.Action{}) {
+		t.Fatalf("older success survived suppression revision: action=%+v accepted=%v err=%v", action, accepted, err)
+	}
+	claims := h.scheduler.Router.Replicas(h.scheduler.states[h.request.DeploymentID].routeHost)
+	for _, claim := range claims {
+		if claim.EndpointID == replica.EndpointID && claim.Healthy {
+			t.Fatal("stale success restored suppressed route")
+		}
+	}
+	if action, err := h.scheduler.HandleHealth(
+		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+		"external-vantage", true, true, false, time.Now().UTC(),
+	); err != nil || action != (policy.Action{}) {
+		t.Fatalf("external healthy evidence failed: action=%+v err=%v", action, err)
+	}
+	for _, claim := range h.scheduler.Router.Replicas(h.scheduler.states[h.request.DeploymentID].routeHost) {
+		if claim.EndpointID == replica.EndpointID && claim.Healthy {
+			t.Fatal("external report reopened the validator-owned serving circuit")
+		}
+	}
+	current := h.scheduler.monitor().Snapshot(replica.EndpointID)
+	currentPeers, err := h.scheduler.activeProbePeers(
+		h.request.DeploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action, applied, restored, err := h.scheduler.handleEndpointHealthVersioned(
+		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+		"periodic-current", true, true, false, time.Now().UTC(), current.Version, currentPeers.targetCircuit,
+	); err != nil || !applied || !restored || action != (policy.Action{}) {
+		t.Fatalf("current internal probe did not restore route: action=%+v applied=%v restored=%v err=%v", action, applied, restored, err)
+	}
+	wrongKey := ed25519.PrivateKey(append([]byte(nil), h.scheduler.SigningKey...))
+	wrongKey[len(wrongKey)-1] ^= 0x01
+	if matched, _ := h.scheduler.Router.SetTemporaryAvailability(
+		h.scheduler.states[h.request.DeploymentID].routeHost, replica.ReplicaID, replica.EndpointID, replica.MinerID, true, wrongKey,
+	); matched {
+		t.Fatal("unauthorized in-process caller mutated serving availability")
+	}
+	forged := make(ed25519.PrivateKey, ed25519.PrivateKeySize)
+	copy(forged[ed25519.SeedSize:], h.scheduler.SigningKey.Public().(ed25519.PublicKey))
+	if matched, _ := h.scheduler.Router.SetTemporaryAvailability(
+		h.scheduler.states[h.request.DeploymentID].routeHost, replica.ReplicaID, replica.EndpointID, replica.MinerID, true, forged,
+	); matched {
+		t.Fatal("public-key suffix without private-key possession mutated serving availability")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestTemporaryCircuitCancellationCannotBecomeRoutingEvidence(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	replica := h.scheduler.ActiveReplicas(h.request.DeploymentID)[0]
+	h.scheduler.mu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		changed bool
+		applied bool
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
+			ctx, h.request.DeploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, 0,
+		)
+		done <- result{changed: changed, applied: applied, err: err}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		h.scheduler.lifecycleMu.Lock()
+		workers := h.scheduler.lifecycleWorkers
+		h.scheduler.lifecycleMu.Unlock()
+		if workers > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			h.scheduler.mu.Unlock()
+			t.Fatal("suppression did not reach the mutation lock")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	h.scheduler.mu.Unlock()
+	got := <-done
+	if got.changed || got.applied || !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("cancelled suppression mutated route: %+v", got)
+	}
+	if snapshot := h.scheduler.monitor().Snapshot(replica.EndpointID); snapshot.Version != 0 {
+		t.Fatalf("cancelled suppression advanced health revision: %+v", snapshot)
+	}
+	for _, claim := range h.scheduler.Router.Replicas(h.scheduler.states[h.request.DeploymentID].routeHost) {
+		if claim.EndpointID == replica.EndpointID && !claim.Healthy {
+			t.Fatal("cancelled suppression opened serving circuit")
+		}
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestTemporaryCircuitRevisionExhaustionFailsClosed(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	replica := h.scheduler.ActiveReplicas(h.request.DeploymentID)[0]
+	h.scheduler.mu.Lock()
+	if h.scheduler.circuitVersions == nil {
+		h.scheduler.circuitVersions = make(map[string]uint64)
+	}
+	h.scheduler.circuitVersions[replica.EndpointID] = ^uint64(0)
+	h.scheduler.mu.Unlock()
+	changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
+		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, ^uint64(0),
+	)
+	if changed || applied || !errors.Is(err, errHealthObservationChanged) {
+		t.Fatalf("exhausted circuit revision was not refused: changed=%v applied=%v err=%v", changed, applied, err)
+	}
+	if !routedHealthy(h.scheduler, h.request.DeploymentID, replica.MinerID) {
+		t.Fatal("exhausted revision changed route availability")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestProberRemovesTwoOfThreeDeadMinersWithOneHealthyWitness(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1", "m2", "m3", "m4", "m5"}, 3)
+	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
+		t.Fatal(err)
+	}
+	defer h.cleanup(t)
+	byReplica := make(map[string]string)
+	for _, replica := range h.scheduler.ActiveReplicas(h.request.DeploymentID) {
+		byReplica[replica.ReplicaID] = replica.MinerID
+	}
+	probe := newScriptedProber(byReplica)
+	prober := &Prober{Scheduler: h.scheduler, probe: probe, Vantage: "periodic-test"}
+	now := time.Now().UTC()
+	prober.Now = func() time.Time { return now }
+	if baseline := prober.Sweep(context.Background()); baseline.Failed() != 0 {
+		t.Fatalf("healthy baseline failed: %+v", baseline.Outcomes)
+	}
+	probe.setDark("m1")
+	probe.setDark("m2")
+	for round := 0; round < 4 && (contains(activeMinerIDs(h.scheduler, h.request.DeploymentID), "m1") || contains(activeMinerIDs(h.scheduler, h.request.DeploymentID), "m2")); round++ {
+		now = now.Add(time.Second)
+		probe.learn(h.scheduler.ActiveReplicas(h.request.DeploymentID))
+		prober.Sweep(context.Background())
+	}
+	active := activeMinerIDs(h.scheduler, h.request.DeploymentID)
+	if contains(active, "m1") || contains(active, "m2") || len(active) != 3 || !contains(active, "m4") || !contains(active, "m5") {
+		t.Fatalf("one healthy witness did not restore two-thirds capacity: %v", active)
+	}
+	if h.scheduler.Ledger.Trust("m1") == 0 || h.scheduler.Ledger.Trust("m2") == 0 {
+		t.Fatal("unattributable liveness failures became economic penalties")
+	}
+}
+
 func TestProberEvictsReplicaServingWrongBytes(t *testing.T) {
 	h, probe, prober, _ := newProbedHarness(t)
 	defer h.cleanup(t)
@@ -330,14 +595,14 @@ func TestProberTreatsSchedulerRacesAsStale(t *testing.T) {
 	defer h.cleanup(t)
 	// Apply an observation for a replica the scheduler no longer knows about,
 	// exactly as a sweep would if the deployment were torn down mid-probe.
-	_, err := h.scheduler.HandleHealth(
+	_, err := h.handleHealth(
 		context.Background(), "no-such-deployment", replicaOf["m1"], "m1",
 		"periodic-test", false, false, false, time.Now().UTC(),
 	)
 	if !errors.Is(err, ErrUnknownDeployment) || !isStaleObservation(err) {
 		t.Fatalf("unknown deployment is not reported as a stale observation: %v", err)
 	}
-	_, err = h.scheduler.HandleHealth(
+	_, err = h.handleHealth(
 		context.Background(), h.request.DeploymentID, "not-a-replica", "m1",
 		"periodic-test", false, false, false, time.Now().UTC(),
 	)
@@ -613,6 +878,11 @@ func TestProberSuppressesSubnetWideCommonModeFailureAndRecovers(t *testing.T) {
 			if active := activeMinerIDs(h.scheduler, h.request.DeploymentID); len(active) != 3 || !contains(active, "m1") || !contains(active, "m2") || !contains(active, "m3") {
 				t.Fatalf("common-mode failure changed active routes: %v", active)
 			}
+			for _, minerID := range []string{"m1", "m2", "m3"} {
+				if routedHealthy(h.scheduler, h.request.DeploymentID, minerID) {
+					t.Fatalf("common-mode failing endpoint %s remained in ordinary traffic", minerID)
+				}
+			}
 			if h.miners["m4"].Assignments() != 0 {
 				t.Fatalf("common-mode failure consumed replacement pool: m4 assignments=%d", h.miners["m4"].Assignments())
 			}
@@ -622,8 +892,8 @@ func TestProberSuppressesSubnetWideCommonModeFailureAndRecovers(t *testing.T) {
 				}
 			}
 
-			// The edge recovers for two peers while m1 remains genuinely down.
-			// Their fresh complete responses re-arm only the ordinary isolated-
+			// The edge recovers for peers while m1 remains genuinely down. One
+			// fresh complete peer response re-arms only the ordinary isolated-
 			// endpoint path; m1 is then evicted and the untouched spare replaces it.
 			probe.setHealthy("m2")
 			probe.setHealthy("m3")
@@ -696,6 +966,42 @@ func TestCorroborationPermitCannotBeDoubleSpentBeforeCommit(t *testing.T) {
 	corroboration.recordApplied(deploymentID, target.EndpointID, peers, permitB, 2)
 }
 
+func TestSingletonCorroborationStoresOneMonotonicWitnessPerTarget(t *testing.T) {
+	const count = 64
+	corroboration := probeCorroboration{}
+	replicas := make([]ActiveReplica, 0, count)
+	for index := 0; index < count; index++ {
+		replicas = append(replicas, ActiveReplica{
+			MinerID: fmt.Sprintf("m-%03d", index), ReplicaID: fmt.Sprintf("r-%03d", index), EndpointID: fmt.Sprintf("e-%03d", index),
+		})
+	}
+	now := time.Now().UTC()
+	for index, replica := range replicas {
+		peers := probePeerSet{deployment: []ActiveReplica{replica}, global: replicas, topologyEpoch: 1}
+		corroboration.recordSuccess(fmt.Sprintf("d-%03d", index), replica.EndpointID, peers, now.Add(time.Duration(index)*time.Millisecond), 1)
+	}
+	for index, target := range replicas {
+		peers := probePeerSet{deployment: []ActiveReplica{target}, global: replicas, topologyEpoch: 1}
+		permit, allowed := corroboration.unreachablePermit(fmt.Sprintf("d-%03d", index), target.EndpointID, peers)
+		if !allowed || permit == nil || !permit.global || len(permit.sequences) != 1 {
+			t.Fatalf("target %d retained more than one witness: allowed=%v permit=%+v", index, allowed, permit)
+		}
+		corroboration.recordApplied(fmt.Sprintf("d-%03d", index), target.EndpointID, peers, permit, 1)
+	}
+	if got := len(corroboration.global.consumed); got != count {
+		t.Fatalf("global consumed state grew beyond one scalar per target: %d", got)
+	}
+	target := replicas[0]
+	peers := probePeerSet{deployment: []ActiveReplica{target}, global: replicas, topologyEpoch: 1}
+	if permit, allowed := corroboration.unreachablePermit("d-000", target.EndpointID, peers); allowed || permit != nil {
+		t.Fatal("old alternate witness bypassed the monotonic consumption fence")
+	}
+	corroboration.recordSuccess("d-001", replicas[1].EndpointID, peers, now.Add(time.Minute), 2)
+	if permit, allowed := corroboration.unreachablePermit("d-000", target.EndpointID, peers); !allowed || permit == nil || len(permit.sequences) != 1 {
+		t.Fatal("fresh alternate witness did not re-arm the target")
+	}
+}
+
 func TestDelayedPeerSnapshotCannotPruneReplacementEvidence(t *testing.T) {
 	const deploymentID = "replacement-race"
 	a := ActiveReplica{MinerID: "ma", ReplicaID: "ra", EndpointID: "ea"}
@@ -733,7 +1039,7 @@ func TestDelayedPeerSnapshotCannotPruneReplacementEvidence(t *testing.T) {
 	}
 }
 
-func TestCurrentReconcilePreservesPermitAcrossWitnessReplacement(t *testing.T) {
+func TestCurrentReconcileAllowsFreshReplacementWitness(t *testing.T) {
 	const deploymentID = "witness-replacement-race"
 	target := ActiveReplica{MinerID: "ma", ReplicaID: "ra", EndpointID: "ea"}
 	retiredWitness := ActiveReplica{MinerID: "mb", ReplicaID: "rb", EndpointID: "eb"}
@@ -762,12 +1068,15 @@ func TestCurrentReconcilePreservesPermitAcrossWitnessReplacement(t *testing.T) {
 	// Current topology GC may discard retired endpoint history, but the exact
 	// target permit must survive until its eventual commit or rollback.
 	corroboration.reconcile([]probeTarget{{deploymentID: deploymentID, replicas: newPeers.deployment}}, newPeers.topologyEpoch)
-	corroboration.recordSuccess(deploymentID, newWitness.EndpointID, newPeers, now.Add(time.Second), 1)
+	// The replacement witness must actually be observed after the target's
+	// latest failure; a result merely recorded later but timestamped earlier is
+	// not valid shared-path evidence.
+	corroboration.recordSuccess(deploymentID, newWitness.EndpointID, newPeers, now.Add(3*time.Second), 1)
 	corroboration.recordApplied(deploymentID, target.EndpointID, oldPeers, permit, 1)
 
 	newPeers.targetHealth = policy.ObservationSnapshot{Version: 1, LastFailure: now.Add(2 * time.Second)}
-	if reused, allowed := corroboration.unreachablePermit(deploymentID, target.EndpointID, newPeers); allowed || reused != nil {
-		t.Fatal("witness replacement allowed surviving success evidence to be reused")
+	if fresh, allowed := corroboration.unreachablePermit(deploymentID, target.EndpointID, newPeers); !allowed || fresh == nil {
+		t.Fatal("fresh replacement witness could not prove the shared path recovered")
 	}
 }
 
@@ -853,7 +1162,7 @@ func TestProberCommonModeFailureCannotCombineWithNewerExternalFailures(t *testin
 	// now satisfy both removal and multi-vantage trust-zero thresholds.
 	now = now.Add(time.Second)
 	for _, replica := range h.scheduler.ActiveReplicas(h.request.DeploymentID) {
-		action, err := h.scheduler.HandleHealth(
+		action, err := h.handleHealth(
 			context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.MinerID,
 			"external-test", false, false, false, now,
 		)
@@ -909,7 +1218,7 @@ func TestExternalFailureCannotCompletePeriodicCommonModeCascade(t *testing.T) {
 	// report must not complete the periodic source's rapid-failure pair.
 	now = now.Add(time.Second)
 	for _, replica := range h.scheduler.ActiveReplicas(h.request.DeploymentID) {
-		action, err := h.scheduler.HandleHealth(
+		action, err := h.handleHealth(
 			context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.MinerID,
 			"external-test", false, false, false, now,
 		)
@@ -1056,7 +1365,7 @@ func TestSingleEndpointSharedPathFailureEvictsWithoutEconomicGuiltOrPoolLoss(t *
 	if baseline := prober.Sweep(context.Background()); baseline.Failed() != 0 {
 		t.Fatalf("healthy baseline failed: %+v", baseline.Outcomes)
 	}
-	if action, err := h.scheduler.HandleHealth(
+	if action, err := h.handleHealth(
 		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.MinerID,
 		"external-test", false, false, false, time.Now().UTC(),
 	); err != nil || action != (policy.Action{}) {
@@ -1103,7 +1412,7 @@ func TestSingleEndpointExternalSuccessDoesNotFreezeLaterIsolatedEviction(t *test
 	if baseline := prober.Sweep(context.Background()); baseline.Failed() != 0 {
 		t.Fatalf("healthy baseline failed: %+v", baseline.Outcomes)
 	}
-	if action, err := h.scheduler.HandleHealth(
+	if action, err := h.handleHealth(
 		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.MinerID,
 		"external-test", true, true, false, time.Now().UTC(),
 	); err != nil || action != (policy.Action{}) {
@@ -1140,7 +1449,7 @@ func TestProberReconciliationHalfOpensWhenEveryRouteIsAbsent(t *testing.T) {
 	originalURL := h.scheduler.Validator.EdgeURL
 	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
 	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
-	action, err := h.scheduler.HandleHealth(
+	action, err := h.handleHealth(
 		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.MinerID,
 		"external-test", true, false, false, time.Now().UTC(),
 	)
@@ -1149,10 +1458,18 @@ func TestProberReconciliationHalfOpensWhenEveryRouteIsAbsent(t *testing.T) {
 	}
 	h.scheduler.Validator.EdgeURL = originalURL
 	h.scheduler.Validator.Client = nil
-	prober := &Prober{Scheduler: h.scheduler}
+	// Provisioning intentionally exceeds the one-probe budget. Half-open
+	// recovery must use the deployment lifecycle timeout, not this 10ms probe
+	// timeout, or the clean replacement can never return.
+	h.miners["m2"].SetDelay(100 * time.Millisecond)
+	prober := &Prober{Scheduler: h.scheduler, Timeout: 10 * time.Millisecond}
 	ctx, cancel := context.WithCancel(context.Background())
 	loops := make(map[string]*endpointLoop)
+	started := time.Now()
 	prober.reconcile(ctx, loops)
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond {
+		t.Fatalf("half-open repair did not exercise delayed provisioning: %s", elapsed)
+	}
 	cancel()
 	for _, loop := range loops {
 		loop.cancel()
@@ -1164,6 +1481,52 @@ func TestProberReconciliationHalfOpensWhenEveryRouteIsAbsent(t *testing.T) {
 	}
 	if trust := h.scheduler.Ledger.Trust(active[0]); trust == 0 {
 		t.Fatal("half-open recovery trust-zeroed the clean candidate")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestHalfOpenLifecycleOutlivesDefaultFiveSecondProbeBudget(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1", "m2"}, 1)
+	h.request.Timeout = 8 * time.Second
+	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
+		t.Fatal(err)
+	}
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	replica := h.scheduler.ActiveReplicas(h.request.DeploymentID)[0]
+	originalURL := h.scheduler.Validator.EdgeURL
+	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
+	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
+	if action, err := h.handleHealth(
+		context.Background(), h.request.DeploymentID, replica.ReplicaID, replica.MinerID,
+		"external-test", true, false, false, time.Now().UTC(),
+	); !errors.Is(err, ErrAcceptanceInconclusive) || !action.RemoveFromRouting {
+		t.Fatalf("zero-route setup: action=%+v err=%v", action, err)
+	}
+	h.scheduler.Validator.EdgeURL = originalURL
+	h.scheduler.Validator.Client = nil
+	h.miners["m2"].SetDelay(5100 * time.Millisecond)
+	prober := &Prober{Scheduler: h.scheduler, Timeout: DefaultProbeTimeout}
+	ctx, cancel := context.WithCancel(context.Background())
+	loops := make(map[string]*endpointLoop)
+	started := time.Now()
+	prober.reconcile(ctx, loops)
+	if elapsed := time.Since(started); elapsed < 5*time.Second {
+		t.Fatalf("replacement lifecycle was incorrectly bounded by probe timeout: %s", elapsed)
+	}
+	cancel()
+	for _, loop := range loops {
+		loop.cancel()
+		<-loop.done
+	}
+	active := activeMinerIDs(h.scheduler, h.request.DeploymentID)
+	if len(active) != 1 || contains(active, "m1") {
+		t.Fatalf("long healthy provisioning did not recover zero-route deployment: %v", active)
 	}
 	h.cleanup(t)
 	deactivated = true
@@ -1219,15 +1582,226 @@ type staleBlockingProber struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+	result  *validator.ProbeResult
+}
+
+type fixedProbeResult struct {
+	result validator.ProbeResult
+}
+
+func (p fixedProbeResult) ProbeReplica(context.Context, string, string, string, string) validator.ProbeResult {
+	return p.result
 }
 
 func (p *staleBlockingProber) ProbeReplica(context.Context, string, string, string, string) validator.ProbeResult {
 	p.once.Do(func() { close(p.started) })
 	<-p.release
+	if p.result != nil {
+		return *p.result
+	}
 	return validator.ProbeResult{
 		Status: 200, ServedByReplica: true, ResponseComplete: true,
 		Error: "incorrect response status=200",
 	}
+}
+
+func TestProberBindsHealthRevisionBeforeNetworkIO(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	replica := target.replicas[0]
+	healthy := validator.ProbeResult{
+		Status: 200, Correct: true, ServedByReplica: true, ResponseComplete: true,
+	}
+	probe := &staleBlockingProber{
+		started: make(chan struct{}), release: make(chan struct{}), result: &healthy,
+	}
+	prober := &Prober{Scheduler: h.scheduler, probe: probe, Vantage: "periodic-test"}
+	observed := make(chan ProbeOutcome, 1)
+	go func() { observed <- prober.observe(context.Background(), target, replica) }()
+	<-probe.started
+
+	changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
+		context.Background(), target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, 0,
+	)
+	if err != nil || !applied || !changed {
+		t.Fatalf("newer failure did not suppress route: changed=%v applied=%v err=%v", changed, applied, err)
+	}
+	close(probe.release)
+	outcome := <-observed
+	if !outcome.CommonModeSuppressed || !errors.Is(outcome.Err, errHealthObservationChanged) {
+		t.Fatalf("pre-failure success adopted a post-failure revision: %+v", outcome)
+	}
+	if outcome.RoutingRestored || outcome.Action != (policy.Action{}) {
+		t.Fatalf("stale success mutated serving state: %+v", outcome)
+	}
+	for _, claim := range h.scheduler.Router.Replicas(h.scheduler.states[target.deploymentID].routeHost) {
+		if claim.EndpointID == replica.EndpointID && claim.Healthy {
+			t.Fatal("pre-failure success reopened the newer failure circuit")
+		}
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestExternalHealthRevisionCannotMaskInFlightLocalSuppression(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	replica := target.replicas[0]
+	dark := validator.ProbeResult{Status: 0, Correct: false, ResponseComplete: false, Error: "connection refused"}
+	probe := &staleBlockingProber{started: make(chan struct{}), release: make(chan struct{}), result: &dark}
+	prober := &Prober{Scheduler: h.scheduler, probe: probe, Vantage: "periodic-test"}
+	observed := make(chan ProbeOutcome, 1)
+	go func() { observed <- prober.observe(context.Background(), target, replica) }()
+	<-probe.started
+
+	if action, err := h.scheduler.HandleHealth(
+		context.Background(), target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+		"external-health", true, true, false, time.Now().UTC(),
+	); err != nil || action != (policy.Action{}) {
+		t.Fatalf("external health update failed: action=%+v err=%v", action, err)
+	}
+	close(probe.release)
+	outcome := <-observed
+	if !outcome.CommonModeSuppressed || !outcome.RoutingSuppressed || !errors.Is(outcome.Err, errHealthObservationChanged) {
+		t.Fatalf("external policy revision masked local route failure: %+v", outcome)
+	}
+	if routedHealthy(h.scheduler, target.deploymentID, replica.MinerID) {
+		t.Fatal("locally unreachable endpoint remained in traffic after concurrent external report")
+	}
+	if !contains(activeMinerIDs(h.scheduler, target.deploymentID), replica.MinerID) || h.scheduler.Ledger.Trust(replica.MinerID) == 0 {
+		t.Fatal("route-local suppression changed eligibility or economic trust")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestExternalHealthRevisionCannotMaskInFlightLocalRecovery(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	replica := target.replicas[0]
+	if changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
+		context.Background(), target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, 0,
+	); err != nil || !applied || !changed {
+		t.Fatalf("failed to establish suppressed route: changed=%v applied=%v err=%v", changed, applied, err)
+	}
+	healthy := validator.ProbeResult{Status: 200, Correct: true, ServedByReplica: true, ResponseComplete: true}
+	probe := &staleBlockingProber{started: make(chan struct{}), release: make(chan struct{}), result: &healthy}
+	prober := &Prober{Scheduler: h.scheduler, probe: probe, Vantage: "periodic-test"}
+	observed := make(chan ProbeOutcome, 1)
+	go func() { observed <- prober.observe(context.Background(), target, replica) }()
+	<-probe.started
+
+	if _, err := h.scheduler.HandleHealth(
+		context.Background(), target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+		"external-health", true, true, false, time.Now().UTC(),
+	); err != nil {
+		t.Fatalf("external health update failed: %v", err)
+	}
+	close(probe.release)
+	outcome := <-observed
+	if !outcome.CommonModeSuppressed || !outcome.RoutingRestored || !errors.Is(outcome.Err, errHealthObservationChanged) {
+		t.Fatalf("external policy revision masked local route recovery: %+v", outcome)
+	}
+	if !routedHealthy(h.scheduler, target.deploymentID, replica.MinerID) {
+		t.Fatal("complete targeted recovery did not restore traffic")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestNewerNoopLocalSuccessFencesOlderFailure(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	replica := target.replicas[0]
+	dark := validator.ProbeResult{Status: 0, Correct: false, ResponseComplete: false, Error: "connection refused"}
+	oldProbe := &staleBlockingProber{started: make(chan struct{}), release: make(chan struct{}), result: &dark}
+	oldProber := &Prober{Scheduler: h.scheduler, probe: oldProbe, Vantage: "periodic-old"}
+	oldObserved := make(chan ProbeOutcome, 1)
+	go func() { oldObserved <- oldProber.observe(context.Background(), target, replica) }()
+	<-oldProbe.started
+
+	newProber := &Prober{Scheduler: h.scheduler, probe: fixedProbeResult{result: validator.ProbeResult{
+		Status: 200, Correct: true, ServedByReplica: true, ResponseComplete: true,
+	}}, Vantage: "periodic-new"}
+	newOutcome := newProber.observe(context.Background(), target, replica)
+	if newOutcome.Err != nil || newOutcome.RoutingRestored {
+		t.Fatalf("newer already-healthy result failed or reported a state change: %+v", newOutcome)
+	}
+	close(oldProbe.release)
+	oldOutcome := <-oldObserved
+	if !oldOutcome.CommonModeSuppressed || !errors.Is(oldOutcome.Err, errHealthObservationChanged) {
+		t.Fatalf("older failure was not fenced by newer no-op success: %+v", oldOutcome)
+	}
+	if !routedHealthy(h.scheduler, target.deploymentID, replica.MinerID) {
+		t.Fatal("older failure suppressed route after newer successful probe")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestNewerNoopLocalFailureFencesOlderRecovery(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	replica := target.replicas[0]
+	if changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
+		context.Background(), target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, 0,
+	); err != nil || !applied || !changed {
+		t.Fatalf("failed to establish suppressed route: changed=%v applied=%v err=%v", changed, applied, err)
+	}
+	healthy := validator.ProbeResult{Status: 200, Correct: true, ServedByReplica: true, ResponseComplete: true}
+	oldProbe := &staleBlockingProber{started: make(chan struct{}), release: make(chan struct{}), result: &healthy}
+	oldProber := &Prober{Scheduler: h.scheduler, probe: oldProbe, Vantage: "periodic-old"}
+	oldObserved := make(chan ProbeOutcome, 1)
+	go func() { oldObserved <- oldProber.observe(context.Background(), target, replica) }()
+	<-oldProbe.started
+
+	newProber := &Prober{Scheduler: h.scheduler, probe: fixedProbeResult{result: validator.ProbeResult{
+		Status: 0, Correct: false, ResponseComplete: false, Error: "connection refused",
+	}}, Vantage: "periodic-new"}
+	newOutcome := newProber.observe(context.Background(), target, replica)
+	if !newOutcome.CommonModeSuppressed || newOutcome.RoutingSuppressed {
+		t.Fatalf("newer already-suppressed failure had unexpected result: %+v", newOutcome)
+	}
+	close(oldProbe.release)
+	oldOutcome := <-oldObserved
+	if !oldOutcome.CommonModeSuppressed || !errors.Is(oldOutcome.Err, errHealthObservationChanged) {
+		t.Fatalf("older recovery was not fenced by newer no-op failure: %+v", oldOutcome)
+	}
+	if routedHealthy(h.scheduler, target.deploymentID, replica.MinerID) {
+		t.Fatal("older success restored route after newer failed probe")
+	}
+	h.cleanup(t)
+	deactivated = true
 }
 
 type cancellationBlockingProber struct {

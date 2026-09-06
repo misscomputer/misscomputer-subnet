@@ -100,10 +100,10 @@ func TestThreeMinerDeployment(t *testing.T) {
 		t.Fatal("m1 endpoint was not routed")
 	}
 	now := time.Now()
-	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", "m1", "vantage-a", false, false, false, now); err != nil || action.RemoveFromRouting {
+	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", removedEndpoint, "m1", "vantage-a", false, false, false, now); err != nil || action.RemoveFromRouting {
 		t.Fatalf("first failure action=%+v err=%v", action, err)
 	}
-	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", "m1", "vantage-a", false, false, false, now.Add(time.Second)); err != nil || !action.AssignReplacement {
+	if action, err := s.HandleHealth(ctx, "abc", "abc-m1", removedEndpoint, "m1", "vantage-a", false, false, false, now.Add(time.Second)); err != nil || !action.AssignReplacement {
 		t.Fatalf("replacement action=%+v err=%v", action, err)
 	}
 	replicas := router.Replicas("abc.on.miss.computer")

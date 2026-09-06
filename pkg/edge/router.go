@@ -551,6 +551,44 @@ func (r *Router) Replicas(host string) []Replica {
 	return values
 }
 
+// SetTemporaryAvailability changes only the process-local serving circuit for
+// one exact active route incarnation. It deliberately does not alter the
+// signed route record, durable route state, scheduler eligibility, or economic
+// trust. The periodic prober uses this narrow seam to stop sending customer
+// traffic to an endpoint after incomplete transport evidence while it gathers
+// enough attributable evidence for a durable scheduler action.
+//
+// Targeted internal probes continue to address unavailable claims, so a
+// complete correct response can close the circuit again. False means the
+// supplied identities no longer name the same active incarnation or the
+// caller did not present this router's service authority. Requiring the
+// authority keeps arbitrary in-process Go consumers from suppressing routes
+// through this exported package seam.
+func (r *Router) SetTemporaryAvailability(routeHost, replicaID, endpointID, minerID string, available bool, key ed25519.PrivateKey) (matched, changed bool) {
+	if len(key) != ed25519.PrivateKeySize {
+		return false, false
+	}
+	// PrivateKey.Public merely returns key[32:] and therefore is not proof that
+	// the seed and public suffix form a real Ed25519 key. Verify the canonical
+	// expansion before accepting this as the process-local authority capability.
+	canonical := ed25519.NewKeyFromSeed(key[:ed25519.SeedSize])
+	if subtle.ConstantTimeCompare(canonical, key) != 1 || !r.IsAuthorizedFor(canonical.Public().(ed25519.PublicKey)) {
+		return false, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	claim, exists := r.claims[endpointID]
+	if !exists || claim.record.State != "active" || claim.record.RouteHost != routeHost ||
+		claim.record.ReplicaID != replicaID || claim.record.MinerID != minerID {
+		return false, false
+	}
+	changed = claim.replica.Healthy != available
+	claim.replica.Healthy = available
+	r.claims[endpointID] = claim
+	r.upsertRouteLocked(routeHost, claim)
+	return true, changed
+}
+
 // TicketFor returns the already-verified signed ticket only when every caller
 // identity names the same current or exactly tombstoned incarnation. Retaining
 // an exact tombstone makes legacy repeated health removal safely idempotent;

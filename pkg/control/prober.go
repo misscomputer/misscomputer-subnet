@@ -81,10 +81,20 @@ type ProbeOutcome struct {
 	ResponseComplete bool `json:"response_complete"`
 	// CommonModeSuppressed is true when the result was an unattributable
 	// edge/network failure without fresh healthy-peer evidence. It remains
-	// visible to operators but is not allowed to mutate health policy state.
-	CommonModeSuppressed bool          `json:"common_mode_suppressed"`
-	Latency              time.Duration `json:"latency"`
-	Action               policy.Action `json:"action"`
+	// visible to operators but is not allowed to add health evidence, advance
+	// failure counters, or impose an economic penalty. It may advance only the
+	// route-local circuit revision used to fence older in-flight probes.
+	CommonModeSuppressed bool `json:"common_mode_suppressed"`
+	// RoutingSuppressed reports that this exact endpoint incarnation was
+	// removed from ordinary round-robin traffic using the process-local serving
+	// circuit. This is availability protection only: it is neither an economic
+	// trust penalty nor a durable route deactivation.
+	RoutingSuppressed bool `json:"routing_suppressed"`
+	// RoutingRestored reports that a complete correct targeted response closed
+	// a previously open serving circuit for this exact incarnation.
+	RoutingRestored bool          `json:"routing_restored"`
+	Latency         time.Duration `json:"latency"`
+	Action          policy.Action `json:"action"`
 	// Stale is true when the observation lost a race with the scheduler: the
 	// deployment was torn down or the replica replaced before the action could
 	// be applied. Such an outcome is expected churn, not a fault.
@@ -297,9 +307,13 @@ type probeCorroboration struct {
 type deploymentCorroboration struct {
 	nextSequence uint64
 	successes    map[string]probeSuccess
-	consumed     map[string]map[string]uint64
-	pending      map[string]*unreachablePermit
-	versions     map[string]uint64
+	// consumed stores one monotonic domain-wide success sequence per target.
+	// A permit needs only one witness, and every later usable witness must have
+	// a greater sequence. Keeping a per-target map of every peer would grow
+	// quadratically across many singleton deployments.
+	consumed map[string]uint64
+	pending  map[string]*unreachablePermit
+	versions map[string]uint64
 }
 
 type probeSuccess struct {
@@ -397,7 +411,7 @@ func (s *deploymentCorroboration) recordSuccess(endpointID string, at time.Time)
 		// Sequence exhaustion is practically unreachable, but resetting both
 		// sides of the comparison together preserves fail-closed semantics.
 		s.successes = make(map[string]probeSuccess)
-		s.consumed = make(map[string]map[string]uint64)
+		s.consumed = make(map[string]uint64)
 		s.pending = make(map[string]*unreachablePermit)
 		s.nextSequence = 0
 	}
@@ -432,10 +446,11 @@ func (c *probeCorroboration) unreachablePermit(deploymentID, endpointID string, 
 
 func corroborationCutoff(state *deploymentCorroboration, endpointID string, health policy.ObservationSnapshot) time.Time {
 	state.ensure()
-	if state.versions[endpointID] != health.Version {
-		return health.LastFailure
-	}
-	return time.Time{}
+	// A sequence number describes when this process recorded a success, not
+	// when that success was observed. Even when the monitor version still
+	// matches, a delayed peer result that predates the target's latest failure
+	// cannot corroborate destructive action against that target.
+	return health.LastFailure
 }
 
 func (s *deploymentCorroboration) reserveUnreachable(endpointID string, active []ActiveReplica, after time.Time, global bool) (*unreachablePermit, bool) {
@@ -444,29 +459,31 @@ func (s *deploymentCorroboration) reserveUnreachable(endpointID string, active [
 		return nil, false
 	}
 	used := s.consumed[endpointID]
-	sequences := make(map[string]uint64, len(active)-1)
-	fresh := 0
+	var witnessID string
+	var witness probeSuccess
 	for _, peer := range active {
 		if peer.EndpointID == endpointID {
 			continue
 		}
 		success := s.successes[peer.EndpointID]
-		sequences[peer.EndpointID] = success.sequence
-		if success.sequence > used[peer.EndpointID] && (after.IsZero() || success.at.After(after)) {
-			fresh++
+		if success.sequence <= used || (!after.IsZero() && success.at.Before(after)) {
+			continue
+		}
+		if witnessID == "" || success.at.After(witness.at) || (success.at.Equal(witness.at) && peer.EndpointID < witnessID) {
+			witnessID = peer.EndpointID
+			witness = success
 		}
 	}
-	// A strict majority of the deployment must have a complete correct path.
-	// For an isolated failure every peer satisfies this; if half or more routes
-	// share the fault, their failure cannot be attributed to individual miners.
-	required := len(active)/2 + 1
-	if peers := len(active) - 1; required > peers {
-		required = peers
-	}
-	if fresh < required {
+	// One fresh complete peer response proves that the shared edge/probe path is
+	// functioning for this deployment. That is sufficient to durably remove a
+	// repeatedly unreachable route without assigning economic blame. Requiring
+	// a majority here deadlocks a three-replica deployment when two miners
+	// genuinely fail: the sole healthy peer can never provide two successes.
+	// A true common-mode outage has no successful peer and remains suppressed.
+	if witnessID == "" {
 		return nil, false
 	}
-	permit := &unreachablePermit{global: global, sequences: sequences}
+	permit := &unreachablePermit{global: global, sequences: map[string]uint64{witnessID: witness.sequence}}
 	s.pending[endpointID] = permit
 	return permit, true
 }
@@ -484,15 +501,12 @@ func (s *deploymentCorroboration) reserveUnreachableWithoutWitness(endpointID st
 func (s *deploymentCorroboration) consume(endpointID string, sequences map[string]uint64) {
 	s.ensure()
 	used := s.consumed[endpointID]
-	if used == nil {
-		used = make(map[string]uint64)
-		s.consumed[endpointID] = used
-	}
-	for peerID, sequence := range sequences {
-		if sequence > used[peerID] {
-			used[peerID] = sequence
+	for _, sequence := range sequences {
+		if sequence > used {
+			used = sequence
 		}
 	}
+	s.consumed[endpointID] = used
 }
 
 func (s *deploymentCorroboration) ensure() {
@@ -500,7 +514,7 @@ func (s *deploymentCorroboration) ensure() {
 		s.successes = make(map[string]probeSuccess)
 	}
 	if s.consumed == nil {
-		s.consumed = make(map[string]map[string]uint64)
+		s.consumed = make(map[string]uint64)
 	}
 	if s.pending == nil {
 		s.pending = make(map[string]*unreachablePermit)
@@ -518,7 +532,7 @@ func (c *probeCorroboration) state(deploymentID string) *deploymentCorroboration
 	if state == nil {
 		state = &deploymentCorroboration{
 			successes: make(map[string]probeSuccess),
-			consumed:  make(map[string]map[string]uint64),
+			consumed:  make(map[string]uint64),
 			pending:   make(map[string]*unreachablePermit),
 			versions:  make(map[string]uint64),
 		}
@@ -582,15 +596,9 @@ func (s *deploymentCorroboration) prune(active []ActiveReplica) {
 			delete(s.versions, endpointID)
 		}
 	}
-	for endpointID, peers := range s.consumed {
+	for endpointID := range s.consumed {
 		if _, ok := current[endpointID]; !ok {
 			delete(s.consumed, endpointID)
-			continue
-		}
-		for peerID := range peers {
-			if _, ok := current[peerID]; !ok {
-				delete(peers, peerID)
-			}
 		}
 	}
 	for endpointID := range s.pending {
@@ -628,9 +636,10 @@ func (p *Prober) reconcile(ctx context.Context, loops map[string]*endpointLoop) 
 	// failures remain fail-closed and inconclusive attempts release the clean
 	// candidate, so this cannot drain the pool.
 	if len(targets) == 0 {
-		repairCtx, cancel := context.WithTimeout(ctx, p.timeout())
-		err := p.Scheduler.repairOneDeficit(repairCtx)
-		cancel()
+		// A network probe timeout must never bound assignment/provisioning. The
+		// scheduler applies the deployment's own lifecycle budget (normally two
+		// minutes) around this bounded half-open repair attempt.
+		err := p.Scheduler.repairOneDeficit(ctx)
 		if err != nil && ctx.Err() == nil {
 			logger := p.Logger
 			if logger == nil {
@@ -716,6 +725,23 @@ func (p *Prober) Sweep(ctx context.Context) SweepResult {
 }
 
 func (p *Prober) observe(ctx context.Context, target probeTarget, replica ActiveReplica) ProbeOutcome {
+	outcome := ProbeOutcome{
+		DeploymentID: target.deploymentID,
+		MinerID:      replica.MinerID,
+		ReplicaID:    replica.ReplicaID,
+		EndpointID:   replica.EndpointID,
+	}
+	// Bind this network operation to the health revision that exists before
+	// any bytes leave the process. Taking the snapshot after ProbeReplica would
+	// let an older success adopt the revision created by a newer failure and
+	// incorrectly reopen that failure's temporary routing circuit.
+	started, err := p.Scheduler.activeProbePeers(target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID)
+	if err != nil {
+		outcome.Err = err
+		outcome.Stale = isStaleObservation(err)
+		p.finishObservation(outcome)
+		return outcome
+	}
 	probeCtx := ctx
 	if timeout := p.timeout(); timeout > 0 {
 		var cancel context.CancelFunc
@@ -749,18 +775,12 @@ func (p *Prober) observe(ctx context.Context, target probeTarget, replica Active
 	// edge error into a trust-zero.
 	responseComplete := observed.ResponseComplete || observed.Correct
 	replicaAnswered := (observed.ServedByReplica && responseComplete) || observed.Correct
-	outcome := ProbeOutcome{
-		DeploymentID:     target.deploymentID,
-		MinerID:          replica.MinerID,
-		ReplicaID:        replica.ReplicaID,
-		EndpointID:       replica.EndpointID,
-		Reachable:        replicaAnswered,
-		Correct:          observed.Correct,
-		Status:           observed.Status,
-		EdgeGenerated:    observed.EdgeGenerated && responseComplete && !replicaAnswered,
-		ResponseComplete: responseComplete,
-		Latency:          observed.Latency,
-	}
+	outcome.Reachable = replicaAnswered
+	outcome.Correct = observed.Correct
+	outcome.Status = observed.Status
+	outcome.EdgeGenerated = observed.EdgeGenerated && responseComplete && !replicaAnswered
+	outcome.ResponseComplete = responseComplete
+	outcome.Latency = observed.Latency
 	// A parent cancellation is lifecycle control, never evidence about a miner.
 	// Check it after the potentially blocking probe and immediately before any
 	// health/corroboration mutation.
@@ -778,12 +798,55 @@ func (p *Prober) observe(ctx context.Context, target probeTarget, replica Active
 		p.finishObservation(outcome)
 		return outcome
 	}
+	// A liveness result (success or unreachability) is valid as policy evidence
+	// only when no newer health fact landed while its request was in flight. Its
+	// local routing result has an independent circuit revision: external policy
+	// reports may not mask a targeted local failure or recovery, while an older
+	// local request may not overwrite a newer circuit decision. Complete,
+	// attributable wrong content is definitive evidence about this still-active
+	// exact endpoint and must not be maskable by concurrent liveness updates.
+	definitiveFault := outcome.Reachable && !outcome.Correct
+	if active.targetCircuit != started.targetCircuit && !definitiveFault {
+		outcome.Err = errHealthObservationChanged
+		outcome.CommonModeSuppressed = true
+		p.finishObservation(outcome)
+		return outcome
+	}
+	if active.targetHealth.Version != started.targetHealth.Version && !definitiveFault {
+		changed, applied, circuitErr := p.Scheduler.setEndpointAvailabilityIfCircuitVersion(
+			ctx, target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+			outcome.Reachable && outcome.Correct, started.targetCircuit,
+		)
+		outcome.RoutingRestored = outcome.Correct && changed
+		outcome.RoutingSuppressed = !outcome.Correct && changed
+		outcome.CommonModeSuppressed = true
+		outcome.Err = errors.Join(errHealthObservationChanged, circuitErr)
+		if !applied {
+			outcome.Stale = isStaleObservation(circuitErr)
+			outcome.Cancelled = ctx.Err() != nil
+		}
+		p.finishObservation(outcome)
+		return outcome
+	}
 	var permit *unreachablePermit
 	if !outcome.Reachable {
 		var allowed bool
 		permit, allowed = p.corroboration.unreachablePermit(target.deploymentID, replica.EndpointID, active)
 		if !allowed {
+			changed, applied, suppressErr := p.Scheduler.suppressEndpointAvailabilityIfVersion(
+				ctx, target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
+				started.targetCircuit,
+			)
+			if !applied {
+				outcome.Err = suppressErr
+				outcome.Stale = isStaleObservation(suppressErr)
+				outcome.Cancelled = ctx.Err() != nil
+				p.finishObservation(outcome)
+				return outcome
+			}
+			outcome.RoutingSuppressed = changed
 			outcome.CommonModeSuppressed = true
+			outcome.Err = suppressErr
 			p.finishObservation(outcome)
 			return outcome
 		}
@@ -794,11 +857,14 @@ func (p *Prober) observe(ctx context.Context, target probeTarget, replica Active
 	// Fraudulence is a claim about a miner substituting or forging content and
 	// is never inferred from a transport-level or body-mismatch observation.
 	// The prober reports only what it saw and lets policy decide.
-	action, applied, err := p.Scheduler.handleEndpointHealthVersioned(
+	action, applied, routingChanged, err := p.Scheduler.handleEndpointHealthVersioned(
 		ctx, target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID,
-		p.vantage(), outcome.Reachable, outcome.Correct, false, observedAt, active.targetHealth.Version,
+		p.vantage(), outcome.Reachable, outcome.Correct, false, observedAt,
+		started.targetHealth.Version, started.targetCircuit,
 	)
 	if !applied {
+		outcome.RoutingRestored = outcome.Correct && routingChanged
+		outcome.RoutingSuppressed = !outcome.Correct && routingChanged
 		outcome.Err = err
 		switch {
 		case ctx.Err() != nil:
@@ -812,6 +878,8 @@ func (p *Prober) observe(ctx context.Context, target probeTarget, replica Active
 		p.finishObservation(outcome)
 		return outcome
 	}
+	outcome.RoutingRestored = outcome.Correct && routingChanged
+	outcome.RoutingSuppressed = !outcome.Correct && routingChanged
 	outcome.Action = action
 	outcome.Err = err
 	outcome.Stale = isStaleObservation(err)
@@ -863,6 +931,8 @@ func (p *Prober) log(outcome ProbeOutcome) {
 		"edge_generated", outcome.EdgeGenerated,
 		"response_complete", outcome.ResponseComplete,
 		"common_mode_suppressed", outcome.CommonModeSuppressed,
+		"routing_suppressed", outcome.RoutingSuppressed,
+		"routing_restored", outcome.RoutingRestored,
 	}
 	switch {
 	case outcome.Cancelled:

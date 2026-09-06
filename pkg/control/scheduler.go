@@ -49,6 +49,7 @@ var (
 	// network, cancellation, or incomplete-transport failure.
 	ErrAcceptanceInconclusive   = errors.New("acceptance probe was inconclusive")
 	errHealthObservationChanged = errors.New("endpoint health changed after corroboration")
+	errHealthObservationStale   = errors.New("health observation is replayed or out of order")
 )
 
 // ScoringDisposition makes the acceptance-observation boundary explicit.
@@ -61,6 +62,20 @@ const (
 	ScoringProductionEligible ScoringDisposition = "production_eligible"
 	ScoringEvidenceOnly       ScoringDisposition = "evidence_only"
 )
+
+type committedHealthActionError struct{ cause error }
+
+func (err *committedHealthActionError) Error() string { return err.cause.Error() }
+func (err *committedHealthActionError) Unwrap() error { return err.cause }
+
+// HealthObservationCommitted reports that the scheduler accepted the health
+// evidence and committed its policy action before a later cleanup, trust, or
+// replacement step failed. Callers must still persist the accepted scoring
+// sample exactly once; retrying the same health message is replay-rejected.
+func HealthObservationCommitted(err error) bool {
+	var committed *committedHealthActionError
+	return errors.As(err, &committed)
+}
 
 // CapacityError means the scheduler cannot reach the requested replica count
 // using miners that are trusted, not already active/reserved, and not
@@ -99,7 +114,28 @@ type Scheduler struct {
 	publicationID      string
 	publicationVersion uint64
 	probeTopology      uint64
-	states             map[string]*deploymentState
+	// circuitVersions is deliberately separate from policy.Monitor revisions.
+	// External observations may advance economic-health history, but they must
+	// neither invalidate nor authorize the in-process prober's exact route-local
+	// availability decision. Entries are scoped to nonce-bearing EndpointIDs and
+	// are removed with the active incarnation.
+	circuitVersions map[string]uint64
+	states          map[string]*deploymentState
+	candidateCursor int
+	cleanupCursor   string
+	deficitCursor   string
+
+	// lifecycleMu owns every assignment/cleanup worker which may call a miner,
+	// router, or durable store. Drain closes admission to new workers before it
+	// waits, so Plane.Close never tears those resources out from under a late
+	// cancellation-ignoring assigner.
+	lifecycleMu      sync.Mutex
+	lifecycleWorkers int
+	lifecycleClosing bool
+	lifecycleIdle    chan struct{}
+	// afterReplacementObservationFailure is a deterministic concurrency seam
+	// used only by package tests. Production construction leaves it nil.
+	afterReplacementObservationFailure func()
 }
 
 // bumpProbeTopologyLocked advances the incarnation set observed by the
@@ -112,13 +148,25 @@ func (s *Scheduler) bumpProbeTopologyLocked() {
 	}
 }
 
+// retireProbeStateLocked drops every process-local observation/circuit record
+// owned by an endpoint at the same boundary where active routing ownership is
+// removed. Endpoint IDs include generation and nonce, so no later incarnation
+// may inherit this state. Scheduler.mu must be held.
+func (s *Scheduler) retireProbeStateLocked(endpointID string) {
+	delete(s.circuitVersions, endpointID)
+	if s.Health != nil {
+		s.Health.Forget(endpointID)
+	}
+}
+
 type deploymentState struct {
 	request        DeployRequest
 	routeHost      string
 	active         map[string]activeAssignment
 	reserved       map[string]*candidateReservation
 	excluded       map[string]struct{}
-	pendingCleanup map[string]activeAssignment
+	pendingCleanup map[string]*cleanupLease
+	cleanupCursor  string
 	generation     uint64
 	deploying      bool
 	// Deactivation keeps exact ticket ownership until route, miner, and
@@ -138,6 +186,18 @@ type activeAssignment struct {
 	publicationVersion uint64
 }
 
+// cleanupLease is the scheduler's exact ownership record for a ticket whose
+// route/miner/durable cleanup is not yet proven complete. assignmentPending is
+// true while the original Assign call can still create the workload; cleaning
+// prevents two repair triggers from acting on the same incarnation.
+type cleanupLease struct {
+	assignment        activeAssignment
+	assignmentPending bool
+	requiresRetry     bool
+	preserveExclusion bool
+	cleaning          bool
+}
+
 // candidateReservation binds a miner handle to the exact scheduler
 // publication observed while holding Scheduler.mu. Ticket signing consumes
 // this captured subnet instead of taking a second lock-window snapshot.
@@ -147,6 +207,16 @@ type candidateReservation struct {
 	publicationID      string
 	publicationVersion uint64
 }
+
+type reservationDisposition uint8
+
+const (
+	reservationAccepted reservationDisposition = iota
+	reservationDeploymentStale
+	reservationCandidateIneligible
+	reservationPublicationChanged
+	reservationMismatch
+)
 
 type DeployRequest struct {
 	DeploymentID       string
@@ -202,8 +272,11 @@ type assignmentResult struct {
 }
 
 type launchedAssignment struct {
-	miner  miner.Assigner
-	ticket protocol.Ticket
+	miner          miner.Assigner
+	ticket         protocol.Ticket
+	done           chan assignmentResult
+	fenced         chan struct{}
+	needsPostFence atomic.Bool
 }
 
 // assignmentAttempt gives every launched ticket a cleanup lease. Aborting an
@@ -213,25 +286,37 @@ type launchedAssignment struct {
 // returning, and a late success cannot strand its workload.
 type assignmentAttempt struct {
 	scheduler *Scheduler
+	state     *deploymentState
 	ctx       context.Context
 	results   chan assignmentResult
 	aborted   atomic.Bool
+	finalize  sync.Once
+	finalized chan struct{}
 	mu        sync.Mutex
-	launched  []launchedAssignment
+	launched  []*launchedAssignment
 }
 
-func newAssignmentAttempt(s *Scheduler, ctx context.Context, capacity int) *assignmentAttempt {
+func newAssignmentAttempt(s *Scheduler, state *deploymentState, ctx context.Context, capacity int) *assignmentAttempt {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &assignmentAttempt{scheduler: s, ctx: ctx, results: make(chan assignmentResult, capacity)}
+	return &assignmentAttempt{
+		scheduler: s, state: state, ctx: ctx, results: make(chan assignmentResult, capacity), finalized: make(chan struct{}),
+	}
 }
 
-func (a *assignmentAttempt) launch(candidate miner.Assigner, ticket protocol.Ticket) {
+func (a *assignmentAttempt) launch(candidate miner.Assigner, ticket protocol.Ticket) error {
+	// The Deploy/health/repair operation which owns this attempt has already
+	// passed the lifecycle admission gate. A child must remain admissible after
+	// Drain starts: otherwise shutdown can observe the parent but reject the
+	// exact assignment worker which the parent is required to join.
+	a.scheduler.beginOwnedLifecycleWorker()
+	launched := &launchedAssignment{miner: candidate, ticket: ticket, done: make(chan assignmentResult, 1), fenced: make(chan struct{})}
 	a.mu.Lock()
-	a.launched = append(a.launched, launchedAssignment{miner: candidate, ticket: ticket})
+	a.launched = append(a.launched, launched)
 	a.mu.Unlock()
 	go func() {
+		defer a.scheduler.endLifecycleWorker()
 		now := a.scheduler.clock()
 		started := now().UTC()
 		assigned, err := candidate.Assign(a.ctx, ticket)
@@ -240,44 +325,258 @@ func (a *assignmentAttempt) launch(candidate miner.Assigner, ticket protocol.Tic
 			miner: candidate, ticket: ticket, result: assigned, err: err,
 			latency: max(finished.Sub(started), 0), observedAt: finished,
 		}
+		launched.done <- outcome
+		close(launched.done)
+		// results is sized for every launch. Never abandon lifecycle ownership
+		// merely because the request context was cancelled.
+		a.results <- outcome
+		// The request owner makes an explicit terminal decision. This handshake
+		// closes the race where Assign returned just before abort: the worker can
+		// neither miss the abort nor leave assignmentPending stuck forever.
+		<-a.finalized
 		if a.aborted.Load() {
-			a.scheduler.deactivateTicket(candidate, ticket)
-		}
-		select {
-		case a.results <- outcome:
-		case <-a.ctx.Done():
-			if !a.aborted.Load() {
-				a.scheduler.deactivateTicket(candidate, ticket)
+			// The assignment worker itself is already lifecycle-owned, so it can
+			// finish the ownership transfer even if Plane.Drain started after the
+			// request was admitted. The early fence may run before Assign returns;
+			// waiting for it and then cleaning again proves that a late workload
+			// cannot survive the cancellation.
+			<-launched.fenced
+			if launched.needsPostFence.Load() && a.scheduler.markAssignmentCompleteAndClaimCleanup(a.state, candidate.ID(), expectedEndpointID(ticket)) {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), assignmentCleanupTime)
+				cleanupErr := a.scheduler.deactivateTicket(cleanupCtx, candidate, ticket)
+				cancel()
+				a.scheduler.finishCleanupLease(a.state, candidate.ID(), expectedEndpointID(ticket), cleanupErr)
 			}
 		}
 	}()
+	return nil
 }
 
-func (a *assignmentAttempt) abort(routeHost string) {
+func (a *assignmentAttempt) complete() {
+	a.finalize.Do(func() { close(a.finalized) })
+}
+
+func (a *assignmentAttempt) abort() {
 	if !a.aborted.CompareAndSwap(false, true) {
 		return
 	}
 	a.mu.Lock()
-	launched := append([]launchedAssignment(nil), a.launched...)
+	launched := append([]*launchedAssignment(nil), a.launched...)
 	a.mu.Unlock()
-	var cleanup sync.WaitGroup
 	for _, assignment := range launched {
-		cleanup.Add(1)
-		go func(assignment launchedAssignment) {
-			defer cleanup.Done()
-			a.scheduler.deactivateTicket(assignment.miner, assignment.ticket)
+		assignmentPending := true
+		select {
+		case <-assignment.done:
+			assignmentPending = false
+		default:
+		}
+		assignment.needsPostFence.Store(assignmentPending)
+		claimed := a.scheduler.retainAndClaimCleanupLease(
+			a.state, assignment.miner, assignment.ticket, assignmentPending, false, false,
+		)
+		if !claimed {
+			// Exact ownership can only already belong to another cleanup worker or
+			// to a completed deployment teardown. Do not launch a second cleanup
+			// for the same ticket. The late-assignment fence below will make one
+			// final exact cleanup claim after Assign returns when necessary.
+			close(assignment.fenced)
+			continue
+		}
+		// Fence the exact ticket immediately, even if Assign ignores
+		// cancellation or a forwarding bridge continues the operation after its
+		// client disconnects. The late cleanup below runs again after Assign is
+		// joined, because an early idempotent stop cannot prove that no workload
+		// will subsequently appear.
+		a.scheduler.beginOwnedLifecycleWorker()
+		go func(assignment *launchedAssignment) {
+			defer a.scheduler.endLifecycleWorker()
+			defer close(assignment.fenced)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), assignmentCleanupTime)
+			err := a.scheduler.deactivateTicket(cleanupCtx, assignment.miner, assignment.ticket)
+			cancel()
+			a.scheduler.finishCleanupLease(a.state, assignment.miner.ID(), expectedEndpointID(assignment.ticket), err)
 		}(assignment)
 	}
-	done := make(chan struct{})
-	go func() {
-		cleanup.Wait()
-		close(done)
-	}()
+	a.complete()
 	timer := time.NewTimer(assignmentCleanupTime)
 	defer timer.Stop()
+	for _, assignment := range launched {
+		select {
+		case <-assignment.fenced:
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+func (s *Scheduler) beginLifecycleWorker() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycleClosing {
+		return false
+	}
+	if s.lifecycleWorkers == 0 {
+		s.lifecycleIdle = make(chan struct{})
+	}
+	s.lifecycleWorkers++
+	return true
+}
+
+// beginOwnedLifecycleWorker transfers part of an already-admitted scheduler
+// operation into a child goroutine. It is intentionally allowed while Drain is
+// waiting: the parent is still counted, so the idle channel cannot close
+// between this increment and the child's eventual completion. Callers must
+// already own one lifecycle count.
+func (s *Scheduler) beginOwnedLifecycleWorker() {
+	s.lifecycleMu.Lock()
+	if s.lifecycleWorkers == 0 {
+		// This is an internal invariant rather than a recoverable configuration
+		// error: admitting an unowned child could race resource closure.
+		s.lifecycleMu.Unlock()
+		panic("scheduler lifecycle child has no owner")
+	}
+	s.lifecycleWorkers++
+	s.lifecycleMu.Unlock()
+}
+
+func (s *Scheduler) endLifecycleWorker() {
+	s.lifecycleMu.Lock()
+	s.lifecycleWorkers--
+	if s.lifecycleWorkers == 0 && s.lifecycleIdle != nil {
+		close(s.lifecycleIdle)
+		s.lifecycleIdle = nil
+	}
+	s.lifecycleMu.Unlock()
+}
+
+// Drain rejects new scheduler-owned workers and waits for every already-owned
+// assignment and cleanup worker. A timeout is explicit: callers must not close
+// the router or durable store after a failed drain.
+func (s *Scheduler) Drain(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("scheduler drain context is required")
+	}
+	s.lifecycleMu.Lock()
+	s.lifecycleClosing = true
+	if s.lifecycleWorkers == 0 {
+		s.lifecycleMu.Unlock()
+		return nil
+	}
+	idle := s.lifecycleIdle
+	s.lifecycleMu.Unlock()
 	select {
-	case <-done:
-	case <-timer.C:
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("drain scheduler lifecycle: %w", ctx.Err())
+	}
+}
+
+func assignmentFromTicket(candidate miner.Assigner, ticket protocol.Ticket) activeAssignment {
+	return activeAssignment{
+		miner: candidate, replicaID: protocol.ReplicaID(ticket), endpointID: expectedEndpointID(ticket), ticket: ticket,
+	}
+}
+
+// retainCleanupLease transfers exact ownership from a reservation/active slot
+// into quarantine. It is idempotent for the same endpoint and never replaces a
+// newer cleanup incarnation for the miner.
+func (s *Scheduler) retainCleanupLease(state *deploymentState, candidate miner.Assigner, ticket protocol.Ticket, assignmentPending, requiresRetry bool) {
+	s.retainCleanupLeaseWithDisposition(state, candidate, ticket, assignmentPending, requiresRetry, false, false)
+}
+
+// retainAndClaimCleanupLease transfers exact ticket ownership and atomically
+// claims the only cleanup invocation allowed for that incarnation. No repair,
+// deployment teardown, or cancellation path can observe an unclaimed lease in
+// between those two operations.
+func (s *Scheduler) retainAndClaimCleanupLease(state *deploymentState, candidate miner.Assigner, ticket protocol.Ticket, assignmentPending, requiresRetry, preserveExclusion bool) bool {
+	return s.retainCleanupLeaseWithDisposition(state, candidate, ticket, assignmentPending, requiresRetry, preserveExclusion, true)
+}
+
+func (s *Scheduler) retainCleanupLeaseWithDisposition(state *deploymentState, candidate miner.Assigner, ticket protocol.Ticket, assignmentPending, requiresRetry, preserveExclusion, claim bool) bool {
+	if state == nil || candidate == nil {
+		return false
+	}
+	assignment := assignmentFromTicket(candidate, ticket)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.states[state.request.DeploymentID] != state {
+		return false
+	}
+	minerID := candidate.ID()
+	delete(state.reserved, minerID)
+	if current, ok := state.active[minerID]; ok && current.endpointID == assignment.endpointID {
+		assignment = current
+		delete(state.active, minerID)
+		s.retireProbeStateLocked(current.endpointID)
+		s.bumpProbeTopologyLocked()
+	}
+	state.excluded[minerID] = struct{}{}
+	if current, ok := state.pendingCleanup[minerID]; ok {
+		if current.assignment.endpointID != assignment.endpointID {
+			// The older exact lease remains authoritative. Candidate selection is
+			// already blocked, and replacing it would lose cleanup ownership.
+			return false
+		}
+		current.assignment = assignment
+		current.assignmentPending = current.assignmentPending || assignmentPending
+		current.requiresRetry = current.requiresRetry || requiresRetry
+		current.preserveExclusion = current.preserveExclusion || preserveExclusion
+		if claim && !current.cleaning {
+			current.cleaning = true
+			return true
+		}
+		return false
+	}
+	state.pendingCleanup[minerID] = &cleanupLease{
+		assignment: assignment, assignmentPending: assignmentPending, requiresRetry: requiresRetry,
+		preserveExclusion: preserveExclusion, cleaning: claim,
+	}
+	return claim
+}
+
+func (s *Scheduler) markAssignmentCompleteAndClaimCleanup(state *deploymentState, minerID, endpointID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.states[state.request.DeploymentID] == state {
+		if lease := state.pendingCleanup[minerID]; lease != nil && lease.assignment.endpointID == endpointID {
+			lease.assignmentPending = false
+			if !lease.cleaning {
+				lease.cleaning = true
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) finishCleanupLease(state *deploymentState, minerID, endpointID string, cleanupErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.states[state.request.DeploymentID] != state {
+		return
+	}
+	lease := state.pendingCleanup[minerID]
+	if lease == nil || lease.assignment.endpointID != endpointID {
+		return
+	}
+	lease.cleaning = false
+	if cleanupErr == nil && !lease.assignmentPending && !lease.requiresRetry {
+		delete(state.pendingCleanup, minerID)
+		if !lease.preserveExclusion {
+			delete(state.excluded, minerID)
+		}
+		s.maybeDeleteDeactivatedStateLocked(state)
+	}
+}
+
+func (s *Scheduler) maybeDeleteDeactivatedStateLocked(state *deploymentState) {
+	if state == nil || !state.deactivationRequested || state.deploying || state.cleanupInProgress ||
+		len(state.active) != 0 || len(state.reserved) != 0 || len(state.pendingCleanup) != 0 {
+		return
+	}
+	if s.states[state.request.DeploymentID] == state {
+		delete(s.states, state.request.DeploymentID)
 	}
 }
 
@@ -320,6 +619,10 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 		return DeployResult{}, fmt.Errorf("route label prefix plus deployment ID must form one lowercase DNS label")
 	}
 	routeHost := routeLabel + "." + domain
+	if !s.beginLifecycleWorker() {
+		return DeployResult{}, errors.New("scheduler is draining")
+	}
+	defer s.endLifecycleWorker()
 	// A redeployed deployment ID must continue its route-generation sequence:
 	// the route authority (and its durable store) treats any generation at or
 	// below the deployment's high-water mark as a stale replay and fails
@@ -337,14 +640,20 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 		return DeployResult{}, err
 	}
 	ctx, cancel := context.WithTimeout(parent, req.Timeout)
-	attempt := newAssignmentAttempt(s, ctx, s.minerCount())
+	// At most replicas assignments are in flight, even if a concurrent
+	// publication expands Miners after this attempt is constructed. Size the
+	// terminal result handoff for that invariant so cancelled workers can always
+	// publish and reach their post-fence cleanup without a departed receiver.
+	attempt := newAssignmentAttempt(s, state, ctx, max(s.minerCount(), replicas))
 	succeeded := false
 	defer func() {
-		cancel()
 		if succeeded {
+			attempt.complete()
+			cancel()
 			return
 		}
-		attempt.abort(routeHost)
+		cancel()
+		attempt.abort()
 		s.mu.Lock()
 		if s.states[req.DeploymentID] == state {
 			state.deploying = false
@@ -380,12 +689,15 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 	}
 	inFlight := 0
 	reservationsByNonce := make(map[string]*candidateReservation)
+	attemptedCandidates := make(map[string]struct{})
+	var lastInconclusive error
 	launchNext := func() error {
-		reservation, available := s.reserveInitialCandidate(state)
+		reservation, available := s.reserveInitialCandidateSkipping(state, attemptedCandidates)
 		if reservation == nil {
-			return &CapacityError{DeploymentID: req.DeploymentID, Required: replicas, Available: available}
+			return errors.Join(lastInconclusive, &CapacityError{DeploymentID: req.DeploymentID, Required: replicas, Available: available})
 		}
 		candidate := reservation.candidate
+		attemptedCandidates[candidate.ID()] = struct{}{}
 		ticket, ticketErr := s.ticketForReservation(req, reservation, routeHost, firstGeneration, now())
 		if ticketErr != nil {
 			s.releaseReservation(state, candidate.ID())
@@ -397,7 +709,12 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 		}
 		reservationsByNonce[ticket.AssignmentNonce] = reservation
 		inFlight++
-		attempt.launch(candidate, ticket)
+		if err := attempt.launch(candidate, ticket); err != nil {
+			inFlight--
+			delete(reservationsByNonce, ticket.AssignmentNonce)
+			s.releaseReservation(state, candidate.ID())
+			return err
+		}
 		return nil
 	}
 	for inFlight < replicas {
@@ -425,11 +742,13 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 				return result, fmt.Errorf("deployment timed out with %d/%d ready: %w", len(result.ReadyMiners), replicas, err)
 			}
 			if outcome.err != nil || !s.Ledger.Eligible(outcome.miner.ID()) {
-				s.deactivateTicket(outcome.miner, outcome.ticket)
-				s.failReservation(state, outcome.miner.ID())
+				cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
 				appendUnique(&result.FailedMiners, outcome.miner.ID())
 				if err := recordObservation(observation); err != nil {
-					return result, err
+					return result, errors.Join(err, cleanupErr)
+				}
+				if cleanupErr != nil {
+					return result, fmt.Errorf("cleanup failed assignment: %w", cleanupErr)
 				}
 				if err := launchNext(); err != nil {
 					return result, err
@@ -437,8 +756,7 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 				continue
 			}
 			if verifyErr := s.verifyResultForDisposition(outcome.miner, outcome.ticket, outcome.result, req.ScoringDisposition); verifyErr != nil {
-				cleanupErr := s.deactivateTicket(outcome.miner, outcome.ticket)
-				s.failReservation(state, outcome.miner.ID())
+				cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
 				appendUnique(&result.FailedMiners, outcome.miner.ID())
 				observationErr := recordObservation(observation)
 				var persistenceErr *trustPersistenceError
@@ -464,21 +782,25 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 				return result, fmt.Errorf("persist accepted receipt: %w", err)
 			}
 			if err := s.Router.RegisterPending(ctx, outcome.ticket, outcome.result.Receipt, outcome.miner.PublicKey(), s.SigningKey); err != nil {
-				s.deactivateTicket(outcome.miner, outcome.ticket)
-				s.failReservation(state, outcome.miner.ID())
-				return result, fmt.Errorf("register authenticated pending edge route: %w", err)
+				cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
+				return result, errors.Join(fmt.Errorf("register authenticated pending edge route: %w", err), cleanupErr)
 			}
 			probe := s.Validator.ProbeReplica(ctx, routeHost, outcome.result.Receipt.ReplicaID, req.Workload.ChallengePath, req.Workload.ChallengeValue)
 			if err := ctx.Err(); err != nil {
 				probe.ResponseComplete = false
 				probe.Error = err.Error()
-				return result, errors.Join(s.rejectInconclusiveAcceptance(state, outcome, probe), err)
+				return result, errors.Join(s.rejectInconclusiveAcceptance(ctx, state, outcome, probe), err)
 			}
 			if !probe.Correct {
 				if !attributableAcceptanceFailure(probe) {
-					return result, s.rejectInconclusiveAcceptance(state, outcome, probe)
+					lastInconclusive = errors.Join(lastInconclusive, s.rejectInconclusiveAcceptance(ctx, state, outcome, probe))
+					appendUnique(&result.FailedMiners, outcome.miner.ID())
+					if err := launchNext(); err != nil {
+						return result, err
+					}
+					continue
 				}
-				if err := s.rejectAcceptance(state, routeHost, outcome, req.ScoringDisposition); err != nil {
+				if err := s.rejectAcceptance(ctx, state, routeHost, outcome, req.ScoringDisposition); err != nil {
 					return result, fmt.Errorf("persist strict acceptance rejection: %w", err)
 				}
 				appendUnique(&result.FailedMiners, outcome.miner.ID())
@@ -491,22 +813,26 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 				continue
 			}
 			if err := s.Router.Activate(ctx, outcome.ticket, outcome.result.Receipt, outcome.miner.PublicKey(), s.SigningKey); err != nil {
-				s.deactivateTicket(outcome.miner, outcome.ticket)
-				s.failReservation(state, outcome.miner.ID())
-				return result, fmt.Errorf("activate authenticated edge route: %w", err)
+				cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
+				return result, errors.Join(fmt.Errorf("activate authenticated edge route: %w", err), cleanupErr)
 			}
 			if result.FirstReplicaAt.IsZero() {
 				probe = s.Validator.Probe(ctx, routeHost, req.Workload.ChallengePath, req.Workload.ChallengeValue)
 				if err := ctx.Err(); err != nil {
 					probe.ResponseComplete = false
 					probe.Error = err.Error()
-					return result, errors.Join(s.rejectInconclusiveAcceptance(state, outcome, probe), err)
+					return result, errors.Join(s.rejectInconclusiveAcceptance(ctx, state, outcome, probe), err)
 				}
 				if !probe.Correct {
 					if !attributableAcceptanceFailure(probe) {
-						return result, s.rejectInconclusiveAcceptance(state, outcome, probe)
+						lastInconclusive = errors.Join(lastInconclusive, s.rejectInconclusiveAcceptance(ctx, state, outcome, probe))
+						appendUnique(&result.FailedMiners, outcome.miner.ID())
+						if err := launchNext(); err != nil {
+							return result, err
+						}
+						continue
 					}
-					if err := s.rejectAcceptance(state, routeHost, outcome, req.ScoringDisposition); err != nil {
+					if err := s.rejectAcceptance(ctx, state, routeHost, outcome, req.ScoringDisposition); err != nil {
 						return result, fmt.Errorf("persist public acceptance rejection: %w", err)
 					}
 					appendUnique(&result.FailedMiners, outcome.miner.ID())
@@ -520,23 +846,31 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 				}
 			}
 			if reservation == nil {
-				s.deactivateTicket(outcome.miner, outcome.ticket)
-				s.failReservation(state, outcome.miner.ID())
-				return result, fmt.Errorf("assignment %q lost its scheduler publication reservation", outcome.ticket.AssignmentNonce)
+				cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
+				return result, errors.Join(fmt.Errorf("assignment %q lost its scheduler publication reservation", outcome.ticket.AssignmentNonce), cleanupErr)
 			}
 			assignment := activeAssignment{
 				miner: outcome.miner, replicaID: outcome.result.Receipt.ReplicaID, endpointID: expectedEndpointID(outcome.ticket),
 				ticket: outcome.ticket, receipt: outcome.result.Receipt,
 				publicationID: reservation.publicationID, publicationVersion: reservation.publicationVersion,
 			}
-			if !s.acceptReservation(state, outcome.miner.ID(), assignment) {
-				s.deactivateTicket(outcome.miner, outcome.ticket)
-				return result, fmt.Errorf("deployment %q was deactivated during assignment", req.DeploymentID)
-			}
+			// Persist the endpoint while it is still an unpublished reservation.
+			// If teardown starts during this write, acceptReservation observes the
+			// deactivation fence and transfers the now-durable exact ticket into
+			// cleanup ownership. Publishing active first would let teardown finish
+			// before this write and then recreate an orphaned active row.
 			if store := s.Ledger.Durable(); store != nil {
 				if err := store.PutEndpoint(ctx, durable.Endpoint{EndpointID: assignment.endpointID, DeploymentID: req.DeploymentID, MinerHotkey: outcome.miner.ID(), Active: true}); err != nil {
-					return result, err
+					cleanupErr := s.cleanupReservation(ctx, state, outcome, false)
+					return result, errors.Join(err, cleanupErr)
 				}
+			}
+			if disposition := s.acceptReservation(state, outcome.miner.ID(), assignment); disposition != reservationAccepted {
+				cleanupErr := s.cleanupUnaccepted(ctx, state, outcome)
+				return result, errors.Join(
+					fmt.Errorf("deployment %q rejected assignment reservation (disposition %d)", req.DeploymentID, disposition),
+					cleanupErr,
+				)
 			}
 			result.ReadyMiners = append(result.ReadyMiners, outcome.miner.ID())
 			result.AcceptedTickets = append(result.AcceptedTickets, AcceptedTicket{
@@ -623,7 +957,7 @@ func (s *Scheduler) beginDeployment(req DeployRequest, routeHost string, firstGe
 	state := &deploymentState{
 		request: req, routeHost: routeHost, active: make(map[string]activeAssignment),
 		reserved: make(map[string]*candidateReservation), excluded: make(map[string]struct{}),
-		pendingCleanup: make(map[string]activeAssignment), generation: firstGeneration, deploying: true,
+		pendingCleanup: make(map[string]*cleanupLease), generation: firstGeneration, deploying: true,
 	}
 	s.states[req.DeploymentID] = state
 	s.bumpProbeTopologyLocked()
@@ -631,6 +965,10 @@ func (s *Scheduler) beginDeployment(req DeployRequest, routeHost string, firstGe
 }
 
 func (s *Scheduler) reserveInitialCandidate(state *deploymentState) (*candidateReservation, int) {
+	return s.reserveInitialCandidateSkipping(state, nil)
+}
+
+func (s *Scheduler) reserveInitialCandidateSkipping(state *deploymentState, skip map[string]struct{}) (*candidateReservation, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.states[state.request.DeploymentID] != state || state.deactivationRequested {
@@ -640,8 +978,9 @@ func (s *Scheduler) reserveInitialCandidate(state *deploymentState) (*candidateR
 		_, active := state.active[required]
 		_, reserved := state.reserved[required]
 		_, excluded := state.excluded[required]
+		_, skipped := skip[required]
 		if !active && !reserved {
-			if excluded {
+			if excluded || skipped {
 				return nil, len(state.active) + len(state.reserved)
 			}
 			for _, candidate := range s.Miners {
@@ -654,10 +993,18 @@ func (s *Scheduler) reserveInitialCandidate(state *deploymentState) (*candidateR
 			return nil, len(state.active) + len(state.reserved)
 		}
 	}
-	for _, candidate := range s.Miners {
+	for offset := 0; offset < len(s.Miners); offset++ {
+		index := (s.candidateCursor + offset) % len(s.Miners)
+		candidate := s.Miners[index]
+		if candidate != nil {
+			if _, skipped := skip[candidate.ID()]; skipped {
+				continue
+			}
+		}
 		if s.candidateCleanLocked(state, candidate) {
 			reservation := s.captureReservationLocked(candidate)
 			state.reserved[candidate.ID()] = reservation
+			s.candidateCursor = (index + 1) % len(s.Miners)
 			return reservation, len(state.active) + len(state.reserved)
 		}
 	}
@@ -665,6 +1012,10 @@ func (s *Scheduler) reserveInitialCandidate(state *deploymentState) (*candidateR
 }
 
 func (s *Scheduler) reserveReplacementCandidate(state *deploymentState) (*candidateReservation, uint64, int, bool) {
+	return s.reserveReplacementCandidateSkipping(state, nil)
+}
+
+func (s *Scheduler) reserveReplacementCandidateSkipping(state *deploymentState, skip map[string]struct{}) (*candidateReservation, uint64, int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.states[state.request.DeploymentID] != state || state.deactivationRequested {
@@ -677,11 +1028,19 @@ func (s *Scheduler) reserveReplacementCandidate(state *deploymentState) (*candid
 	if state.generation == ^uint64(0) {
 		return nil, 0, current, true
 	}
-	for _, candidate := range s.Miners {
+	for offset := 0; offset < len(s.Miners); offset++ {
+		index := (s.candidateCursor + offset) % len(s.Miners)
+		candidate := s.Miners[index]
+		if candidate != nil {
+			if _, skipped := skip[candidate.ID()]; skipped {
+				continue
+			}
+		}
 		if s.candidateCleanLocked(state, candidate) {
 			reservation := s.captureReservationLocked(candidate)
 			state.reserved[candidate.ID()] = reservation
 			state.generation++
+			s.candidateCursor = (index + 1) % len(s.Miners)
 			return reservation, state.generation, len(state.active) + len(state.reserved), true
 		}
 	}
@@ -713,6 +1072,7 @@ func (s *Scheduler) releaseReservation(state *deploymentState, minerID string) {
 	s.mu.Lock()
 	if s.states[state.request.DeploymentID] == state {
 		delete(state.reserved, minerID)
+		s.maybeDeleteDeactivatedStateLocked(state)
 	}
 	s.mu.Unlock()
 }
@@ -722,40 +1082,74 @@ func (s *Scheduler) failReservation(state *deploymentState, minerID string) {
 	if s.states[state.request.DeploymentID] == state {
 		delete(state.reserved, minerID)
 		state.excluded[minerID] = struct{}{}
+		s.maybeDeleteDeactivatedStateLocked(state)
 	}
 	s.mu.Unlock()
 }
 
-func (s *Scheduler) retainPendingCleanup(state *deploymentState, outcome assignmentResult) {
+func (s *Scheduler) cleanupUnaccepted(ctx context.Context, state *deploymentState, outcome assignmentResult) error {
+	if !s.retainAndClaimCleanupLease(state, outcome.miner, outcome.ticket, false, false, false) {
+		return errors.New("exact assignment cleanup ownership was lost")
+	}
+	err := s.cleanupTicket(ctx, outcome.miner, outcome.ticket)
+	s.finishCleanupLease(state, outcome.miner.ID(), expectedEndpointID(outcome.ticket), err)
+	return err
+}
+
+// cleanupReservation resolves a launched ticket before its reservation is
+// released or failed. A cleanup error transfers the exact ticket into the
+// scheduler's quarantine instead of discarding ownership. Successful cleanup
+// makes an evidence-neutral candidate reusable; attributable/invalid failures
+// remain excluded when exclude is true.
+func (s *Scheduler) cleanupReservation(ctx context.Context, state *deploymentState, outcome assignmentResult, exclude bool) error {
+	endpointID := expectedEndpointID(outcome.ticket)
+	if !s.retainAndClaimCleanupLease(state, outcome.miner, outcome.ticket, false, false, exclude) {
+		return errors.New("exact assignment cleanup ownership was lost")
+	}
+	err := s.cleanupTicket(ctx, outcome.miner, outcome.ticket)
+	s.finishCleanupLease(state, outcome.miner.ID(), endpointID, err)
+	return err
+}
+
+func (s *Scheduler) acceptReservation(state *deploymentState, minerID string, assignment activeAssignment) reservationDisposition {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.states[state.request.DeploymentID] != state {
-		return
+		return reservationDeploymentStale
 	}
-	minerID := outcome.miner.ID()
-	delete(state.reserved, minerID)
-	state.excluded[minerID] = struct{}{}
-	state.pendingCleanup[minerID] = activeAssignment{
-		miner: outcome.miner, replicaID: protocol.ReplicaID(outcome.ticket), endpointID: expectedEndpointID(outcome.ticket), ticket: outcome.ticket,
-	}
-}
-
-func (s *Scheduler) acceptReservation(state *deploymentState, minerID string, assignment activeAssignment) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	reservation := state.reserved[minerID]
-	if s.states[state.request.DeploymentID] != state || state.deactivationRequested || reservation == nil || !s.Ledger.Eligible(minerID) ||
-		assignment.publicationID != reservation.publicationID || assignment.publicationVersion != reservation.publicationVersion {
-		return false
+	if reservation == nil {
+		state.excluded[minerID] = struct{}{}
+		state.pendingCleanup[minerID] = &cleanupLease{assignment: assignment}
+		return reservationMismatch
 	}
+	// A matching reservation is consumed exactly once even when a late
+	// eligibility/publication race prevents activation. Capacity debt therefore
+	// stays visible instead of being hidden by an immortal reservation.
 	delete(state.reserved, minerID)
+	quarantine := func() {
+		state.excluded[minerID] = struct{}{}
+		state.pendingCleanup[minerID] = &cleanupLease{assignment: assignment}
+	}
+	if state.deactivationRequested {
+		quarantine()
+		return reservationDeploymentStale
+	}
+	if !s.Ledger.Eligible(minerID) {
+		quarantine()
+		return reservationCandidateIneligible
+	}
+	if assignment.publicationID != reservation.publicationID || assignment.publicationVersion != reservation.publicationVersion {
+		quarantine()
+		return reservationPublicationChanged
+	}
 	state.active[minerID] = assignment
 	s.bumpProbeTopologyLocked()
-	return true
+	return reservationAccepted
 }
 
-func (s *Scheduler) rejectAcceptance(state *deploymentState, routeHost string, outcome assignmentResult, disposition ScoringDisposition) error {
-	cleanupErr := s.deactivateTicket(outcome.miner, outcome.ticket)
+func (s *Scheduler) rejectAcceptance(ctx context.Context, state *deploymentState, routeHost string, outcome assignmentResult, disposition ScoringDisposition) error {
+	cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
 	// Only a complete response carrying the edge's upstream marker reaches this
 	// function. The candidate therefore controlled the wrong response and can
 	// be economically penalized without attributing an edge/network failure to
@@ -764,7 +1158,6 @@ func (s *Scheduler) rejectAcceptance(state *deploymentState, routeHost string, o
 	if disposition != ScoringEvidenceOnly {
 		trustErr = s.Ledger.SetTrust(outcome.miner.ID(), 0)
 	}
-	s.failReservation(state, outcome.miner.ID())
 	return errors.Join(cleanupErr, trustErr)
 }
 
@@ -772,19 +1165,12 @@ func attributableAcceptanceFailure(probe validator.ProbeResult) bool {
 	return probe.ServedByReplica && probe.ResponseComplete
 }
 
-func (s *Scheduler) rejectInconclusiveAcceptance(state *deploymentState, outcome assignmentResult, probe validator.ProbeResult) error {
-	cleanupErr := s.deactivateTicket(outcome.miner, outcome.ticket)
-	if cleanupErr != nil {
-		// Keep uncertain runtime/route ownership quarantined inside this
-		// deployment. Releasing the reservation here would let a half-open retry
-		// assign a second incarnation to the same miner while cleanup of the first
-		// one is still unresolved. This is evidence-neutral (trust is unchanged),
-		// but deliberately removes the candidate from this deployment's pool until
-		// the exact cleanup is retried successfully or the deployment is cleaned.
-		s.retainPendingCleanup(state, outcome)
-	} else {
-		s.releaseReservation(state, outcome.miner.ID())
-	}
+func (s *Scheduler) rejectInconclusiveAcceptance(ctx context.Context, state *deploymentState, outcome assignmentResult, probe validator.ProbeResult) error {
+	// Transfer the reservation to an exact, exclusively claimed cleanup lease
+	// before any external cleanup begins. A successful evidence-neutral cleanup
+	// releases the candidate; failure leaves the same incarnation quarantined
+	// for a later bounded retry without changing economic trust.
+	cleanupErr := s.cleanupReservation(ctx, state, outcome, false)
 	detail := probe.Error
 	if detail == "" {
 		detail = "no complete replica response"
@@ -905,12 +1291,13 @@ func expectedEndpointID(ticket protocol.Ticket) string {
 	return protocol.EndpointID(ticket)
 }
 
-func (s *Scheduler) deactivateTicket(candidate miner.Assigner, ticket protocol.Ticket) error {
+func (s *Scheduler) deactivateTicket(ctx context.Context, candidate miner.Assigner, ticket protocol.Ticket) error {
+	if ctx == nil {
+		return errors.New("assignment cleanup context is required")
+	}
 	var routeErr error
 	if s.Router != nil && len(s.SigningKey) == ed25519.PrivateKeySize {
-		routeCtx, routeCancel := context.WithTimeout(context.Background(), assignmentCleanupTime)
-		routeErr = s.Router.Deactivate(routeCtx, ticket, s.SigningKey)
-		routeCancel()
+		routeErr = s.Router.Deactivate(ctx, ticket, s.SigningKey)
 		if routeErr != nil {
 			routeErr = fmt.Errorf("deactivate edge route: %w", routeErr)
 		}
@@ -918,31 +1305,52 @@ func (s *Scheduler) deactivateTicket(candidate miner.Assigner, ticket protocol.T
 	if known, ok := candidate.(interface {
 		DeactivateKnown(context.Context, string, string) error
 	}); ok {
-		ctx, cancel := context.WithTimeout(context.Background(), assignmentCleanupTime)
-		defer cancel()
 		if err := known.DeactivateKnown(ctx, expectedEndpointID(ticket), ticket.DeploymentID); err != nil {
 			return errors.Join(routeErr, err)
 		}
 		if store := s.Ledger.Durable(); store != nil {
-			return errors.Join(routeErr, store.DeactivateEndpoint(context.Background(), expectedEndpointID(ticket)))
+			return errors.Join(routeErr, store.DeactivateEndpoint(ctx, expectedEndpointID(ticket)))
 		}
 		return routeErr
 	}
-	return errors.Join(routeErr, s.deactivate(candidate, expectedEndpointID(ticket)))
+	return errors.Join(routeErr, s.deactivate(ctx, candidate, expectedEndpointID(ticket)))
 }
 
-func (s *Scheduler) deactivate(candidate miner.Assigner, endpointID string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), assignmentCleanupTime)
-	defer cancel()
+func (s *Scheduler) deactivate(ctx context.Context, candidate miner.Assigner, endpointID string) error {
+	if ctx == nil {
+		return errors.New("endpoint cleanup context is required")
+	}
 	if err := candidate.Deactivate(ctx, endpointID); err != nil {
 		return err
 	}
 	if store := s.Ledger.Durable(); store != nil {
-		if err := store.DeactivateEndpoint(context.Background(), endpointID); err != nil {
+		if err := store.DeactivateEndpoint(ctx, endpointID); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func cleanupBudget(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		// Cleanup ownership survives request cancellation, but remains bounded by
+		// one shared deadline across route, miner, and durable state.
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, assignmentCleanupTime)
+}
+
+func (s *Scheduler) cleanupTicket(parent context.Context, candidate miner.Assigner, ticket protocol.Ticket) error {
+	ctx, cancel := cleanupBudget(parent)
+	defer cancel()
+	return s.deactivateTicket(ctx, candidate, ticket)
+}
+
+func (s *Scheduler) cleanupEndpoint(parent context.Context, candidate miner.Assigner, endpointID string) error {
+	ctx, cancel := cleanupBudget(parent)
+	defer cancel()
+	return s.deactivate(ctx, candidate, endpointID)
 }
 
 func (s *Scheduler) monitor() *policy.Monitor {
@@ -955,16 +1363,29 @@ func (s *Scheduler) monitor() *policy.Monitor {
 	return health
 }
 
-// ObserveHealth applies post-acceptance serving/economic policy. endpointID
-// must identify the exact incarnation so counters never cross generations.
+// ObserveHealth applies post-acceptance serving/economic policy for legacy Go
+// callers. Deprecated: new integrations should submit the versioned v3 health
+// contract through HandleHealth. The exact route ticket is verified before
+// any policy mutation, and this compatibility seam shares the same replay
+// fence as v3 so it cannot regress v3 freshness state.
 func (s *Scheduler) ObserveHealth(routeHost, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time) (policy.Action, error) {
-	action := s.monitor().Observe(endpointID, vantage, reachable, correct, fraudulent, at)
+	if !s.beginLifecycleWorker() {
+		return policy.Action{}, errors.New("scheduler is draining")
+	}
+	defer s.endLifecycleWorker()
+	ticket, exists := s.Router.TicketFor(routeHost, replicaID, endpointID, minerID)
+	if !exists {
+		return policy.Action{}, errors.New("health observation does not identify an exact active route incarnation")
+	}
+	action, applied := s.monitor().ObserveExternalIfNewer(endpointID, vantage, reachable, correct, fraudulent, at)
+	if !applied {
+		return policy.Action{}, errHealthObservationStale
+	}
 	if action.RemoveFromRouting {
-		ticket, exists := s.Router.TicketFor(routeHost, replicaID, endpointID, minerID)
-		if !exists {
-			return action, errors.New("health observation does not identify an exact active route incarnation")
-		}
-		if err := s.Router.Deactivate(context.Background(), ticket, s.SigningKey); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), assignmentCleanupTime)
+		err := s.Router.Deactivate(cleanupCtx, ticket, s.SigningKey)
+		cancel()
+		if err != nil {
 			return action, fmt.Errorf("deactivate unhealthy edge route: %w", err)
 		}
 	}
@@ -976,34 +1397,123 @@ func (s *Scheduler) ObserveHealth(routeHost, replicaID, endpointID, minerID, van
 	return action, nil
 }
 
-// HandleHealth applies an external post-acceptance observation. External
-// reports identify the currently active stable replica; the in-process prober
-// uses handleEndpointHealth below to bind an observation to one exact endpoint
-// incarnation.
-func (s *Scheduler) HandleHealth(ctx context.Context, deploymentID, replicaID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time) (policy.Action, error) {
-	action, _, err := s.handleHealth(ctx, deploymentID, replicaID, "", minerID, vantage, reachable, correct, fraudulent, at, false, nil)
+// HandleHealth applies an authenticated external post-acceptance observation.
+// EndpointID is mandatory because ReplicaID is stable across replacement
+// generations. The private runtime transport authenticates the caller before
+// this method, and this method repeats the exact current-incarnation check
+// immediately before mutating health state.
+func (s *Scheduler) HandleHealth(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time) (policy.Action, error) {
+	return s.HandleHealthWithCommit(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, nil)
+}
+
+// HandleHealthWithCommit is the durable external-observation boundary. commit
+// runs under exact-incarnation and replay/order serialization immediately
+// before policy state changes. If it fails, no health evidence is consumed and
+// the identical authenticated report remains retryable. The callback must be
+// bounded and must not call back into this Scheduler or its Health monitor;
+// doing so would re-enter the serialization locks. The production caller uses
+// it only for the independent durable observation insert.
+func (s *Scheduler) HandleHealthWithCommit(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time, commit func() error) (policy.Action, error) {
+	if endpointID == "" {
+		return policy.Action{}, errors.New("external health observation requires an exact endpoint incarnation")
+	}
+	action, applied, _, err := s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, false, nil, nil, commit)
+	if applied && err != nil {
+		err = &committedHealthActionError{cause: err}
+	}
 	return action, err
 }
 
 // handleEndpointHealth applies an internal observation only if endpointID is
 // still the exact active generation/nonce incarnation that was probed.
 func (s *Scheduler) handleEndpointHealth(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time) (policy.Action, error) {
-	action, _, err := s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, true, nil)
+	action, _, _, err := s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, true, nil, nil, nil)
 	return action, err
 }
 
-func (s *Scheduler) handleEndpointHealthVersioned(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time, expectedHealthVersion uint64) (policy.Action, bool, error) {
-	return s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, true, &expectedHealthVersion)
+func (s *Scheduler) handleEndpointHealthVersioned(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time, expectedHealthVersion, expectedCircuitVersion uint64) (policy.Action, bool, bool, error) {
+	return s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, true, &expectedHealthVersion, &expectedCircuitVersion, nil)
+}
+
+// suppressEndpointAvailabilityIfVersion opens only the process-local serving
+// circuit when unreachable evidence is not yet safe to apply economically or
+// durably. Its route-local CAS is independent of economic-health history: an
+// external report cannot mask this validator's newer targeted result, while a
+// newer local circuit decision still fences an older in-flight probe.
+func (s *Scheduler) suppressEndpointAvailabilityIfVersion(ctx context.Context, deploymentID, replicaID, endpointID, minerID string, expectedCircuitVersion uint64) (bool, bool, error) {
+	return s.setEndpointAvailabilityIfCircuitVersion(ctx, deploymentID, replicaID, endpointID, minerID, false, expectedCircuitVersion)
+}
+
+// setEndpointAvailabilityIfCircuitVersion changes only process-local serving
+// availability for the exact active endpoint incarnation. It adds no health
+// evidence and has no economic effect.
+func (s *Scheduler) setEndpointAvailabilityIfCircuitVersion(ctx context.Context, deploymentID, replicaID, endpointID, minerID string, available bool, expectedCircuitVersion uint64) (bool, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, false, err
+	}
+	if !s.beginLifecycleWorker() {
+		return false, false, errors.New("scheduler is draining")
+	}
+	defer s.endLifecycleWorker()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.states[deploymentID]
+	if state == nil {
+		return false, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrUnknownDeployment)
+	}
+	if state.deactivationRequested {
+		return false, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrDeploymentDeactivating)
+	}
+	assignment := state.active[minerID]
+	if assignment.miner == nil || assignment.replicaID != replicaID || assignment.endpointID != endpointID {
+		return false, false, fmt.Errorf("replica %q of miner %q: %w", replicaID, minerID, ErrReplicaNotActive)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, false, err
+	}
+	if s.circuitVersionLocked(endpointID) != expectedCircuitVersion || expectedCircuitVersion == ^uint64(0) {
+		return false, false, errHealthObservationChanged
+	}
+	matched, changed := s.Router.SetTemporaryAvailability(
+		state.routeHost, replicaID, endpointID, minerID, available, s.SigningKey,
+	)
+	if !matched {
+		return false, true, fmt.Errorf("replica %q of miner %q serving circuit: %w", replicaID, minerID, ErrReplicaNotActive)
+	}
+	s.advanceCircuitVersionLocked(endpointID)
+	return changed, true, nil
+}
+
+func (s *Scheduler) circuitVersionLocked(endpointID string) uint64 {
+	if s.circuitVersions == nil {
+		return 0
+	}
+	return s.circuitVersions[endpointID]
+}
+
+func (s *Scheduler) advanceCircuitVersionLocked(endpointID string) bool {
+	if s.circuitVersions == nil {
+		s.circuitVersions = make(map[string]uint64)
+	}
+	if s.circuitVersions[endpointID] == ^uint64(0) {
+		return false
+	}
+	s.circuitVersions[endpointID]++
+	return true
 }
 
 // handleHealth applies post-acceptance policy and synchronously restores the
 // requested replica count. Validation, monitor observation, and ownership of a
 // removal are claimed under one scheduler lock, so teardown/redeploy cannot
 // turn an already in-flight result into an action on a newer incarnation.
-func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time, suppressInternalLivenessTrust bool, expectedHealthVersion *uint64) (policy.Action, bool, error) {
+func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time, suppressInternalLivenessTrust bool, expectedHealthVersion, expectedCircuitVersion *uint64, externalCommit func() error) (policy.Action, bool, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return policy.Action{}, false, err
+		return policy.Action{}, false, false, err
 	}
+	if !s.beginLifecycleWorker() {
+		return policy.Action{}, false, false, errors.New("scheduler is draining")
+	}
+	defer s.endLifecycleWorker()
 	health := s.monitor()
 	s.mu.Lock()
 	state := s.states[deploymentID]
@@ -1014,33 +1524,96 @@ func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, e
 	}
 	if state == nil {
 		s.mu.Unlock()
-		return policy.Action{}, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrUnknownDeployment)
+		return policy.Action{}, false, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrUnknownDeployment)
 	}
 	if deactivating {
 		s.mu.Unlock()
-		return policy.Action{}, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrDeploymentDeactivating)
+		return policy.Action{}, false, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrDeploymentDeactivating)
 	}
-	if removed.miner == nil || removed.replicaID != replicaID || (endpointID != "" && removed.endpointID != endpointID) {
+	if removed.miner == nil || removed.replicaID != replicaID || removed.endpointID != endpointID {
 		s.mu.Unlock()
-		return policy.Action{}, false, fmt.Errorf("replica %q of miner %q: %w", replicaID, minerID, ErrReplicaNotActive)
+		return policy.Action{}, false, false, fmt.Errorf("replica %q of miner %q: %w", replicaID, minerID, ErrReplicaNotActive)
 	}
 	if err := ctx.Err(); err != nil {
 		s.mu.Unlock()
-		return policy.Action{}, false, err
+		return policy.Action{}, false, false, err
+	}
+	definitiveFault := fraudulent || (reachable && !correct)
+	currentCircuitVersion := s.circuitVersionLocked(endpointID)
+	if suppressInternalLivenessTrust && currentCircuitVersion == ^uint64(0) && !definitiveFault {
+		s.mu.Unlock()
+		return policy.Action{}, false, false, errHealthObservationChanged
+	}
+	if expectedCircuitVersion != nil && currentCircuitVersion != *expectedCircuitVersion && !definitiveFault {
+		s.mu.Unlock()
+		return policy.Action{}, false, false, errHealthObservationChanged
 	}
 	var action policy.Action
 	if expectedHealthVersion == nil {
 		if suppressInternalLivenessTrust {
 			action = health.ObserveInternal(removed.endpointID, vantage, reachable, correct, fraudulent, at)
 		} else {
-			action = health.Observe(removed.endpointID, vantage, reachable, correct, fraudulent, at)
+			var applied bool
+			var commitErr error
+			action, applied, commitErr = health.ObserveExternalIfNewerWithCommit(removed.endpointID, vantage, reachable, correct, fraudulent, at, externalCommit)
+			if commitErr != nil {
+				s.mu.Unlock()
+				return policy.Action{}, false, false, commitErr
+			}
+			if !applied {
+				s.mu.Unlock()
+				return policy.Action{}, false, false, errHealthObservationStale
+			}
 		}
 	} else {
 		var applied bool
 		action, applied = health.ObserveIfVersion(removed.endpointID, vantage, reachable, correct, fraudulent, at, *expectedHealthVersion)
 		if !applied {
+			// External evidence can advance economic-health history while this
+			// validator's targeted request is in flight. That must not make a
+			// locally broken route remain available (or a recovered route remain
+			// suppressed). Commit only the exact circuit result under its
+			// independent CAS, without adding policy evidence or corroboration.
+			routingChanged := false
+			var routingErr error
+			if suppressInternalLivenessTrust && expectedCircuitVersion != nil && *expectedCircuitVersion != ^uint64(0) && s.circuitVersionLocked(endpointID) == *expectedCircuitVersion {
+				available := reachable && correct && !fraudulent
+				matched, changed := s.Router.SetTemporaryAvailability(
+					state.routeHost, removed.replicaID, removed.endpointID, minerID, available, s.SigningKey,
+				)
+				routingChanged = changed
+				if !matched {
+					routingErr = fmt.Errorf("replica %q of miner %q serving circuit: %w", replicaID, minerID, ErrReplicaNotActive)
+				} else {
+					s.advanceCircuitVersionLocked(endpointID)
+				}
+			}
 			s.mu.Unlock()
-			return policy.Action{}, false, errHealthObservationChanged
+			return policy.Action{}, false, routingChanged, errors.Join(errHealthObservationChanged, routingErr)
+		}
+	}
+	// Commit serving availability only after the exact endpoint and expected
+	// monitor version have both matched, while Scheduler.mu still prevents a
+	// concurrent removal/replacement. This makes the final ordering fail-closed:
+	// a stale successful probe cannot re-enable a route removed by newer fault
+	// evidence, and every non-correct response is suppressed before durable
+	// teardown is attempted.
+	routingChanged := false
+	var routingErr error
+	// Only the in-process targeted prober owns temporary circuit restoration.
+	// An externally authenticated healthy report cannot prove that this
+	// validator's edge path recovered. External evidence may still force the
+	// circuit closed when policy commits a durable removal.
+	if suppressInternalLivenessTrust || action.RemoveFromRouting {
+		available := suppressInternalLivenessTrust && reachable && correct && !fraudulent && !action.RemoveFromRouting
+		matched, changed := s.Router.SetTemporaryAvailability(
+			state.routeHost, removed.replicaID, removed.endpointID, minerID, available, s.SigningKey,
+		)
+		routingChanged = changed
+		if !matched {
+			routingErr = fmt.Errorf("replica %q of miner %q serving circuit: %w", replicaID, minerID, ErrReplicaNotActive)
+		} else {
+			s.advanceCircuitVersionLocked(endpointID)
 		}
 	}
 	if action.TrustZero && (state.request.ScoringDisposition == ScoringEvidenceOnly || (suppressInternalLivenessTrust && !reachable)) {
@@ -1048,7 +1621,14 @@ func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, e
 	}
 	if action.RemoveFromRouting {
 		delete(state.active, minerID)
+		s.retireProbeStateLocked(removed.endpointID)
 		state.excluded[minerID] = struct{}{}
+		// Transfer exact ownership before releasing the scheduler lock. A
+		// concurrent deployment teardown must see this lease and cannot delete the
+		// state while route/miner/durable cleanup is in flight.
+		state.pendingCleanup[minerID] = &cleanupLease{
+			assignment: removed, preserveExclusion: true, cleaning: true,
+		}
 		s.bumpProbeTopologyLocked()
 	}
 	s.mu.Unlock()
@@ -1064,17 +1644,19 @@ func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, e
 		// deficit visible in desired-active-reserved capacity. Each later correct
 		// observation proves the shared path works and repairs at most one deficit.
 		if reachable && correct && !fraudulent {
-			return action, true, errors.Join(trustErr, s.repairOneDeficit(ctx))
+			return action, true, routingChanged, errors.Join(routingErr, trustErr, s.repairOneDeficitOwned(ctx))
 		}
-		return action, true, trustErr
+		return action, true, routingChanged, errors.Join(routingErr, trustErr)
 	}
-	routeErr := s.Router.Deactivate(context.Background(), removed.ticket, s.SigningKey)
-	cleanupErr := s.deactivate(removed.miner, removed.endpointID)
+	cleanupCtx, cancelCleanup := cleanupBudget(ctx)
+	routeErr := s.Router.Deactivate(cleanupCtx, removed.ticket, s.SigningKey)
+	cleanupErr := s.deactivate(cleanupCtx, removed.miner, removed.endpointID)
+	cancelCleanup()
+	s.finishCleanupLease(state, minerID, removed.endpointID, errors.Join(routeErr, cleanupErr))
 	// Only the removal owner reaches this line, and a replacement always
 	// observes under a new generation/nonce endpoint key, so the removed
 	// incarnation's monitor state can be released instead of accumulating
 	// forever in a long-running control plane.
-	s.monitor().Forget(removed.endpointID)
 	if cleanupErr != nil {
 		cleanupErr = fmt.Errorf("deactivate removed endpoint %q: %w", removed.endpointID, cleanupErr)
 	}
@@ -1085,12 +1667,14 @@ func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, e
 	if action.AssignReplacement {
 		replacementErr = s.assignReplacement(ctx, state)
 	}
-	return action, true, errors.Join(trustErr, routeErr, cleanupErr, replacementErr)
+	return action, true, routingChanged, errors.Join(routingErr, trustErr, routeErr, cleanupErr, replacementErr)
 }
 
 func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentState) error {
-	cleanupErr := s.retryPendingCleanup(ctx, state)
-	return errors.Join(cleanupErr, s.assignReplacementAfterCleanup(ctx, state))
+	repairCtx, cancel := s.replacementLifecycleContext(ctx, state)
+	defer cancel()
+	cleanupErr := s.retryPendingCleanup(repairCtx, state)
+	return errors.Join(cleanupErr, s.assignReplacementAfterCleanup(repairCtx, state))
 }
 
 // retryPendingCleanup resolves exact inconclusive-assignment ownership before
@@ -1101,49 +1685,65 @@ func (s *Scheduler) retryPendingCleanup(ctx context.Context, state *deploymentSt
 		return err
 	}
 	s.mu.Lock()
+	if s.states[state.request.DeploymentID] != state || state.deactivationRequested {
+		s.mu.Unlock()
+		return nil
+	}
 	minerIDs := make([]string, 0, len(state.pendingCleanup))
-	for minerID := range state.pendingCleanup {
-		minerIDs = append(minerIDs, minerID)
+	for minerID, lease := range state.pendingCleanup {
+		if !lease.assignmentPending && !lease.cleaning {
+			minerIDs = append(minerIDs, minerID)
+		}
 	}
 	sort.Strings(minerIDs)
-	assignments := make([]activeAssignment, 0, len(minerIDs))
-	for _, minerID := range minerIDs {
-		assignments = append(assignments, state.pendingCleanup[minerID])
+	minerID := nextSortedID(minerIDs, state.cleanupCursor)
+	var assignment activeAssignment
+	if minerID != "" {
+		state.cleanupCursor = minerID
+		lease := state.pendingCleanup[minerID]
+		lease.cleaning = true
+		lease.requiresRetry = false
+		assignment = lease.assignment
 	}
 	s.mu.Unlock()
-
-	var cleanupErrors []error
-	for _, assignment := range assignments {
-		if err := ctx.Err(); err != nil {
-			cleanupErrors = append(cleanupErrors, err)
-			break
-		}
-		if err := s.deactivateTicket(assignment.miner, assignment.ticket); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("retry cleanup for endpoint %q: %w", assignment.endpointID, err))
-			continue
-		}
-		s.mu.Lock()
-		if s.states[state.request.DeploymentID] == state {
-			if current, exists := state.pendingCleanup[assignment.miner.ID()]; exists && current.endpointID == assignment.endpointID {
-				delete(state.pendingCleanup, assignment.miner.ID())
-				delete(state.excluded, assignment.miner.ID())
-			}
-		}
-		s.mu.Unlock()
+	if minerID == "" {
+		return nil
 	}
-	return errors.Join(cleanupErrors...)
+	cleanupErr := s.cleanupTicket(ctx, assignment.miner, assignment.ticket)
+	s.finishCleanupLease(state, minerID, assignment.endpointID, cleanupErr)
+	if cleanupErr != nil {
+		return fmt.Errorf("retry cleanup for endpoint %q: %w", assignment.endpointID, cleanupErr)
+	}
+	return nil
+}
+
+func nextSortedID(ids []string, after string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	index := sort.SearchStrings(ids, after)
+	for index < len(ids) && ids[index] <= after {
+		index++
+	}
+	if index == len(ids) {
+		index = 0
+	}
+	return ids[index]
 }
 
 func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *deploymentState) error {
+	attemptedCandidates := make(map[string]struct{})
+	var lastInconclusive error
 	for {
-		reservation, generation, available, needed := s.reserveReplacementCandidate(state)
+		reservation, generation, available, needed := s.reserveReplacementCandidateSkipping(state, attemptedCandidates)
 		if !needed {
 			return nil
 		}
 		if reservation == nil {
-			return &CapacityError{DeploymentID: state.request.DeploymentID, Required: s.replicaCount(), Available: available}
+			return errors.Join(lastInconclusive, &CapacityError{DeploymentID: state.request.DeploymentID, Required: s.replicaCount(), Available: available})
 		}
 		candidate := reservation.candidate
+		attemptedCandidates[candidate.ID()] = struct{}{}
 		ticket, err := s.ticketForReservation(state.request, reservation, state.routeHost, generation, s.clock()())
 		if err != nil {
 			s.releaseReservation(state, candidate.ID())
@@ -1153,15 +1753,18 @@ func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *de
 			s.releaseReservation(state, candidate.ID())
 			return err
 		}
-		attempt := newAssignmentAttempt(s, ctx, 1)
-		attempt.launch(candidate, ticket)
+		attempt := newAssignmentAttempt(s, state, ctx, 1)
+		if err := attempt.launch(candidate, ticket); err != nil {
+			s.releaseReservation(state, candidate.ID())
+			return err
+		}
 		var outcome assignmentResult
 		select {
 		case <-ctx.Done():
-			attempt.abort(state.routeHost)
-			s.releaseReservation(state, candidate.ID())
+			attempt.abort()
 			return fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), ctx.Err())
 		case outcome = <-attempt.results:
+			attempt.complete()
 		}
 		recordObservation := func(success bool) error {
 			if state.request.ScoringDisposition == ScoringEvidenceOnly {
@@ -1178,15 +1781,16 @@ func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *de
 			})
 		}
 		if ctx.Err() != nil {
-			s.deactivateTicket(candidate, ticket)
-			s.releaseReservation(state, candidate.ID())
-			return fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), ctx.Err())
+			cleanupErr := s.cleanupReservation(ctx, state, outcome, false)
+			return errors.Join(fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), ctx.Err()), cleanupErr)
 		}
 		if outcome.err != nil || !s.Ledger.Eligible(candidate.ID()) {
-			s.deactivateTicket(candidate, ticket)
-			s.failReservation(state, candidate.ID())
+			cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
 			if err := recordObservation(false); err != nil {
-				return fmt.Errorf("persist replacement observation: %w", err)
+				return errors.Join(fmt.Errorf("persist replacement observation: %w", err), cleanupErr)
+			}
+			if cleanupErr != nil {
+				return fmt.Errorf("cleanup failed replacement assignment: %w", cleanupErr)
 			}
 			if ctx.Err() != nil {
 				return fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), ctx.Err())
@@ -1194,8 +1798,7 @@ func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *de
 			continue
 		}
 		if verifyErr := s.verifyResultForDisposition(candidate, ticket, outcome.result, state.request.ScoringDisposition); verifyErr != nil {
-			cleanupErr := s.deactivateTicket(candidate, ticket)
-			s.failReservation(state, candidate.ID())
+			cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
 			observationErr := recordObservation(false)
 			var persistenceErr *trustPersistenceError
 			if errors.As(verifyErr, &persistenceErr) {
@@ -1214,29 +1817,31 @@ func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *de
 			continue
 		}
 		if err := s.Ledger.AddReceipt(outcome.result.Receipt); err != nil {
-			s.deactivateTicket(candidate, ticket)
-			s.failReservation(state, candidate.ID())
-			return fmt.Errorf("persist replacement receipt: %w", err)
+			cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
+			return errors.Join(fmt.Errorf("persist replacement receipt: %w", err), cleanupErr)
 		}
 		if err := s.Router.RegisterPending(ctx, ticket, outcome.result.Receipt, candidate.PublicKey(), s.SigningKey); err != nil {
-			s.deactivateTicket(candidate, ticket)
-			s.failReservation(state, candidate.ID())
-			return fmt.Errorf("register authenticated replacement edge route: %w", err)
+			cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
+			return errors.Join(fmt.Errorf("register authenticated replacement edge route: %w", err), cleanupErr)
 		}
 		probe := s.Validator.ProbeReplica(ctx, state.routeHost, outcome.result.Receipt.ReplicaID, state.request.Workload.ChallengePath, state.request.Workload.ChallengeValue)
 		if err := ctx.Err(); err != nil {
 			probe.ResponseComplete = false
 			probe.Error = err.Error()
 			return errors.Join(
-				s.rejectInconclusiveAcceptance(state, outcome, probe),
+				s.rejectInconclusiveAcceptance(ctx, state, outcome, probe),
 				fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), err),
 			)
 		}
 		if !probe.Correct {
 			if !attributableAcceptanceFailure(probe) {
-				return s.rejectInconclusiveAcceptance(state, outcome, probe)
+				lastInconclusive = errors.Join(lastInconclusive, s.rejectInconclusiveAcceptance(ctx, state, outcome, probe))
+				if ctx.Err() != nil {
+					return errors.Join(lastInconclusive, ctx.Err())
+				}
+				continue
 			}
-			if err := s.rejectAcceptance(state, state.routeHost, outcome, state.request.ScoringDisposition); err != nil {
+			if err := s.rejectAcceptance(ctx, state, state.routeHost, outcome, state.request.ScoringDisposition); err != nil {
 				return fmt.Errorf("persist replacement acceptance rejection: %w", err)
 			}
 			if err := recordObservation(false); err != nil {
@@ -1248,42 +1853,37 @@ func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *de
 			continue
 		}
 		if err := s.Router.Activate(ctx, ticket, outcome.result.Receipt, candidate.PublicKey(), s.SigningKey); err != nil {
-			s.deactivateTicket(candidate, ticket)
-			s.failReservation(state, candidate.ID())
-			return fmt.Errorf("activate authenticated replacement edge route: %w", err)
+			cleanupErr := s.cleanupReservation(ctx, state, outcome, true)
+			return errors.Join(fmt.Errorf("activate authenticated replacement edge route: %w", err), cleanupErr)
 		}
 		assignment := activeAssignment{
 			miner: candidate, replicaID: outcome.result.Receipt.ReplicaID, endpointID: expectedEndpointID(ticket),
 			ticket: ticket, receipt: outcome.result.Receipt,
 			publicationID: reservation.publicationID, publicationVersion: reservation.publicationVersion,
 		}
-		if !s.acceptReservation(state, candidate.ID(), assignment) {
-			s.deactivateTicket(candidate, ticket)
-			return fmt.Errorf("deployment %q was deactivated during replacement", state.request.DeploymentID)
-		}
 		if store := s.Ledger.Durable(); store != nil {
 			if err := store.PutEndpoint(ctx, durable.Endpoint{EndpointID: assignment.endpointID, DeploymentID: state.request.DeploymentID, MinerHotkey: candidate.ID(), Active: true}); err != nil {
-				s.mu.Lock()
-				if current, exists := state.active[candidate.ID()]; s.states[state.request.DeploymentID] == state && exists && current.endpointID == assignment.endpointID {
-					delete(state.active, candidate.ID())
-					state.excluded[candidate.ID()] = struct{}{}
-					s.bumpProbeTopologyLocked()
-				}
-				s.mu.Unlock()
-				s.deactivateTicket(candidate, ticket)
-				return err
+				cleanupErr := s.cleanupReservation(ctx, state, outcome, false)
+				return errors.Join(err, cleanupErr)
 			}
 		}
+		if disposition := s.acceptReservation(state, candidate.ID(), assignment); disposition != reservationAccepted {
+			cleanupErr := s.cleanupUnaccepted(ctx, state, outcome)
+			return errors.Join(
+				fmt.Errorf("deployment %q rejected replacement reservation (disposition %d)", state.request.DeploymentID, disposition),
+				cleanupErr,
+			)
+		}
 		if err := recordObservation(true); err != nil {
-			s.mu.Lock()
-			if current, exists := state.active[candidate.ID()]; s.states[state.request.DeploymentID] == state && exists && current.endpointID == assignment.endpointID {
-				delete(state.active, candidate.ID())
-				state.excluded[candidate.ID()] = struct{}{}
-				s.bumpProbeTopologyLocked()
+			if s.afterReplacementObservationFailure != nil {
+				s.afterReplacementObservationFailure()
 			}
-			s.mu.Unlock()
-			s.deactivateTicket(candidate, ticket)
-			return fmt.Errorf("persist replacement observation: %w", err)
+			// cleanupUnaccepted atomically transfers this exact active endpoint to
+			// a claimed cleanup lease before doing I/O. Deleting active ownership
+			// first would let concurrent deployment teardown observe neither owner
+			// and leave the activated route/runtime orphaned.
+			cleanupErr := s.cleanupUnaccepted(ctx, state, outcome)
+			return errors.Join(fmt.Errorf("persist replacement observation: %w", err), cleanupErr)
 		}
 		return nil
 	}
@@ -1295,6 +1895,14 @@ func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *de
 // collapse into one retry and concurrent healthy observations cannot overfill
 // a deployment.
 func (s *Scheduler) repairOneDeficit(ctx context.Context) error {
+	if !s.beginLifecycleWorker() {
+		return errors.New("scheduler is draining")
+	}
+	defer s.endLifecycleWorker()
+	return s.repairOneDeficitOwned(ctx)
+}
+
+func (s *Scheduler) repairOneDeficitOwned(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1312,8 +1920,9 @@ func (s *Scheduler) repairOneDeficit(ctx context.Context) error {
 	}
 	sort.Strings(pendingIDs)
 	var cleanupState *deploymentState
-	if len(pendingIDs) > 0 {
-		cleanupState = s.states[pendingIDs[0]]
+	if cleanupID := nextSortedID(pendingIDs, s.cleanupCursor); cleanupID != "" {
+		s.cleanupCursor = cleanupID
+		cleanupState = s.states[cleanupID]
 	}
 	s.mu.Unlock()
 	var cleanupErr error
@@ -1334,14 +1943,25 @@ func (s *Scheduler) repairOneDeficit(ctx context.Context) error {
 	}
 	sort.Strings(deploymentIDs)
 	var state *deploymentState
-	if len(deploymentIDs) > 0 {
-		state = s.states[deploymentIDs[0]]
+	if deploymentID := nextSortedID(deploymentIDs, s.deficitCursor); deploymentID != "" {
+		s.deficitCursor = deploymentID
+		state = s.states[deploymentID]
 	}
 	s.mu.Unlock()
 	if state == nil {
 		return cleanupErr
 	}
-	return errors.Join(cleanupErr, s.assignReplacementAfterCleanup(ctx, state))
+	repairCtx, cancel := s.replacementLifecycleContext(ctx, state)
+	defer cancel()
+	return errors.Join(cleanupErr, s.assignReplacementAfterCleanup(repairCtx, state))
+}
+
+func (s *Scheduler) replacementLifecycleContext(parent context.Context, state *deploymentState) (context.Context, context.CancelFunc) {
+	timeout := defaultDeployTimeout
+	if state != nil && state.request.Timeout > 0 {
+		timeout = state.request.Timeout
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 // DeactivateDeployment removes an active deployment using the endpoint IDs
@@ -1351,6 +1971,10 @@ func (s *Scheduler) DeactivateDeployment(ctx context.Context, deploymentID strin
 	if ctx == nil {
 		return errors.New("deployment cleanup context is required")
 	}
+	if !s.beginLifecycleWorker() {
+		return errors.New("scheduler is draining")
+	}
+	defer s.endLifecycleWorker()
 	s.mu.Lock()
 	state := s.states[deploymentID]
 	if state == nil {
@@ -1368,15 +1992,40 @@ func (s *Scheduler) DeactivateDeployment(ctx context.Context, deploymentID strin
 	state.cleanupInProgress = true
 	assignments := make([]activeAssignment, 0, len(state.active)+len(state.pendingCleanup))
 	seenEndpoints := make(map[string]struct{}, len(state.active)+len(state.pendingCleanup))
-	for _, assignment := range state.active {
-		assignments = append(assignments, assignment)
-		seenEndpoints[assignment.endpointID] = struct{}{}
-	}
-	for _, assignment := range state.pendingCleanup {
-		if _, duplicate := seenEndpoints[assignment.endpointID]; duplicate {
-			continue
+	pendingWorkers := len(state.reserved)
+	activeChanged := false
+	for minerID, assignment := range state.active {
+		// Transfer serving ownership into an exclusively claimed exact cleanup
+		// lease before any external teardown begins. A concurrent failed Deploy
+		// abort then sees this owner instead of starting a second cleanup for an
+		// already accepted ticket.
+		delete(state.active, minerID)
+		s.retireProbeStateLocked(assignment.endpointID)
+		state.excluded[minerID] = struct{}{}
+		state.pendingCleanup[minerID] = &cleanupLease{
+			assignment: assignment, preserveExclusion: true, cleaning: true,
 		}
 		assignments = append(assignments, assignment)
+		seenEndpoints[assignment.endpointID] = struct{}{}
+		activeChanged = true
+	}
+	for _, lease := range state.pendingCleanup {
+		if _, duplicate := seenEndpoints[lease.assignment.endpointID]; duplicate {
+			continue
+		}
+		if lease.assignmentPending || lease.cleaning {
+			pendingWorkers++
+			continue
+		}
+		// Claim the exact lease under Scheduler.mu before launching cleanup.
+		// Cancellation fencing and repair retries therefore cannot clean the
+		// same incarnation concurrently with deployment teardown.
+		lease.cleaning = true
+		assignment := lease.assignment
+		assignments = append(assignments, assignment)
+	}
+	if activeChanged {
+		s.bumpProbeTopologyLocked()
 	}
 	s.mu.Unlock()
 	type cleanupResult struct {
@@ -1386,10 +2035,11 @@ func (s *Scheduler) DeactivateDeployment(ctx context.Context, deploymentID strin
 	var cleanup sync.WaitGroup
 	results := make(chan cleanupResult, len(assignments))
 	for _, assignment := range assignments {
-		s.monitor().Forget(assignment.endpointID)
+		s.beginOwnedLifecycleWorker()
 		cleanup.Add(1)
 		go func(assignment activeAssignment) {
 			defer cleanup.Done()
+			defer s.endLifecycleWorker()
 			routeErr := s.Router.Deactivate(ctx, assignment.ticket, s.SigningKey)
 			var minerErr error
 			if known, ok := assignment.miner.(interface {
@@ -1413,35 +2063,37 @@ func (s *Scheduler) DeactivateDeployment(ctx context.Context, deploymentID strin
 		cleanup.Wait()
 		close(results)
 		var failures []error
+		if pendingWorkers > 0 {
+			failures = append(failures, fmt.Errorf("%d assignment or cleanup workers still own exact tickets", pendingWorkers))
+		}
 		succeeded := make([]activeAssignment, 0, len(assignments))
+		failed := make([]activeAssignment, 0, len(assignments))
 		for result := range results {
 			if result.err != nil {
 				failures = append(failures, result.err)
+				failed = append(failed, result.assignment)
 			} else {
 				succeeded = append(succeeded, result.assignment)
 			}
 		}
 		s.mu.Lock()
 		if s.states[deploymentID] == state {
-			activeChanged := false
 			for _, assignment := range succeeded {
-				if current, exists := state.active[assignment.miner.ID()]; exists && current.endpointID == assignment.endpointID {
-					delete(state.active, assignment.miner.ID())
-					activeChanged = true
-				}
-				if current, exists := state.pendingCleanup[assignment.miner.ID()]; exists && current.endpointID == assignment.endpointID {
+				if current, exists := state.pendingCleanup[assignment.miner.ID()]; exists && current.assignment.endpointID == assignment.endpointID && !current.assignmentPending {
 					delete(state.pendingCleanup, assignment.miner.ID())
-					delete(state.excluded, assignment.miner.ID())
 				}
 			}
-			if activeChanged {
-				s.bumpProbeTopologyLocked()
+			for _, assignment := range failed {
+				if current := state.pendingCleanup[assignment.miner.ID()]; current != nil && current.assignment.endpointID == assignment.endpointID {
+					current.cleaning = false
+					current.requiresRetry = true
+				}
 			}
 			state.cleanupInProgress = false
-			if len(state.active) == 0 && len(state.pendingCleanup) == 0 && !state.deploying {
+			if len(state.active) == 0 && len(state.reserved) == 0 && len(state.pendingCleanup) == 0 && !state.deploying {
 				delete(s.states, deploymentID)
-			} else if state.deploying && len(failures) == 0 {
-				failures = append(failures, errors.New("deployment assignments are still in flight"))
+			} else if (state.deploying || len(state.reserved) > 0) && len(failures) == 0 {
+				failures = append(failures, errors.New("deployment assignments or reservations are still in flight"))
 			}
 		}
 		s.mu.Unlock()
@@ -1465,6 +2117,10 @@ func (s *Scheduler) PendingCleanupAssignments(ctx context.Context, deploymentID 
 	if ctx == nil {
 		return 0, errors.New("cleanup inspection context is required")
 	}
+	if !s.beginLifecycleWorker() {
+		return 0, errors.New("scheduler is draining")
+	}
+	defer s.endLifecycleWorker()
 	if deploymentID == "" || s.Ledger == nil {
 		return 0, nil
 	}
@@ -1474,8 +2130,8 @@ func (s *Scheduler) PendingCleanupAssignments(ctx context.Context, deploymentID 
 		for _, assignment := range state.active {
 			pending[assignment.endpointID] = struct{}{}
 		}
-		for _, assignment := range state.pendingCleanup {
-			pending[assignment.endpointID] = struct{}{}
+		for _, lease := range state.pendingCleanup {
+			pending[lease.assignment.endpointID] = struct{}{}
 		}
 	}
 	s.mu.Unlock()
@@ -1607,13 +2263,15 @@ func (s *Scheduler) ActiveReplicas(deploymentID string) []ActiveReplica {
 
 // activeProbePeers verifies that one endpoint incarnation is still active and
 // returns the current route-local and process-global peers plus an exact health
-// snapshot. The periodic prober uses this before touching its local
-// corroboration state, then handleEndpointHealthVersioned repeats both the
-// endpoint and health-version checks at the mutation boundary.
+// snapshot and the independent route-circuit revision. The periodic prober
+// uses this before touching its local corroboration state, then
+// handleEndpointHealthVersioned repeats the endpoint, health-version, and
+// circuit-version checks at the mutation boundary.
 type probePeerSet struct {
 	deployment    []ActiveReplica
 	global        []ActiveReplica
 	targetHealth  policy.ObservationSnapshot
+	targetCircuit uint64
 	topologyEpoch uint64
 }
 
@@ -1637,6 +2295,7 @@ func (s *Scheduler) activeProbePeers(deploymentID, replicaID, endpointID, minerI
 		topologyEpoch: s.probeTopology,
 	}
 	peers.targetHealth = health.Snapshot(endpointID)
+	peers.targetCircuit = s.circuitVersionLocked(endpointID)
 	for activeMinerID, active := range state.active {
 		peers.deployment = append(peers.deployment, ActiveReplica{MinerID: activeMinerID, ReplicaID: active.replicaID, EndpointID: active.endpointID})
 	}

@@ -6,9 +6,12 @@
 package neuron
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
@@ -18,11 +21,15 @@ import (
 )
 
 const (
-	SynapseVersion        = "subnet-synapse.v2"
-	ServiceBindingVersion = "service-binding.v2"
-	TransportLocal        = "local"
-	TransportHTTPS        = "https"
-	TransportHTTP         = "http"
+	SynapseVersion = "subnet-synapse.v2"
+	// HealthObservationVersion is intentionally message-scoped. Health v2
+	// lacked an endpoint incarnation and cannot safely be replayed across a
+	// replacement, while the other v2 neuron contracts remain current.
+	HealthObservationVersion = "subnet-synapse.v3"
+	ServiceBindingVersion    = "service-binding.v2"
+	TransportLocal           = "local"
+	TransportHTTPS           = "https"
+	TransportHTTP            = "http"
 	// FeatureProbeAttestationV1 advertises the mandatory miner-signed public
 	// probe attestation. Mainnet validators refuse assignment eligibility to
 	// any miner whose capability handshake does not carry it.
@@ -229,9 +236,13 @@ type LocalSyntheticDeployRequest struct {
 }
 
 type HealthObservation struct {
-	Protocol     string    `json:"protocol"`
-	DeploymentID string    `json:"deployment_id"`
-	ReplicaID    string    `json:"replica_id"`
+	Protocol     string `json:"protocol"`
+	DeploymentID string `json:"deployment_id"`
+	ReplicaID    string `json:"replica_id"`
+	// EndpointID binds the authenticated report to one exact generation and
+	// assignment nonce. ReplicaID is stable across replacements and is not
+	// sufficient to authorize a health mutation.
+	EndpointID   string    `json:"endpoint_id"`
 	MinerHotkey  string    `json:"miner_hotkey"`
 	Vantage      string    `json:"vantage"`
 	Reachable    bool      `json:"reachable"`
@@ -240,6 +251,38 @@ type HealthObservation struct {
 	LatencyMS    int64     `json:"latency_ms"`
 	Availability float64   `json:"availability"`
 	ObservedAt   time.Time `json:"observed_at"`
+}
+
+// UnmarshalJSON preserves the schema's required-field semantics for scalar
+// values. Go's ordinary value-field decoder cannot distinguish an omitted
+// false/zero from an explicitly supplied false/zero, which would let an
+// incomplete health report become real failure evidence.
+func (observation *HealthObservation) UnmarshalJSON(payload []byte) error {
+	type plain HealthObservation
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("health observation must contain one JSON object")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return err
+	}
+	for _, required := range []string{
+		"protocol", "deployment_id", "replica_id", "endpoint_id", "miner_hotkey", "vantage",
+		"reachable", "correct", "fraudulent", "latency_ms", "availability", "observed_at",
+	} {
+		value, present := fields[required]
+		if !present || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("health observation requires non-null field %q", required)
+		}
+	}
+	*observation = HealthObservation(decoded)
+	return nil
 }
 
 func BindingJSON(binding ServiceKeyBinding) []byte {
