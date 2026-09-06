@@ -51,7 +51,10 @@ const (
 // endpoint's consecutive failure observations exceeds the health rapid window.
 // Such a prober silently never evicts an unreachable replica, so it is refused
 // rather than started.
-var ErrProbeCadence = errors.New("probe cadence cannot evict an unreachable replica")
+var (
+	ErrProbeCadence       = errors.New("probe cadence cannot evict an unreachable replica")
+	errProbeTimestampZero = errors.New("probe result is missing its terminal observation time")
+)
 
 // replicaProber is deliberately private because its call carries the raw
 // hidden challenge. Exporting this callback would let an external Go consumer
@@ -466,7 +469,7 @@ func (s *deploymentCorroboration) reserveUnreachable(endpointID string, active [
 			continue
 		}
 		success := s.successes[peer.EndpointID]
-		if success.sequence <= used || (!after.IsZero() && success.at.Before(after)) {
+		if success.sequence <= used || (!after.IsZero() && !success.at.After(after)) {
 			continue
 		}
 		if witnessID == "" || success.at.After(witness.at) || (success.at.Equal(witness.at) && peer.EndpointID < witnessID) {
@@ -790,7 +793,17 @@ func (p *Prober) observe(ctx context.Context, target probeTarget, replica Active
 		p.finishObservation(outcome)
 		return outcome
 	}
-	observedAt := p.clock()().UTC()
+	// Validator captures At at the network completion boundary (after EOF for a
+	// complete response). Preserve that causal timestamp unchanged: stamping a
+	// delayed result here would let a success completed before a peer's failure
+	// masquerade as fresh post-failure corroboration.
+	observedAt := observed.At.UTC()
+	if observedAt.IsZero() {
+		outcome.CommonModeSuppressed = true
+		outcome.Err = errProbeTimestampZero
+		p.finishObservation(outcome)
+		return outcome
+	}
 	active, err := p.Scheduler.activeProbePeers(target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID)
 	if err != nil {
 		outcome.Err = err

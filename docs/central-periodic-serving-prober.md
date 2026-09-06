@@ -90,6 +90,13 @@ an intermediary strips unknown headers. The validator also records
 without a transport error. Headers followed by a truncated body prove neither
 complete content nor miner guilt.
 
+`ProbeResult.At` is the terminal observation timestamp, not the request-start
+time. For a complete response the validator captures it only after the body has
+reached EOF and preserves it unchanged through health and corroboration. Peer
+success must be strictly later than the target's latest failure to authorize
+destructive liveness action; a response that completed earlier but was
+descheduled and processed later is never fresh evidence.
+
 The observation is mapped as follows:
 
 | Probe result | Reported | Policy outcome |

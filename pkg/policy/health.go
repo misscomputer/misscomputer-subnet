@@ -3,6 +3,7 @@
 package policy
 
 import (
+	"context"
 	"errors"
 	"math"
 	"sync"
@@ -146,8 +147,19 @@ func (m *Monitor) observeClass(endpointID, vantage string, reachable, correct, f
 // after a newer liveness report; otherwise repeated healthy posts could mask
 // cryptographic fault evidence. At version exhaustion it fails closed.
 func (m *Monitor) ObserveIfVersion(endpointID, vantage string, reachable, correct, fraudulent bool, at time.Time, expectedVersion uint64) (Action, bool) {
+	return m.ObserveIfVersionContext(context.Background(), endpointID, vantage, reachable, correct, fraudulent, at, expectedVersion)
+}
+
+// ObserveIfVersionContext is ObserveIfVersion with lifecycle cancellation
+// linearized under the monitor mutation lock. A caller cancelled while waiting
+// for another observation to finish cannot subsequently advance this
+// endpoint's version, failure counters, or policy action.
+func (m *Monitor) ObserveIfVersionContext(ctx context.Context, endpointID, vantage string, reachable, correct, fraudulent bool, at time.Time, expectedVersion uint64) (Action, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if ctx == nil || ctx.Err() != nil {
+		return Action{}, false
+	}
 	s := m.states[endpointID]
 	currentVersion := uint64(0)
 	if s != nil {
@@ -155,6 +167,12 @@ func (m *Monitor) ObserveIfVersion(endpointID, vantage string, reachable, correc
 	}
 	definitiveFault := fraudulent || (reachable && !correct)
 	if (currentVersion != expectedVersion && !definitiveFault) || currentVersion == math.MaxUint64 {
+		return Action{}, false
+	}
+	// Keep this check immediately adjacent to the first mutation while m.mu is
+	// held. Checks made by callers before lock acquisition have a cancellation
+	// race when another health commit owns the monitor serialization point.
+	if err := ctx.Err(); err != nil {
 		return Action{}, false
 	}
 	if s == nil {

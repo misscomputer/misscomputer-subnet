@@ -27,6 +27,14 @@ the active-replica snapshot and pass that exact value; there is no legacy
 overload because silently substituting an empty or stable identifier would
 reintroduce cross-incarnation replay.
 
+`validator.ProbeResult.At` now identifies the terminal network observation,
+not request start. For a complete response it is captured immediately after
+body EOF, and `Latency` includes the complete body transfer. This causal
+timestamp is required so a result completed before a peer failure cannot be
+re-stamped as fresh corroboration merely because its goroutine was processed
+later. Callers that need the approximate request start can subtract `Latency`
+from `At`.
+
 ### `POST /v1/health`
 
 Health reports use the message-scoped protocol

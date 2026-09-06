@@ -3,6 +3,7 @@
 package policy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -81,6 +82,46 @@ func TestVersionedObservationRejectsChangedHealthHistory(t *testing.T) {
 	current := m.Snapshot("e1")
 	if current.Version != stale.Version+1 || !current.LastFailure.Equal(now.Add(time.Second)) {
 		t.Fatalf("stale observation changed snapshot: stale=%+v current=%+v", stale, current)
+	}
+}
+
+func TestVersionedObservationCancelledWhileWaitingForMonitorDoesNotMutate(t *testing.T) {
+	m := NewMonitor()
+	now := time.Now().UTC()
+	if action, applied := m.ObserveIfVersionContext(
+		context.Background(), "endpoint-g1-nonce", "periodic", false, false, false, now, 0,
+	); !applied || action.RemoveFromRouting {
+		t.Fatalf("first internal failure: action=%+v applied=%v", action, applied)
+	}
+	before := m.Snapshot("endpoint-g1-nonce")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	result := make(chan struct {
+		action  Action
+		applied bool
+	}, 1)
+	m.mu.Lock()
+	go func() {
+		close(started)
+		action, applied := m.ObserveIfVersionContext(
+			ctx, "endpoint-g1-nonce", "periodic", false, false, false, now.Add(time.Second), before.Version,
+		)
+		result <- struct {
+			action  Action
+			applied bool
+		}{action: action, applied: applied}
+	}()
+	<-started
+	cancel()
+	m.mu.Unlock()
+
+	got := <-result
+	if got.applied || got.action != (Action{}) {
+		t.Fatalf("cancelled second failure produced policy action: action=%+v applied=%v", got.action, got.applied)
+	}
+	if after := m.Snapshot("endpoint-g1-nonce"); after != before {
+		t.Fatalf("cancelled lock-wait mutated health: before=%+v after=%+v", before, after)
 	}
 }
 

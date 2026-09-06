@@ -1567,8 +1567,12 @@ func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, e
 		}
 	} else {
 		var applied bool
-		action, applied = health.ObserveIfVersion(removed.endpointID, vantage, reachable, correct, fraudulent, at, *expectedHealthVersion)
+		action, applied = health.ObserveIfVersionContext(ctx, removed.endpointID, vantage, reachable, correct, fraudulent, at, *expectedHealthVersion)
 		if !applied {
+			if err := ctx.Err(); err != nil {
+				s.mu.Unlock()
+				return policy.Action{}, false, false, err
+			}
 			// External evidence can advance economic-health history while this
 			// validator's targeted request is in flight. That must not make a
 			// locally broken route remain available (or a recovered route remain

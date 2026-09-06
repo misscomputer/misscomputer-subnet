@@ -36,7 +36,12 @@ func newScriptedProber(replicaToMiner map[string]string) *scriptedProber {
 	}
 }
 
-func (s *scriptedProber) ProbeReplica(_ context.Context, _, replicaID, _, _ string) validator.ProbeResult {
+func (s *scriptedProber) ProbeReplica(_ context.Context, _, replicaID, _, _ string) (result validator.ProbeResult) {
+	defer func() {
+		if result.At.IsZero() {
+			result.At = time.Now().UTC()
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	minerID := s.byMiner[replicaID]
@@ -1125,6 +1130,10 @@ func TestCorroborationDomainChangeRequiresPostFailureSuccess(t *testing.T) {
 	if reused, allowed := corroboration.unreachablePermit(deploymentID, target.EndpointID, singletonPeers); allowed || reused != nil {
 		t.Fatal("domain change reused global successes that predated the first failure")
 	}
+	corroboration.recordSuccess("other", globalD.EndpointID, singletonPeers, failureAt, 2)
+	if ambiguous, allowed := corroboration.unreachablePermit(deploymentID, target.EndpointID, singletonPeers); allowed || ambiguous != nil {
+		t.Fatal("success simultaneous with failure was treated as post-failure evidence")
+	}
 	corroboration.recordSuccess("other", globalD.EndpointID, singletonPeers, failureAt.Add(time.Second), 2)
 	corroboration.recordSuccess("other", globalE.EndpointID, singletonPeers, failureAt.Add(time.Second), 2)
 	if fresh, allowed := corroboration.unreachablePermit(deploymentID, target.EndpointID, singletonPeers); !allowed || fresh == nil || !fresh.global {
@@ -1589,11 +1598,28 @@ type fixedProbeResult struct {
 	result validator.ProbeResult
 }
 
-func (p fixedProbeResult) ProbeReplica(context.Context, string, string, string, string) validator.ProbeResult {
+type unstampedProbeResult struct {
+	result validator.ProbeResult
+}
+
+func (p unstampedProbeResult) ProbeReplica(context.Context, string, string, string, string) validator.ProbeResult {
 	return p.result
 }
 
-func (p *staleBlockingProber) ProbeReplica(context.Context, string, string, string, string) validator.ProbeResult {
+func (p fixedProbeResult) ProbeReplica(context.Context, string, string, string, string) validator.ProbeResult {
+	result := p.result
+	if result.At.IsZero() {
+		result.At = time.Now().UTC()
+	}
+	return result
+}
+
+func (p *staleBlockingProber) ProbeReplica(context.Context, string, string, string, string) (result validator.ProbeResult) {
+	defer func() {
+		if result.At.IsZero() {
+			result.At = time.Now().UTC()
+		}
+	}()
 	p.once.Do(func() { close(p.started) })
 	<-p.release
 	if p.result != nil {
@@ -1644,6 +1670,136 @@ func TestProberBindsHealthRevisionBeforeNetworkIO(t *testing.T) {
 		if claim.EndpointID == replica.EndpointID && claim.Healthy {
 			t.Fatal("pre-failure success reopened the newer failure circuit")
 		}
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestDelayedPeerSuccessKeepsItsPreFailureCompletionTime(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	var failed, peer ActiveReplica
+	for _, replica := range target.replicas {
+		switch replica.MinerID {
+		case "m1":
+			failed = replica
+		case "m2":
+			peer = replica
+		}
+	}
+	if failed.EndpointID == "" || peer.EndpointID == "" {
+		t.Fatal("probe fixtures did not contain m1 and m2")
+	}
+	failureAt := time.Now().UTC()
+	completedBeforeFailure := failureAt.Add(-time.Second)
+	blocked := &staleBlockingProber{
+		started: make(chan struct{}), release: make(chan struct{}),
+		result: &validator.ProbeResult{
+			At: completedBeforeFailure, Status: 200, Correct: true,
+			ServedByReplica: true, ResponseComplete: true,
+		},
+	}
+	// If observe re-stamps after ProbeReplica returns, this processing time makes
+	// the old result appear fresh. The production path must ignore it and carry
+	// the validator's completion timestamp unchanged.
+	prober := &Prober{
+		Scheduler: h.scheduler, probe: blocked, Vantage: "periodic-test",
+		Now: func() time.Time { return failureAt.Add(time.Second) },
+	}
+	peerObserved := make(chan ProbeOutcome, 1)
+	go func() { peerObserved <- prober.observe(context.Background(), target, peer) }()
+	<-blocked.started
+
+	if action, err := h.scheduler.handleEndpointHealth(
+		context.Background(), target.deploymentID, failed.ReplicaID, failed.EndpointID, failed.MinerID,
+		"periodic-test", false, false, false, failureAt,
+	); err != nil || action.RemoveFromRouting {
+		t.Fatalf("failed to seed target failure: action=%+v err=%v", action, err)
+	}
+	failedPeers, err := h.scheduler.activeProbePeers(target.deploymentID, failed.ReplicaID, failed.EndpointID, failed.MinerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prober.corroboration.recordApplied(target.deploymentID, failed.EndpointID, failedPeers, nil, failedPeers.targetHealth.Version)
+	beforeSecond := h.scheduler.monitor().Snapshot(failed.EndpointID)
+	close(blocked.release)
+	oldPeer := <-peerObserved
+	if oldPeer.Err != nil || !oldPeer.Correct {
+		t.Fatalf("delayed peer success did not apply: %+v", oldPeer)
+	}
+	prober.corroboration.mu.Lock()
+	stored := prober.corroboration.deployments[target.deploymentID].successes[peer.EndpointID]
+	prober.corroboration.mu.Unlock()
+	if !stored.at.Equal(completedBeforeFailure) {
+		t.Fatalf("peer completion was re-stamped: stored=%v want=%v", stored.at, completedBeforeFailure)
+	}
+
+	prober.probe = fixedProbeResult{result: validator.ProbeResult{
+		At: failureAt.Add(2 * time.Second), Error: "shared edge unavailable",
+	}}
+	suppressed := prober.observe(context.Background(), target, failed)
+	if !suppressed.CommonModeSuppressed || suppressed.Action != (policy.Action{}) {
+		t.Fatalf("pre-failure peer success authorized destructive action: %+v", suppressed)
+	}
+	if after := h.scheduler.monitor().Snapshot(failed.EndpointID); after != beforeSecond {
+		t.Fatalf("suppressed shared-path failure mutated health: before=%+v after=%+v", beforeSecond, after)
+	}
+	if !contains(activeMinerIDs(h.scheduler, target.deploymentID), failed.MinerID) {
+		t.Fatal("pre-failure peer success evicted the target")
+	}
+
+	completedAfterFailure := failureAt.Add(3 * time.Second)
+	prober.probe = fixedProbeResult{result: validator.ProbeResult{
+		At: completedAfterFailure, Status: 200, Correct: true,
+		ServedByReplica: true, ResponseComplete: true,
+	}}
+	if freshPeer := prober.observe(context.Background(), target, peer); freshPeer.Err != nil || !freshPeer.Correct {
+		t.Fatalf("post-failure peer success did not apply: %+v", freshPeer)
+	}
+	prober.probe = fixedProbeResult{result: validator.ProbeResult{
+		At: failureAt.Add(4 * time.Second), Error: "isolated target unavailable",
+	}}
+	removed := prober.observe(context.Background(), target, failed)
+	if !removed.Action.RemoveFromRouting || removed.CommonModeSuppressed {
+		t.Fatalf("fresh post-failure success did not authorize isolated eviction: %+v", removed)
+	}
+	if h.scheduler.Ledger.Trust(failed.MinerID) == 0 {
+		t.Fatal("internal liveness eviction became economic trust-zero")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestProbeWithoutTerminalTimestampCannotMutateHealth(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	replica := target.replicas[0]
+	before := h.scheduler.monitor().Snapshot(replica.EndpointID)
+	prober := &Prober{
+		Scheduler: h.scheduler,
+		probe: unstampedProbeResult{result: validator.ProbeResult{
+			Status: 200, Correct: true, ServedByReplica: true, ResponseComplete: true,
+		}},
+		Vantage: "periodic-test",
+	}
+	outcome := prober.observe(context.Background(), target, replica)
+	if !errors.Is(outcome.Err, errProbeTimestampZero) || !outcome.CommonModeSuppressed || outcome.Action != (policy.Action{}) {
+		t.Fatalf("unstamped result was not suppressed: %+v", outcome)
+	}
+	if after := h.scheduler.monitor().Snapshot(replica.EndpointID); after != before {
+		t.Fatalf("unstamped result mutated health: before=%+v after=%+v", before, after)
 	}
 	h.cleanup(t)
 	deactivated = true
@@ -1834,7 +1990,12 @@ func (c *cancelOnSecondErrContext) Err() error {
 	return nil
 }
 
-func (p *cancellationBlockingProber) ProbeReplica(ctx context.Context, _, _, _, _ string) validator.ProbeResult {
+func (p *cancellationBlockingProber) ProbeReplica(ctx context.Context, _, _, _, _ string) (result validator.ProbeResult) {
+	defer func() {
+		if result.At.IsZero() {
+			result.At = time.Now().UTC()
+		}
+	}()
 	p.mu.Lock()
 	block := p.block
 	p.mu.Unlock()
@@ -2050,7 +2211,12 @@ func TestProberCancellationAtMutationBoundaryDoesNotSpendCorroboration(t *testin
 	deactivated = true
 }
 
-func (p *pacedProber) ProbeReplica(ctx context.Context, _, replicaID, _, _ string) validator.ProbeResult {
+func (p *pacedProber) ProbeReplica(ctx context.Context, _, replicaID, _, _ string) (result validator.ProbeResult) {
+	defer func() {
+		if result.At.IsZero() {
+			result.At = time.Now().UTC()
+		}
+	}()
 	p.mu.Lock()
 	hung := p.hung[p.byMiner[replicaID]]
 	p.inFlight++

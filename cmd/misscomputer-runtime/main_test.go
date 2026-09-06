@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -192,6 +193,18 @@ func (p *orderedRuntimePlane) Close(context.Context) error {
 
 func (*orderedRuntimePlane) CampaignEnabled() bool { return false }
 
+type closeFailingRuntimePlane struct {
+	err error
+}
+
+func (*closeFailingRuntimePlane) Run(ctx context.Context) error {
+	<-ctx.Done()
+	return nil
+}
+
+func (p *closeFailingRuntimePlane) Close(context.Context) error { return p.err }
+func (*closeFailingRuntimePlane) CampaignEnabled() bool         { return false }
+
 func TestRuntimeJoinsPlaneRunBeforeClosingPlaneResources(t *testing.T) {
 	root := t.TempDir()
 	server, err := runtimeapi.Open(filepath.Join(root, "state"))
@@ -205,6 +218,7 @@ func TestRuntimeJoinsPlaneRunBeforeClosingPlaneResources(t *testing.T) {
 		_ = server.Close()
 		t.Fatal(err)
 	}
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
 	edgeListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		_ = listener.Close()
@@ -253,5 +267,69 @@ func TestRuntimeJoinsPlaneRunBeforeClosingPlaneResources(t *testing.T) {
 	case <-plane.closeCalled:
 	default:
 		t.Fatal("Plane.Close was not called after Plane.Run exited")
+	}
+}
+
+func TestRuntimeRetainsSingletonOwnershipWhenPlaneCloseFails(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	server, err := runtimeapi.Open(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Control = http.NewServeMux()
+	socketPath := filepath.Join(root, "runtime.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		_ = server.Close()
+		t.Fatal(err)
+	}
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	edgeListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = listener.Close()
+		_ = server.Close()
+		t.Fatal(err)
+	}
+	closeFailure := errors.New("injected plane close failure")
+	instance := &runtime{
+		server: server, plane: &closeFailingRuntimePlane{err: closeFailure},
+		listener: listener, edgeListener: edgeListener,
+		edgeServer: &http.Server{Handler: http.NewServeMux()}, socketPath: socketPath,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- instance.serve(ctx) }()
+	cancel()
+	select {
+	case err := <-served:
+		if !errors.Is(err, closeFailure) {
+			t.Fatalf("serve hid Plane.Close failure: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after Plane.Close failed")
+	}
+	if _, err := runtimeapi.Open(stateDir); err == nil || !strings.Contains(err.Error(), "another public runtime owns") {
+		t.Fatalf("failed Plane.Close released singleton ownership: %v", err)
+	}
+	if _, err := os.Lstat(socketPath); err != nil {
+		t.Fatalf("failed Plane.Close removed ownership socket: %v", err)
+	}
+
+	// Explicit owner cleanup releases both resources; serve itself must not do
+	// this on the failed-close path.
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := runtimeapi.Open(stateDir)
+	if err != nil {
+		t.Fatalf("explicit owner cleanup did not release state directory: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -241,6 +241,12 @@ func newRuntime(config configuration, logger *slog.Logger) (instance *runtime, e
 	if err != nil {
 		return nil, err
 	}
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		// Successful shutdown removes the pathname explicitly. Keeping automatic
+		// unlink disabled lets a failed Plane.Close retain the ownership marker
+		// alongside the state-directory flock.
+		unixListener.SetUnlinkOnClose(false)
+	}
 	defer func() {
 		if err != nil {
 			_ = listener.Close()
@@ -317,10 +323,16 @@ func (r *runtime) serve(ctx context.Context) error {
 		return first
 	}
 	planeCloseContext, stopPlaneClose := context.WithTimeout(context.Background(), 20*time.Second)
-	if err := r.plane.Close(planeCloseContext); first == nil {
-		first = err
-	}
+	planeCloseErr := r.plane.Close(planeCloseContext)
 	stopPlaneClose()
+	if planeCloseErr != nil {
+		// Plane.Close deliberately leaves its gateway/store owned when a
+		// lifecycle worker has not drained. Retain the runtime journal, singleton
+		// state-directory flock, and socket pathname as well; releasing only the
+		// outer ownership would let a second runtime enter while the first plane
+		// still has live work against the same state.
+		return errors.Join(first, planeCloseErr)
+	}
 	if err := r.server.Close(); first == nil {
 		first = err
 	}

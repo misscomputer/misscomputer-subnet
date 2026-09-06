@@ -54,6 +54,24 @@ func (b *oversizedInterruptedProbeBody) Read(destination []byte) (int, error) {
 
 func (*oversizedInterruptedProbeBody) Close() error { return nil }
 
+type delayedCompleteProbeBody struct {
+	started chan struct{}
+	release chan struct{}
+	read    bool
+}
+
+func (b *delayedCompleteProbeBody) Read(destination []byte) (int, error) {
+	if b.read {
+		return 0, io.EOF
+	}
+	b.read = true
+	close(b.started)
+	<-b.release
+	return copy(destination, "correct"), nil
+}
+
+func (*delayedCompleteProbeBody) Close() error { return nil }
+
 func TestProbeHostTemplateUsesPublicHostnameAndExactTargetHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Host != "edge-dev-app.miss.computer" || req.Header.Get(edge.TargetReplicaHeader) != "app-miner" ||
@@ -80,6 +98,36 @@ func TestProbeHostTemplateUsesPublicHostnameAndExactTargetHeaders(t *testing.T) 
 	}.ProbeReplica(context.Background(), "edge-dev-app.miss.computer", "app-miner", "/challenge", "correct")
 	if !value.Correct || value.Status != http.StatusOK {
 		t.Fatalf("templated public probe failed: %+v", value)
+	}
+}
+
+func TestProbeObservationTimeAndLatencyIncludeFullBodyCompletion(t *testing.T) {
+	body := &delayedCompleteProbeBody{started: make(chan struct{}), release: make(chan struct{})}
+	client := &http.Client{Transport: probeRoundTripper(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: body}, nil
+	})}
+	result := make(chan ProbeResult, 1)
+	go func() {
+		result <- Validator{EdgeURL: "https://edge.test", Client: client}.
+			ProbeReplica(context.Background(), "app.test", "app-miner", "/challenge", "correct")
+	}()
+	<-body.started
+	// Make the pre-EOF interval large enough that header-only latency accounting
+	// cannot accidentally satisfy the assertion under scheduler jitter.
+	time.Sleep(25 * time.Millisecond)
+	releasedAt := time.Now().UTC()
+	close(body.release)
+	observed := <-result
+	if !observed.Correct || !observed.ResponseComplete {
+		t.Fatalf("delayed complete response was not accepted: %+v", observed)
+	}
+	if observed.At.Before(releasedAt) {
+		t.Fatalf("observation time predates body EOF release: at=%v release=%v", observed.At, releasedAt)
+	}
+	if observed.Latency < 25*time.Millisecond {
+		t.Fatalf("probe latency excluded body transfer: %v", observed.Latency)
 	}
 }
 
