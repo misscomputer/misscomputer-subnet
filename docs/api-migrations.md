@@ -21,6 +21,21 @@ probe internally. `ProbeOutcome` exposes only result metadata and never the
 raw challenge. There is deliberately no compatibility adapter for the removed
 callback seam.
 
+`Prober.Timeout` is now the authoritative whole-request budget for periodic
+probes even when it exceeds five seconds. The scheduler validator's independent
+five-second default remains in force for admission; the periodic path preserves
+the configured HTTP transport but prevents that admission-oriented client
+timeout from silently shortening its own context deadline. An earlier parent
+deadline still wins, and preserved transport-stage bounds or failures may
+return sooner. This correction changes no API shape and leaves the shipped 5s
+timeout default unchanged.
+
+`Prober.Validate` now returns `ErrProbeCadence` when the scheduler health
+monitor's `RapidWindow` is zero or negative. Such a policy resets rapid failure
+evidence instead of accumulating the failures needed for eviction, so it is no
+longer accepted as an inert configuration. The shipped 15s rapid window is
+unchanged.
+
 `control.Scheduler.HandleHealth` also intentionally adds `endpointID` between
 the stable replica ID and miner ID. Go callers must retain the endpoint ID from
 the active-replica snapshot and pass that exact value; there is no legacy

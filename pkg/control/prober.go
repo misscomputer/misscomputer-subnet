@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net/http"
 	"sync"
 	"time"
 
@@ -62,6 +63,42 @@ var (
 // boundary.
 type replicaProber interface {
 	ProbeReplica(ctx context.Context, routeHost, replicaID, challengePath, expectedValue string) validator.ProbeResult
+}
+
+// periodicValidatorProber prevents http.Client.Timeout from overriding the
+// deadline installed by Prober.observe. Validator's nil-client fallback has an
+// independent five-second timeout for scheduler admission probes. Reusing that
+// fallback here would silently cap a configured periodic timeout above five
+// seconds. A caller-supplied Client may carry the same kind of shorter total
+// timeout, so clone it and clear only Client.Timeout; its transport, cookie jar,
+// and other behavior remain intact. Transport-stage failures may still return
+// sooner. Validator clones the result again to install its fail-closed redirect
+// policy without mutating shared client state.
+//
+// Sweep is intentionally usable as a one-shot diagnostic without calling
+// Validate. If its caller has disabled both the derived timeout and every parent
+// deadline, retain Validator's ordinary client behavior instead of creating an
+// unbounded request.
+type periodicValidatorProber struct {
+	validator validator.Validator
+}
+
+func (p periodicValidatorProber) ProbeReplica(
+	ctx context.Context,
+	routeHost, replicaID, challengePath, expectedValue string,
+) validator.ProbeResult {
+	if _, bounded := ctx.Deadline(); !bounded {
+		return p.validator.ProbeReplica(ctx, routeHost, replicaID, challengePath, expectedValue)
+	}
+	probe := p.validator
+	if probe.Client == nil {
+		probe.Client = &http.Client{}
+	} else {
+		client := *probe.Client
+		client.Timeout = 0
+		probe.Client = &client
+	}
+	return probe.ProbeReplica(ctx, routeHost, replicaID, challengePath, expectedValue)
 }
 
 // ProbeOutcome records one replica observation and the policy action it caused.
@@ -163,7 +200,9 @@ type Prober struct {
 	// DefaultProbeTimeout. It must be positive and shorter than Interval:
 	// without a deadline the prober itself controls, a hung replica's failure
 	// gap is whatever the Validator's client happens to allow, and the cadence
-	// guarantee below cannot be enforced. Validate refuses anything else.
+	// guarantee below cannot be enforced. For periodic probes this context
+	// deadline, rather than Validator's independent admission client timeout, is
+	// the whole-request budget. Validate refuses anything else.
 	Timeout time.Duration
 	// CadenceMargin defaults to DefaultProbeCadenceMargin. It is the slack
 	// Validate reserves inside the rapid window for applying an observation and
@@ -259,7 +298,7 @@ func (p *Prober) Validate() error {
 	}
 	window := p.Scheduler.monitor().RapidWindow
 	if window <= 0 {
-		return nil
+		return fmt.Errorf("%w: health rapid window %v must be positive", ErrProbeCadence, window)
 	}
 	margin := p.cadenceMargin()
 	gap, valid := probeCadenceBound(interval, timeout, margin)
@@ -978,7 +1017,7 @@ func (p *Prober) prober() replicaProber {
 	if p.probe != nil {
 		return p.probe
 	}
-	return p.Scheduler.Validator
+	return periodicValidatorProber{validator: p.Scheduler.Validator}
 }
 
 func (p *Prober) interval() time.Duration {
