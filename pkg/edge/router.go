@@ -291,6 +291,16 @@ func (r *Router) ApplyRouteUpdate(ctx context.Context, update RouteUpdate, miner
 	if err := r.validateTransitionLocked(update, record); err != nil {
 		return err
 	}
+	if update.Action == RouteDeactivate {
+		// Deactivation is a fail-closed serving boundary, not merely a durable
+		// bookkeeping transition. Once the exact authoritative tombstone has
+		// passed identity/lifecycle validation, remove that incarnation from
+		// ordinary rotation before attempting fallible persistence. If the
+		// durable write fails, the scheduler retains cleanup ownership and may
+		// retry the same tombstone, while this process cannot keep sending public
+		// traffic to a route it has already decided to tear down.
+		r.suppressExactRouteLocked(record)
+	}
 	if r.store != nil {
 		var committed bool
 		committed, err = r.store.ApplyEdgeRouteTransition(ctx, "edge-route-update", replayKey, update.ExpiresAt, record)
@@ -307,6 +317,16 @@ func (r *Router) ApplyRouteUpdate(ctx context.Context, update RouteUpdate, miner
 	}
 	r.applyTransitionLocked(update, record, target, routeTransport)
 	return nil
+}
+
+func (r *Router) suppressExactRouteLocked(record RouteRecord) {
+	claim, exists := r.claims[record.EndpointID]
+	if !exists || claim.record.State != "active" || !sameRouteIdentity(claim.record, record) {
+		return
+	}
+	claim.replica.Healthy = false
+	r.claims[record.EndpointID] = claim
+	r.upsertRouteLocked(record.RouteHost, claim)
 }
 
 func (r *Router) validateTransitionLocked(update RouteUpdate, record RouteRecord) error {

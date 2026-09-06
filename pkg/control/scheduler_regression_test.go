@@ -397,6 +397,130 @@ func TestLateEligibilityRaceConsumesReservationAndLeavesVisibleDebt(t *testing.T
 	}
 }
 
+func TestPostActivationReservationRejectionFailsClosedAcrossDurableDeactivationFailure(t *testing.T) {
+	t.Run("initial assignment", func(t *testing.T) {
+		routeStore, triggerDB := newDurableRouteStore(t)
+		h := newSchedulerHarnessWithRouteStore(t, []string{"m1", "m2"}, 1, routeStore)
+		failRouteDeactivation(t, triggerDB, "m1")
+
+		var once sync.Once
+		h.scheduler.Validator.Client = &http.Client{Transport: schedulerProbeTransport(func(request *http.Request) (*http.Response, error) {
+			response, err := http.DefaultTransport.RoundTrip(request)
+			if err == nil {
+				once.Do(func() {
+					if trustErr := h.scheduler.Ledger.SetTrust("m1", 0); trustErr != nil {
+						t.Errorf("inject late initial eligibility change: %v", trustErr)
+					}
+				})
+			}
+			return response, err
+		})}
+		_, err := h.scheduler.Deploy(context.Background(), h.request)
+		if err == nil || !strings.Contains(err.Error(), "rejected assignment reservation") || !strings.Contains(err.Error(), "injected edge deactivation persistence failure") {
+			t.Fatalf("late initial rejection did not retain the durable cleanup failure: %v", err)
+		}
+
+		endpointID := exactPendingCleanupEndpoint(t, h.scheduler, h.request.DeploymentID, "m1")
+		assertRouteUnavailableToOrdinaryTraffic(t, h.scheduler.Router, h.request.DeploymentID+".on.miss.computer", endpointID, "m1")
+		if record, exists, routeErr := routeStore.EdgeRoute(context.Background(), endpointID); routeErr != nil || !exists || record.State != "active" {
+			t.Fatalf("injected failure did not leave a retryable durable active route: record=%+v exists=%v err=%v", record, exists, routeErr)
+		}
+		if err := h.scheduler.repairOneDeficit(context.Background()); err != nil {
+			t.Fatalf("cleanup-only failed deployment entered repair: %v", err)
+		}
+		if h.miners["m2"].Assignments() != 0 {
+			t.Fatalf("failed initial deployment created replacement capacity: m2 assignments=%d", h.miners["m2"].Assignments())
+		}
+
+		restoreRouteDeactivation(t, triggerDB)
+		if err := h.scheduler.DeactivateDeployment(context.Background(), h.request.DeploymentID); err != nil {
+			t.Fatalf("retry exact initial cleanup: %v", err)
+		}
+		assertExactRouteRemoved(t, routeStore, h.scheduler.Router, h.request.DeploymentID+".on.miss.computer", endpointID)
+	})
+
+	t.Run("replacement", func(t *testing.T) {
+		routeStore, triggerDB := newDurableRouteStore(t)
+		h := newSchedulerHarnessWithRouteStore(t, []string{"m1", "m2", "m3", "m4"}, 1, routeStore)
+		if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
+			t.Fatal(err)
+		}
+		deactivated := false
+		defer func() {
+			if !deactivated {
+				h.cleanup(t)
+			}
+		}()
+		current := h.scheduler.ActiveReplicas(h.request.DeploymentID)[0]
+		failRouteDeactivation(t, triggerDB, "m2")
+		var once sync.Once
+		h.scheduler.Validator.Client = &http.Client{Transport: schedulerProbeTransport(func(request *http.Request) (*http.Response, error) {
+			response, err := http.DefaultTransport.RoundTrip(request)
+			if err == nil {
+				once.Do(func() {
+					if trustErr := h.scheduler.Ledger.SetTrust("m2", 0); trustErr != nil {
+						t.Errorf("inject late replacement eligibility change: %v", trustErr)
+					}
+				})
+			}
+			return response, err
+		})}
+		_, err := h.scheduler.HandleHealth(
+			context.Background(), h.request.DeploymentID, current.ReplicaID, current.EndpointID, current.MinerID,
+			"external", true, false, false, time.Now().UTC(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "rejected replacement reservation") || !strings.Contains(err.Error(), "injected edge deactivation persistence failure") {
+			t.Fatalf("late replacement rejection did not retain the durable cleanup failure: %v", err)
+		}
+
+		endpointID := exactPendingCleanupEndpoint(t, h.scheduler, h.request.DeploymentID, "m2")
+		routeHost := h.request.DeploymentID + ".on.miss.computer"
+		assertRouteUnavailableToOrdinaryTraffic(t, h.scheduler.Router, routeHost, endpointID, "m2")
+		if record, exists, routeErr := routeStore.EdgeRoute(context.Background(), endpointID); routeErr != nil || !exists || record.State != "active" {
+			t.Fatalf("injected failure did not leave a retryable durable active route: record=%+v exists=%v err=%v", record, exists, routeErr)
+		}
+
+		h.scheduler.Validator.Client = nil
+		if repairErr := h.scheduler.repairOneDeficit(context.Background()); repairErr == nil || !strings.Contains(repairErr.Error(), "injected edge deactivation persistence failure") {
+			t.Fatalf("repair hid the retained cleanup failure: %v", repairErr)
+		}
+		if got := activeMinerIDs(h.scheduler, h.request.DeploymentID); len(got) != 1 || got[0] != "m3" {
+			t.Fatalf("visible debt was not repaired with the next clean miner: %v", got)
+		}
+		replicas := h.scheduler.Router.Replicas(routeHost)
+		healthy := 0
+		for _, replica := range replicas {
+			if replica.Healthy {
+				healthy++
+			}
+			if replica.EndpointID == endpointID && replica.Healthy {
+				t.Fatalf("rejected exact incarnation re-entered ordinary rotation: %+v", replica)
+			}
+		}
+		if healthy != 1 || h.miners["m4"].Assignments() != 0 {
+			t.Fatalf("repair created extra publicly healthy capacity: healthy=%d replicas=%+v m4_assignments=%d", healthy, replicas, h.miners["m4"].Assignments())
+		}
+
+		restoreRouteDeactivation(t, triggerDB)
+		if err := h.scheduler.repairOneDeficit(context.Background()); err != nil {
+			t.Fatalf("retry exact replacement cleanup: %v", err)
+		}
+		if pending := pendingCleanupCount(h.scheduler, h.request.DeploymentID); pending != 0 {
+			t.Fatalf("successful retry retained cleanup ownership: pending=%d", pending)
+		}
+		assertExactRouteRemoved(t, routeStore, h.scheduler.Router, routeHost, endpointID)
+		if got := activeMinerIDs(h.scheduler, h.request.DeploymentID); len(got) != 1 || got[0] != "m3" || h.miners["m4"].Assignments() != 0 {
+			t.Fatalf("cleanup retry changed healthy capacity: active=%v m4_assignments=%d", got, h.miners["m4"].Assignments())
+		}
+		remaining := h.scheduler.Router.Replicas(routeHost)
+		if len(remaining) != 1 || remaining[0].MinerID != "m3" || !remaining[0].Healthy {
+			t.Fatalf("exact old-route cleanup damaged the healthy replacement: %+v", remaining)
+		}
+		h.cleanup(t)
+		deactivated = true
+	})
+}
+
 func TestReplacementObservationFailureRetainsOwnershipAcrossConcurrentTeardown(t *testing.T) {
 	h := newSchedulerHarness(t, []string{"m1", "m2"}, 1)
 	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
@@ -467,6 +591,10 @@ BEGIN SELECT RAISE(FAIL, 'injected acceptance observation failure'); END`); err 
 }
 
 func newSchedulerHarness(t *testing.T, ids []string, replicas int) *schedulerHarness {
+	return newSchedulerHarnessWithRouteStore(t, ids, replicas, nil)
+}
+
+func newSchedulerHarnessWithRouteStore(t *testing.T, ids []string, replicas int, routeStore edge.RouteStateStore) *schedulerHarness {
 	t.Helper()
 	ctx := context.Background()
 	ownerPublic, ownerPrivate, err := ed25519.GenerateKey(rand.Reader)
@@ -484,7 +612,7 @@ func newSchedulerHarness(t *testing.T, ids []string, replicas int) *schedulerHar
 	}
 	tunnels := tunnel.NewLocalRegistry()
 	probeToken := "scheduler-regression-probe"
-	router := newAuthorizedTestRouter(t, tunnels, probeToken, ownerPublic, "on.miss.computer")
+	router := newAuthorizedTestRouterWithStore(t, tunnels, probeToken, ownerPublic, "on.miss.computer", routeStore)
 	edgeServer := httptest.NewServer(router)
 	t.Cleanup(edgeServer.Close)
 	assigners := make([]miner.Assigner, 0, len(ids))
@@ -541,6 +669,97 @@ func useDurableLedger(t *testing.T, h *schedulerHarness) (*durable.Store, *sql.D
 	}
 	t.Cleanup(func() { _ = triggerDB.Close() })
 	return store, triggerDB
+}
+
+func newDurableRouteStore(t *testing.T) (*durable.Store, *sql.DB) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "edge-route-state.db")
+	store, err := durable.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	triggerDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = triggerDB.Close() })
+	return store, triggerDB
+}
+
+func failRouteDeactivation(t *testing.T, triggerDB *sql.DB, minerID string) {
+	t.Helper()
+	if strings.Contains(minerID, "'") {
+		t.Fatalf("unsafe miner fixture ID %q", minerID)
+	}
+	statement := `CREATE TRIGGER fail_route_deactivation
+BEFORE UPDATE OF state ON edge_routes
+WHEN OLD.miner_hotkey = '` + minerID + `' AND NEW.state = 'deactivated'
+BEGIN SELECT RAISE(FAIL, 'injected edge deactivation persistence failure'); END`
+	if _, err := triggerDB.ExecContext(context.Background(), statement); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func restoreRouteDeactivation(t *testing.T, triggerDB *sql.DB) {
+	t.Helper()
+	if _, err := triggerDB.ExecContext(context.Background(), `DROP TRIGGER fail_route_deactivation`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func exactPendingCleanupEndpoint(t *testing.T, scheduler *Scheduler, deploymentID, minerID string) string {
+	t.Helper()
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	state := scheduler.states[deploymentID]
+	if state == nil || state.pendingCleanup[minerID] == nil {
+		t.Fatalf("missing exact cleanup ownership for deployment=%q miner=%q", deploymentID, minerID)
+	}
+	return state.pendingCleanup[minerID].assignment.endpointID
+}
+
+func pendingCleanupCount(scheduler *Scheduler, deploymentID string) int {
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	if state := scheduler.states[deploymentID]; state != nil {
+		return len(state.pendingCleanup)
+	}
+	return 0
+}
+
+func assertRouteUnavailableToOrdinaryTraffic(t *testing.T, router *edge.Router, routeHost, endpointID, minerID string) {
+	t.Helper()
+	replicas := router.Replicas(routeHost)
+	if len(replicas) != 1 || replicas[0].EndpointID != endpointID || replicas[0].MinerID != minerID || replicas[0].Healthy {
+		t.Fatalf("rejected route was not retained but suppressed: %+v", replicas)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://"+routeHost+"/", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("suppressed rejected route served ordinary traffic: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func assertExactRouteRemoved(t *testing.T, store *durable.Store, router *edge.Router, routeHost, endpointID string) {
+	t.Helper()
+	if replicas := router.Replicas(routeHost); len(replicas) != 0 && containsEndpoint(replicas, endpointID) {
+		t.Fatalf("successful retry retained rejected route: %+v", replicas)
+	}
+	record, exists, err := store.EdgeRoute(context.Background(), endpointID)
+	if err != nil || !exists || record.State != "deactivated" {
+		t.Fatalf("successful retry did not durably deactivate exact route: record=%+v exists=%v err=%v", record, exists, err)
+	}
+}
+
+func containsEndpoint(replicas []edge.Replica, endpointID string) bool {
+	for _, replica := range replicas {
+		if replica.EndpointID == endpointID {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPendingCleanupInspectionCannotOutliveSchedulerDrain(t *testing.T) {

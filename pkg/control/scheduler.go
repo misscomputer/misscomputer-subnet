@@ -511,6 +511,13 @@ func (s *Scheduler) retainCleanupLeaseWithDisposition(state *deploymentState, ca
 		s.retireProbeStateLocked(current.endpointID)
 		s.bumpProbeTopologyLocked()
 	}
+	// The cleanup lease is the ownership boundary for an assignment that must
+	// no longer receive ordinary traffic. Suppress the exact generation+nonce
+	// incarnation while Scheduler.mu still protects that transfer; tickets that
+	// never reached activation simply do not match. Router.Deactivate repeats
+	// this fail-closed suppression after signed lifecycle validation so a
+	// persistence failure cannot republish the route.
+	s.suppressAssignmentLocked(assignment)
 	state.excluded[minerID] = struct{}{}
 	if current, ok := state.pendingCleanup[minerID]; ok {
 		if current.assignment.endpointID != assignment.endpointID {
@@ -533,6 +540,15 @@ func (s *Scheduler) retainCleanupLeaseWithDisposition(state *deploymentState, ca
 		preserveExclusion: preserveExclusion, cleaning: claim,
 	}
 	return claim
+}
+
+func (s *Scheduler) suppressAssignmentLocked(assignment activeAssignment) {
+	if s.Router == nil || assignment.miner == nil || len(s.SigningKey) != ed25519.PrivateKeySize {
+		return
+	}
+	s.Router.SetTemporaryAvailability(
+		assignment.ticket.RouteHost, assignment.replicaID, assignment.endpointID, assignment.miner.ID(), false, s.SigningKey,
+	)
 }
 
 func (s *Scheduler) markAssignmentCompleteAndClaimCleanup(state *deploymentState, minerID, endpointID string) bool {
@@ -1117,20 +1133,22 @@ func (s *Scheduler) acceptReservation(state *deploymentState, minerID string, as
 	if s.states[state.request.DeploymentID] != state {
 		return reservationDeploymentStale
 	}
-	reservation := state.reserved[minerID]
-	if reservation == nil {
+	quarantine := func() {
+		// This assignment has already passed edge activation. Make the exact
+		// incarnation unavailable before transferring ownership to cleanup.
+		s.suppressAssignmentLocked(assignment)
 		state.excluded[minerID] = struct{}{}
 		state.pendingCleanup[minerID] = &cleanupLease{assignment: assignment}
+	}
+	reservation := state.reserved[minerID]
+	if reservation == nil {
+		quarantine()
 		return reservationMismatch
 	}
 	// A matching reservation is consumed exactly once even when a late
 	// eligibility/publication race prevents activation. Capacity debt therefore
 	// stays visible instead of being hidden by an immortal reservation.
 	delete(state.reserved, minerID)
-	quarantine := func() {
-		state.excluded[minerID] = struct{}{}
-		state.pendingCleanup[minerID] = &cleanupLease{assignment: assignment}
-	}
 	if state.deactivationRequested {
 		quarantine()
 		return reservationDeploymentStale

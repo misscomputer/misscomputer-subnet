@@ -25,12 +25,16 @@ import (
 )
 
 func newAuthorizedTestRouter(t *testing.T, tunnels tunnel.Registry, probeToken string, authority ed25519.PublicKey, domain string) *edge.Router {
+	return newAuthorizedTestRouterWithStore(t, tunnels, probeToken, authority, domain, nil)
+}
+
+func newAuthorizedTestRouterWithStore(t *testing.T, tunnels tunnel.Registry, probeToken string, authority ed25519.PublicKey, domain string, store edge.RouteStateStore) *edge.Router {
 	t.Helper()
 	if domain == "" {
 		domain = "on.miss.computer"
 	}
 	router, err := edge.NewAuthorizedRouter(tunnels, probeToken, edge.RouterConfig{
-		AuthorityKey: authority, Domain: domain, AllowPrivateUpstreams: true,
+		AuthorityKey: authority, Store: store, Domain: domain, AllowPrivateUpstreams: true,
 	})
 	if err != nil {
 		t.Fatal(err)
