@@ -249,10 +249,12 @@ at most one unit of each per trigger; one permanent low-ID failure therefore
 cannot block process-wide recovery. Complete healthy observations repair one
 deficit at a time, so concurrent deficits cannot collapse into one boolean. If
 every route is absent, periodic reconciliation makes one bounded half-open
-recovery attempt instead. The five-second probe timeout applies only to a
-single HTTP probe; assignment/provisioning uses the deployment lifecycle budget
-(two minutes by default). A complete marked wrong response and an invalid signed
-receipt remain
+recovery attempt instead. A periodic probe's configured timeout (five seconds
+by default) applies only to that single HTTP probe; assignment/provisioning uses
+the deployment lifecycle budget (two minutes by default). Scheduler admission
+probing retains its own independent five-second HTTP bound, so increasing the
+periodic timeout does not increase the amount of time a candidate gets during
+admission. A complete marked wrong response and an invalid signed receipt remain
 economically punishable.
 
 Observations that lose a race with the scheduler — the deployment was torn down,
@@ -301,9 +303,23 @@ mode, it is a prober that does nothing. A non-positive timeout is refused for
 the same reason: without a deadline the prober itself owns, a hung replica's
 failure gap is whatever the HTTP client happens to allow. `controlplane.New`
 performs the same checks at construction, so a library caller cannot
-misconfigure it silently either. The bound uses checked duration addition;
+misconfigure it silently either. `RapidWindow` itself must also be positive: a
+zero or negative window makes the monitor reset rapid-failure evidence on every
+observation, so `Validate` rejects it with `ErrProbeCadence` instead of starting
+a driver that can never evict. The bound uses checked duration addition;
 individually parseable values whose sum would overflow `time.Duration` are
 refused rather than wrapping into an apparently valid negative gap.
+
+The context deadline installed for each periodic request is its authoritative
+whole-request deadline. The validator's HTTP transport, cookie jar, and
+redirect policy are preserved, but a separate `http.Client.Timeout` is not
+allowed to silently cap that configured periodic budget. For example, an
+accepted 7s interval / 6s timeout pairing (`6s + 7s + 2s = 15s`) permits a
+complete response that arrives after five seconds but before six. An earlier
+parent cancellation or deadline still wins, and preserved transport-stage
+bounds or transport failures can return earlier. A custom transport must honor
+request-context cancellation, as Go's standard transport does. This separation
+leaves the independent admission timeout unchanged.
 
 The shipped defaults are `DefaultProbeInterval` 6s, `DefaultProbeTimeout` 5s and
 `DefaultProbeCadenceMargin` 2s: 13s inside the 15s window. An already running
@@ -328,9 +344,11 @@ misscomputer-runtime \
 
 `--periodic-probe-interval 0` (the default) keeps it inert. The runtime refuses
 a negative interval or timeout, and refuses a timeout that is not shorter than
-the interval. `controlplane.Config.PeriodicProbeInterval` is the equivalent
-library-level switch, and `controlplane.New` additionally refuses any pairing
-whose cadence bound exceeds the health rapid window. `Plane.Run` supervises the
+the interval. `controlplane.Config.PeriodicProbeInterval` and
+`PeriodicProbeTimeout` are the equivalent library settings, and
+`controlplane.New` refuses any pairing whose cadence bound exceeds the shipped
+positive health rapid window. Direct `Prober` construction against a customized
+monitor also refuses a nonpositive rapid window. `Plane.Run` supervises the
 prober beside the synthetic campaign and stops it on cancellation.
 
 ## What it deliberately does not do

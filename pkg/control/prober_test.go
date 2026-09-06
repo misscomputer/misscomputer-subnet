@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/misscomputer/misscomputer-subnet/pkg/edge"
 	"github.com/misscomputer/misscomputer-subnet/pkg/policy"
 	"github.com/misscomputer/misscomputer-subnet/pkg/validator"
 )
@@ -709,6 +711,102 @@ func TestProberRefusesCadenceThatCannotEvict(t *testing.T) {
 			}
 			if err := prober.Run(context.Background()); !errors.Is(err, ErrProbeCadence) {
 				t.Fatalf("Run started a prober that can never evict: %v", err)
+			}
+		})
+	}
+}
+
+func TestPeriodicProbeHonorsSixSecondTimeoutWithoutWeakeningAdmissionBound(t *testing.T) {
+	h, _, _, _ := newProbedHarness(t)
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	target := h.scheduler.probeTargets()[0]
+	replica := target.replicas[0]
+
+	// This is the production construction: scheduler admission has a nil Client,
+	// so Validator supplies its independent five-second bound. Periodic probing
+	// must retain that admission behavior while allowing its own configured
+	// context deadline to be authoritative.
+	if h.scheduler.Validator.Client != nil {
+		t.Fatal("test requires the production nil validator client")
+	}
+	const responseDelay = 5300 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != target.challengePath ||
+			request.Header.Get(edge.TargetReplicaHeader) != replica.ReplicaID ||
+			request.Header.Get(edge.ProbeAuthorizationHeader) != h.scheduler.Validator.InternalProbeToken {
+			http.Error(w, "incorrect targeted probe", http.StatusBadRequest)
+			return
+		}
+		timer := time.NewTimer(responseDelay)
+		defer timer.Stop()
+		select {
+		case <-request.Context().Done():
+			return
+		case <-timer.C:
+		}
+		w.Header().Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+		_, _ = w.Write([]byte(target.challengeValue))
+	}))
+	defer server.Close()
+	h.scheduler.Validator.EdgeURL = server.URL
+
+	prober := &Prober{Scheduler: h.scheduler, Interval: 7 * time.Second, Timeout: 6 * time.Second}
+	if err := prober.Validate(); err != nil {
+		t.Fatalf("valid 6s timeout / 7s interval was refused: %v", err)
+	}
+
+	// Exercise both paths concurrently so the regression crosses five real
+	// seconds only once. The direct scheduler-validator call models admission and
+	// must still fail at its independent five-second limit. The periodic path sees
+	// the same response after that limit but before its configured six seconds and
+	// must accept it.
+	admissionDone := make(chan validator.ProbeResult, 1)
+	periodicDone := make(chan ProbeOutcome, 1)
+	go func() {
+		admissionDone <- h.scheduler.Validator.ProbeReplica(
+			context.Background(), target.routeHost, replica.ReplicaID, target.challengePath, target.challengeValue,
+		)
+	}()
+	go func() {
+		periodicDone <- prober.observe(context.Background(), target, replica)
+	}()
+
+	admission := <-admissionDone
+	periodic := <-periodicDone
+	if admission.Correct || admission.Status != 0 || admission.ResponseComplete || admission.Error == "" {
+		t.Fatalf("admission probe lost its independent five-second bound: %+v", admission)
+	}
+	if !periodic.Correct || !periodic.Reachable || !periodic.ResponseComplete || periodic.Err != nil {
+		t.Fatalf("periodic response after 5s but before configured 6s was rejected: %+v", periodic)
+	}
+	if periodic.Latency <= 5*time.Second {
+		t.Fatalf("regression did not cross the old five-second client cap: latency=%v", periodic.Latency)
+	}
+
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestProberRefusesNonpositiveRapidWindow(t *testing.T) {
+	for name, window := range map[string]time.Duration{
+		"zero":     0,
+		"negative": -time.Nanosecond,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, _, _, _ := newProbedHarness(t)
+			defer h.cleanup(t)
+			h.scheduler.monitor().RapidWindow = window
+			prober := &Prober{Scheduler: h.scheduler}
+			if err := prober.Validate(); !errors.Is(err, ErrProbeCadence) {
+				t.Fatalf("Validate accepted rapid window %v: %v", window, err)
+			}
+			if err := prober.Run(context.Background()); !errors.Is(err, ErrProbeCadence) {
+				t.Fatalf("Run started with rapid window %v: %v", window, err)
 			}
 		})
 	}

@@ -79,7 +79,9 @@ type Config struct {
 	// wrong bytes after acceptance is evicted without an external caller.
 	PeriodicProbeInterval time.Duration
 	// PeriodicProbeTimeout bounds one replica probe. Zero uses
-	// control.DefaultProbeTimeout.
+	// control.DefaultProbeTimeout. The periodic request context owns this
+	// whole-request budget independently of the scheduler admission probe's
+	// five-second client timeout.
 	PeriodicProbeTimeout time.Duration
 
 	Logger *slog.Logger
