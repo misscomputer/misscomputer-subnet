@@ -38,13 +38,17 @@ func baseArguments(t *testing.T) []string {
 
 func TestConfigurationFailsClosed(t *testing.T) {
 	for name, arguments := range map[string][]string{
-		"relative socket":     append(baseArguments(t), "--socket", "runtime.sock"),
-		"unclean state dir":   append(baseArguments(t), "--state-dir", "/var/lib//misscomputer"),
-		"missing identity":    append(baseArguments(t), "--validator-hotkey", ""),
-		"two replicas":        append(baseArguments(t), "--replicas", "2"),
-		"non-loopback edge":   append(baseArguments(t), "--edge-bind", "0.0.0.0:8081"),
-		"netuid out of range": append(baseArguments(t), "--netuid", "70000"),
-		"positional":          append(baseArguments(t), "extra"),
+		"relative socket":         append(baseArguments(t), "--socket", "runtime.sock"),
+		"unclean state dir":       append(baseArguments(t), "--state-dir", "/var/lib//misscomputer"),
+		"missing identity":        append(baseArguments(t), "--validator-hotkey", ""),
+		"two replicas":            append(baseArguments(t), "--replicas", "2"),
+		"non-loopback edge":       append(baseArguments(t), "--edge-bind", "0.0.0.0:8081"),
+		"netuid out of range":     append(baseArguments(t), "--netuid", "70000"),
+		"positional":              append(baseArguments(t), "extra"),
+		"negative probe interval": append(baseArguments(t), "--periodic-probe-interval", "-1s"),
+		"negative probe timeout":  append(baseArguments(t), "--periodic-probe-timeout", "-1s"),
+		"probe timeout exceeds interval": append(baseArguments(t),
+			"--periodic-probe-interval", "5s", "--periodic-probe-timeout", "5s"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseConfiguration(arguments); err == nil {
@@ -52,8 +56,22 @@ func TestConfigurationFailsClosed(t *testing.T) {
 			}
 		})
 	}
-	if _, err := parseConfiguration(baseArguments(t)); err != nil {
+	config, err := parseConfiguration(baseArguments(t))
+	if err != nil {
 		t.Fatal(err)
+	}
+	// The periodic prober is opt-in: an unflagged runtime keeps the historical
+	// behaviour in which health policy runs only on externally posted
+	// observations.
+	if config.periodicProbeInterval != 0 {
+		t.Fatalf("periodic probing defaulted to enabled at %v", config.periodicProbeInterval)
+	}
+	enabled, err := parseConfiguration(append(baseArguments(t), "--periodic-probe-interval", "10s", "--periodic-probe-timeout", "4s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled.periodicProbeInterval != 10*time.Second || enabled.periodicProbeTimeout != 4*time.Second {
+		t.Fatalf("periodic probe flags were not carried: %+v", enabled)
 	}
 }
 

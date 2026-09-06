@@ -34,6 +34,17 @@ const (
 
 var ErrDeploymentActive = errors.New("deployment ID is already active")
 
+// A health observation always races the scheduler: the deployment it names can
+// be torn down, or its replica replaced, between the moment the observation was
+// taken and the moment it is applied. These sentinels let a caller that
+// generates its own observations — such as the periodic Prober — tell that
+// benign staleness apart from a real policy or cleanup failure.
+var (
+	ErrUnknownDeployment      = errors.New("unknown deployment")
+	ErrDeploymentDeactivating = errors.New("deployment is deactivating")
+	ErrReplicaNotActive       = errors.New("replica is not active for miner")
+)
+
 // ScoringDisposition makes the acceptance-observation boundary explicit.
 // Ordinary customer deployments retain the historical production-eligible
 // behavior. Synthetic campaign deployments use evidence_only so their probe
@@ -890,13 +901,13 @@ func (s *Scheduler) HandleHealth(ctx context.Context, deploymentID, replicaID, m
 	}
 	s.mu.Unlock()
 	if state == nil {
-		return policy.Action{}, fmt.Errorf("unknown deployment %q", deploymentID)
+		return policy.Action{}, fmt.Errorf("deployment %q: %w", deploymentID, ErrUnknownDeployment)
 	}
 	if deactivating {
-		return policy.Action{}, fmt.Errorf("deployment %q is deactivating", deploymentID)
+		return policy.Action{}, fmt.Errorf("deployment %q: %w", deploymentID, ErrDeploymentDeactivating)
 	}
 	if removed.miner == nil || removed.replicaID != replicaID {
-		return policy.Action{}, fmt.Errorf("replica %q is not active for miner %q", replicaID, minerID)
+		return policy.Action{}, fmt.Errorf("replica %q of miner %q: %w", replicaID, minerID, ErrReplicaNotActive)
 	}
 	action := s.monitor().Observe(removed.endpointID, vantage, reachable, correct, fraudulent, at)
 	var trustErr error
@@ -1312,6 +1323,46 @@ func (s *Scheduler) ActiveReplicas(deploymentID string) []ActiveReplica {
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i].MinerID < values[j].MinerID })
 	return values
+}
+
+// probeTarget is the exact per-deployment input the periodic prober needs. It
+// carries the hidden challenge value, so it stays unexported and is never
+// projected onto the control API, the durable store, or a published manifest.
+type probeTarget struct {
+	deploymentID   string
+	routeHost      string
+	challengePath  string
+	challengeValue string
+	replicas       []ActiveReplica
+}
+
+// probeTargets snapshots every deployment that is settled enough to probe:
+// deploying and deactivating deployments are skipped so a sweep can never race
+// acceptance or teardown. The returned slices are copies, so the caller holds
+// no scheduler state while it performs network I/O.
+func (s *Scheduler) probeTargets() []probeTarget {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	targets := make([]probeTarget, 0, len(s.states))
+	for deploymentID, state := range s.states {
+		if state.deploying || state.deactivationRequested || len(state.active) == 0 {
+			continue
+		}
+		replicas := make([]ActiveReplica, 0, len(state.active))
+		for minerID, assignment := range state.active {
+			replicas = append(replicas, ActiveReplica{MinerID: minerID, ReplicaID: assignment.replicaID, EndpointID: assignment.endpointID})
+		}
+		sort.Slice(replicas, func(i, j int) bool { return replicas[i].MinerID < replicas[j].MinerID })
+		targets = append(targets, probeTarget{
+			deploymentID:   deploymentID,
+			routeHost:      state.routeHost,
+			challengePath:  state.request.Workload.ChallengePath,
+			challengeValue: state.request.Workload.ChallengeValue,
+			replicas:       replicas,
+		})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].deploymentID < targets[j].deploymentID })
+	return targets
 }
 
 func (s *Scheduler) DeploymentScoringDisposition(deploymentID string) (ScoringDisposition, bool) {

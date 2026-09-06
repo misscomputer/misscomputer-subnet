@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
+	"github.com/misscomputer/misscomputer-subnet/pkg/control"
 	"github.com/misscomputer/misscomputer-subnet/pkg/durable"
 	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
 )
@@ -86,6 +87,8 @@ func TestNewRejectsIncompleteOrUnsafeConfiguration(t *testing.T) {
 		"insecure http without private axons": func(c *Config) { c.AllowInsecureMockHTTP = true },
 		"no trusted proxies":                  func(c *Config) { c.EdgeTrustedProxyCIDRs = nil },
 		"invalid trusted proxy":               func(c *Config) { c.EdgeTrustedProxyCIDRs = []string{"not-a-cidr"} },
+		"negative probe interval":             func(c *Config) { c.PeriodicProbeInterval = -time.Second },
+		"negative probe timeout":              func(c *Config) { c.PeriodicProbeTimeout = -time.Second },
 	} {
 		t.Run(name, func(t *testing.T) {
 			config := testConfig(t)
@@ -206,5 +209,50 @@ func TestEdgeOriginTrustsOnlyConfiguredPeersAndDeploymentHosts(t *testing.T) {
 				t.Fatalf("trusted peer without a route answered %d", response.Code)
 			}
 		})
+	}
+}
+
+func TestPeriodicProberIsOptInAndRunsBesideTheCampaign(t *testing.T) {
+	// Without the interval the plane must behave exactly as before: no prober,
+	// and Run blocks purely on cancellation.
+	inert := newTestPlane(t, nil)
+	if inert.prober != nil {
+		t.Fatal("periodic prober was constructed without an explicit interval")
+	}
+
+	plane := newTestPlane(t, func(c *Config) {
+		c.PeriodicProbeInterval = 5 * time.Millisecond
+		c.PeriodicProbeTimeout = time.Millisecond
+	})
+	if plane.prober == nil {
+		t.Fatal("configured periodic prober was not constructed")
+	}
+	if plane.prober.Interval != 5*time.Millisecond || plane.prober.Timeout != time.Millisecond {
+		t.Fatalf("prober did not carry its configuration: %+v", plane.prober)
+	}
+
+	sweeps := make(chan struct{}, 4)
+	plane.prober.OnSweep = func(control.SweepResult) {
+		select {
+		case sweeps <- struct{}{}:
+		default:
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- plane.Run(ctx) }()
+	select {
+	case <-sweeps:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Plane.Run did not drive the periodic prober")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Plane.Run returned %v after cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Plane.Run did not stop the prober and return")
 	}
 }
