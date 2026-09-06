@@ -264,6 +264,17 @@ func TestNewRefusesProbeCadenceThatCanNeverEvict(t *testing.T) {
 		"cadence exceeds the health rapid window": func(c *Config) {
 			c.PeriodicProbeInterval, c.PeriodicProbeTimeout = 30*time.Second, time.Second
 		},
+		"duration addition overflows": func(c *Config) {
+			var err error
+			c.PeriodicProbeInterval, err = time.ParseDuration("2000000h")
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.PeriodicProbeTimeout, err = time.ParseDuration("1000000h")
+			if err != nil {
+				t.Fatal(err)
+			}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			config := testConfig(t)

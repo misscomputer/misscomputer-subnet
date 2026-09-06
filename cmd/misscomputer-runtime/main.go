@@ -168,12 +168,21 @@ func parseConfiguration(arguments []string) (configuration, error) {
 
 type runtime struct {
 	server       *runtimeapi.Server
-	plane        *controlplane.Plane
+	plane        runtimePlane
 	listener     net.Listener
 	edgeListener net.Listener
 	edgeServer   *http.Server
 	socketPath   string
 	logger       *slog.Logger
+	// beforePlaneJoin is an internal lifecycle test barrier. Production
+	// construction leaves it nil.
+	beforePlaneJoin func()
+}
+
+type runtimePlane interface {
+	Run(context.Context) error
+	Close(context.Context) error
+	CampaignEnabled() bool
 }
 
 func newRuntime(config configuration, logger *slog.Logger) (instance *runtime, err error) {
@@ -263,9 +272,14 @@ func (r *runtime) serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	failures := make(chan error, 3)
+	planeDone := make(chan error, 1)
 	go func() { failures <- normalizeListenerError(r.server.Serve(r.listener)) }()
 	go func() { failures <- normalizeListenerError(r.edgeServer.Serve(r.edgeListener)) }()
-	go func() { failures <- r.plane.Run(ctx) }()
+	go func() {
+		err := r.plane.Run(ctx)
+		planeDone <- err
+		failures <- err
+	}()
 	r.logger.Info("public runtime ready", "socket", r.socketPath, "edge_bind", r.edgeAddress(), "campaign", r.plane.CampaignEnabled())
 	var first error
 	select {
@@ -274,14 +288,25 @@ func (r *runtime) serve(ctx context.Context) error {
 	}
 	cancel()
 	_ = r.listener.Close()
-	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer shutdownCancel()
-	if err := r.edgeServer.Shutdown(shutdownContext); first == nil {
+	edgeShutdownContext, stopEdgeShutdown := context.WithTimeout(context.Background(), 20*time.Second)
+	if err := r.edgeServer.Shutdown(edgeShutdownContext); first == nil {
 		first = err
 	}
-	if err := r.plane.Close(shutdownContext); first == nil {
+	stopEdgeShutdown()
+	// Plane.Run owns and joins the periodic prober. Do not close the gateway or
+	// durable store underneath it: wait for the lifecycle to finish before
+	// Plane.Close releases either resource.
+	if r.beforePlaneJoin != nil {
+		r.beforePlaneJoin()
+	}
+	if err := <-planeDone; first == nil {
 		first = err
 	}
+	planeCloseContext, stopPlaneClose := context.WithTimeout(context.Background(), 20*time.Second)
+	if err := r.plane.Close(planeCloseContext); first == nil {
+		first = err
+	}
+	stopPlaneClose()
 	if err := r.server.Close(); first == nil {
 		first = err
 	}

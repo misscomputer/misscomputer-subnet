@@ -81,12 +81,11 @@ func TestDockerFailedAcceptanceCleansResources(t *testing.T) {
 		DeploymentID: "docker-failed-acceptance", Manifest: manifest, ManifestKey: artifact.ManifestKey(manifest.ImageDigest), Workload: spec, Timeout: 15 * time.Second,
 	}
 	_, err = scheduler.Deploy(ctx, request)
-	var capacity *CapacityError
-	if !errors.As(err, &capacity) {
+	if !errors.Is(err, ErrAcceptanceInconclusive) {
 		t.Fatalf("failed acceptance error = %v", err)
 	}
-	if got := assignmentLedger.Trust(agent.ID()); got != 0 {
-		t.Fatalf("failed acceptance trust = %v", got)
+	if got := assignmentLedger.Trust(agent.ID()); got == 0 || !assignmentLedger.Eligible(agent.ID()) {
+		t.Fatalf("inconclusive acceptance punished candidate: trust=%v eligible=%v", got, assignmentLedger.Eligible(agent.ID()))
 	}
 	tracked.mu.Lock()
 	assignmentCount := len(tracked.seen)

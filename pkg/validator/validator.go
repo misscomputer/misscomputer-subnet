@@ -30,10 +30,19 @@ type ProbeResult struct {
 	// with the wrong bytes" from "the miner never replied at all", and callers
 	// that act differently on those two facts must read this field, not Status.
 	ServedByReplica bool `json:"served_by_replica"`
+	// ResponseComplete is true only after the response body was read without a
+	// transport error through EOF. Headers can prove that a replica started a
+	// response, but they cannot make truncated bytes attributable content: a
+	// connection can fail anywhere between the edge and this validator after
+	// those headers arrive. Callers must require both
+	// ServedByReplica and ResponseComplete before treating wrong content as an
+	// economic fault.
+	ResponseComplete bool `json:"response_complete"`
 	// EdgeGenerated is true when a response arrived without the edge's upstream
-	// marker: the edge, an intermediary, or a fronting CDN produced it on the
-	// miner's behalf. It is the exact complement of ServedByReplica for a
-	// completed HTTP exchange, and false when no response arrived at all.
+	// marker and the body was not independently correct: the edge, an
+	// intermediary, or a fronting CDN produced it on the miner's behalf. It is
+	// false for incomplete transport and for exact content that proves a valid
+	// response even if an intermediary stripped the marker.
 	EdgeGenerated bool   `json:"edge_generated"`
 	Error         string `json:"error,omitempty"`
 }
@@ -101,13 +110,28 @@ func (v Validator) probe(ctx context.Context, routeHost, challengePath, expected
 	defer resp.Body.Close()
 	result.Status = resp.StatusCode
 	result.ServedByReplica = resp.Header.Get(edge.UpstreamResponseHeader) == edge.UpstreamResponseMarker
-	result.EdgeGenerated = !result.ServedByReplica
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// Retain only one byte beyond the accepted comparison bound. If that byte is
+	// reached, drain the remainder without retaining it so completion still
+	// means EOF rather than merely a conclusive-sized prefix. Any body error
+	// before EOF stays incomplete transport evidence.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4097))
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
-	result.Correct = resp.StatusCode == http.StatusOK && protocol.ChallengeDigest(string(body)) == protocol.ChallengeDigest(expectedValue)
+	if len(body) > 4096 {
+		// LimitReader has enough bytes to prove a mismatch, but it reaches its
+		// own synthetic EOF before learning whether the transport completed.
+		// Drain without retaining more attacker-controlled memory so a later
+		// reset is still classified as incomplete transport rather than content.
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			result.Error = err.Error()
+			return result
+		}
+	}
+	result.ResponseComplete = true
+	result.Correct = len(body) <= 4096 && resp.StatusCode == http.StatusOK && protocol.ChallengeDigest(string(body)) == protocol.ChallengeDigest(expectedValue)
+	result.EdgeGenerated = !result.Correct && !result.ServedByReplica
 	if !result.Correct {
 		if result.EdgeGenerated {
 			result.Error = fmt.Sprintf("edge-generated response status=%d", resp.StatusCode)

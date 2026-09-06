@@ -12,7 +12,10 @@ receiving edge traffic until a human or an external reporter noticed.
 
 `control.Prober` is the missing driver. It re-probes every active replica of
 every settled deployment on an interval and applies each observation through
-the existing `HandleHealth` path. It introduces no policy of its own.
+the existing health-policy path. A local corroboration fence prevents a shared
+edge or network failure from being attributed to every miner at once; it does
+not change the action for complete wrong content or for an isolated endpoint
+whose healthy peers prove that the shared path is working.
 
 ## Authority boundary
 
@@ -27,16 +30,22 @@ the fact that both look at whether a route serves the right bytes.
 
 ## Why it runs in-process
 
-A targeted probe needs the **raw hidden challenge value**. That value lives only
-in the scheduler's in-memory deployment state. It is deliberately absent from
-the control API, the durable store, the scheduler state export, and every
-published manifest — the public contracts carry only `challenge_sha256`. An
-out-of-process driver would therefore require exporting the raw challenge,
-which would defeat the design that lets a manifest be published safely at all.
+A targeted probe needs the **raw hidden challenge value**. For an active
+deployment, that value lives inside the narrow trusted workload/scheduler
+boundary (synthetic campaign recovery also retains its private workload
+material). The privileged deployment ingress terminates inside that boundary;
+the value is deliberately absent from outward control responses, durable
+endpoint records, scheduler state export, and every published manifest — the
+published contracts carry only `challenge_sha256`. An out-of-process driver
+would therefore require a new export across that boundary.
 
 So the prober lives beside the scheduler in `pkg/control`, reads its targets
-through the unexported `Scheduler.probeTargets`, and the hidden challenge value
-gains no exported accessor.
+through the unexported `Scheduler.probeTargetsVersioned`, and the hidden
+challenge value gains no exported accessor. The probe callback and its
+interface are also unexported, so an external Go consumer cannot inject an
+implementation that captures the expected value. Prober outcomes, callbacks,
+logs, durable endpoint records, published manifests, and outward control
+responses contain observations and digests only, never the raw value.
 
 ## Behaviour
 
@@ -51,7 +60,10 @@ Deployments that are `deploying` or `deactivationRequested`, and deployments
 with no active replicas, are skipped, so probing can never race acceptance or
 teardown. Loops are keyed by endpoint ID, which carries generation and nonce, so
 a replacement never inherits the loop or the health counters of the incarnation
-it replaced.
+it replaced. Every result is checked against that exact endpoint ID before it
+can update corroboration state, then checked again atomically at the scheduler
+mutation boundary. A result from an older redeploy is discarded as stale even
+when its deployment, replica, and miner labels are identical to the new one.
 
 Each replica is probed with `ProbeReplica` — targeted, not public. An untargeted
 request round-robins across healthy replicas, so a single failing replica could
@@ -70,26 +82,35 @@ replied.
 `ModifyResponse`, which runs only once a real upstream response has arrived. It
 is `Set`, not `Add`, so a replica cannot influence it, and no edge-generated
 error response passes through that code path — absence of the marker is exact,
-not a heuristic. `validator.ProbeResult` surfaces it as `ServedByReplica` and
-its complement `EdgeGenerated`.
+not a heuristic. `validator.ProbeResult` surfaces the marker as
+`ServedByReplica` and flags a completed, incorrect unmarked response as
+`EdgeGenerated`. Exact challenge content remains independently sufficient when
+an intermediary strips unknown headers. The validator also records
+`ResponseComplete`, which becomes true only after the body is read through EOF
+without a transport error. Headers followed by a truncated body prove neither
+complete content nor miner guilt.
 
 The observation is mapped as follows:
 
 | Probe result | Reported | Policy outcome |
 | --- | --- | --- |
-| status 200 with the upstream marker, body digest matches | reachable, correct | no action |
-| upstream marker present, wrong body or status | reachable, **not** correct | immediate eviction, replacement, trust-zero |
-| status present, **no** upstream marker (edge-generated 502/404/403/503) | **not** reachable | eviction after two failures inside the rapid window |
-| no status line at all (timeout, refused, TLS failure) | **not** reachable | eviction after two failures inside the rapid window |
+| complete status 200 with the upstream marker, body digest matches | reachable, correct | no action; supplies healthy-peer evidence |
+| complete response with the upstream marker, wrong body or status | reachable, **not** correct | immediate eviction and replacement; trust-zero for production-eligible deployments |
+| headers/marker arrive but the body read fails | **not** reachable, incomplete | liveness evidence only; never immediate trust-zero |
+| complete status with **no** upstream marker (edge-generated 502/404/403/503) | **not** reachable | liveness evidence only |
+| no status line at all (timeout, refused, TLS failure) | **not** reachable | liveness evidence only |
 
 Classifying an edge-generated error as "reachable but incorrect" would hand a
 merely offline miner the permanent, single-vantage trust-zero reserved for
 serving forged content — and one probe-token misconfiguration would inflict it
 on every miner in the subnet in a single pass.
 
-An oversized upstream response is deliberately in the unreachable column: the
-edge rejects it before the marker is written to the client, so the prober has no
-attested view of what the miner served and does not claim one.
+A response rejected by the edge's configured upstream-size limit is deliberately
+in the unreachable column: the edge diverts it to its own error response before
+the marker is written to the client, so the prober has no attested view of what
+the miner served and does not claim one. A smaller, complete marked body that is
+already longer than the bounded challenge comparison is attributable wrong
+content; the validator still drains it through EOF before making that claim.
 
 A correct response is accepted as independent proof that the replica answered,
 because it requires a 200 carrying the exact hidden challenge value that no edge
@@ -101,16 +122,101 @@ unreachable — never to upgrade an edge error into a trust-zero.
 forging content, and neither a transport failure nor a body mismatch
 establishes it. The prober reports only what it observed.
 
-Because the prober is a single vantage, unreachability alone never zeroes
-trust: `policy.Monitor` requires corroboration from two distinct vantages for
-that. Serving the wrong bytes does zero trust immediately, which is existing
-policy and unchanged.
+Unreachability from the internal prober never zeroes trust: it is ambiguous
+liveness evidence from one shared path, and the scheduler strips that economic
+action even if external history already supplied another vantage. The external
+health path retains its existing multi-vantage policy. Complete wrong bytes
+attributable to a replica do zero trust immediately for a production-eligible
+deployment, which is existing policy and unchanged. `ScoringEvidenceOnly`
+deployments retain eviction and replacement but suppress even that attributable
+economic action.
+
+### Common-mode protection
+
+An edge, fronting network, or probe-token fault can make every clean endpoint
+look unreachable at the same time. Counting two such rounds independently for
+every route would remove all routes, and probing replacements through the same
+broken path would exhaust the clean pool.
+
+The prober therefore keeps a private, in-memory corroboration fence per
+deployment and endpoint incarnation. An unattributable failure can enter
+`policy.Monitor` only when it consumes fresh complete-success evidence from a
+strict majority of the deployment's current endpoints other than the failing
+one. A singleton deployment has no route-local witness, so it falls back to
+the same validator process's current endpoints in other deployments. This
+fallback protects a subnet containing many one-replica deployments from the
+same shared edge/token cascade; it does not coordinate with another validator.
+
+A later failure must consume newer peer evidence. Healthy evidence must also
+postdate any newer external health failure that the prober did not apply. The
+monitor exposes a versioned snapshot and atomically rejects the prober's result
+if health history changes between corroboration and mutation. During a common
+outage, at most one earlier baseline-backed failure can have entered the
+monitor; no peer successes advance, so the destructive second failure is
+suppressed. If probing starts during the outage, even that baseline evidence is
+absent. Suppressed results remain in `ProbeOutcome` with
+`common_mode_suppressed=true` for alerting and diagnosis.
+
+Peer snapshots belong to individual in-flight observations and can complete
+out of order, so they never prune unrelated corroboration evidence. Cleanup is
+performed only from a scheduler snapshot carrying a monotonic topology epoch;
+a stale snapshot cannot erase a replacement's evidence, and a permit already
+reserved for a still-active target survives witness replacement until its exact
+health mutation commits or rolls back. If topology changes between the
+deployment-local and process-global evidence domains, successes from before the
+last failure are not reusable in the new domain.
+
+Rapid routing-removal counters are source-classed between this internal
+periodic prober and external `/v1/health` reports. One ambiguous periodic result
+and one external result therefore cannot become the destructive two-failure
+pair in either order. Two corroborated periodic failures still evict an
+isolated endpoint, and two external failures retain the external health path's
+existing authority; multi-vantage consecutive evidence remains a separate
+policy input.
+
+If the whole process has only one active endpoint, no independent endpoint can
+distinguish a miner failure from a path failure. There is also no subnet-wide
+cascade to arrest. That endpoint therefore retains the ordinary two-failure
+fail-closed eviction contract, while liveness observations from the internal
+prober are forbidden from setting economic trust to zero. If the shared path is
+actually broken, replacement acceptance is inconclusive and preserves the
+clean spare for a later half-open recovery attempt. External health successes
+do not freeze this single-endpoint liveness fallback.
+
+For one isolated failed endpoint, its healthy peers continuously refresh the
+proof, so the ordinary two-failure eviction contract still applies. Complete
+replica-backed wrong content is attributable and bypasses this fence entirely.
+There is no exchange with another validator and no new scoring authority.
+
+Admission remains fail-closed: an assignment is never activated without a
+correct probe. A no-response, edge-generated response, cancelled probe, or
+incomplete body is nevertheless inconclusive rather than miner-attributable;
+the pending route/runtime is cleaned up without trust-zero, negative scoring
+evidence, or permanent candidate exclusion after successful cleanup. If exact
+route/runtime cleanup itself fails, the scheduler retains that ticket and
+quarantines the candidate within the deployment until a later healthy signal
+retries cleanup; this ownership quarantine is evidence-neutral and never
+changes trust. When this happens during initial deployment, the failed
+deployment remains cleanup-only and blocks redeploy of that ID until explicit
+cleanup succeeds; it can never be half-opened into service behind the failed
+API call. An inconclusive replacement stops the candidate loop but leaves
+capacity debt derived from the desired, active, and reserved counts. Complete
+healthy observations repair one deficit at a time, so concurrent deficits
+cannot collapse into one boolean. If every route is absent, periodic
+reconciliation makes one bounded half-open recovery attempt instead. A
+complete marked wrong response and an invalid signed receipt remain
+economically punishable.
 
 Observations that lose a race with the scheduler — the deployment was torn down,
 or the replica replaced, while the probe was in flight — are reported as
 `Stale` and logged at debug. `ErrUnknownDeployment`, `ErrDeploymentDeactivating`
 and `ErrReplicaNotActive` exist so a caller can tell that benign churn apart
 from a real policy or cleanup failure.
+
+Parent cancellation is checked again after every probe and before any of these
+mutations. `Run` joins all endpoint loops, `Plane.Run` joins the prober, and the
+runtime joins `Plane.Run` before `Plane.Close` closes the gateway or store, so
+shutdown cancellation is never counted as miner-health evidence.
 
 ## Cadence and the rapid window
 
@@ -144,13 +250,18 @@ mode, it is a prober that does nothing. A non-positive timeout is refused for
 the same reason: without a deadline the prober itself owns, a hung replica's
 failure gap is whatever the HTTP client happens to allow. `controlplane.New`
 performs the same checks at construction, so a library caller cannot
-misconfigure it silently either.
+misconfigure it silently either. The bound uses checked duration addition;
+individually parseable values whose sum would overflow `time.Duration` are
+refused rather than wrapping into an apparently valid negative gap.
 
 The shipped defaults are `DefaultProbeInterval` 6s, `DefaultProbeTimeout` 5s and
-`DefaultProbeCadenceMargin` 2s: 13s inside the 15s window, evicting a hung or
-dark replica after roughly 22s. Concurrency is bounded by construction at one
-in-flight probe per active endpoint, which is the least a driver that must
-observe every endpoint on a fixed cadence can use.
+`DefaultProbeCadenceMargin` 2s: 13s inside the 15s window. An already running
+endpoint loop with healthy peers evicts an isolated hung replica after roughly
+22s (6s wait + 5s timeout, twice). A newly activated endpoint can first wait up
+to one 6s reconciliation interval before its loop is created, so
+activation-to-eviction can approach 28s. Common-mode suppression can delay an
+ambiguous failure until fresh healthy-peer evidence exists. Concurrency remains
+bounded by construction at one in-flight probe per active endpoint.
 
 ## Enabling it
 

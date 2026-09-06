@@ -367,6 +367,9 @@ func TestTargetedProbePreventsGoodReplicaMaskingBadCandidate(t *testing.T) {
 	if !contains(result.FailedMiners, "m2") || !contains(result.ReadyMiners, "m4") {
 		t.Fatalf("bad candidate was not replaced: %+v", result)
 	}
+	if trust := s.Ledger.Trust("m2"); trust != 0 {
+		t.Fatalf("complete replica-backed wrong content was not trust-zeroed: %v", trust)
+	}
 	for _, replica := range router.Replicas("masked.on.miss.computer") {
 		if replica.MinerID == "m2" {
 			t.Fatal("bad candidate remained in routing")

@@ -8,6 +8,8 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -18,8 +20,10 @@ import (
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
 	"github.com/misscomputer/misscomputer-subnet/pkg/durable"
+	"github.com/misscomputer/misscomputer-subnet/pkg/edge"
 	"github.com/misscomputer/misscomputer-subnet/pkg/ledger"
 	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
+	"github.com/misscomputer/misscomputer-subnet/pkg/policy"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	deployruntime "github.com/misscomputer/misscomputer-subnet/pkg/runtime"
 	"github.com/misscomputer/misscomputer-subnet/pkg/tunnel"
@@ -42,6 +46,44 @@ type flakyDeactivateAssigner struct {
 	mu       sync.Mutex
 	failures int
 	calls    int
+}
+
+type schedulerProbeTransport func(*http.Request) (*http.Response, error)
+
+func (f schedulerProbeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type schedulerInterruptedBody struct {
+	read bool
+}
+
+func (b *schedulerInterruptedBody) Read(destination []byte) (int, error) {
+	if !b.read {
+		b.read = true
+		return copy(destination, "partial"), nil
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+func (*schedulerInterruptedBody) Close() error { return nil }
+
+type blockingAcceptanceTransport struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (t *blockingAcceptanceTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.once.Do(func() { close(t.started) })
+	<-t.release
+	header := make(http.Header)
+	header.Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader("complete but wrong")),
+	}, nil
 }
 
 func (m *receiptTamperAssigner) ID() string                   { return m.inner.ID() }
@@ -461,18 +503,425 @@ func TestRemovedMinerCapacityErrorDoesNotCycle(t *testing.T) {
 	}
 }
 
-func TestAcceptanceNetworkFailureImmediatelyZerosTrust(t *testing.T) {
+func TestAcceptanceNetworkFailurePreservesCandidateForRetry(t *testing.T) {
 	h := newSchedulerHarness(t, []string{"m1"}, 1)
+	originalURL := h.scheduler.Validator.EdgeURL
 	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
 	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
 	_, err := h.scheduler.Deploy(context.Background(), h.request)
-	var capacity *CapacityError
-	if !errors.As(err, &capacity) {
+	if !errors.Is(err, ErrAcceptanceInconclusive) {
 		t.Fatalf("network acceptance failure error = %v", err)
 	}
-	if got := h.scheduler.Ledger.Trust("m1"); got != 0 {
-		t.Fatalf("trust after one unreachable acceptance probe = %v", got)
+	if got := h.scheduler.Ledger.Trust("m1"); got == 0 || !h.scheduler.Ledger.Eligible("m1") {
+		t.Fatalf("inconclusive acceptance probe punished candidate: trust=%v eligible=%v", got, h.scheduler.Ledger.Eligible("m1"))
 	}
+	if active := h.scheduler.ActiveReplicas(h.request.DeploymentID); len(active) != 0 {
+		t.Fatalf("inconclusive acceptance did not fail closed: %+v", active)
+	}
+	h.scheduler.Validator.EdgeURL = originalURL
+	result, err := h.scheduler.Deploy(context.Background(), h.request)
+	if err != nil || len(result.ReadyMiners) != 1 || result.ReadyMiners[0] != "m1" {
+		t.Fatalf("clean candidate was not reusable after path recovery: result=%+v err=%v", result, err)
+	}
+	h.cleanup(t)
+}
+
+func TestInitialInconclusiveCleanupFailureBlocksRedeployUntilExactCleanup(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1"}, 1)
+	flaky := &flakyDeactivateAssigner{inner: h.scheduler.Miners[0], failures: 3}
+	h.scheduler.Miners[0] = flaky
+	originalURL := h.scheduler.Validator.EdgeURL
+	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
+	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
+	_, err := h.scheduler.Deploy(context.Background(), h.request)
+	if !errors.Is(err, ErrAcceptanceInconclusive) || !strings.Contains(err.Error(), "injected deactivation failure") {
+		t.Fatalf("initial inconclusive cleanup failure = %v", err)
+	}
+	if pending, pendingErr := h.scheduler.PendingCleanupAssignments(context.Background(), h.request.DeploymentID); pendingErr != nil || pending != 1 {
+		t.Fatalf("failed initial cleanup lost exact ownership: pending=%d err=%v", pending, pendingErr)
+	}
+	if _, err := h.scheduler.Deploy(context.Background(), h.request); !errors.Is(err, ErrDeploymentActive) {
+		t.Fatalf("redeploy reused candidate before cleanup: %v", err)
+	}
+	if h.miners["m1"].Assignments() != 1 {
+		t.Fatalf("blocked redeploy launched another assignment: %d", h.miners["m1"].Assignments())
+	}
+	if trust := h.scheduler.Ledger.Trust("m1"); trust == 0 || !h.scheduler.Ledger.Eligible("m1") {
+		t.Fatalf("cleanup uncertainty became economic guilt: trust=%v eligible=%v", trust, h.scheduler.Ledger.Eligible("m1"))
+	}
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+	err = h.scheduler.DeactivateDeployment(cleanupCtx, h.request.DeploymentID)
+	cleanupCancel()
+	if err == nil || !strings.Contains(err.Error(), "injected deactivation failure") {
+		t.Fatalf("persistent exact cleanup failure was hidden: %v", err)
+	}
+	if pending, pendingErr := h.scheduler.PendingCleanupAssignments(context.Background(), h.request.DeploymentID); pendingErr != nil || pending != 1 {
+		t.Fatalf("failed explicit cleanup dropped ownership: pending=%d err=%v", pending, pendingErr)
+	}
+	cleanupCtx, cleanupCancel = context.WithTimeout(context.Background(), time.Second)
+	err = h.scheduler.DeactivateDeployment(cleanupCtx, h.request.DeploymentID)
+	cleanupCancel()
+	if err != nil {
+		t.Fatalf("retry exact cleanup: %v", err)
+	}
+	if pending, pendingErr := h.scheduler.PendingCleanupAssignments(context.Background(), h.request.DeploymentID); pendingErr != nil || pending != 0 {
+		t.Fatalf("successful exact cleanup retained ownership: pending=%d err=%v", pending, pendingErr)
+	}
+
+	h.scheduler.Validator.EdgeURL = originalURL
+	h.scheduler.Validator.Client = nil
+	result, err := h.scheduler.Deploy(context.Background(), h.request)
+	if err != nil || len(result.ReadyMiners) != 1 || result.ReadyMiners[0] != "m1" {
+		t.Fatalf("candidate was not reusable after exact cleanup: result=%+v err=%v", result, err)
+	}
+	if h.miners["m1"].Assignments() != 2 {
+		t.Fatalf("post-cleanup assignment count=%d", h.miners["m1"].Assignments())
+	}
+	h.cleanup(t)
+}
+
+func TestAcceptanceUnattributableHTTPFailurePreservesCandidateForRetry(t *testing.T) {
+	for name, transport := range map[string]http.RoundTripper{
+		"edge generated status": schedulerProbeTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("probe forbidden")),
+			}, nil
+		}),
+		"incomplete marked body": schedulerProbeTransport(func(*http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     header,
+				Body:       &schedulerInterruptedBody{},
+			}, nil
+		}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newSchedulerHarness(t, []string{"m1"}, 1)
+			originalURL := h.scheduler.Validator.EdgeURL
+			h.scheduler.Validator.Client = &http.Client{Transport: transport}
+			_, err := h.scheduler.Deploy(context.Background(), h.request)
+			if !errors.Is(err, ErrAcceptanceInconclusive) {
+				t.Fatalf("unattributable acceptance error = %v", err)
+			}
+			if trust := h.scheduler.Ledger.Trust("m1"); trust == 0 || !h.scheduler.Ledger.Eligible("m1") {
+				t.Fatalf("unattributable response punished candidate: trust=%v eligible=%v", trust, h.scheduler.Ledger.Eligible("m1"))
+			}
+			if active := h.scheduler.ActiveReplicas(h.request.DeploymentID); len(active) != 0 {
+				t.Fatalf("unattributable acceptance did not fail closed: %+v", active)
+			}
+			h.scheduler.Validator.EdgeURL = originalURL
+			h.scheduler.Validator.Client = nil
+			result, err := h.scheduler.Deploy(context.Background(), h.request)
+			if err != nil || len(result.ReadyMiners) != 1 || result.ReadyMiners[0] != "m1" {
+				t.Fatalf("clean candidate was not reusable after recovery: result=%+v err=%v", result, err)
+			}
+			h.cleanup(t)
+		})
+	}
+}
+
+func TestPublicAcceptanceEdgeFailurePreservesCandidateForRetry(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1"}, 1)
+	originalURL := h.scheduler.Validator.EdgeURL
+	calls := 0
+	h.scheduler.Validator.Client = &http.Client{Transport: schedulerProbeTransport(func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			header := make(http.Header)
+			header.Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     header,
+				Body:       io.NopCloser(strings.NewReader(h.request.Workload.ChallengeValue)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("edge unavailable")),
+		}, nil
+	})}
+	_, err := h.scheduler.Deploy(context.Background(), h.request)
+	if !errors.Is(err, ErrAcceptanceInconclusive) || calls != 2 {
+		t.Fatalf("public edge failure calls=%d error=%v", calls, err)
+	}
+	if trust := h.scheduler.Ledger.Trust("m1"); trust == 0 || !h.scheduler.Ledger.Eligible("m1") {
+		t.Fatalf("public edge failure punished candidate: trust=%v eligible=%v", trust, h.scheduler.Ledger.Eligible("m1"))
+	}
+	if active := h.scheduler.ActiveReplicas(h.request.DeploymentID); len(active) != 0 {
+		t.Fatalf("public edge failure did not fail closed: %+v", active)
+	}
+	h.scheduler.Validator.EdgeURL = originalURL
+	h.scheduler.Validator.Client = nil
+	result, err := h.scheduler.Deploy(context.Background(), h.request)
+	if err != nil || len(result.ReadyMiners) != 1 || result.ReadyMiners[0] != "m1" {
+		t.Fatalf("candidate did not recover after public edge failure: result=%+v err=%v", result, err)
+	}
+	h.cleanup(t)
+}
+
+func TestAcceptanceCancellationAfterProbeCannotPunishCandidate(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1"}, 1)
+	transport := &blockingAcceptanceTransport{started: make(chan struct{}), release: make(chan struct{})}
+	h.scheduler.Validator.Client = &http.Client{Transport: transport}
+	ctx, cancel := context.WithCancel(context.Background())
+	completed := make(chan error, 1)
+	go func() {
+		_, err := h.scheduler.Deploy(ctx, h.request)
+		completed <- err
+	}()
+	<-transport.started
+	cancel()
+	close(transport.release)
+	select {
+	case err := <-completed:
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrAcceptanceInconclusive) {
+			t.Fatalf("cancelled acceptance error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled acceptance probe did not finish")
+	}
+	if trust := h.scheduler.Ledger.Trust("m1"); trust == 0 || !h.scheduler.Ledger.Eligible("m1") {
+		t.Fatalf("shutdown cancellation punished candidate: trust=%v eligible=%v", trust, h.scheduler.Ledger.Eligible("m1"))
+	}
+	if active := h.scheduler.ActiveReplicas(h.request.DeploymentID); len(active) != 0 {
+		t.Fatalf("cancelled acceptance activated a route: %+v", active)
+	}
+}
+
+func TestReplacementAcceptanceNetworkFailureDefersWithoutBurningPool(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1", "m2", "m3", "m4"}, 3)
+	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
+		t.Fatal(err)
+	}
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	originalURL := h.scheduler.Validator.EdgeURL
+	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
+	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
+	action, err := h.scheduler.HandleHealth(
+		context.Background(), h.request.DeploymentID, "regression-m1", "m1", "v1",
+		true, false, false, time.Now().UTC(),
+	)
+	if !errors.Is(err, ErrAcceptanceInconclusive) {
+		t.Fatalf("replacement path failure error = %v", err)
+	}
+	if !action.RemoveFromRouting || !action.AssignReplacement || !action.TrustZero {
+		t.Fatalf("attributable old-miner failure lost its policy action: %+v", action)
+	}
+	if trust := h.scheduler.Ledger.Trust("m4"); trust == 0 || !h.scheduler.Ledger.Eligible("m4") {
+		t.Fatalf("shared path failure burned clean spare: trust=%v eligible=%v", trust, h.scheduler.Ledger.Eligible("m4"))
+	}
+	if active := activeMinerIDs(h.scheduler, h.request.DeploymentID); len(active) != 2 || contains(active, "m4") {
+		t.Fatalf("inconclusive replacement did not fail closed: %v", active)
+	}
+
+	// A complete healthy observation proves the edge path recovered and claims
+	// the single deferred repair. The same clean candidate must be selectable.
+	h.scheduler.Validator.EdgeURL = originalURL
+	action, err = h.scheduler.HandleHealth(
+		context.Background(), h.request.DeploymentID, "regression-m2", "m2", "v1",
+		true, true, false, time.Now().UTC().Add(time.Second),
+	)
+	if err != nil || action != (policy.Action{}) {
+		t.Fatalf("recovery observation could not restore redundancy: action=%+v err=%v", action, err)
+	}
+	if active := activeMinerIDs(h.scheduler, h.request.DeploymentID); len(active) != 3 || !contains(active, "m4") {
+		t.Fatalf("deferred replacement did not restore clean spare: %v", active)
+	}
+	if trust := h.scheduler.Ledger.Trust("m4"); trust == 0 {
+		t.Fatal("recovered clean spare was trust-zeroed")
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestInconclusiveReplacementCleanupFailureRetainsExactOwnership(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1", "m2", "m3", "m4", "m5"}, 3)
+	for index, candidate := range h.scheduler.Miners {
+		if candidate.ID() == "m4" {
+			h.scheduler.Miners[index] = &flakyDeactivateAssigner{inner: candidate, failures: 2}
+		}
+	}
+	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
+		t.Fatal(err)
+	}
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	originalURL := h.scheduler.Validator.EdgeURL
+	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
+	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
+	action, err := h.scheduler.HandleHealth(
+		context.Background(), h.request.DeploymentID, "regression-m1", "m1", "v1",
+		true, false, false, time.Now().UTC(),
+	)
+	if !errors.Is(err, ErrAcceptanceInconclusive) || !strings.Contains(err.Error(), "injected deactivation failure") || !action.RemoveFromRouting {
+		t.Fatalf("inconclusive replacement with failed cleanup: action=%+v err=%v", action, err)
+	}
+	if h.miners["m4"].Assignments() != 1 {
+		t.Fatalf("first clean spare assignment count=%d", h.miners["m4"].Assignments())
+	}
+	if pending, pendingErr := h.scheduler.PendingCleanupAssignments(context.Background(), h.request.DeploymentID); pendingErr != nil || pending != 3 {
+		// Two active replicas plus the exact failed m4 acceptance incarnation.
+		t.Fatalf("failed cleanup ownership was not retained: pending=%d err=%v", pending, pendingErr)
+	}
+
+	h.scheduler.Validator.EdgeURL = originalURL
+	h.scheduler.Validator.Client = nil
+	action, err = h.scheduler.HandleHealth(
+		context.Background(), h.request.DeploymentID, "regression-m2", "m2", "v1",
+		true, true, false, time.Now().UTC().Add(time.Second),
+	)
+	if !strings.Contains(fmt.Sprint(err), "injected deactivation failure") || action != (policy.Action{}) {
+		t.Fatalf("cleanup retry/redundancy repair result: action=%+v err=%v", action, err)
+	}
+	active := activeMinerIDs(h.scheduler, h.request.DeploymentID)
+	if len(active) != 3 || contains(active, "m4") || !contains(active, "m5") {
+		t.Fatalf("uncertain m4 was reused instead of a clean spare: %v", active)
+	}
+	if h.miners["m4"].Assignments() != 1 || h.miners["m5"].Assignments() != 1 {
+		t.Fatalf("candidate assignments after failed cleanup: m4=%d m5=%d", h.miners["m4"].Assignments(), h.miners["m5"].Assignments())
+	}
+	if trust := h.scheduler.Ledger.Trust("m4"); trust == 0 || !h.scheduler.Ledger.Eligible("m4") {
+		t.Fatalf("cleanup uncertainty became economic guilt: trust=%v eligible=%v", trust, h.scheduler.Ledger.Eligible("m4"))
+	}
+
+	// The next healthy signal retries and completes m4's exact old cleanup even
+	// though capacity is already full; it does not launch another assignment.
+	action, err = h.scheduler.HandleHealth(
+		context.Background(), h.request.DeploymentID, "regression-m2", "m2", "v1",
+		true, true, false, time.Now().UTC().Add(2*time.Second),
+	)
+	if err != nil || action != (policy.Action{}) {
+		t.Fatalf("successful cleanup retry: action=%+v err=%v", action, err)
+	}
+	if pending, pendingErr := h.scheduler.PendingCleanupAssignments(context.Background(), h.request.DeploymentID); pendingErr != nil || pending != 3 {
+		// The three active replicas remain cleanup-owned; m4 no longer does.
+		t.Fatalf("successful retry retained stale cleanup ownership: pending=%d err=%v", pending, pendingErr)
+	}
+	h.scheduler.mu.Lock()
+	pendingCleanup := len(h.scheduler.states[h.request.DeploymentID].pendingCleanup)
+	h.scheduler.mu.Unlock()
+	if pendingCleanup != 0 {
+		t.Fatalf("successful retry retained %d inconclusive cleanup leases", pendingCleanup)
+	}
+	if h.miners["m4"].Assignments() != 1 {
+		t.Fatalf("cleaned m4 was unexpectedly reassigned: %d", h.miners["m4"].Assignments())
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestMultipleInconclusiveReplacementsRetainExactCapacityDebt(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1", "m2", "m3", "m4", "m5"}, 3)
+	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
+		t.Fatal(err)
+	}
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			h.cleanup(t)
+		}
+	}()
+	byMiner := make(map[string]string)
+	for _, replica := range h.scheduler.ActiveReplicas(h.request.DeploymentID) {
+		byMiner[replica.MinerID] = replica.ReplicaID
+	}
+	originalURL := h.scheduler.Validator.EdgeURL
+	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
+	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
+	for _, minerID := range []string{"m1", "m2"} {
+		action, err := h.scheduler.HandleHealth(
+			context.Background(), h.request.DeploymentID, byMiner[minerID], minerID, "v1",
+			true, false, false, time.Now().UTC(),
+		)
+		if !errors.Is(err, ErrAcceptanceInconclusive) || !action.RemoveFromRouting {
+			t.Fatalf("remove %s during edge fault: action=%+v err=%v", minerID, action, err)
+		}
+	}
+	if active := activeMinerIDs(h.scheduler, h.request.DeploymentID); len(active) != 1 || !contains(active, "m3") {
+		t.Fatalf("two failed replacements left unexpected active set: %v", active)
+	}
+	for _, minerID := range []string{"m4", "m5"} {
+		if trust := h.scheduler.Ledger.Trust(minerID); trust == 0 || !h.scheduler.Ledger.Eligible(minerID) {
+			t.Fatalf("inconclusive replacement burned %s: trust=%v eligible=%v", minerID, trust, h.scheduler.Ledger.Eligible(minerID))
+		}
+	}
+
+	h.scheduler.Validator.EdgeURL = originalURL
+	h.scheduler.Validator.Client = nil
+	for attempt := 0; attempt < 2; attempt++ {
+		action, err := h.scheduler.HandleHealth(
+			context.Background(), h.request.DeploymentID, byMiner["m3"], "m3", "v1",
+			true, true, false, time.Now().UTC().Add(time.Duration(attempt+1)*time.Second),
+		)
+		if err != nil || action != (policy.Action{}) {
+			t.Fatalf("capacity repair %d: action=%+v err=%v", attempt+1, action, err)
+		}
+	}
+	active := activeMinerIDs(h.scheduler, h.request.DeploymentID)
+	if len(active) != 3 || !contains(active, "m3") || !contains(active, "m4") || !contains(active, "m5") {
+		t.Fatalf("capacity debt collapsed or overfilled: %v", active)
+	}
+	h.cleanup(t)
+	deactivated = true
+}
+
+func TestHealthyDeploymentRepairsZeroActiveDeferredDeployment(t *testing.T) {
+	h := newSchedulerHarness(t, []string{"m1", "m2", "m3"}, 1)
+	requests := []DeployRequest{h.request, h.request}
+	requests[0].DeploymentID, requests[0].RequiredMiner = "zero-a", "m1"
+	requests[1].DeploymentID, requests[1].RequiredMiner = "zero-b", "m2"
+	for _, request := range requests {
+		if _, err := h.scheduler.Deploy(context.Background(), request); err != nil {
+			t.Fatalf("deploy %s: %v", request.DeploymentID, err)
+		}
+	}
+	deactivated := false
+	defer func() {
+		if !deactivated {
+			cleanupDeployments(t, h.scheduler, []string{"zero-a", "zero-b"})
+		}
+	}()
+	activeA := h.scheduler.ActiveReplicas("zero-a")[0]
+	activeB := h.scheduler.ActiveReplicas("zero-b")[0]
+	originalURL := h.scheduler.Validator.EdgeURL
+	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
+	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
+	action, err := h.scheduler.HandleHealth(
+		context.Background(), "zero-a", activeA.ReplicaID, activeA.MinerID, "v1",
+		true, false, false, time.Now().UTC(),
+	)
+	if !errors.Is(err, ErrAcceptanceInconclusive) || !action.RemoveFromRouting || len(h.scheduler.ActiveReplicas("zero-a")) != 0 {
+		t.Fatalf("zero-active setup: action=%+v active=%v err=%v", action, activeMinerIDs(h.scheduler, "zero-a"), err)
+	}
+	h.scheduler.Validator.EdgeURL = originalURL
+	h.scheduler.Validator.Client = nil
+	action, err = h.scheduler.HandleHealth(
+		context.Background(), "zero-b", activeB.ReplicaID, activeB.MinerID, "v1",
+		true, true, false, time.Now().UTC().Add(time.Second),
+	)
+	if err != nil || action != (policy.Action{}) {
+		t.Fatalf("healthy peer deployment did not trigger repair: action=%+v err=%v", action, err)
+	}
+	if active := activeMinerIDs(h.scheduler, "zero-a"); len(active) != 1 {
+		t.Fatalf("zero-active deployment did not recover: %v", active)
+	}
+	cleanupDeployments(t, h.scheduler, []string{"zero-a", "zero-b"})
+	deactivated = true
 }
 
 type lateSuccessMiner struct {

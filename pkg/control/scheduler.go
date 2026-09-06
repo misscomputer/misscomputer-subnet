@@ -43,6 +43,12 @@ var (
 	ErrUnknownDeployment      = errors.New("unknown deployment")
 	ErrDeploymentDeactivating = errors.New("deployment is deactivating")
 	ErrReplicaNotActive       = errors.New("replica is not active for miner")
+	// ErrAcceptanceInconclusive reports an admission probe that did not yield a
+	// complete response attributable to the candidate. The assignment still
+	// fails closed, but the candidate is not economically blamed for an edge,
+	// network, cancellation, or incomplete-transport failure.
+	ErrAcceptanceInconclusive   = errors.New("acceptance probe was inconclusive")
+	errHealthObservationChanged = errors.New("endpoint health changed after corroboration")
 )
 
 // ScoringDisposition makes the acceptance-observation boundary explicit.
@@ -92,17 +98,29 @@ type Scheduler struct {
 	mu                 sync.Mutex
 	publicationID      string
 	publicationVersion uint64
+	probeTopology      uint64
 	states             map[string]*deploymentState
 }
 
+// bumpProbeTopologyLocked advances the incarnation set observed by the
+// periodic prober. At exhaustion, destructive corroboration pruning stays
+// disabled (see probeCorroboration.reconcile) rather than treating two
+// different topologies as the same generation.
+func (s *Scheduler) bumpProbeTopologyLocked() {
+	if s.probeTopology != ^uint64(0) {
+		s.probeTopology++
+	}
+}
+
 type deploymentState struct {
-	request    DeployRequest
-	routeHost  string
-	active     map[string]activeAssignment
-	reserved   map[string]*candidateReservation
-	excluded   map[string]struct{}
-	generation uint64
-	deploying  bool
+	request        DeployRequest
+	routeHost      string
+	active         map[string]activeAssignment
+	reserved       map[string]*candidateReservation
+	excluded       map[string]struct{}
+	pendingCleanup map[string]activeAssignment
+	generation     uint64
+	deploying      bool
 	// Deactivation keeps exact ticket ownership until route, miner, and
 	// durable endpoint cleanup have all succeeded. This makes retries safe
 	// without reopening placement or replacement races.
@@ -331,9 +349,15 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 		if s.states[req.DeploymentID] == state {
 			state.deploying = false
 			state.reserved = make(map[string]*candidateReservation)
-			if !state.deactivationRequested || (len(state.active) == 0 && !state.cleanupInProgress) {
+			if len(state.pendingCleanup) > 0 {
+				// The caller saw a failed deployment, so this cleanup-only state
+				// must never be half-opened into service. Retain exact ownership
+				// and block redeploy until DeactivateDeployment tears it down.
+				state.deactivationRequested = true
+			} else if !state.deactivationRequested || (len(state.active) == 0 && !state.cleanupInProgress) {
 				delete(s.states, req.DeploymentID)
 			}
+			s.bumpProbeTopologyLocked()
 		}
 		s.mu.Unlock()
 	}()
@@ -445,7 +469,15 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 				return result, fmt.Errorf("register authenticated pending edge route: %w", err)
 			}
 			probe := s.Validator.ProbeReplica(ctx, routeHost, outcome.result.Receipt.ReplicaID, req.Workload.ChallengePath, req.Workload.ChallengeValue)
+			if err := ctx.Err(); err != nil {
+				probe.ResponseComplete = false
+				probe.Error = err.Error()
+				return result, errors.Join(s.rejectInconclusiveAcceptance(state, outcome, probe), err)
+			}
 			if !probe.Correct {
+				if !attributableAcceptanceFailure(probe) {
+					return result, s.rejectInconclusiveAcceptance(state, outcome, probe)
+				}
 				if err := s.rejectAcceptance(state, routeHost, outcome, req.ScoringDisposition); err != nil {
 					return result, fmt.Errorf("persist strict acceptance rejection: %w", err)
 				}
@@ -465,7 +497,15 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 			}
 			if result.FirstReplicaAt.IsZero() {
 				probe = s.Validator.Probe(ctx, routeHost, req.Workload.ChallengePath, req.Workload.ChallengeValue)
+				if err := ctx.Err(); err != nil {
+					probe.ResponseComplete = false
+					probe.Error = err.Error()
+					return result, errors.Join(s.rejectInconclusiveAcceptance(state, outcome, probe), err)
+				}
 				if !probe.Correct {
+					if !attributableAcceptanceFailure(probe) {
+						return result, s.rejectInconclusiveAcceptance(state, outcome, probe)
+					}
 					if err := s.rejectAcceptance(state, routeHost, outcome, req.ScoringDisposition); err != nil {
 						return result, fmt.Errorf("persist public acceptance rejection: %w", err)
 					}
@@ -535,6 +575,7 @@ func (s *Scheduler) Deploy(parent context.Context, req DeployRequest) (DeployRes
 		return result, fmt.Errorf("deployment %q was deactivated before registration completed", req.DeploymentID)
 	}
 	state.deploying = false
+	s.bumpProbeTopologyLocked()
 	s.mu.Unlock()
 	succeeded = true
 	return result, nil
@@ -581,9 +622,11 @@ func (s *Scheduler) beginDeployment(req DeployRequest, routeHost string, firstGe
 	}
 	state := &deploymentState{
 		request: req, routeHost: routeHost, active: make(map[string]activeAssignment),
-		reserved: make(map[string]*candidateReservation), excluded: make(map[string]struct{}), generation: firstGeneration, deploying: true,
+		reserved: make(map[string]*candidateReservation), excluded: make(map[string]struct{}),
+		pendingCleanup: make(map[string]activeAssignment), generation: firstGeneration, deploying: true,
 	}
 	s.states[req.DeploymentID] = state
+	s.bumpProbeTopologyLocked()
 	return state, nil
 }
 
@@ -621,24 +664,28 @@ func (s *Scheduler) reserveInitialCandidate(state *deploymentState) (*candidateR
 	return nil, len(state.active) + len(state.reserved)
 }
 
-func (s *Scheduler) reserveReplacementCandidate(state *deploymentState) (*candidateReservation, uint64, int) {
+func (s *Scheduler) reserveReplacementCandidate(state *deploymentState) (*candidateReservation, uint64, int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.states[state.request.DeploymentID] != state || state.deactivationRequested {
-		return nil, 0, 0
+		return nil, 0, 0, false
+	}
+	current := len(state.active) + len(state.reserved)
+	if current >= s.replicaCount() {
+		return nil, 0, current, false
 	}
 	if state.generation == ^uint64(0) {
-		return nil, 0, len(state.active) + len(state.reserved)
+		return nil, 0, current, true
 	}
 	for _, candidate := range s.Miners {
 		if s.candidateCleanLocked(state, candidate) {
 			reservation := s.captureReservationLocked(candidate)
 			state.reserved[candidate.ID()] = reservation
 			state.generation++
-			return reservation, state.generation, len(state.active) + len(state.reserved)
+			return reservation, state.generation, len(state.active) + len(state.reserved), true
 		}
 	}
-	return nil, 0, len(state.active) + len(state.reserved)
+	return nil, 0, current, true
 }
 
 func (s *Scheduler) captureReservationLocked(candidate miner.Assigner) *candidateReservation {
@@ -679,6 +726,20 @@ func (s *Scheduler) failReservation(state *deploymentState, minerID string) {
 	s.mu.Unlock()
 }
 
+func (s *Scheduler) retainPendingCleanup(state *deploymentState, outcome assignmentResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.states[state.request.DeploymentID] != state {
+		return
+	}
+	minerID := outcome.miner.ID()
+	delete(state.reserved, minerID)
+	state.excluded[minerID] = struct{}{}
+	state.pendingCleanup[minerID] = activeAssignment{
+		miner: outcome.miner, replicaID: protocol.ReplicaID(outcome.ticket), endpointID: expectedEndpointID(outcome.ticket), ticket: outcome.ticket,
+	}
+}
+
 func (s *Scheduler) acceptReservation(state *deploymentState, minerID string, assignment activeAssignment) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -689,21 +750,49 @@ func (s *Scheduler) acceptReservation(state *deploymentState, minerID string, as
 	}
 	delete(state.reserved, minerID)
 	state.active[minerID] = assignment
+	s.bumpProbeTopologyLocked()
 	return true
 }
 
 func (s *Scheduler) rejectAcceptance(state *deploymentState, routeHost string, outcome assignmentResult, disposition ScoringDisposition) error {
 	cleanupErr := s.deactivateTicket(outcome.miner, outcome.ticket)
-	// Acceptance is deliberately strict: unreachability, an edge/network
-	// error, or incorrect content all make this assignment unacceptable and
-	// may immediately zero economic trust. Corroboration applies only to the
-	// separate post-acceptance health monitor.
+	// Only a complete response carrying the edge's upstream marker reaches this
+	// function. The candidate therefore controlled the wrong response and can
+	// be economically penalized without attributing an edge/network failure to
+	// it. Inconclusive failures use rejectInconclusiveAcceptance instead.
 	var trustErr error
 	if disposition != ScoringEvidenceOnly {
 		trustErr = s.Ledger.SetTrust(outcome.miner.ID(), 0)
 	}
 	s.failReservation(state, outcome.miner.ID())
 	return errors.Join(cleanupErr, trustErr)
+}
+
+func attributableAcceptanceFailure(probe validator.ProbeResult) bool {
+	return probe.ServedByReplica && probe.ResponseComplete
+}
+
+func (s *Scheduler) rejectInconclusiveAcceptance(state *deploymentState, outcome assignmentResult, probe validator.ProbeResult) error {
+	cleanupErr := s.deactivateTicket(outcome.miner, outcome.ticket)
+	if cleanupErr != nil {
+		// Keep uncertain runtime/route ownership quarantined inside this
+		// deployment. Releasing the reservation here would let a half-open retry
+		// assign a second incarnation to the same miner while cleanup of the first
+		// one is still unresolved. This is evidence-neutral (trust is unchanged),
+		// but deliberately removes the candidate from this deployment's pool until
+		// the exact cleanup is retried successfully or the deployment is cleaned.
+		s.retainPendingCleanup(state, outcome)
+	} else {
+		s.releaseReservation(state, outcome.miner.ID())
+	}
+	detail := probe.Error
+	if detail == "" {
+		detail = "no complete replica response"
+	}
+	return errors.Join(
+		fmt.Errorf("%w for miner %q: status=%d: %s", ErrAcceptanceInconclusive, outcome.miner.ID(), probe.Status, detail),
+		cleanupErr,
+	)
 }
 
 func (s *Scheduler) ticket(req DeployRequest, candidate miner.Assigner, routeHost string, generation uint64, now time.Time) (protocol.Ticket, error) {
@@ -887,11 +976,35 @@ func (s *Scheduler) ObserveHealth(routeHost, replicaID, endpointID, minerID, van
 	return action, nil
 }
 
-// HandleHealth applies post-acceptance policy and synchronously restores the
-// requested replica count. Removal atomically quarantines the old miner, and
-// each replacement candidate is reserved before the scheduler lock is
-// released so concurrent health handlers cannot double-assign it.
+// HandleHealth applies an external post-acceptance observation. External
+// reports identify the currently active stable replica; the in-process prober
+// uses handleEndpointHealth below to bind an observation to one exact endpoint
+// incarnation.
 func (s *Scheduler) HandleHealth(ctx context.Context, deploymentID, replicaID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time) (policy.Action, error) {
+	action, _, err := s.handleHealth(ctx, deploymentID, replicaID, "", minerID, vantage, reachable, correct, fraudulent, at, false, nil)
+	return action, err
+}
+
+// handleEndpointHealth applies an internal observation only if endpointID is
+// still the exact active generation/nonce incarnation that was probed.
+func (s *Scheduler) handleEndpointHealth(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time) (policy.Action, error) {
+	action, _, err := s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, true, nil)
+	return action, err
+}
+
+func (s *Scheduler) handleEndpointHealthVersioned(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time, expectedHealthVersion uint64) (policy.Action, bool, error) {
+	return s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, true, &expectedHealthVersion)
+}
+
+// handleHealth applies post-acceptance policy and synchronously restores the
+// requested replica count. Validation, monitor observation, and ownership of a
+// removal are claimed under one scheduler lock, so teardown/redeploy cannot
+// turn an already in-flight result into an action on a newer incarnation.
+func (s *Scheduler) handleHealth(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time, suppressInternalLivenessTrust bool, expectedHealthVersion *uint64) (policy.Action, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return policy.Action{}, false, err
+	}
+	health := s.monitor()
 	s.mu.Lock()
 	state := s.states[deploymentID]
 	deactivating := state != nil && state.deactivationRequested
@@ -899,40 +1012,62 @@ func (s *Scheduler) HandleHealth(ctx context.Context, deploymentID, replicaID, m
 	if state != nil && !deactivating {
 		removed = state.active[minerID]
 	}
-	s.mu.Unlock()
 	if state == nil {
-		return policy.Action{}, fmt.Errorf("deployment %q: %w", deploymentID, ErrUnknownDeployment)
+		s.mu.Unlock()
+		return policy.Action{}, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrUnknownDeployment)
 	}
 	if deactivating {
-		return policy.Action{}, fmt.Errorf("deployment %q: %w", deploymentID, ErrDeploymentDeactivating)
+		s.mu.Unlock()
+		return policy.Action{}, false, fmt.Errorf("deployment %q: %w", deploymentID, ErrDeploymentDeactivating)
 	}
-	if removed.miner == nil || removed.replicaID != replicaID {
-		return policy.Action{}, fmt.Errorf("replica %q of miner %q: %w", replicaID, minerID, ErrReplicaNotActive)
+	if removed.miner == nil || removed.replicaID != replicaID || (endpointID != "" && removed.endpointID != endpointID) {
+		s.mu.Unlock()
+		return policy.Action{}, false, fmt.Errorf("replica %q of miner %q: %w", replicaID, minerID, ErrReplicaNotActive)
 	}
-	action := s.monitor().Observe(removed.endpointID, vantage, reachable, correct, fraudulent, at)
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return policy.Action{}, false, err
+	}
+	var action policy.Action
+	if expectedHealthVersion == nil {
+		if suppressInternalLivenessTrust {
+			action = health.ObserveInternal(removed.endpointID, vantage, reachable, correct, fraudulent, at)
+		} else {
+			action = health.Observe(removed.endpointID, vantage, reachable, correct, fraudulent, at)
+		}
+	} else {
+		var applied bool
+		action, applied = health.ObserveIfVersion(removed.endpointID, vantage, reachable, correct, fraudulent, at, *expectedHealthVersion)
+		if !applied {
+			s.mu.Unlock()
+			return policy.Action{}, false, errHealthObservationChanged
+		}
+	}
+	if action.TrustZero && (state.request.ScoringDisposition == ScoringEvidenceOnly || (suppressInternalLivenessTrust && !reachable)) {
+		action.TrustZero = false
+	}
+	if action.RemoveFromRouting {
+		delete(state.active, minerID)
+		state.excluded[minerID] = struct{}{}
+		s.bumpProbeTopologyLocked()
+	}
+	s.mu.Unlock()
+
 	var trustErr error
 	if action.TrustZero {
-		if state.request.ScoringDisposition == ScoringEvidenceOnly {
-			action.TrustZero = false
-		} else if err := s.Ledger.SetTrust(minerID, 0); err != nil {
+		if err := s.Ledger.SetTrust(minerID, 0); err != nil {
 			trustErr = fmt.Errorf("persist trust-zero for miner %q: %w", minerID, err)
 		}
 	}
 	if !action.RemoveFromRouting {
-		return action, trustErr
+		// Inconclusive replacement probes leave clean candidates available and a
+		// deficit visible in desired-active-reserved capacity. Each later correct
+		// observation proves the shared path works and repairs at most one deficit.
+		if reachable && correct && !fraudulent {
+			return action, true, errors.Join(trustErr, s.repairOneDeficit(ctx))
+		}
+		return action, true, trustErr
 	}
-
-	// Only the handler that atomically removes this exact incarnation owns its
-	// cleanup and replacement. Duplicate concurrent observations become no-ops.
-	s.mu.Lock()
-	current, stillActive := state.active[minerID]
-	if s.states[deploymentID] != state || state.deactivationRequested || !stillActive || current.endpointID != removed.endpointID {
-		s.mu.Unlock()
-		return action, trustErr
-	}
-	delete(state.active, minerID)
-	state.excluded[minerID] = struct{}{}
-	s.mu.Unlock()
 	routeErr := s.Router.Deactivate(context.Background(), removed.ticket, s.SigningKey)
 	cleanupErr := s.deactivate(removed.miner, removed.endpointID)
 	// Only the removal owner reaches this line, and a replacement always
@@ -950,12 +1085,61 @@ func (s *Scheduler) HandleHealth(ctx context.Context, deploymentID, replicaID, m
 	if action.AssignReplacement {
 		replacementErr = s.assignReplacement(ctx, state)
 	}
-	return action, errors.Join(trustErr, routeErr, cleanupErr, replacementErr)
+	return action, true, errors.Join(trustErr, routeErr, cleanupErr, replacementErr)
 }
 
 func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentState) error {
+	cleanupErr := s.retryPendingCleanup(ctx, state)
+	return errors.Join(cleanupErr, s.assignReplacementAfterCleanup(ctx, state))
+}
+
+// retryPendingCleanup resolves exact inconclusive-assignment ownership before
+// placement considers that miner again. Failures stay quarantined but do not
+// prevent another clean candidate from restoring the deployment's capacity.
+func (s *Scheduler) retryPendingCleanup(ctx context.Context, state *deploymentState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	minerIDs := make([]string, 0, len(state.pendingCleanup))
+	for minerID := range state.pendingCleanup {
+		minerIDs = append(minerIDs, minerID)
+	}
+	sort.Strings(minerIDs)
+	assignments := make([]activeAssignment, 0, len(minerIDs))
+	for _, minerID := range minerIDs {
+		assignments = append(assignments, state.pendingCleanup[minerID])
+	}
+	s.mu.Unlock()
+
+	var cleanupErrors []error
+	for _, assignment := range assignments {
+		if err := ctx.Err(); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+			break
+		}
+		if err := s.deactivateTicket(assignment.miner, assignment.ticket); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("retry cleanup for endpoint %q: %w", assignment.endpointID, err))
+			continue
+		}
+		s.mu.Lock()
+		if s.states[state.request.DeploymentID] == state {
+			if current, exists := state.pendingCleanup[assignment.miner.ID()]; exists && current.endpointID == assignment.endpointID {
+				delete(state.pendingCleanup, assignment.miner.ID())
+				delete(state.excluded, assignment.miner.ID())
+			}
+		}
+		s.mu.Unlock()
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func (s *Scheduler) assignReplacementAfterCleanup(ctx context.Context, state *deploymentState) error {
 	for {
-		reservation, generation, available := s.reserveReplacementCandidate(state)
+		reservation, generation, available, needed := s.reserveReplacementCandidate(state)
+		if !needed {
+			return nil
+		}
 		if reservation == nil {
 			return &CapacityError{DeploymentID: state.request.DeploymentID, Required: s.replicaCount(), Available: available}
 		}
@@ -975,7 +1159,7 @@ func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentStat
 		select {
 		case <-ctx.Done():
 			attempt.abort(state.routeHost)
-			s.failReservation(state, candidate.ID())
+			s.releaseReservation(state, candidate.ID())
 			return fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), ctx.Err())
 		case outcome = <-attempt.results:
 		}
@@ -992,6 +1176,11 @@ func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentStat
 				LatencyMS: max(outcome.latency.Milliseconds(), 0), Availability: availability,
 				ObservedAt: outcome.observedAt, Kind: "acceptance",
 			})
+		}
+		if ctx.Err() != nil {
+			s.deactivateTicket(candidate, ticket)
+			s.releaseReservation(state, candidate.ID())
+			return fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), ctx.Err())
 		}
 		if outcome.err != nil || !s.Ledger.Eligible(candidate.ID()) {
 			s.deactivateTicket(candidate, ticket)
@@ -1035,7 +1224,18 @@ func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentStat
 			return fmt.Errorf("register authenticated replacement edge route: %w", err)
 		}
 		probe := s.Validator.ProbeReplica(ctx, state.routeHost, outcome.result.Receipt.ReplicaID, state.request.Workload.ChallengePath, state.request.Workload.ChallengeValue)
+		if err := ctx.Err(); err != nil {
+			probe.ResponseComplete = false
+			probe.Error = err.Error()
+			return errors.Join(
+				s.rejectInconclusiveAcceptance(state, outcome, probe),
+				fmt.Errorf("replacement assignment to %s: %w", candidate.ID(), err),
+			)
+		}
 		if !probe.Correct {
+			if !attributableAcceptanceFailure(probe) {
+				return s.rejectInconclusiveAcceptance(state, outcome, probe)
+			}
 			if err := s.rejectAcceptance(state, state.routeHost, outcome, state.request.ScoringDisposition); err != nil {
 				return fmt.Errorf("persist replacement acceptance rejection: %w", err)
 			}
@@ -1067,6 +1267,7 @@ func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentStat
 				if current, exists := state.active[candidate.ID()]; s.states[state.request.DeploymentID] == state && exists && current.endpointID == assignment.endpointID {
 					delete(state.active, candidate.ID())
 					state.excluded[candidate.ID()] = struct{}{}
+					s.bumpProbeTopologyLocked()
 				}
 				s.mu.Unlock()
 				s.deactivateTicket(candidate, ticket)
@@ -1078,6 +1279,7 @@ func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentStat
 			if current, exists := state.active[candidate.ID()]; s.states[state.request.DeploymentID] == state && exists && current.endpointID == assignment.endpointID {
 				delete(state.active, candidate.ID())
 				state.excluded[candidate.ID()] = struct{}{}
+				s.bumpProbeTopologyLocked()
 			}
 			s.mu.Unlock()
 			s.deactivateTicket(candidate, ticket)
@@ -1085,6 +1287,61 @@ func (s *Scheduler) assignReplacement(ctx context.Context, state *deploymentStat
 		}
 		return nil
 	}
+}
+
+// repairOneDeficit claims at most one missing replica across settled
+// deployments. Capacity debt is derived from active plus in-flight
+// reservations instead of stored as a boolean, so concurrent removals cannot
+// collapse into one retry and concurrent healthy observations cannot overfill
+// a deployment.
+func (s *Scheduler) repairOneDeficit(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// A successful health observation is also a safe bounded opportunity to
+	// retry one exact cleanup lease, even when another candidate has already
+	// restored capacity. This eventually returns a clean candidate to the pool
+	// without ever reusing it while its prior incarnation is uncertain.
+	s.mu.Lock()
+	pendingIDs := make([]string, 0, len(s.states))
+	for deploymentID, state := range s.states {
+		if state.deploying || state.deactivationRequested || len(state.pendingCleanup) == 0 {
+			continue
+		}
+		pendingIDs = append(pendingIDs, deploymentID)
+	}
+	sort.Strings(pendingIDs)
+	var cleanupState *deploymentState
+	if len(pendingIDs) > 0 {
+		cleanupState = s.states[pendingIDs[0]]
+	}
+	s.mu.Unlock()
+	var cleanupErr error
+	if cleanupState != nil {
+		cleanupErr = s.retryPendingCleanup(ctx, cleanupState)
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(cleanupErr, err)
+	}
+
+	s.mu.Lock()
+	deploymentIDs := make([]string, 0, len(s.states))
+	for deploymentID, state := range s.states {
+		if state.deploying || state.deactivationRequested || len(state.active)+len(state.reserved) >= s.replicaCount() {
+			continue
+		}
+		deploymentIDs = append(deploymentIDs, deploymentID)
+	}
+	sort.Strings(deploymentIDs)
+	var state *deploymentState
+	if len(deploymentIDs) > 0 {
+		state = s.states[deploymentIDs[0]]
+	}
+	s.mu.Unlock()
+	if state == nil {
+		return cleanupErr
+	}
+	return errors.Join(cleanupErr, s.assignReplacementAfterCleanup(ctx, state))
 }
 
 // DeactivateDeployment removes an active deployment using the endpoint IDs
@@ -1104,10 +1361,21 @@ func (s *Scheduler) DeactivateDeployment(ctx context.Context, deploymentID strin
 		s.mu.Unlock()
 		return fmt.Errorf("deployment %q cleanup is already in progress", deploymentID)
 	}
-	state.deactivationRequested = true
+	if !state.deactivationRequested {
+		state.deactivationRequested = true
+		s.bumpProbeTopologyLocked()
+	}
 	state.cleanupInProgress = true
-	assignments := make([]activeAssignment, 0, len(state.active))
+	assignments := make([]activeAssignment, 0, len(state.active)+len(state.pendingCleanup))
+	seenEndpoints := make(map[string]struct{}, len(state.active)+len(state.pendingCleanup))
 	for _, assignment := range state.active {
+		assignments = append(assignments, assignment)
+		seenEndpoints[assignment.endpointID] = struct{}{}
+	}
+	for _, assignment := range state.pendingCleanup {
+		if _, duplicate := seenEndpoints[assignment.endpointID]; duplicate {
+			continue
+		}
 		assignments = append(assignments, assignment)
 	}
 	s.mu.Unlock()
@@ -1155,13 +1423,22 @@ func (s *Scheduler) DeactivateDeployment(ctx context.Context, deploymentID strin
 		}
 		s.mu.Lock()
 		if s.states[deploymentID] == state {
+			activeChanged := false
 			for _, assignment := range succeeded {
 				if current, exists := state.active[assignment.miner.ID()]; exists && current.endpointID == assignment.endpointID {
 					delete(state.active, assignment.miner.ID())
+					activeChanged = true
+				}
+				if current, exists := state.pendingCleanup[assignment.miner.ID()]; exists && current.endpointID == assignment.endpointID {
+					delete(state.pendingCleanup, assignment.miner.ID())
+					delete(state.excluded, assignment.miner.ID())
 				}
 			}
+			if activeChanged {
+				s.bumpProbeTopologyLocked()
+			}
 			state.cleanupInProgress = false
-			if len(state.active) == 0 && !state.deploying {
+			if len(state.active) == 0 && len(state.pendingCleanup) == 0 && !state.deploying {
 				delete(s.states, deploymentID)
 			} else if state.deploying && len(failures) == 0 {
 				failures = append(failures, errors.New("deployment assignments are still in flight"))
@@ -1195,6 +1472,9 @@ func (s *Scheduler) PendingCleanupAssignments(ctx context.Context, deploymentID 
 	s.mu.Lock()
 	if state := s.states[deploymentID]; state != nil {
 		for _, assignment := range state.active {
+			pending[assignment.endpointID] = struct{}{}
+		}
+		for _, assignment := range state.pendingCleanup {
 			pending[assignment.endpointID] = struct{}{}
 		}
 	}
@@ -1325,9 +1605,58 @@ func (s *Scheduler) ActiveReplicas(deploymentID string) []ActiveReplica {
 	return values
 }
 
+// activeProbePeers verifies that one endpoint incarnation is still active and
+// returns the current route-local and process-global peers plus an exact health
+// snapshot. The periodic prober uses this before touching its local
+// corroboration state, then handleEndpointHealthVersioned repeats both the
+// endpoint and health-version checks at the mutation boundary.
+type probePeerSet struct {
+	deployment    []ActiveReplica
+	global        []ActiveReplica
+	targetHealth  policy.ObservationSnapshot
+	topologyEpoch uint64
+}
+
+func (s *Scheduler) activeProbePeers(deploymentID, replicaID, endpointID, minerID string) (probePeerSet, error) {
+	health := s.monitor()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.states[deploymentID]
+	if state == nil {
+		return probePeerSet{}, fmt.Errorf("deployment %q: %w", deploymentID, ErrUnknownDeployment)
+	}
+	if state.deactivationRequested {
+		return probePeerSet{}, fmt.Errorf("deployment %q: %w", deploymentID, ErrDeploymentDeactivating)
+	}
+	assignment := state.active[minerID]
+	if assignment.miner == nil || assignment.replicaID != replicaID || assignment.endpointID != endpointID {
+		return probePeerSet{}, fmt.Errorf("replica %q of miner %q: %w", replicaID, minerID, ErrReplicaNotActive)
+	}
+	peers := probePeerSet{
+		deployment:    make([]ActiveReplica, 0, len(state.active)),
+		topologyEpoch: s.probeTopology,
+	}
+	peers.targetHealth = health.Snapshot(endpointID)
+	for activeMinerID, active := range state.active {
+		peers.deployment = append(peers.deployment, ActiveReplica{MinerID: activeMinerID, ReplicaID: active.replicaID, EndpointID: active.endpointID})
+	}
+	for _, candidateState := range s.states {
+		if candidateState.deploying || candidateState.deactivationRequested {
+			continue
+		}
+		for activeMinerID, active := range candidateState.active {
+			peers.global = append(peers.global, ActiveReplica{MinerID: activeMinerID, ReplicaID: active.replicaID, EndpointID: active.endpointID})
+		}
+	}
+	sort.Slice(peers.deployment, func(i, j int) bool { return peers.deployment[i].EndpointID < peers.deployment[j].EndpointID })
+	sort.Slice(peers.global, func(i, j int) bool { return peers.global[i].EndpointID < peers.global[j].EndpointID })
+	return peers, nil
+}
+
 // probeTarget is the exact per-deployment input the periodic prober needs. It
 // carries the hidden challenge value, so it stays unexported and is never
-// projected onto the control API, the durable store, or a published manifest.
+// projected into prober outcomes, callbacks, logs, durable endpoint records,
+// or published manifests.
 type probeTarget struct {
 	deploymentID   string
 	routeHost      string
@@ -1341,6 +1670,11 @@ type probeTarget struct {
 // acceptance or teardown. The returned slices are copies, so the caller holds
 // no scheduler state while it performs network I/O.
 func (s *Scheduler) probeTargets() []probeTarget {
+	targets, _ := s.probeTargetsVersioned()
+	return targets
+}
+
+func (s *Scheduler) probeTargetsVersioned() ([]probeTarget, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	targets := make([]probeTarget, 0, len(s.states))
@@ -1362,7 +1696,7 @@ func (s *Scheduler) probeTargets() []probeTarget {
 		})
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].deploymentID < targets[j].deploymentID })
-	return targets
+	return targets, s.probeTopology
 }
 
 func (s *Scheduler) DeploymentScoringDisposition(deploymentID string) (ScoringDisposition, bool) {

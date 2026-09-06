@@ -4,6 +4,7 @@ package validator
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,44 @@ import (
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/edge"
 )
+
+type probeRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f probeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type interruptedProbeBody struct {
+	read bool
+}
+
+func (b *interruptedProbeBody) Read(destination []byte) (int, error) {
+	if !b.read {
+		b.read = true
+		return copy(destination, "partial"), nil
+	}
+	return 0, io.ErrUnexpectedEOF
+}
+
+func (*interruptedProbeBody) Close() error { return nil }
+
+type oversizedInterruptedProbeBody struct {
+	remaining int
+}
+
+func (b *oversizedInterruptedProbeBody) Read(destination []byte) (int, error) {
+	if b.remaining == 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	count := min(len(destination), b.remaining)
+	for index := 0; index < count; index++ {
+		destination[index] = 'x'
+	}
+	b.remaining -= count
+	return count, nil
+}
+
+func (*oversizedInterruptedProbeBody) Close() error { return nil }
 
 func TestProbeHostTemplateUsesPublicHostnameAndExactTargetHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -128,9 +167,55 @@ func TestProbeDistinguishesReplicaResponsesFromEdgeGeneratedErrors(t *testing.T)
 			if value.Correct != testCase.wantCorrect {
 				t.Fatalf("correct = %v, want %v", value.Correct, testCase.wantCorrect)
 			}
+			if !value.ResponseComplete {
+				t.Fatalf("completed HTTP response was marked incomplete: %+v", value)
+			}
 			if testCase.wantErrorSubstr != "" && !strings.Contains(value.Error, testCase.wantErrorSubstr) {
 				t.Fatalf("error %q does not report %q", value.Error, testCase.wantErrorSubstr)
 			}
 		})
+	}
+}
+
+func TestProbeClassifiesMidBodyTransportErrorAsIncomplete(t *testing.T) {
+	client := &http.Client{Transport: probeRoundTripper(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       &interruptedProbeBody{},
+		}, nil
+	})}
+	result := Validator{EdgeURL: "https://edge.test", Client: client}.
+		ProbeReplica(context.Background(), "app.test", "app-miner", "/challenge", "partial")
+	if result.Correct || result.ResponseComplete {
+		t.Fatalf("truncated body became complete content: %+v", result)
+	}
+	if !result.ServedByReplica || result.EdgeGenerated {
+		t.Fatalf("header provenance was lost or rewritten: %+v", result)
+	}
+	if !strings.Contains(result.Error, io.ErrUnexpectedEOF.Error()) {
+		t.Fatalf("body transport error was not reported: %+v", result)
+	}
+}
+
+func TestProbeDrainsOversizedBodyBeforeDeclaringTransportComplete(t *testing.T) {
+	client := &http.Client{Transport: probeRoundTripper(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       &oversizedInterruptedProbeBody{remaining: 5000},
+		}, nil
+	})}
+	result := Validator{EdgeURL: "https://edge.test", Client: client}.
+		ProbeReplica(context.Background(), "app.test", "app-miner", "/challenge", "correct")
+	if result.Correct || result.ResponseComplete || result.EdgeGenerated {
+		t.Fatalf("oversized truncated body became complete content: %+v", result)
+	}
+	if !result.ServedByReplica || !strings.Contains(result.Error, io.ErrUnexpectedEOF.Error()) {
+		t.Fatalf("oversized transport failure lost provenance/error: %+v", result)
 	}
 }
