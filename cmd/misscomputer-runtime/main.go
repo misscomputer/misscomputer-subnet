@@ -132,8 +132,8 @@ func parseConfiguration(arguments []string) (configuration, error) {
 	flags.StringVar(&config.campaignConfigFile, "campaign-config-file", "", "canonical synthetic campaign runtime config (empty keeps campaign inert)")
 	flags.StringVar(&config.campaignStateDir, "campaign-state-dir", "", "private atomic synthetic campaign state directory")
 	flags.StringVar(&config.campaignReadinessFile, "campaign-readiness-file", "", "canonical pre-provisioned wildcard readiness proof")
-	flags.DurationVar(&config.periodicProbeInterval, "periodic-probe-interval", 0, "re-probe every active replica on this interval and apply health policy (0 disables; must stay below the health rapid window)")
-	flags.DurationVar(&config.periodicProbeTimeout, "periodic-probe-timeout", control.DefaultProbeTimeout, "per-replica deadline for one periodic probe")
+	flags.DurationVar(&config.periodicProbeInterval, "periodic-probe-interval", 0, "re-probe every active replica on this interval and apply health policy (0 disables; probe timeout plus interval must stay inside the health rapid window)")
+	flags.DurationVar(&config.periodicProbeTimeout, "periodic-probe-timeout", control.DefaultProbeTimeout, "per-replica deadline for one periodic probe; a hung replica burns all of it before it is observed as a failure")
 	if err := flags.Parse(arguments); err != nil {
 		return config, err
 	}

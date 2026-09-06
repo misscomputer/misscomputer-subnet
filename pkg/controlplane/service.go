@@ -212,9 +212,18 @@ func New(config Config) (plane *Plane, err error) {
 	}
 	plane = &Plane{api: serviceAPI, store: store, gateway: gateway, control: routes(serviceAPI), logger: logger}
 	if config.PeriodicProbeInterval > 0 {
-		plane.prober = &control.Prober{
+		prober := &control.Prober{
 			Scheduler: scheduler, Interval: config.PeriodicProbeInterval, Timeout: config.PeriodicProbeTimeout, Logger: logger,
 		}
+		// A prober whose cadence cannot produce two failures inside the health
+		// rapid window evicts nothing at all, and a timeout at or beyond the
+		// interval is the ordinary way to reach that state. The CLI rejects both,
+		// but a library caller configuring the plane directly deserves the same
+		// refusal instead of a silently inert prober.
+		if cadenceErr := prober.Validate(); cadenceErr != nil {
+			return nil, cadenceErr
+		}
+		plane.prober = prober
 	}
 	if config.CampaignConfigFile != "" {
 		campaignConfig, campaignDigest, loadErr := campaignintegration.LoadRuntimeConfig(config.CampaignConfigFile)

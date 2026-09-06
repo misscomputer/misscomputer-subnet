@@ -40,25 +40,62 @@ gains no exported accessor.
 
 ## Behaviour
 
-One sweep visits deployments in canonical order and replicas sequentially,
-mirroring the sequential discipline of the public probe CLI. Bounded
-concurrency is a later refinement that would change no contract here.
+`Run` gives every active endpoint its own probe loop: probe, apply, wait
+`Interval`, repeat. Endpoints are therefore paced independently of each other —
+see [Cadence and the rapid window](#cadence-and-the-rapid-window) for why that
+is a correctness requirement rather than a performance choice. `Sweep` remains
+available as a one-shot diagnostic pass in canonical deployment order; it is not
+the continuous driver.
 
 Deployments that are `deploying` or `deactivationRequested`, and deployments
-with no active replicas, are skipped, so a sweep can never race acceptance or
-teardown.
+with no active replicas, are skipped, so probing can never race acceptance or
+teardown. Loops are keyed by endpoint ID, which carries generation and nonce, so
+a replacement never inherits the loop or the health counters of the incarnation
+it replaced.
 
 Each replica is probed with `ProbeReplica` — targeted, not public. An untargeted
 request round-robins across healthy replicas, so a single failing replica could
 otherwise hide behind its peers.
 
+### Reading a probe result
+
+A probe travels through the edge, and **the edge answers with a status of its
+own whenever the miner is the thing that is down or unroutable**: `502` for a
+dial failure or a nil tunnel target, `404` for a replica dropped from the
+routes, `403` for a probe-token mismatch, `503` when nothing on the host is
+healthy. A status code alone therefore says nothing about whether the miner
+replied.
+
+`pkg/edge` sets `X-Miss-Edge-Upstream: replica` in the reverse proxy's
+`ModifyResponse`, which runs only once a real upstream response has arrived. It
+is `Set`, not `Add`, so a replica cannot influence it, and no edge-generated
+error response passes through that code path — absence of the marker is exact,
+not a heuristic. `validator.ProbeResult` surfaces it as `ServedByReplica` and
+its complement `EdgeGenerated`.
+
 The observation is mapped as follows:
 
 | Probe result | Reported | Policy outcome |
 | --- | --- | --- |
-| status 200, body digest matches | reachable, correct | no action |
-| any status, wrong body or status | reachable, **not** correct | immediate eviction, replacement, trust-zero |
+| status 200 with the upstream marker, body digest matches | reachable, correct | no action |
+| upstream marker present, wrong body or status | reachable, **not** correct | immediate eviction, replacement, trust-zero |
+| status present, **no** upstream marker (edge-generated 502/404/403/503) | **not** reachable | eviction after two failures inside the rapid window |
 | no status line at all (timeout, refused, TLS failure) | **not** reachable | eviction after two failures inside the rapid window |
+
+Classifying an edge-generated error as "reachable but incorrect" would hand a
+merely offline miner the permanent, single-vantage trust-zero reserved for
+serving forged content — and one probe-token misconfiguration would inflict it
+on every miner in the subnet in a single pass.
+
+An oversized upstream response is deliberately in the unreachable column: the
+edge rejects it before the marker is written to the client, so the prober has no
+attested view of what the miner served and does not claim one.
+
+A correct response is accepted as independent proof that the replica answered,
+because it requires a 200 carrying the exact hidden challenge value that no edge
+or intermediary error page can produce. If some fronting proxy ever stripped the
+marker, the only possible effect is to downgrade an incorrect response to
+unreachable — never to upgrade an edge error into a trust-zero.
 
 `fraudulent` is never inferred. It is a claim about a miner substituting or
 forging content, and neither a transport failure nor a body mismatch
@@ -75,18 +112,45 @@ or the replica replaced, while the probe was in flight — are reported as
 and `ErrReplicaNotActive` exist so a caller can tell that benign churn apart
 from a real policy or cleanup failure.
 
-## Interval and the rapid window
+## Cadence and the rapid window
 
-The interval **must stay below `policy.Monitor.RapidWindow`** (15s by default).
-Policy evicts an unreachable endpoint on its second failure inside that window
-and resets the counter whenever two consecutive failures are further apart. A
-single-vantage driver sweeping at or beyond the rapid window would therefore
-reset its own evidence on every pass and never evict anything.
+Policy evicts an unreachable endpoint on its second failure inside
+`policy.Monitor.RapidWindow` (15s by default) and resets the counter whenever
+two consecutive failures are further apart. The quantity that must therefore be
+bounded is **the wall-clock gap between one endpoint's consecutive failure
+observations** — not the configured interval.
 
-`DefaultProbeInterval` is 10s for this reason, which evicts a dark replica after
-roughly 20s. `Prober.Run` logs a warning if it is started with an interval that
-cannot ever evict. `DefaultProbeTimeout` is 5s so one hung replica cannot stall
-the sweep past its own interval.
+Under a sequential sweep those are very different numbers. The interval is
+measured from the end of the previous pass, so the real gap is
+`probe timeout + rest-of-sweep + interval`, and the rest of the sweep grows with
+the deployment and replica count. A hung replica — one that accepts the
+connection and then stays silent — burns the entire probe timeout before it
+fails, and a peer being evicted drags a whole replacement assignment into the
+same pass. With the old 10s interval and 5s timeout, a deployment set of any
+real size pushed that gap past 15s, the counter reset on every pass, and a hung
+replica was **never evicted, silently, forever**.
+
+Per-endpoint loops remove the coupling: the gap is
+`probe timeout + interval + the cost of applying one no-action observation`,
+whatever every other endpoint is doing. `ProbeCadenceBound` states it and
+`Prober.Validate` enforces
+
+```
+timeout + interval + cadence margin <= policy.Monitor.RapidWindow
+```
+
+refusing to start otherwise — a cadence that cannot evict is not a degraded
+mode, it is a prober that does nothing. A non-positive timeout is refused for
+the same reason: without a deadline the prober itself owns, a hung replica's
+failure gap is whatever the HTTP client happens to allow. `controlplane.New`
+performs the same checks at construction, so a library caller cannot
+misconfigure it silently either.
+
+The shipped defaults are `DefaultProbeInterval` 6s, `DefaultProbeTimeout` 5s and
+`DefaultProbeCadenceMargin` 2s: 13s inside the 15s window, evicting a hung or
+dark replica after roughly 22s. Concurrency is bounded by construction at one
+in-flight probe per active endpoint, which is the least a driver that must
+observe every endpoint on a fixed cadence can use.
 
 ## Enabling it
 
@@ -95,7 +159,7 @@ before.
 
 ```
 misscomputer-runtime \
-  --periodic-probe-interval 10s \
+  --periodic-probe-interval 6s \
   --periodic-probe-timeout 5s \
   ...
 ```
@@ -103,8 +167,9 @@ misscomputer-runtime \
 `--periodic-probe-interval 0` (the default) keeps it inert. The runtime refuses
 a negative interval or timeout, and refuses a timeout that is not shorter than
 the interval. `controlplane.Config.PeriodicProbeInterval` is the equivalent
-library-level switch; `Plane.Run` supervises the prober beside the synthetic
-campaign and stops it on cancellation.
+library-level switch, and `controlplane.New` additionally refuses any pairing
+whose cadence bound exceeds the health rapid window. `Plane.Run` supervises the
+prober beside the synthetic campaign and stops it on cancellation.
 
 ## What it deliberately does not do
 

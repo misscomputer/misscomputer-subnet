@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -231,21 +232,14 @@ func TestPeriodicProberIsOptInAndRunsBesideTheCampaign(t *testing.T) {
 		t.Fatalf("prober did not carry its configuration: %+v", plane.prober)
 	}
 
-	sweeps := make(chan struct{}, 4)
-	plane.prober.OnSweep = func(control.SweepResult) {
-		select {
-		case sweeps <- struct{}{}:
-		default:
-		}
-	}
+	// Run supervises the prober beside the campaign and joins it on
+	// cancellation; a prober that was never started, or one whose goroutine
+	// outlives its context, hangs here instead of returning. What the prober
+	// then does to each endpoint is asserted where endpoints exist, in
+	// control.TestProberRunObservesEveryReplicaUntilCancelled.
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- plane.Run(ctx) }()
-	select {
-	case <-sweeps:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Plane.Run did not drive the periodic prober")
-	}
 	cancel()
 	select {
 	case err := <-done:
@@ -254,5 +248,36 @@ func TestPeriodicProberIsOptInAndRunsBesideTheCampaign(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Plane.Run did not stop the prober and return")
+	}
+}
+
+func TestNewRefusesProbeCadenceThatCanNeverEvict(t *testing.T) {
+	// The CLI already refuses these, but a library caller configuring the plane
+	// directly used to get a prober that started, swept, and evicted nothing.
+	for name, mutate := range map[string]func(*Config){
+		"timeout is not shorter than interval": func(c *Config) {
+			c.PeriodicProbeInterval, c.PeriodicProbeTimeout = time.Second, time.Second
+		},
+		"unset timeout defaults above the interval": func(c *Config) {
+			c.PeriodicProbeInterval = time.Second
+		},
+		"cadence exceeds the health rapid window": func(c *Config) {
+			c.PeriodicProbeInterval, c.PeriodicProbeTimeout = 30*time.Second, time.Second
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := testConfig(t)
+			mutate(&config)
+			plane, err := New(config)
+			if err == nil {
+				closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = plane.Close(closeCtx)
+				t.Fatal("New accepted a probe cadence that can never evict an unreachable replica")
+			}
+			if !errors.Is(err, control.ErrProbeCadence) {
+				t.Fatalf("New returned %v, want a probe cadence refusal", err)
+			}
+		})
 	}
 }

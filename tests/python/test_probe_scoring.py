@@ -36,6 +36,7 @@ from misscomputer_subnet.assignment_probe import (
     verify_active_assignment_manifest,
 )
 from misscomputer_subnet.probe_scoring import (
+    MAX_ROUNDS,
     ProbeRound,
     ProbeScoringError,
     ProbeScoringPolicy,
@@ -377,6 +378,16 @@ def test_scoring_rejects_untrustworthy_windows() -> None:
     with pytest.raises(ProbeScoringError, match="scoring_rounds_empty"):
         accumulate_scoring_window(
             [],
+            validator_uid=VALIDATOR_UID,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+    # Too many rounds and no rounds at all are opposite faults, and an operator
+    # reading the rejection code has nothing else to go on.
+    with pytest.raises(ProbeScoringError, match="scoring_rounds_overflow"):
+        accumulate_scoring_window(
+            list(rounds) * (MAX_ROUNDS // len(rounds) + 1),
             validator_uid=VALIDATOR_UID,
             validator_hotkey=VALIDATOR_HOTKEY,
             window_start_epoch=WINDOW_START,

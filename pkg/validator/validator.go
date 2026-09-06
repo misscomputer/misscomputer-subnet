@@ -21,7 +21,21 @@ type ProbeResult struct {
 	Latency time.Duration `json:"latency"`
 	Status  int           `json:"status"`
 	Correct bool          `json:"correct"`
-	Error   string        `json:"error,omitempty"`
+	// ServedByReplica is true only when the edge attested that this exact
+	// response came back from a replica. A probe travels through the edge, and
+	// the edge answers with a status of its own whenever the miner is the thing
+	// that is down or unroutable — 502 for a dead backend or a nil tunnel
+	// target, 404 for a replica that is no longer routed, 403 for a probe-token
+	// mismatch. Status alone therefore cannot distinguish "the miner replied
+	// with the wrong bytes" from "the miner never replied at all", and callers
+	// that act differently on those two facts must read this field, not Status.
+	ServedByReplica bool `json:"served_by_replica"`
+	// EdgeGenerated is true when a response arrived without the edge's upstream
+	// marker: the edge, an intermediary, or a fronting CDN produced it on the
+	// miner's behalf. It is the exact complement of ServedByReplica for a
+	// completed HTTP exchange, and false when no response arrived at all.
+	EdgeGenerated bool   `json:"edge_generated"`
+	Error         string `json:"error,omitempty"`
 }
 
 type Validator struct {
@@ -86,6 +100,8 @@ func (v Validator) probe(ctx context.Context, routeHost, challengePath, expected
 	}
 	defer resp.Body.Close()
 	result.Status = resp.StatusCode
+	result.ServedByReplica = resp.Header.Get(edge.UpstreamResponseHeader) == edge.UpstreamResponseMarker
+	result.EdgeGenerated = !result.ServedByReplica
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
 		result.Error = err.Error()
@@ -93,6 +109,10 @@ func (v Validator) probe(ctx context.Context, routeHost, challengePath, expected
 	}
 	result.Correct = resp.StatusCode == http.StatusOK && protocol.ChallengeDigest(string(body)) == protocol.ChallengeDigest(expectedValue)
 	if !result.Correct {
+		if result.EdgeGenerated {
+			result.Error = fmt.Sprintf("edge-generated response status=%d", resp.StatusCode)
+			return result
+		}
 		result.Error = fmt.Sprintf("incorrect response status=%d", resp.StatusCode)
 	}
 	return result

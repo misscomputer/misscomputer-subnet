@@ -66,11 +66,11 @@ func TestConfigurationFailsClosed(t *testing.T) {
 	if config.periodicProbeInterval != 0 {
 		t.Fatalf("periodic probing defaulted to enabled at %v", config.periodicProbeInterval)
 	}
-	enabled, err := parseConfiguration(append(baseArguments(t), "--periodic-probe-interval", "10s", "--periodic-probe-timeout", "4s"))
+	enabled, err := parseConfiguration(append(baseArguments(t), "--periodic-probe-interval", "6s", "--periodic-probe-timeout", "5s"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if enabled.periodicProbeInterval != 10*time.Second || enabled.periodicProbeTimeout != 4*time.Second {
+	if enabled.periodicProbeInterval != 6*time.Second || enabled.periodicProbeTimeout != 5*time.Second {
 		t.Fatalf("periodic probe flags were not carried: %+v", enabled)
 	}
 }

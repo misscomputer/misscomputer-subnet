@@ -73,6 +73,7 @@ ScoringRejectionCode = Literal[
     "scoring_report_identity_mismatch",
     "scoring_report_outside_window",
     "scoring_rounds_empty",
+    "scoring_rounds_overflow",
     "scoring_unpublished_attribution",
     "scoring_window_invalid",
 ]
@@ -331,7 +332,7 @@ def accumulate_scoring_window(
     if not rounds:
         _reject("scoring_rounds_empty")
     if len(rounds) > MAX_ROUNDS:
-        _reject("scoring_rounds_empty")
+        _reject("scoring_rounds_overflow")
     if window_end_epoch <= window_start_epoch:
         _reject("scoring_window_invalid")
 
