@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,5 +64,73 @@ func TestProbeDoesNotFollowRedirectAwayFromDeploymentHost(t *testing.T) {
 	result := Validator{EdgeURL: origin.URL}.Probe(context.Background(), "app.test", "/challenge", "correct")
 	if result.Correct || result.Status != http.StatusFound {
 		t.Fatalf("redirect satisfied public acceptance: %+v", result)
+	}
+}
+
+func TestProbeDistinguishesReplicaResponsesFromEdgeGeneratedErrors(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		handler         http.HandlerFunc
+		wantStatus      int
+		wantServed      bool
+		wantEdge        bool
+		wantCorrect     bool
+		wantErrorSubstr string
+	}{
+		"replica served the challenge": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+				_, _ = w.Write([]byte("correct"))
+			},
+			wantStatus: http.StatusOK, wantServed: true, wantCorrect: true,
+		},
+		"replica served the wrong bytes": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set(edge.UpstreamResponseHeader, edge.UpstreamResponseMarker)
+				_, _ = w.Write([]byte("something else"))
+			},
+			wantStatus: http.StatusOK, wantServed: true, wantErrorSubstr: "incorrect response",
+		},
+		// The edge answers 502 on the miner's behalf when the miner is dead. It
+		// must not be readable as the miner having answered anything.
+		"edge answered for a dead replica": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "replica unavailable", http.StatusBadGateway)
+			},
+			wantStatus: http.StatusBadGateway, wantEdge: true, wantErrorSubstr: "edge-generated response",
+		},
+		"edge refused the probe token": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "targeted probe forbidden", http.StatusForbidden)
+			},
+			wantStatus: http.StatusForbidden, wantEdge: true, wantErrorSubstr: "edge-generated response",
+		},
+		// A response body a miner fully controls cannot be used to forge the
+		// marker: the marker is a response header the edge alone writes.
+		"replica cannot forge the marker in its body": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, edge.UpstreamResponseHeader+": "+edge.UpstreamResponseMarker, http.StatusBadGateway)
+			},
+			wantStatus: http.StatusBadGateway, wantEdge: true, wantErrorSubstr: "edge-generated response",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(testCase.handler)
+			defer server.Close()
+			value := Validator{Vantage: "test", EdgeURL: server.URL, InternalProbeToken: "probe-token"}.
+				ProbeReplica(context.Background(), "app.test", "app-miner", "/challenge", "correct")
+			if value.Status != testCase.wantStatus {
+				t.Fatalf("status = %d, want %d", value.Status, testCase.wantStatus)
+			}
+			if value.ServedByReplica != testCase.wantServed || value.EdgeGenerated != testCase.wantEdge {
+				t.Fatalf("served_by_replica=%v edge_generated=%v, want %v/%v",
+					value.ServedByReplica, value.EdgeGenerated, testCase.wantServed, testCase.wantEdge)
+			}
+			if value.Correct != testCase.wantCorrect {
+				t.Fatalf("correct = %v, want %v", value.Correct, testCase.wantCorrect)
+			}
+			if testCase.wantErrorSubstr != "" && !strings.Contains(value.Error, testCase.wantErrorSubstr) {
+				t.Fatalf("error %q does not report %q", value.Error, testCase.wantErrorSubstr)
+			}
+		})
 	}
 }

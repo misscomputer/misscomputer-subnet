@@ -25,6 +25,7 @@ import (
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
 	"github.com/misscomputer/misscomputer-subnet/pkg/bridge"
+	"github.com/misscomputer/misscomputer-subnet/pkg/control"
 	"github.com/misscomputer/misscomputer-subnet/pkg/controlplane"
 	"github.com/misscomputer/misscomputer-subnet/pkg/runtimeapi"
 	"github.com/misscomputer/misscomputer-subnet/pkg/service"
@@ -72,6 +73,9 @@ type configuration struct {
 	campaignConfigFile    string
 	campaignStateDir      string
 	campaignReadinessFile string
+
+	periodicProbeInterval time.Duration
+	periodicProbeTimeout  time.Duration
 }
 
 func main() {
@@ -128,6 +132,8 @@ func parseConfiguration(arguments []string) (configuration, error) {
 	flags.StringVar(&config.campaignConfigFile, "campaign-config-file", "", "canonical synthetic campaign runtime config (empty keeps campaign inert)")
 	flags.StringVar(&config.campaignStateDir, "campaign-state-dir", "", "private atomic synthetic campaign state directory")
 	flags.StringVar(&config.campaignReadinessFile, "campaign-readiness-file", "", "canonical pre-provisioned wildcard readiness proof")
+	flags.DurationVar(&config.periodicProbeInterval, "periodic-probe-interval", 0, "re-probe every active replica on this interval and apply health policy (0 disables; probe timeout plus interval must stay inside the health rapid window)")
+	flags.DurationVar(&config.periodicProbeTimeout, "periodic-probe-timeout", control.DefaultProbeTimeout, "per-replica deadline for one periodic probe; a hung replica burns all of it before it is observed as a failure")
 	if err := flags.Parse(arguments); err != nil {
 		return config, err
 	}
@@ -150,6 +156,12 @@ func parseConfiguration(arguments []string) (configuration, error) {
 	}
 	if config.edgeMaxRequestBytes < 1 || config.edgeMaxResponseBytes < 1 || config.edgeResponseHeaderTimeout <= 0 {
 		return config, errors.New("edge request/response bounds and response-header timeout must be positive")
+	}
+	if config.periodicProbeInterval < 0 || config.periodicProbeTimeout < 0 {
+		return config, errors.New("periodic-probe-interval and periodic-probe-timeout must not be negative")
+	}
+	if config.periodicProbeInterval > 0 && config.periodicProbeTimeout >= config.periodicProbeInterval {
+		return config, errors.New("periodic-probe-timeout must be shorter than periodic-probe-interval")
 	}
 	return config, nil
 }
@@ -198,6 +210,7 @@ func newRuntime(config configuration, logger *slog.Logger) (instance *runtime, e
 		EdgeResponseHeaderTimeout: config.edgeResponseHeaderTimeout,
 		AllowLocalWorkloads:       config.allowLocalWorkloads, AllowPrivateAxons: config.allowPrivateAxons, AllowInsecureMockHTTP: config.allowInsecureMockHTTP,
 		CampaignConfigFile: config.campaignConfigFile, CampaignStateDir: config.campaignStateDir, CampaignReadinessFile: config.campaignReadinessFile,
+		PeriodicProbeInterval: config.periodicProbeInterval, PeriodicProbeTimeout: config.periodicProbeTimeout,
 		Logger: logger,
 	})
 	if err != nil {

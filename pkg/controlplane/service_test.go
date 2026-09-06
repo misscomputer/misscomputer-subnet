@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
+	"github.com/misscomputer/misscomputer-subnet/pkg/control"
 	"github.com/misscomputer/misscomputer-subnet/pkg/durable"
 	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
 )
@@ -86,6 +88,8 @@ func TestNewRejectsIncompleteOrUnsafeConfiguration(t *testing.T) {
 		"insecure http without private axons": func(c *Config) { c.AllowInsecureMockHTTP = true },
 		"no trusted proxies":                  func(c *Config) { c.EdgeTrustedProxyCIDRs = nil },
 		"invalid trusted proxy":               func(c *Config) { c.EdgeTrustedProxyCIDRs = []string{"not-a-cidr"} },
+		"negative probe interval":             func(c *Config) { c.PeriodicProbeInterval = -time.Second },
+		"negative probe timeout":              func(c *Config) { c.PeriodicProbeTimeout = -time.Second },
 	} {
 		t.Run(name, func(t *testing.T) {
 			config := testConfig(t)
@@ -204,6 +208,75 @@ func TestEdgeOriginTrustsOnlyConfiguredPeersAndDeploymentHosts(t *testing.T) {
 				t.Fatalf("foreign host was routed: %d", response.Code)
 			case !test.forbidden && !test.misdirect && (response.Code == http.StatusForbidden || response.Code == http.StatusMisdirectedRequest || response.Code == http.StatusOK):
 				t.Fatalf("trusted peer without a route answered %d", response.Code)
+			}
+		})
+	}
+}
+
+func TestPeriodicProberIsOptInAndRunsBesideTheCampaign(t *testing.T) {
+	// Without the interval the plane must behave exactly as before: no prober,
+	// and Run blocks purely on cancellation.
+	inert := newTestPlane(t, nil)
+	if inert.prober != nil {
+		t.Fatal("periodic prober was constructed without an explicit interval")
+	}
+
+	plane := newTestPlane(t, func(c *Config) {
+		c.PeriodicProbeInterval = 5 * time.Millisecond
+		c.PeriodicProbeTimeout = time.Millisecond
+	})
+	if plane.prober == nil {
+		t.Fatal("configured periodic prober was not constructed")
+	}
+	if plane.prober.Interval != 5*time.Millisecond || plane.prober.Timeout != time.Millisecond {
+		t.Fatalf("prober did not carry its configuration: %+v", plane.prober)
+	}
+
+	// Run supervises the prober beside the campaign and joins it on
+	// cancellation; a prober that was never started, or one whose goroutine
+	// outlives its context, hangs here instead of returning. What the prober
+	// then does to each endpoint is asserted where endpoints exist, in
+	// control.TestProberRunObservesEveryReplicaUntilCancelled.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- plane.Run(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Plane.Run returned %v after cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Plane.Run did not stop the prober and return")
+	}
+}
+
+func TestNewRefusesProbeCadenceThatCanNeverEvict(t *testing.T) {
+	// The CLI already refuses these, but a library caller configuring the plane
+	// directly used to get a prober that started, swept, and evicted nothing.
+	for name, mutate := range map[string]func(*Config){
+		"timeout is not shorter than interval": func(c *Config) {
+			c.PeriodicProbeInterval, c.PeriodicProbeTimeout = time.Second, time.Second
+		},
+		"unset timeout defaults above the interval": func(c *Config) {
+			c.PeriodicProbeInterval = time.Second
+		},
+		"cadence exceeds the health rapid window": func(c *Config) {
+			c.PeriodicProbeInterval, c.PeriodicProbeTimeout = 30*time.Second, time.Second
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := testConfig(t)
+			mutate(&config)
+			plane, err := New(config)
+			if err == nil {
+				closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = plane.Close(closeCtx)
+				t.Fatal("New accepted a probe cadence that can never evict an unreachable replica")
+			}
+			if !errors.Is(err, control.ErrProbeCadence) {
+				t.Fatalf("New returned %v, want a probe cadence refusal", err)
 			}
 		})
 	}

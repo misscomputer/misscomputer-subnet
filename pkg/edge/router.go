@@ -34,6 +34,28 @@ import (
 const (
 	TargetReplicaHeader      = "X-Miss-Target-Replica"
 	ProbeAuthorizationHeader = "X-Miss-Internal-Probe-Token"
+	// UpstreamResponseHeader marks a response the edge actually received from a
+	// replica, as opposed to one the edge synthesized on the replica's behalf.
+	//
+	// Every edge-generated status — 403 for a probe-token mismatch, 404 for a
+	// replica that is no longer routed, 502 for a dial failure or a nil tunnel
+	// target, 503 when nothing is healthy, 421 for a non-canonical host — is a
+	// statement about the edge or about routing, never evidence that the miner
+	// answered anything. A caller reading a bare status code cannot tell the two
+	// apart, and treating an edge-generated error as "the miner answered wrongly"
+	// is the difference between counting a liveness failure and permanently
+	// zeroing a miner's trust.
+	//
+	// The marker is set in ModifyResponse, which runs only once a real upstream
+	// response has arrived, and it is Set (not Add), so a replica cannot
+	// influence it: a replica that omits the header still gets it, and a replica
+	// that forges it only asserts something already true of every response that
+	// reaches that code path. No edge-generated error response passes through
+	// ModifyResponse, so absence of the marker is exact, not heuristic.
+	UpstreamResponseHeader = "X-Miss-Edge-Upstream"
+	// UpstreamResponseMarker is the only value UpstreamResponseHeader ever
+	// carries on an edge-proxied response.
+	UpstreamResponseMarker = "replica"
 )
 
 var errResponseTooLarge = errors.New("edge upstream response exceeds configured limit")
@@ -623,6 +645,10 @@ func (r *Router) proxy(w http.ResponseWriter, req *http.Request, claim routeClai
 			request.Out.Header.Set("X-Forwarded-Proto", forwarded.proto)
 		},
 		ModifyResponse: func(response *http.Response) error {
+			// Reaching here means the replica produced this response line. Assert
+			// that before any rejection below can divert to the ErrorHandler, so
+			// the marker is present on exactly the responses the replica served.
+			response.Header.Set(UpstreamResponseHeader, UpstreamResponseMarker)
 			if response.ContentLength > r.config.MaxResponseBytes {
 				return errResponseTooLarge
 			}

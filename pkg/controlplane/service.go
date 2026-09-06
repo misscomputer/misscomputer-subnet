@@ -67,6 +67,20 @@ type Config struct {
 	CampaignStateDir      string
 	CampaignReadinessFile string
 
+	// PeriodicProbeInterval enables the internal periodic serving prober. Zero
+	// keeps it inert, preserving the historical behaviour in which health
+	// actions run only when an external vantage posts an observation. A
+	// negative value is rejected.
+	//
+	// The prober re-probes every active replica through the same internal
+	// targeted path used at admission time and applies the result through the
+	// existing health policy, so a miner that goes dark or starts serving the
+	// wrong bytes after acceptance is evicted without an external caller.
+	PeriodicProbeInterval time.Duration
+	// PeriodicProbeTimeout bounds one replica probe. Zero uses
+	// control.DefaultProbeTimeout.
+	PeriodicProbeTimeout time.Duration
+
 	Logger *slog.Logger
 }
 
@@ -78,6 +92,7 @@ type Plane struct {
 	store    *durable.Store
 	gateway  *edge.Gateway
 	campaign *campaignintegration.Runner
+	prober   *control.Prober
 	control  http.Handler
 	logger   *slog.Logger
 }
@@ -88,6 +103,9 @@ func New(config Config) (plane *Plane, err error) {
 	}
 	if config.Replicas != 3 {
 		return nil, errors.New("this subnet architecture requires exactly three active replicas")
+	}
+	if config.PeriodicProbeInterval < 0 || config.PeriodicProbeTimeout < 0 {
+		return nil, errors.New("periodic probe interval and timeout must not be negative")
 	}
 	if config.EdgeMaxRequestBytes == 0 {
 		config.EdgeMaxRequestBytes = 1 << 20
@@ -193,6 +211,20 @@ func New(config Config) (plane *Plane, err error) {
 		tunnels:                registry,
 	}
 	plane = &Plane{api: serviceAPI, store: store, gateway: gateway, control: routes(serviceAPI), logger: logger}
+	if config.PeriodicProbeInterval > 0 {
+		prober := &control.Prober{
+			Scheduler: scheduler, Interval: config.PeriodicProbeInterval, Timeout: config.PeriodicProbeTimeout, Logger: logger,
+		}
+		// A prober whose cadence cannot produce two failures inside the health
+		// rapid window evicts nothing at all, and a timeout at or beyond the
+		// interval is the ordinary way to reach that state. The CLI rejects both,
+		// but a library caller configuring the plane directly deserves the same
+		// refusal instead of a silently inert prober.
+		if cadenceErr := prober.Validate(); cadenceErr != nil {
+			return nil, cadenceErr
+		}
+		plane.prober = prober
+	}
 	if config.CampaignConfigFile != "" {
 		campaignConfig, campaignDigest, loadErr := campaignintegration.LoadRuntimeConfig(config.CampaignConfigFile)
 		if loadErr != nil {
@@ -279,6 +311,26 @@ func (p *Plane) CampaignEnabled() bool { return p.campaign != nil }
 // Run drives the synthetic campaign until ctx is cancelled. Without an enabled
 // campaign it simply waits for cancellation so callers have one lifecycle.
 func (p *Plane) Run(ctx context.Context) error {
+	// The prober owns no state the campaign needs and never returns before
+	// cancellation, so it runs beside the campaign rather than in sequence.
+	proberDone := make(chan struct{})
+	if p.prober == nil {
+		close(proberDone)
+	} else {
+		proberCtx, stopProber := context.WithCancel(ctx)
+		defer stopProber()
+		p.logger.Info("periodic serving prober ready", "interval", p.prober.Interval, "timeout", p.prober.Timeout)
+		go func() {
+			defer close(proberDone)
+			if err := p.prober.Run(proberCtx); err != nil && !errors.Is(err, context.Canceled) {
+				p.logger.Error("periodic serving prober stopped", "error", err)
+			}
+		}()
+		defer func() {
+			stopProber()
+			<-proberDone
+		}()
+	}
 	if p.campaign == nil {
 		<-ctx.Done()
 		return nil
