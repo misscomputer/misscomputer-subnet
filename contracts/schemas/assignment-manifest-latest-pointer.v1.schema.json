@@ -18,6 +18,12 @@
       "title": "Finalized Block Hash",
       "type": "string"
     },
+    "finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Epoch",
+      "type": "integer"
+    },
     "finalized_height": {
       "maximum": 9223372036854775807,
       "minimum": 0,
@@ -121,6 +127,7 @@
     "manifest_digest_sha256",
     "finalized_height",
     "finalized_block_hash",
+    "finalized_epoch",
     "issued_at_epoch",
     "expires_at_epoch",
     "manifest_object_key",

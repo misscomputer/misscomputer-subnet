@@ -145,6 +145,13 @@ def test_succession_rules_are_transactional() -> None:
         "snapshot_finalized_fork": build_snapshot(
             snapshot_sequence=2, state_revision=8, finalized_block_hash=label_digest("fork")
         ),
+        "snapshot_finalized_epoch_rollback": build_snapshot(
+            snapshot_sequence=2,
+            state_revision=8,
+            finalized_height=FINALIZED_HEIGHT + 5,
+            finalized_block_hash=label_digest("next-block"),
+            finalized_epoch=41,
+        ),
         "snapshot_authority_mismatch": build_snapshot(
             snapshot_sequence=2, state_revision=8, central_authority=label_digest("other")
         ),

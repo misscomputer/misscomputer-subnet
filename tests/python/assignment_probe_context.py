@@ -200,12 +200,18 @@ def build_id(deployment_id: str) -> str:
     return label_digest(f"build-{deployment_id}")[:24]
 
 
+TICKET_EXPIRES_AT = BASE_EPOCH + 3_500
+LEASE_EXPIRES_AT_BLOCK = FINALIZED_HEIGHT + 60
+
+
 def build_replica(
     deployment_id: str,
     miner_uid: int,
     miner_hotkey: str,
     *,
     generation: int = 1,
+    expires_at_block: int = LEASE_EXPIRES_AT_BLOCK,
+    ticket_expires_at_epoch: int = TICKET_EXPIRES_AT,
 ) -> AssignedReplica:
     return build_assigned_replica(
         miner_uid=miner_uid,
@@ -217,9 +223,9 @@ def build_replica(
         ticket_digest_sha256=label_digest(f"ticket-{deployment_id}-{miner_hotkey}"),
         receipt_digest_sha256=label_digest(f"receipt-{deployment_id}-{miner_hotkey}"),
         chain_block=FINALIZED_HEIGHT - 60,
-        expires_at_block=FINALIZED_HEIGHT + 60,
+        expires_at_block=expires_at_block,
         ticket_issued_at_epoch=BASE_EPOCH - 500,
-        ticket_expires_at_epoch=BASE_EPOCH + 3_500,
+        ticket_expires_at_epoch=ticket_expires_at_epoch,
     )
 
 
@@ -230,6 +236,8 @@ def build_deployment(
     campaign_sequence: int,
     attestation_requirement: AttestationRequirement = "miner_service_key_v1",
     route_suffix: str = ROUTE_SUFFIX,
+    expires_at_block: int = LEASE_EXPIRES_AT_BLOCK,
+    ticket_expires_at_epoch: int = TICKET_EXPIRES_AT,
 ) -> ActiveDeploymentAssignment:
     return build_active_deployment_assignment(
         deployment_id=deployment_id,
@@ -240,7 +248,16 @@ def build_deployment(
         image_digest="sha256:" + label_digest(f"image-{deployment_id}"),
         workload_spec_digest_sha256=label_digest(f"workload-{deployment_id}"),
         attestation_requirement=attestation_requirement,
-        replicas=[build_replica(deployment_id, uid, hotkey) for uid, hotkey in miners],
+        replicas=[
+            build_replica(
+                deployment_id,
+                uid,
+                hotkey,
+                expires_at_block=expires_at_block,
+                ticket_expires_at_epoch=ticket_expires_at_epoch,
+            )
+            for uid, hotkey in miners
+        ],
     )
 
 

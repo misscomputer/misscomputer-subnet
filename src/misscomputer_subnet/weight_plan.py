@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urlsplit
 
+from .validator_decision import ValidatorWeightDecision, weight_plan_rows_for_submission
+
 if TYPE_CHECKING:
     from .chain import MetagraphSnapshot, NeuronRecord
 
@@ -434,6 +436,66 @@ def build_weight_plan(
         version_key=version_key,
         created_block=snapshot.block,
         expires_at_block=conservative_expiry_block(snapshot),
+    )
+
+
+def build_weight_plan_from_decision(
+    decision: ValidatorWeightDecision,
+    *,
+    snapshot: MetagraphSnapshot,
+    finalized_block_hash: str,
+    version_key: int,
+) -> WeightPlan:
+    """The only path from a sealed ``validator-weight-decision`` to a weight plan.
+
+    The decision names the finalized metagraph view it was judged against:
+    network, netuid, validator identity, finalized height, block hash, epoch,
+    the complete identity fingerprint, and every registered UID/hotkey pair.
+    All of it is checked against the snapshot the plan will be built from
+    before the unchanged :func:`build_weight_plan` sees a single row, so a
+    decision can never be replayed against a different chain segment, a
+    reorganised metagraph, or a remapped UID.
+    """
+
+    rows = weight_plan_rows_for_submission(decision)
+    if snapshot.finalized is not True:
+        raise WeightPlanError("weight plans require a finalized metagraph snapshot")
+    if (
+        _validate_network_identity(snapshot.network, field_name="snapshot network")
+        != decision.network
+        or snapshot.netuid != decision.netuid
+    ):
+        raise WeightPlanError("decision network identity does not match the snapshot")
+    block = _validate_integer(
+        snapshot.block, field_name="snapshot block", minimum=0, maximum=MAX_BLOCK
+    )
+    tempo = _validate_integer(
+        snapshot.tempo, field_name="snapshot tempo", minimum=1, maximum=MAX_BLOCK
+    )
+    if block != decision.registered_finalized_height:
+        raise WeightPlanError("decision finalized height does not match the snapshot block")
+    if block // tempo != decision.registered_finalized_epoch:
+        raise WeightPlanError("decision finalized epoch does not match the snapshot epoch")
+    if (
+        not isinstance(finalized_block_hash, str)
+        or finalized_block_hash != decision.registered_finalized_block_hash
+    ):
+        raise WeightPlanError("decision finalized block hash does not match the snapshot")
+    by_hotkey = {neuron.hotkey: neuron for neuron in snapshot.neurons}
+    validator = by_hotkey.get(decision.validator_hotkey)
+    if validator is None or validator.uid != decision.validator_uid:
+        raise WeightPlanError("decision validator identity is absent from the snapshot")
+    for row in decision.rows:
+        neuron = by_hotkey.get(row.hotkey)
+        if neuron is None or neuron.uid != row.uid:
+            raise WeightPlanError("decision row identity is absent from or remapped in snapshot")
+    if snapshot_identity_fingerprint(snapshot) != decision.metagraph_identity_fingerprint_sha256:
+        raise WeightPlanError("decision metagraph fingerprint does not match the snapshot")
+    return build_weight_plan(
+        snapshot=snapshot,
+        validator_hotkey=decision.validator_hotkey,
+        rows=rows,
+        version_key=version_key,
     )
 
 

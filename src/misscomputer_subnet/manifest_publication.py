@@ -12,17 +12,20 @@ Object layout (relative to one publication root)
   manifest bytes, content-addressed by its own digest;
 - ``v1/manifests/<manifest_digest_sha256>.<signer_key_id>.signature.json`` —
   one immutable canonical signature envelope per signer;
+- ``v1/manifests/<manifest_digest_sha256>.pointer.json`` — the immutable copy
+  of the latest pointer as it was published for that manifest; it is what
+  makes the publication history discoverable by walking ``previous`` links;
 - ``v1/latest.json`` — the only mutable object: an
   ``assignment-manifest-latest-pointer`` v1 naming the current publication.
 
 Atomic publication order
 ------------------------
-The manifest object and every signature object are written and readable
-*before* the pointer is replaced; the pointer is replaced atomically (single
-object PUT or rename). A reader that follows the pointer therefore always
-finds complete, immutable objects. A pointer is never rewritten to a lower
-sequence. Immutable objects are never modified or deleted while any
-unexpired pointer or validator chain state could still name them.
+The manifest object, every signature object, and the immutable pointer copy
+are written and readable *before* ``v1/latest.json`` is replaced; the latest
+pointer is replaced atomically (single object PUT or rename). A reader that
+follows the pointer therefore always finds complete, immutable objects. A
+pointer is never rewritten to a lower sequence. Immutable objects are never
+modified or deleted while any validator could still need them to catch up.
 
 Cache behaviour
 ---------------
@@ -38,11 +41,34 @@ freshness bounds then force the validator to abstain.
 Why the pointer is not independently signed
 -------------------------------------------
 Every field the pointer carries is copied from, and re-checked against, the
-signed manifest it names, and the object key is the manifest's own digest.
-A forged pointer can only name a manifest that verifies under the pinned
-trust policy, and the append-only chain state rejects any rollback or
+signed manifest and the exact signature envelopes it names, and the object
+key is the manifest's own digest. A forged pointer can only name a manifest
+that verifies under the pinned trust policy, with the signer set the pointer
+itself claims, and the append-only chain state rejects any rollback or
 equivocation it might point at. Signing the pointer would add a signing
 ceremony per publication without changing what an attacker can achieve.
+
+Onboarding and catch-up
+-----------------------
+A validator's chain state starts at genesis and otherwise only ever advances
+by consecutive accepted sequences, so two situations need a defined,
+authenticated path:
+
+- **Onboarding.** A validator with no history has nothing to compare against;
+  :func:`anchor_manifest_chain_state` accepts the current head at any
+  sequence, but only through the complete live verification (canonical form,
+  policy, threshold, roles, real signatures, freshness, block leases) and only
+  from a genesis state. Its non-equivocation history begins at that anchor.
+  An operator may instead distribute an already-anchored chain state beside
+  the trust policy; both travel over the same out-of-band trust channel.
+- **Catch-up.** A validator that missed publications walks ``previous``
+  links back from the head, fetching each historical manifest, its immutable
+  pointer copy, and the signature objects the copy names, until it reaches
+  its last accepted digest. :func:`replay_manifest_history` then verifies the
+  span in ascending order under historical semantics and yields the state
+  from which the head verifies live. The span is bounded by the pinned
+  policy's ``max_sequence_gap``; a deeper gap is an operator re-anchoring
+  event, never a silent reset.
 
 Key rotation
 ------------
@@ -75,10 +101,15 @@ from .assignment_probe import (
     AssignmentManifestChainState,
     AssignmentManifestSignatureEnvelope,
     AssignmentManifestTrustPolicy,
+    AssignmentProbeError,
     Digest,
     Epoch,
     KeyID,
+    ManifestVerificationResult,
     PositiveEpoch,
+    verify_active_assignment_manifest,
+    verify_historical_active_assignment_manifest,
+    verify_pointer_signer_set,
 )
 from .contract_codec import (
     StrictFrozenModel,
@@ -116,14 +147,21 @@ ObjectKey = Annotated[
 ]
 
 PublicationRejectionCode = Literal[
+    "anchor_state_not_genesis",
+    "history_depth_exceeded",
+    "history_link_mismatch",
+    "history_pointer_mismatch",
     "pointer_authority_mismatch",
     "pointer_equivocation",
     "pointer_expired",
     "pointer_future",
     "pointer_manifest_mismatch",
     "pointer_network_mismatch",
+    "pointer_required_role_missing",
     "pointer_rollback",
     "pointer_sequence_gap",
+    "pointer_signature_mismatch",
+    "pointer_signer_invalid",
     "pointer_signer_untrusted",
     "pointer_stale",
     "pointer_threshold_not_met",
@@ -149,6 +187,15 @@ def _reject(code: PublicationRejectionCode) -> NoReturn:
     raise ManifestPublicationError(code)
 
 
+def _validate_evaluation_epoch(evaluation_epoch: int) -> None:
+    if (
+        isinstance(evaluation_epoch, bool)
+        or not isinstance(evaluation_epoch, int)
+        or not 0 <= evaluation_epoch <= MAX_EPOCH
+    ):
+        raise ValueError("evaluation_epoch_invalid")
+
+
 def manifest_object_key(manifest_digest_sha256: str) -> str:
     """Content-addressed immutable key for one manifest's canonical bytes."""
 
@@ -159,6 +206,12 @@ def signature_object_key(manifest_digest_sha256: str, signer_key_id: str) -> str
     """Immutable key for one signer's envelope over one manifest."""
 
     return f"{MANIFEST_OBJECT_PREFIX}{manifest_digest_sha256}.{signer_key_id}.signature.json"
+
+
+def pointer_object_key(manifest_digest_sha256: str) -> str:
+    """Immutable key for the pointer copy published beside one manifest."""
+
+    return f"{MANIFEST_OBJECT_PREFIX}{manifest_digest_sha256}.pointer.json"
 
 
 class AssignmentManifestLatestPointer(StrictFrozenModel):
@@ -178,6 +231,7 @@ class AssignmentManifestLatestPointer(StrictFrozenModel):
     manifest_digest_sha256: Digest
     finalized_height: Epoch
     finalized_block_hash: Digest
+    finalized_epoch: Epoch
     issued_at_epoch: Epoch
     expires_at_epoch: PositiveEpoch
     manifest_object_key: ObjectKey
@@ -204,14 +258,34 @@ class AssignmentManifestLatestPointer(StrictFrozenModel):
             for key_id in self.signer_key_ids
         ]
 
+    @property
+    def pointer_object_key(self) -> str:
+        return pointer_object_key(self.manifest_digest_sha256)
+
 
 @dataclass(frozen=True)
 class LatestPointerVerdict:
-    """Pre-fetch outcome: which immutable objects to fetch and whether this is a re-probe."""
+    """Pre-fetch outcome: which immutable objects to fetch and how the chain state relates.
+
+    ``history_depth`` is the number of publications strictly between the last
+    accepted sequence and the pointer's sequence; when it is positive the
+    fetcher must walk ``previous`` links and :func:`replay_manifest_history`
+    before the named manifest can extend the chain state.
+    """
 
     manifest_object_key: str
     signature_object_keys: list[str]
     reprobe: bool
+    history_depth: int
+
+
+@dataclass(frozen=True)
+class ManifestHistoryEntry:
+    """One historical publication as fetched during catch-up: pointer copy, manifest, envelopes."""
+
+    pointer: AssignmentManifestLatestPointer
+    manifest: ActiveAssignmentManifest
+    signatures: Sequence[AssignmentManifestSignatureEnvelope]
 
 
 def build_manifest_latest_pointer(
@@ -246,6 +320,7 @@ def build_manifest_latest_pointer(
         "manifest_digest_sha256": manifest.manifest_digest_sha256,
         "finalized_height": manifest.finalized_height,
         "finalized_block_hash": manifest.finalized_block_hash,
+        "finalized_epoch": manifest.finalized_epoch,
         "issued_at_epoch": manifest.issued_at_epoch,
         "expires_at_epoch": manifest.expires_at_epoch,
         "manifest_object_key": manifest_object_key(manifest.manifest_digest_sha256),
@@ -254,6 +329,80 @@ def build_manifest_latest_pointer(
     return AssignmentManifestLatestPointer.model_validate(
         {**unsigned, "pointer_digest_sha256": digest(unsigned)}
     )
+
+
+def _verify_pointer_signer_provenance(
+    pointer: AssignmentManifestLatestPointer,
+    policy: AssignmentManifestTrustPolicy,
+    *,
+    evaluation_epoch: int,
+) -> None:
+    """Refuse a pointer whose claimed signer set could not satisfy the pinned policy."""
+
+    try:
+        verify_pointer_signer_set(
+            policy,
+            pointer.signer_key_ids,
+            issued_at_epoch=pointer.issued_at_epoch,
+            expires_at_epoch=pointer.expires_at_epoch,
+            evaluation_epoch=evaluation_epoch,
+        )
+    except AssignmentProbeError as failure:
+        if failure.code == "signer_untrusted":
+            _reject("pointer_signer_untrusted")
+        if failure.code == "threshold_not_met":
+            _reject("pointer_threshold_not_met")
+        if failure.code == "required_role_missing":
+            _reject("pointer_required_role_missing")
+        _reject("pointer_signer_invalid")
+
+
+def _verify_pointer_chain_position(
+    pointer: AssignmentManifestLatestPointer,
+    policy: AssignmentManifestTrustPolicy,
+    state: AssignmentManifestChainState,
+) -> tuple[bool, int]:
+    """Mirror the append-only chain rules on the pointer's copied chain fields.
+
+    Returns ``(reprobe, history_depth)``. A gap of up to ``max_sequence_gap``
+    publications is not a rejection: it is the span the fetcher must replay
+    through :func:`replay_manifest_history` before the head can be accepted.
+    """
+
+    if state.accepted_manifest_count == 0:
+        if pointer.sequence != 1:
+            _reject("pointer_sequence_gap")
+        return False, 0
+    if pointer.sequence == state.last_sequence:
+        if pointer.manifest_digest_sha256 != state.last_manifest_digest_sha256:
+            _reject("pointer_equivocation")
+        return True, 0
+    if pointer.sequence < state.last_sequence:
+        _reject("pointer_rollback")
+    if pointer.sequence - state.last_sequence > policy.max_sequence_gap:
+        _reject("pointer_sequence_gap")
+    history_depth = pointer.sequence - state.last_sequence - 1
+    if history_depth == 0 and (
+        pointer.previous_manifest_digest_sha256 != state.last_manifest_digest_sha256
+    ):
+        _reject("pointer_equivocation")
+    last_height = state.last_finalized_height
+    last_epoch = state.last_finalized_epoch
+    if last_height is None or last_epoch is None:
+        _reject("pointer_rollback")
+    if pointer.finalized_height < last_height or pointer.finalized_epoch < last_epoch:
+        _reject("pointer_rollback")
+    if pointer.finalized_height - last_height > policy.max_finalized_height_gap:
+        _reject("pointer_sequence_gap")
+    if pointer.finalized_height == last_height and (
+        pointer.finalized_block_hash != state.last_finalized_block_hash
+        or pointer.finalized_epoch != last_epoch
+    ):
+        _reject("pointer_equivocation")
+    last_issued = state.last_issued_at_epoch
+    if last_issued is None or pointer.issued_at_epoch < last_issued:
+        _reject("pointer_rollback")
+    return False, history_depth
 
 
 def verify_manifest_latest_pointer(
@@ -267,15 +416,13 @@ def verify_manifest_latest_pointer(
 
     Every rejection here would also be a rejection of the manifest the pointer
     names, so this never widens acceptance; it only avoids fetching objects
-    that cannot verify and gives the pointer its own stable reason codes.
+    that cannot verify and gives the pointer its own stable reason codes. The
+    signer set the pointer claims is checked against the pinned policy's key
+    validity windows, revocations, threshold, and required roles exactly as
+    the envelopes will be, minus the cryptography.
     """
 
-    if (
-        isinstance(evaluation_epoch, bool)
-        or not isinstance(evaluation_epoch, int)
-        or not 0 <= evaluation_epoch <= MAX_EPOCH
-    ):
-        raise ValueError("evaluation_epoch_invalid")
+    _validate_evaluation_epoch(evaluation_epoch)
     pointer = revalidate(pointer, AssignmentManifestLatestPointer)
     policy = revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
     state = revalidate(prior_chain_state, AssignmentManifestChainState)
@@ -288,11 +435,13 @@ def verify_manifest_latest_pointer(
         or state.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256
     ):
         _reject("pointer_trust_policy_mismatch")
-    trusted = {item.key_id for item in policy.trusted_keys}
-    if not set(pointer.signer_key_ids) <= trusted:
-        _reject("pointer_signer_untrusted")
-    if len(pointer.signer_key_ids) < policy.threshold:
-        _reject("pointer_threshold_not_met")
+    if (
+        pointer.issued_at_epoch < policy.valid_from_epoch
+        or pointer.expires_at_epoch > policy.valid_until_epoch
+        or pointer.expires_at_epoch - pointer.issued_at_epoch > policy.max_manifest_lifetime_seconds
+    ):
+        _reject("pointer_trust_policy_mismatch")
+    _verify_pointer_signer_provenance(pointer, policy, evaluation_epoch=evaluation_epoch)
     if pointer.issued_at_epoch > evaluation_epoch + policy.max_future_skew_seconds:
         _reject("pointer_future")
     if evaluation_epoch >= pointer.expires_at_epoch:
@@ -302,39 +451,38 @@ def verify_manifest_latest_pointer(
         and evaluation_epoch - pointer.issued_at_epoch > policy.max_manifest_age_seconds
     ):
         _reject("pointer_stale")
-    reprobe = False
-    if state.accepted_manifest_count == 0:
-        if pointer.sequence != 1:
-            _reject("pointer_sequence_gap")
-    elif pointer.sequence == state.last_sequence:
-        if pointer.manifest_digest_sha256 != state.last_manifest_digest_sha256:
-            _reject("pointer_equivocation")
-        reprobe = True
-    elif pointer.sequence < state.last_sequence:
-        _reject("pointer_rollback")
-    elif pointer.sequence - state.last_sequence > policy.max_sequence_gap:
-        _reject("pointer_sequence_gap")
+    reprobe, history_depth = _verify_pointer_chain_position(pointer, policy, state)
     return LatestPointerVerdict(
         manifest_object_key=pointer.manifest_object_key,
         signature_object_keys=pointer.signature_object_keys,
         reprobe=reprobe,
+        history_depth=history_depth,
     )
 
 
 def bind_latest_pointer_to_manifest(
     pointer: AssignmentManifestLatestPointer,
     manifest: ActiveAssignmentManifest,
+    signatures: Sequence[AssignmentManifestSignatureEnvelope],
 ) -> None:
-    """Reject a fetched manifest that is not exactly the one the pointer named."""
+    """Reject fetched objects that are not exactly the manifest and envelopes the pointer named.
+
+    The envelopes must be exactly the pointer's signer set, in the pointer's
+    canonical order, each over the pointer's manifest digest; a fetcher that
+    obtained a different or additional envelope has not fetched what was
+    published and must not proceed to signature verification with it.
+    """
 
     pointer = revalidate(pointer, AssignmentManifestLatestPointer)
     manifest = revalidate(manifest, ActiveAssignmentManifest)
+    envelopes = [revalidate(item, AssignmentManifestSignatureEnvelope) for item in signatures]
     if (
         pointer.manifest_digest_sha256 != manifest.manifest_digest_sha256
         or pointer.sequence != manifest.sequence
         or pointer.previous_manifest_digest_sha256 != manifest.previous_manifest_digest_sha256
         or pointer.finalized_height != manifest.finalized_height
         or pointer.finalized_block_hash != manifest.finalized_block_hash
+        or pointer.finalized_epoch != manifest.finalized_epoch
         or pointer.issued_at_epoch != manifest.issued_at_epoch
         or pointer.expires_at_epoch != manifest.expires_at_epoch
         or pointer.trust_policy_digest_sha256 != manifest.trust_policy_digest_sha256
@@ -342,8 +490,160 @@ def bind_latest_pointer_to_manifest(
         != manifest.central_authority_fingerprint_sha256
         or pointer.network != manifest.network
         or pointer.netuid != manifest.netuid
+        or pointer.purpose != manifest.purpose
     ):
         _reject("pointer_manifest_mismatch")
+    if [item.signer_key_id for item in envelopes] != pointer.signer_key_ids:
+        _reject("pointer_signature_mismatch")
+    for envelope in envelopes:
+        if (
+            envelope.manifest_digest_sha256 != pointer.manifest_digest_sha256
+            or envelope.purpose != pointer.purpose
+        ):
+            _reject("pointer_signature_mismatch")
+
+
+def anchor_manifest_chain_state(
+    manifest: ActiveAssignmentManifest,
+    signatures: Sequence[AssignmentManifestSignatureEnvelope],
+    approved_trust_policy: AssignmentManifestTrustPolicy,
+    genesis_chain_state: AssignmentManifestChainState,
+    *,
+    evaluation_epoch: int,
+    current_finalized_height: int | None = None,
+) -> ManifestVerificationResult:
+    """Onboard a validator with no history on the current live head, at any sequence.
+
+    This is the one deliberate exception to "genesis accepts only sequence 1"
+    and it is available only from a genesis state, so it can never be used to
+    skip past history a validator already holds. The head must pass complete
+    live verification; the resulting state records one accepted manifest at
+    the head's sequence, and every later publication must extend it through
+    the ordinary append-only rules.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
+    state = revalidate(genesis_chain_state, AssignmentManifestChainState)
+    if state.accepted_manifest_count != 0:
+        _reject("anchor_state_not_genesis")
+    policy = revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
+    value = revalidate(manifest, ActiveAssignmentManifest)
+    if state.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256:
+        _reject("rebind_state_policy_mismatch")
+    # Verify the head exactly as the live path would, against a synthetic
+    # genesis that already sits one sequence below it, so the append-only
+    # rules (link, height, epoch, issue time) are not bypassed for the anchor.
+    if value.sequence == 1:
+        return verify_active_assignment_manifest(
+            value,
+            signatures,
+            policy,
+            state,
+            evaluation_epoch=evaluation_epoch,
+            current_finalized_height=current_finalized_height,
+        )
+    unsigned: dict[str, object] = {
+        "schema": MANIFEST_CHAIN_STATE_SCHEMA,
+        "schema_version": PROBE_SCHEMA_VERSION,
+        "purpose": MANIFEST_PURPOSE,
+        "network": state.network,
+        "netuid": state.netuid,
+        "central_authority_fingerprint_sha256": state.central_authority_fingerprint_sha256,
+        "trust_policy_digest_sha256": state.trust_policy_digest_sha256,
+        "accepted_manifest_count": 1,
+        "last_sequence": value.sequence - 1,
+        "last_finalized_height": value.finalized_height,
+        "last_finalized_block_hash": value.finalized_block_hash,
+        "last_finalized_epoch": value.finalized_epoch,
+        "last_issued_at_epoch": value.issued_at_epoch,
+        "last_expires_at_epoch": value.expires_at_epoch,
+        "last_manifest_digest_sha256": value.previous_manifest_digest_sha256,
+    }
+    predecessor = AssignmentManifestChainState.model_validate(
+        {**unsigned, "state_digest_sha256": digest(unsigned)}
+    )
+    result = verify_active_assignment_manifest(
+        value,
+        signatures,
+        policy,
+        predecessor,
+        evaluation_epoch=evaluation_epoch,
+        current_finalized_height=current_finalized_height,
+    )
+    anchored: dict[str, object] = {
+        **unsigned,
+        "accepted_manifest_count": 1,
+        "last_sequence": value.sequence,
+        "last_manifest_digest_sha256": value.manifest_digest_sha256,
+    }
+    return ManifestVerificationResult(
+        manifest=result.manifest,
+        verified_signer_key_ids=result.verified_signer_key_ids,
+        verified_roles=result.verified_roles,
+        next_chain_state=AssignmentManifestChainState.model_validate(
+            {**anchored, "state_digest_sha256": digest(anchored)}
+        ),
+        reprobe=False,
+    )
+
+
+def replay_manifest_history(
+    prior_chain_state: AssignmentManifestChainState,
+    history: Sequence[ManifestHistoryEntry],
+    approved_trust_policy: AssignmentManifestTrustPolicy,
+    *,
+    evaluation_epoch: int,
+) -> AssignmentManifestChainState:
+    """Advance a chain state across the consecutive historical publications it missed.
+
+    ``history`` is the span strictly between the validator's last accepted
+    manifest and the live head, in ascending sequence order, each entry
+    carrying the immutable pointer copy, the manifest, and exactly the
+    envelopes that copy names. Every entry is bound pointer-to-objects, then
+    verified under historical semantics, and must be exactly the next
+    sequence; the returned state is the one the live head must extend. The
+    head itself is not part of the history and is verified live afterwards,
+    which is what authenticates the replayed span end to end. The span may
+    not exceed the policy's ``max_sequence_gap``; a validator further behind
+    than that is re-anchored by its operator, never silently resynchronised.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
+    state = revalidate(prior_chain_state, AssignmentManifestChainState)
+    policy = revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
+    if len(history) > policy.max_sequence_gap:
+        _reject("history_depth_exceeded")
+    for entry in history:
+        pointer = revalidate(entry.pointer, AssignmentManifestLatestPointer)
+        manifest = revalidate(entry.manifest, ActiveAssignmentManifest)
+        if (
+            pointer.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256
+            or pointer.central_authority_fingerprint_sha256
+            != policy.central_authority_fingerprint_sha256
+            or pointer.network != policy.network
+            or pointer.netuid != policy.netuid
+        ):
+            _reject("history_pointer_mismatch")
+        try:
+            _verify_pointer_signer_provenance(
+                pointer, policy, evaluation_epoch=pointer.issued_at_epoch
+            )
+            bind_latest_pointer_to_manifest(pointer, manifest, entry.signatures)
+        except ManifestPublicationError:
+            _reject("history_pointer_mismatch")
+        if manifest.sequence != state.last_sequence + 1 or (
+            state.accepted_manifest_count > 0
+            and manifest.previous_manifest_digest_sha256 != state.last_manifest_digest_sha256
+        ):
+            _reject("history_link_mismatch")
+        state = verify_historical_active_assignment_manifest(
+            manifest,
+            entry.signatures,
+            policy,
+            state,
+            evaluation_epoch=evaluation_epoch,
+        ).next_chain_state
+    return state
 
 
 def rebind_manifest_chain_state_trust_policy(
@@ -361,12 +661,7 @@ def rebind_manifest_chain_state_trust_policy(
     under the successor policy still has to extend the same append-only chain.
     """
 
-    if (
-        isinstance(evaluation_epoch, bool)
-        or not isinstance(evaluation_epoch, int)
-        or not 0 <= evaluation_epoch <= MAX_EPOCH
-    ):
-        raise ValueError("evaluation_epoch_invalid")
+    _validate_evaluation_epoch(evaluation_epoch)
     state = revalidate(state, AssignmentManifestChainState)
     current = revalidate(current_trust_policy, AssignmentManifestTrustPolicy)
     successor = revalidate(next_trust_policy, AssignmentManifestTrustPolicy)
@@ -399,6 +694,7 @@ def rebind_manifest_chain_state_trust_policy(
         "last_sequence": state.last_sequence,
         "last_finalized_height": state.last_finalized_height,
         "last_finalized_block_hash": state.last_finalized_block_hash,
+        "last_finalized_epoch": state.last_finalized_epoch,
         "last_issued_at_epoch": state.last_issued_at_epoch,
         "last_expires_at_epoch": state.last_expires_at_epoch,
         "last_manifest_digest_sha256": state.last_manifest_digest_sha256,

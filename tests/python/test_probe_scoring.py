@@ -28,6 +28,7 @@ from misscomputer_subnet.assignment_probe import (
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
     AssignmentManifestTrustPolicy,
+    ProbeObservation,
     ProbeTransportFailure,
     ValidatorProbeReport,
     build_initial_manifest_chain_state,
@@ -571,3 +572,42 @@ def test_unpublished_attribution_is_refused() -> None:
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
+
+
+def test_mutated_report_is_refused_rather_than_counted() -> None:
+    """A frozen report's nested observation list is still a Python list; scoring re-validates."""
+
+    policy, manifest = single_deployment_context()
+    round_one = rotate(policy, manifest, ["MinerA"], rounds=1)[0]
+    baseline = accumulate_scoring_window(
+        [round_one],
+        validator_uid=VALIDATOR_UID,
+        validator_hotkey=VALIDATOR_HOTKEY,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+    )
+    extra = ProbeObservation.model_validate(
+        round_one.report.observations[0].model_dump(mode="json", by_alias=True)
+    )
+    round_one.report.observations.append(extra)
+    try:
+        with pytest.raises(ProbeScoringError, match="scoring_round_invalid"):
+            accumulate_scoring_window(
+                [round_one],
+                validator_uid=VALIDATOR_UID,
+                validator_hotkey=VALIDATOR_HOTKEY,
+                window_start_epoch=WINDOW_START,
+                window_end_epoch=WINDOW_END,
+            )
+    finally:
+        round_one.report.observations.pop()
+    assert (
+        accumulate_scoring_window(
+            [round_one],
+            validator_uid=VALIDATOR_UID,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+        == baseline
+    )

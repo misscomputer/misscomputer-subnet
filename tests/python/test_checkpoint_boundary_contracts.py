@@ -119,6 +119,7 @@ def test_publication_operations_round_trip_through_the_boundary() -> None:
         evaluation_epoch=EVALUATION_EPOCH,
     )
     assert verdict == {
+        "history_depth": 0,
         "manifest_object_key": pointer["manifest_object_key"],
         "reprobe": False,
         "signature_object_keys": [
@@ -126,9 +127,19 @@ def test_publication_operations_round_trip_through_the_boundary() -> None:
             f"v1/manifests/{pointer['manifest_digest_sha256']}.issuer.signature.json",
         ],
     }
-    assert call("bind_latest_pointer_to_manifest", pointer=pointer, manifest=manifest) == {
-        "value": True
-    }
+    assert call(
+        "bind_latest_pointer_to_manifest",
+        pointer=pointer,
+        manifest=manifest,
+        signatures=signatures,
+    ) == {"value": True}
+    with pytest.raises(ValueError, match="pointer_signature_mismatch"):
+        call(
+            "bind_latest_pointer_to_manifest",
+            pointer=pointer,
+            manifest=manifest,
+            signatures=signatures[:1],
+        )
     accepted = document(context.verification.next_chain_state)
     successor = build_policy(signer_keys(), threshold=1)
     rebound = call(

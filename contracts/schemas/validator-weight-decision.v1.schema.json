@@ -1,5 +1,48 @@
 {
   "$defs": {
+    "AssignedBaseline": {
+      "additionalProperties": false,
+      "description": "The last verified assigned set a decision hands to its successor window.\n\n``established_at_epoch`` is the close of the window whose terminal\nmanifest established it; ``assigned_identity_digest_sha256`` is the digest\nof the sorted ``[uid, hotkey]`` pairs assigned in that manifest.",
+      "properties": {
+        "assigned_identity_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assigned Identity Digest Sha256",
+          "type": "string"
+        },
+        "assigned_miner_count": {
+          "maximum": 4096,
+          "minimum": 0,
+          "title": "Assigned Miner Count",
+          "type": "integer"
+        },
+        "established_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Established At Epoch",
+          "type": "integer"
+        },
+        "manifest_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Digest Sha256",
+          "type": "string"
+        },
+        "manifest_sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Manifest Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "established_at_epoch",
+        "manifest_sequence",
+        "manifest_digest_sha256",
+        "assigned_miner_count",
+        "assigned_identity_digest_sha256"
+      ],
+      "title": "AssignedBaseline",
+      "type": "object"
+    },
     "ProbeScoringPolicy": {
       "additionalProperties": false,
       "description": "Validator-local scoring parameters.\n\nThese are policy, not consensus: a validator may tune them without breaking\nanything, because each validator scores independently.",
@@ -38,6 +81,13 @@
           "title": "Activation Grace Seconds",
           "type": "integer"
         },
+        "assigned_baseline_max_age_seconds": {
+          "default": 86400,
+          "maximum": 2592000,
+          "minimum": 0,
+          "title": "Assigned Baseline Max Age Seconds",
+          "type": "integer"
+        },
         "max_assigned_drop_permille": {
           "default": 500,
           "maximum": 1000,
@@ -74,6 +124,10 @@
       "additionalProperties": false,
       "description": "One registered miner: its class, weight, and the evidence counts behind it.",
       "properties": {
+        "assigned_at_close": {
+          "title": "Assigned At Close",
+          "type": "boolean"
+        },
         "attributions": {
           "minimum": 0,
           "title": "Attributions",
@@ -145,18 +199,20 @@
         "opportunities",
         "expected_attributions_numerator",
         "expected_attributions_denominator",
-        "first_seen_epoch"
+        "first_seen_epoch",
+        "assigned_at_close"
       ],
       "title": "WeightDecisionRow",
       "type": "object"
     }
   },
   "additionalProperties": false,
-  "description": "Sealed, archivable outcome of one scoring window: abstain or submit.",
+  "description": "Sealed, archivable outcome of one scoring window: abstain or submit.\n\nParsing re-derives every abstain reason and every row classification from\nthe sealed fields; a record is accepted only when the ``decision`` it\nstates is the one its own fields imply.",
   "properties": {
     "abstain_reasons": {
       "items": {
         "enum": [
+          "assignment_lease_expired_at_close",
           "coverage_insufficient",
           "manifest_expired_at_close",
           "manifest_invalid",
@@ -168,9 +224,19 @@
         ],
         "type": "string"
       },
-      "maxItems": 8,
+      "maxItems": 9,
       "title": "Abstain Reasons",
       "type": "array"
+    },
+    "assigned_baseline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AssignedBaseline"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "decision": {
       "enum": [
@@ -213,6 +279,25 @@
       "minimum": 0,
       "title": "Observation Count",
       "type": "integer"
+    },
+    "prior_assigned_baseline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AssignedBaseline"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prior_assigned_baseline_status": {
+      "enum": [
+        "absent",
+        "applied",
+        "expired"
+      ],
+      "title": "Prior Assigned Baseline Status",
+      "type": "string"
     },
     "purpose": {
       "const": "public_validator_weight_decision_v1",
@@ -293,11 +378,49 @@
       "title": "Terminal Assigned Miner Count",
       "type": "integer"
     },
+    "terminal_earliest_lease_expires_at_block": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Earliest Lease Expires At Block"
+    },
     "terminal_evaluated_at_epoch": {
       "maximum": 9223372036854775807,
       "minimum": 0,
       "title": "Terminal Evaluated At Epoch",
       "type": "integer"
+    },
+    "terminal_finalized_block_hash": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Block Hash"
+    },
+    "terminal_finalized_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Epoch"
     },
     "terminal_finalized_height": {
       "anyOf": [
@@ -323,6 +446,19 @@
         }
       ],
       "title": "Terminal Manifest Digest Sha256"
+    },
+    "terminal_manifest_effective_expires_at_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Effective Expires At Epoch"
     },
     "terminal_manifest_expires_at_epoch": {
       "anyOf": [
@@ -427,13 +563,20 @@
     "terminal_manifest_digest_sha256",
     "terminal_manifest_sequence",
     "terminal_manifest_expires_at_epoch",
+    "terminal_manifest_effective_expires_at_epoch",
+    "terminal_earliest_lease_expires_at_block",
     "terminal_finalized_height",
+    "terminal_finalized_block_hash",
+    "terminal_finalized_epoch",
     "round_count",
     "observation_count",
     "serving_observation_count",
     "scoring_window_digest_sha256",
+    "prior_assigned_baseline",
+    "prior_assigned_baseline_status",
     "max_assigned_miner_count",
     "terminal_assigned_miner_count",
+    "assigned_baseline",
     "registered_finalized_height",
     "registered_finalized_block_hash",
     "registered_finalized_epoch",

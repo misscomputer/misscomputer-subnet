@@ -61,6 +61,7 @@ from misscomputer_subnet.assignment_snapshot import (
     build_snapshot_replica,
 )
 from misscomputer_subnet.contract_codec import canonical_json
+from misscomputer_subnet.contract_codec import digest as canonical_digest
 from misscomputer_subnet.manifest_publication import (
     AssignmentManifestLatestPointer,
     assignment_manifest_latest_pointer_bytes,
@@ -68,6 +69,7 @@ from misscomputer_subnet.manifest_publication import (
 )
 from misscomputer_subnet.probe_scoring import ProbeRound, RegisteredMiner
 from misscomputer_subnet.validator_decision import (
+    AssignedBaseline,
     RegisteredMinerSet,
     TerminalManifestObservation,
     ValidatorWeightDecision,
@@ -75,6 +77,7 @@ from misscomputer_subnet.validator_decision import (
     decide_weight_submission,
     validator_weight_decision_bytes,
 )
+from misscomputer_subnet.weight_plan import snapshot_identity_fingerprint
 
 VALIDATOR_UID = 7
 VALIDATOR_HOTKEY = "ValidatorA"
@@ -85,8 +88,75 @@ SNAPSHOT_SEQUENCE = 1
 STATE_REVISION = 7
 EXTRA_MINERS: tuple[tuple[int, str], ...] = ((14, "MinerE"), (15, "MinerF"), (16, "MinerG"))
 REGISTERED_MINERS: tuple[tuple[int, str], ...] = MINERS + EXTRA_MINERS
-METAGRAPH_FINGERPRINT = label_digest("contract-checkpoint-metagraph-identity")
+REGISTERED_HEIGHT = FINALIZED_HEIGHT + 50
+REGISTERED_TEMPO = 100
+#: The window's manifests carry tickets and block leases renewed past window
+#: close, as a live scheduler would republish them; the committed manifest
+#: fixture keeps its original, shorter windows.
+WINDOW_TICKET_EXPIRES_AT = WINDOW_END + 3_600
+WINDOW_LEASE_EXPIRES_AT_BLOCK = FINALIZED_HEIGHT + 2_000
 REGISTERED_BLOCK_HASH = label_digest("contract-checkpoint-registered-block")
+
+
+@dataclass(frozen=True, slots=True)
+class MetagraphNeuron:
+    """Duck-typed ``chain.NeuronRecord`` so fixtures never need the chain client."""
+
+    uid: int
+    hotkey: str
+    validator_permit: bool
+    tao_stake: float
+    axon: str | None
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class MetagraphView:
+    """Duck-typed ``chain.MetagraphSnapshot``: exactly what ``weight_plan`` reads."""
+
+    network: str
+    netuid: int
+    block: int
+    tempo: int
+    neurons: tuple[MetagraphNeuron, ...]
+    finalized: bool = True
+
+    @property
+    def epoch(self) -> int:
+        return self.block // self.tempo
+
+
+def metagraph_view(
+    *,
+    miners: Sequence[tuple[int, str]] = REGISTERED_MINERS,
+    finalized_height: int = REGISTERED_HEIGHT,
+    tempo: int = REGISTERED_TEMPO,
+) -> MetagraphView:
+    """The finalized metagraph the golden registered set and weight plan are bound to."""
+
+    neurons = [
+        MetagraphNeuron(
+            uid=VALIDATOR_UID,
+            hotkey=VALIDATOR_HOTKEY,
+            validator_permit=True,
+            tao_stake=1_000.0,
+            axon=None,
+        ),
+        *[
+            MetagraphNeuron(
+                uid=uid, hotkey=hotkey, validator_permit=False, tao_stake=1.0, axon="127.0.0.1:8091"
+            )
+            for uid, hotkey in miners
+        ],
+    ]
+    return MetagraphView(
+        network="finney",
+        netuid=24,
+        block=finalized_height,
+        tempo=tempo,
+        neurons=tuple(neurons),
+        finalized=True,
+    )
 
 
 def nonce_for(label: str) -> str:
@@ -139,6 +209,7 @@ def build_snapshot(
     captured_at_epoch: int = BASE_EPOCH,
     finalized_height: int = FINALIZED_HEIGHT,
     finalized_block_hash: str = FINALIZED_BLOCK_HASH,
+    finalized_epoch: int = 42,
     central_authority: str | None = None,
 ) -> ActiveAssignmentSnapshot:
     policy = build_policy(signer_keys())
@@ -151,13 +222,30 @@ def build_snapshot(
         captured_at_epoch=captured_at_epoch,
         finalized_height=finalized_height,
         finalized_block_hash=finalized_block_hash,
-        finalized_epoch=42,
+        finalized_epoch=finalized_epoch,
         route_host_suffix=ROUTE_SUFFIX,
         probe_port=PROBE_PORT,
         deployments=[
             snapshot_deployment_from(item)
             for item in (fixture_deployments() if deployments is None else deployments)
         ],
+    )
+
+
+def window_deployment(
+    deployment_id: str,
+    miners: Sequence[tuple[int, str]],
+    *,
+    campaign_sequence: int,
+) -> ActiveDeploymentAssignment:
+    """A deployment whose assignment authority outlives the golden window."""
+
+    return build_deployment(
+        deployment_id,
+        miners,
+        campaign_sequence=campaign_sequence,
+        expires_at_block=WINDOW_LEASE_EXPIRES_AT_BLOCK,
+        ticket_expires_at_epoch=WINDOW_TICKET_EXPIRES_AT,
     )
 
 
@@ -226,25 +314,61 @@ def build_round(
 def registered_set(
     *,
     miners: Sequence[tuple[int, str]] = REGISTERED_MINERS,
-    finalized_height: int = FINALIZED_HEIGHT + 50,
+    finalized_height: int = REGISTERED_HEIGHT,
+    finalized_block_hash: str = REGISTERED_BLOCK_HASH,
+    finalized_epoch: int | None = None,
+    tempo: int = REGISTERED_TEMPO,
 ) -> RegisteredMinerSet:
+    """The registered view is a real fingerprint of :func:`metagraph_view`, never a label."""
+
+    view = metagraph_view(
+        miners=[item for item in miners if item[1] != VALIDATOR_HOTKEY],
+        finalized_height=finalized_height,
+        tempo=tempo,
+    )
     return RegisteredMinerSet(
         network="finney",
         netuid=24,
         finalized=True,
         finalized_height=finalized_height,
-        finalized_block_hash=REGISTERED_BLOCK_HASH,
-        finalized_epoch=42,
+        finalized_block_hash=finalized_block_hash,
+        finalized_epoch=view.epoch if finalized_epoch is None else finalized_epoch,
         validator_uid=VALIDATOR_UID,
         validator_hotkey=VALIDATOR_HOTKEY,
         miners=[RegisteredMiner(uid=uid, hotkey=hotkey) for uid, hotkey in miners],
-        metagraph_identity_fingerprint_sha256=METAGRAPH_FINGERPRINT,
+        metagraph_identity_fingerprint_sha256=snapshot_identity_fingerprint(view),
+    )
+
+
+def assigned_baseline(
+    manifest: ActiveAssignmentManifest,
+    *,
+    established_at_epoch: int,
+) -> AssignedBaseline:
+    """The baseline a previous decision would have sealed for ``manifest`` at its close."""
+
+    identities = sorted(
+        {
+            (replica.miner_uid, replica.miner_hotkey)
+            for item in manifest.deployments
+            for replica in item.replicas
+        }
+    )
+    return AssignedBaseline(
+        established_at_epoch=established_at_epoch,
+        manifest_sequence=manifest.sequence,
+        manifest_digest_sha256=manifest.manifest_digest_sha256,
+        assigned_miner_count=len(identities),
+        assigned_identity_digest_sha256=canonical_digest(
+            [[uid, hotkey] for uid, hotkey in identities]
+        ),
     )
 
 
 def make_window_context(
     *,
     decision_policy: WeightDecisionPolicy | None = None,
+    prior_assigned_baseline: AssignedBaseline | None = None,
 ) -> WindowContext:
     """Build the golden window.
 
@@ -256,14 +380,17 @@ def make_window_context(
       delta never answers, so F is unverified but inside activation grace;
     - G is registered and never assigned; the terminal fetch at window close
       re-verifies manifest 3.
+
+    The golden record is a first window: it carries no prior baseline and
+    seals manifest 3's assigned set as the baseline for its successor.
     """
 
     keys = signer_keys()
     policy = build_policy(keys, max_age=3_600)
-    alpha = build_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
-    beta = build_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
-    gamma = build_deployment("fixture-gamma", EXTRA_MINERS[:1], campaign_sequence=3)
-    delta = build_deployment("fixture-delta", EXTRA_MINERS[1:2], campaign_sequence=4)
+    alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
+    beta = window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
+    gamma = window_deployment("fixture-gamma", EXTRA_MINERS[:1], campaign_sequence=3)
+    delta = window_deployment("fixture-delta", EXTRA_MINERS[1:2], campaign_sequence=4)
     manifest_one = build_manifest(policy, [alpha, beta])
     manifest_two = build_manifest(
         policy,
@@ -363,6 +490,7 @@ def make_window_context(
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=decision_policy,
+        prior_assigned_baseline=prior_assigned_baseline,
     )
     return WindowContext(
         keys=keys,
@@ -440,6 +568,27 @@ def _mutate(rendered: bytes, **changes: Any) -> dict[str, Any]:
 
 
 _DELETE = object()
+
+
+def reseal_decision(document: dict[str, Any]) -> dict[str, Any]:
+    """Recompute a mutated decision's row and self digests so only semantics can reject it."""
+
+    resealed = dict(document)
+    if resealed["decision"] == "submit":
+        resealed["weight_plan_rows_digest_sha256"] = canonical_digest(
+            [{"miner_hotkey": row["hotkey"], "weight": row["weight"]} for row in resealed["rows"]]
+        )
+    else:
+        resealed["weight_plan_rows_digest_sha256"] = None
+    unsigned = {key: value for key, value in resealed.items() if key != "decision_digest_sha256"}
+    resealed["decision_digest_sha256"] = canonical_digest(unsigned)
+    return resealed
+
+
+def forged_decision(rendered: bytes, **changes: Any) -> dict[str, Any]:
+    """A self-consistent (digest-valid) record that claims something its fields do not support."""
+
+    return reseal_decision(_mutate(rendered, **changes))
 
 
 def negative_documents() -> dict[str, bytes]:
@@ -565,8 +714,8 @@ def negative_documents() -> dict[str, bytes]:
         "validator-weight-decision",
         "submit-without-positive-evidence",
         "model",
-        "submit_without_positive_evidence",
-        _mutate(
+        "abstain_reasons_not_derived",
+        forged_decision(
             decision,
             rows=[
                 {**row, "weight": 0.0, "classification": "assigned_unverified"}
@@ -574,6 +723,200 @@ def negative_documents() -> dict[str, bytes]:
                 else row
                 for row in json.loads(decision)["rows"]
             ],
+        ),
+    )
+    decision_doc = json.loads(decision)
+    outage_fields: dict[str, Any] = {
+        "terminal_manifest_digest_sha256": None,
+        "terminal_manifest_sequence": None,
+        "terminal_manifest_expires_at_epoch": None,
+        "terminal_manifest_effective_expires_at_epoch": None,
+        "terminal_earliest_lease_expires_at_block": None,
+        "terminal_finalized_height": None,
+        "terminal_finalized_block_hash": None,
+        "terminal_finalized_epoch": None,
+        "assigned_baseline": None,
+    }
+    add(
+        "validator-weight-decision",
+        "submit-with-unavailable-terminal",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            terminal_manifest_status="unavailable",
+            terminal_manifest_rejection_code="timeout",
+            **outage_fields,
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-rejected-terminal",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            terminal_manifest_status="rejected",
+            terminal_manifest_rejection_code="manifest_stale",
+            **outage_fields,
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-expired-terminal",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            terminal_manifest_effective_expires_at_epoch=decision_doc[
+                "terminal_evaluated_at_epoch"
+            ],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-expired-block-lease",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            terminal_earliest_lease_expires_at_block=decision_doc["registered_finalized_height"],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-insufficient-rounds",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision, round_count=decision_doc["decision_policy"]["min_verified_rounds"] - 1
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-undersampled-silent-row",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            rows=[
+                {
+                    **row,
+                    "classification": "assigned_undersampled",
+                    "first_seen_epoch": WINDOW_START,
+                    "expected_attributions_numerator": 2,
+                    "expected_attributions_denominator": 1,
+                }
+                if row["hotkey"] == "MinerF"
+                else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-undersampled-positive-row",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            rows=[
+                {
+                    **row,
+                    "expected_attributions_numerator": 2,
+                    "expected_attributions_denominator": 1,
+                }
+                if row["hotkey"] == "MinerE"
+                else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-mass-drop",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            max_assigned_miner_count=decision_doc["terminal_assigned_miner_count"] * 3,
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-registered-view-behind-terminal",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            registered_finalized_height=decision_doc["terminal_finalized_height"] - 1,
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-same-height-fork",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            registered_finalized_height=decision_doc["terminal_finalized_height"],
+            registered_finalized_epoch=decision_doc["terminal_finalized_epoch"],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-epoch-behind-terminal",
+        "model",
+        "abstain_reasons_not_derived",
+        forged_decision(
+            decision,
+            registered_finalized_epoch=decision_doc["terminal_finalized_epoch"] - 1,
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "row-classification-not-derived",
+        "model",
+        "row_classification_not_derived",
+        forged_decision(
+            decision,
+            rows=[
+                {**row, "classification": "assigned_unverified"}
+                if row["hotkey"] == "MinerF"
+                else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "successor-baseline-not-derived",
+        "model",
+        "assigned_baseline_not_derived",
+        forged_decision(
+            decision,
+            assigned_baseline={
+                **decision_doc["assigned_baseline"],
+                "assigned_miner_count": decision_doc["assigned_baseline"]["assigned_miner_count"]
+                - 1,
+            },
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "prior-baseline-status-not-derived",
+        "model",
+        "baseline_status_not_derived",
+        forged_decision(
+            decision,
+            prior_assigned_baseline={
+                **decision_doc["assigned_baseline"],
+                "established_at_epoch": WINDOW_START
+                - decision_doc["decision_policy"]["assigned_baseline_max_age_seconds"]
+                - 1,
+                "manifest_sequence": 1,
+            },
+            prior_assigned_baseline_status="applied",
         ),
     )
     add(

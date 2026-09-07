@@ -22,9 +22,12 @@ from assignment_probe_context import (
 from contract_checkpoint_context import build_pointer
 
 from misscomputer_subnet.assignment_probe import (
+    ActiveAssignmentManifest,
+    AssignmentManifestChainState,
     AssignmentProbeError,
     build_initial_manifest_chain_state,
     verify_active_assignment_manifest,
+    verify_historical_active_assignment_manifest,
 )
 from misscomputer_subnet.manifest_publication import (
     FETCH_REQUEST_CACHE_CONTROL,
@@ -33,13 +36,17 @@ from misscomputer_subnet.manifest_publication import (
     LATEST_POINTER_CACHE_CONTROL,
     LATEST_POINTER_MAX_AGE_SECONDS,
     LATEST_POINTER_OBJECT_KEY,
+    ManifestHistoryEntry,
     ManifestPublicationError,
+    anchor_manifest_chain_state,
     assignment_manifest_latest_pointer_bytes,
     bind_latest_pointer_to_manifest,
     build_manifest_latest_pointer,
     manifest_object_key,
     parse_assignment_manifest_latest_pointer,
+    pointer_object_key,
     rebind_manifest_chain_state_trust_policy,
+    replay_manifest_history,
     signature_object_key,
     verify_manifest_latest_pointer,
 )
@@ -52,6 +59,7 @@ def test_object_keys_are_content_addressed_and_layout_is_versioned() -> None:
     digest = "ab" * 32
     assert manifest_object_key(digest) == f"v1/manifests/{digest}.json"
     assert signature_object_key(digest, "issuer") == f"v1/manifests/{digest}.issuer.signature.json"
+    assert pointer_object_key(digest) == f"v1/manifests/{digest}.pointer.json"
     assert LATEST_POINTER_OBJECT_KEY == "v1/latest.json"
     assert f"max-age={IMMUTABLE_OBJECT_MAX_AGE_SECONDS}" in IMMUTABLE_OBJECT_CACHE_CONTROL
     assert "immutable" in IMMUTABLE_OBJECT_CACHE_CONTROL
@@ -72,10 +80,43 @@ def test_pointer_names_exactly_the_published_objects() -> None:
         signature_object_key(pointer.manifest_digest_sha256, "auditor"),
         signature_object_key(pointer.manifest_digest_sha256, "issuer"),
     ]
-    bind_latest_pointer_to_manifest(pointer, context.manifest)
+    assert pointer.pointer_object_key == pointer_object_key(pointer.manifest_digest_sha256)
+    assert pointer.finalized_epoch == context.manifest.finalized_epoch
+    bind_latest_pointer_to_manifest(pointer, context.manifest, context.signatures)
     other = build_manifest(context.policy, fixture_deployments()[:1])
     with pytest.raises(ManifestPublicationError) as failure:
-        bind_latest_pointer_to_manifest(pointer, other)
+        bind_latest_pointer_to_manifest(pointer, other, context.signatures)
+    assert failure.value.code == "pointer_manifest_mismatch"
+    # The fetched envelopes must be exactly the signer set the pointer names:
+    # a missing, extra, re-ordered, or differently-signed set is refused
+    # before any signature is checked.
+    all_three = sign_manifest(context.manifest, context.keys, ("auditor", "issuer", "security"))
+    for envelopes in (
+        context.signatures[:1],
+        all_three,
+        list(reversed(context.signatures)),
+        [context.signatures[0], all_three[2]],
+        [],
+    ):
+        with pytest.raises(ManifestPublicationError) as failure:
+            bind_latest_pointer_to_manifest(pointer, context.manifest, envelopes)
+        assert failure.value.code == "pointer_signature_mismatch"
+    foreign = sign_manifest(other, context.keys)
+    with pytest.raises(ManifestPublicationError) as failure:
+        bind_latest_pointer_to_manifest(pointer, context.manifest, foreign)
+    assert failure.value.code == "pointer_signature_mismatch"
+    epoch_pointer = pointer.model_copy(update={"finalized_epoch": pointer.finalized_epoch + 1})
+    with pytest.raises(ManifestPublicationError) as failure:
+        bind_latest_pointer_to_manifest(
+            build_manifest_latest_pointer(context.manifest, context.signatures).model_copy(
+                update={
+                    "finalized_epoch": epoch_pointer.finalized_epoch,
+                    "pointer_digest_sha256": _resealed_pointer_digest(epoch_pointer),
+                }
+            ),
+            context.manifest,
+            context.signatures,
+        )
     assert failure.value.code == "pointer_manifest_mismatch"
     with pytest.raises(ManifestPublicationError) as failure:
         build_manifest_latest_pointer(other, context.signatures)
@@ -86,6 +127,13 @@ def test_pointer_names_exactly_the_published_objects() -> None:
         build_manifest_latest_pointer(context.manifest, context.signatures * 2)
 
 
+def _resealed_pointer_digest(pointer: object) -> str:
+    from misscomputer_subnet.contract_codec import digest as canonical_digest
+    from misscomputer_subnet.contract_codec import model_document
+
+    return canonical_digest(model_document(pointer, exclude={"pointer_digest_sha256"}))  # type: ignore[arg-type]
+
+
 def test_pointer_precheck_mirrors_manifest_acceptance() -> None:
     context = make_context()
     pointer = build_pointer()
@@ -94,6 +142,7 @@ def test_pointer_precheck_mirrors_manifest_acceptance() -> None:
         pointer, context.policy, genesis, evaluation_epoch=EVALUATION_EPOCH
     )
     assert verdict.reprobe is False
+    assert verdict.history_depth == 0
     assert verdict.manifest_object_key == pointer.manifest_object_key
     assert verdict.signature_object_keys == pointer.signature_object_keys
     accepted = context.verification.next_chain_state
@@ -217,6 +266,395 @@ def test_pointer_precheck_mirrors_manifest_acceptance() -> None:
         verify_manifest_latest_pointer(pointer, context.policy, genesis, evaluation_epoch=-1)
 
 
+def test_pointer_precheck_binds_signer_provenance_to_the_policy() -> None:
+    """A pointer's claimed signer set is judged like the envelopes will be, minus cryptography."""
+
+    context = make_context()
+    keys = signer_keys()
+    genesis = build_initial_manifest_chain_state(context.policy)
+    # issuer + security satisfies the threshold of two but not the required
+    # auditor role; under the old precheck it passed and the fetcher would
+    # have downloaded objects that can only fail.
+    wrong_roles = build_manifest_latest_pointer(
+        context.manifest, sign_manifest(context.manifest, keys, ("issuer", "security"))
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            wrong_roles, context.policy, genesis, evaluation_epoch=EVALUATION_EPOCH
+        )
+    assert failure.value.code == "pointer_required_role_missing"
+    # A revoked or not-yet-valid signer named by the pointer is refused.
+    revoked_policy = build_policy(keys, revoked={"issuer": BASE_EPOCH + 10})
+    revoked_manifest = build_manifest(revoked_policy, fixture_deployments())
+    revoked_pointer = build_manifest_latest_pointer(
+        revoked_manifest, sign_manifest(revoked_manifest, keys)
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            revoked_pointer,
+            revoked_policy,
+            build_initial_manifest_chain_state(revoked_policy),
+            evaluation_epoch=EVALUATION_EPOCH,
+        )
+    assert failure.value.code == "pointer_signer_invalid"
+    late_policy = build_policy(keys, key_windows={"issuer": (BASE_EPOCH + 1, BASE_EPOCH + 100_000)})
+    late_manifest = build_manifest(late_policy, fixture_deployments())
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            build_manifest_latest_pointer(late_manifest, sign_manifest(late_manifest, keys)),
+            late_policy,
+            build_initial_manifest_chain_state(late_policy),
+            evaluation_epoch=EVALUATION_EPOCH,
+        )
+    assert failure.value.code == "pointer_signer_invalid"
+    # Chain-view fields copied into the pointer are checked against the state
+    # before any fetch: a rollback or fork at the pointer is refused as such.
+    accepted = context.verification.next_chain_state
+    second = build_manifest(
+        context.policy,
+        fixture_deployments(),
+        sequence=2,
+        previous=context.manifest.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 100,
+        finalized_height=context.manifest.finalized_height - 1,
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            build_manifest_latest_pointer(second, sign_manifest(second, keys)),
+            context.policy,
+            accepted,
+            evaluation_epoch=EVALUATION_EPOCH,
+        )
+    assert failure.value.code == "pointer_rollback"
+    forked = build_manifest(
+        context.policy,
+        fixture_deployments(),
+        sequence=2,
+        previous=context.manifest.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 100,
+        finalized_block_hash=label_digest("fork"),
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            build_manifest_latest_pointer(forked, sign_manifest(forked, keys)),
+            context.policy,
+            accepted,
+            evaluation_epoch=EVALUATION_EPOCH,
+        )
+    assert failure.value.code == "pointer_equivocation"
+    unlinked = build_manifest(
+        context.policy,
+        fixture_deployments(),
+        sequence=2,
+        previous=label_digest("someone-else"),
+        issued_at=BASE_EPOCH + 100,
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            build_manifest_latest_pointer(unlinked, sign_manifest(unlinked, keys)),
+            context.policy,
+            accepted,
+            evaluation_epoch=EVALUATION_EPOCH,
+        )
+    assert failure.value.code == "pointer_equivocation"
+
+
+def _chain(context: object, count: int) -> list[ActiveAssignmentManifest]:
+    """Sequences 1..count, one publication every 100 seconds from the fixture head."""
+
+    keys = signer_keys()
+    policy = context.policy  # type: ignore[attr-defined]
+    manifests = [context.manifest]  # type: ignore[attr-defined]
+    for sequence in range(2, count + 1):
+        previous = manifests[-1]
+        manifests.append(
+            build_manifest(
+                policy,
+                fixture_deployments(),
+                sequence=sequence,
+                previous=previous.manifest_digest_sha256,
+                issued_at=BASE_EPOCH + 100 * (sequence - 1),
+                expires_at=BASE_EPOCH + 100 * (sequence - 1) + 3_600,
+                finalized_height=previous.finalized_height + 5,
+                finalized_block_hash=label_digest(f"block-{sequence}"),
+            )
+        )
+    del keys
+    return manifests
+
+
+def _entry(manifest: ActiveAssignmentManifest, keys: dict) -> ManifestHistoryEntry:  # type: ignore[type-arg]
+    signatures = sign_manifest(manifest, keys)
+    return ManifestHistoryEntry(
+        pointer=build_manifest_latest_pointer(manifest, signatures),
+        manifest=manifest,
+        signatures=signatures,
+    )
+
+
+def test_catch_up_replays_missed_publications_under_historical_semantics() -> None:
+    """A validator at sequence 1 that finds the pointer at sequence 5 catches up 2..4."""
+
+    context = make_context(max_age=600)
+    keys = signer_keys()
+    manifests = _chain(context, 5)
+    accepted = context.verification.next_chain_state
+    head = manifests[4]
+    head_signatures = sign_manifest(head, keys)
+    head_pointer = build_manifest_latest_pointer(head, head_signatures)
+    now = head.issued_at_epoch + 500
+    verdict = verify_manifest_latest_pointer(
+        head_pointer, context.policy, accepted, evaluation_epoch=now
+    )
+    assert verdict.history_depth == 3
+    # Under live semantics the head does not extend sequence 1 (the link is
+    # broken) and the intermediates are expired or stale by now.
+    with pytest.raises(AssignmentProbeError) as failure:
+        verify_active_assignment_manifest(
+            head, head_signatures, context.policy, accepted, evaluation_epoch=now
+        )
+    assert failure.value.code == "previous_link_mismatch"
+    with pytest.raises(AssignmentProbeError) as failure:
+        verify_active_assignment_manifest(
+            manifests[1],
+            sign_manifest(manifests[1], keys),
+            context.policy,
+            accepted,
+            evaluation_epoch=now,
+        )
+    assert failure.value.code == "manifest_stale"
+    history = [_entry(item, keys) for item in manifests[1:4]]
+    caught_up = replay_manifest_history(accepted, history, context.policy, evaluation_epoch=now)
+    assert caught_up.last_sequence == 4
+    assert caught_up.accepted_manifest_count == 4
+    assert caught_up.last_manifest_digest_sha256 == manifests[3].manifest_digest_sha256
+    assert caught_up.last_finalized_epoch == manifests[3].finalized_epoch
+    live = verify_active_assignment_manifest(
+        head, head_signatures, context.policy, caught_up, evaluation_epoch=now
+    )
+    assert live.next_chain_state.last_sequence == 5
+    assert live.reprobe is False
+    # The replayed state is exactly the state a validator that never missed
+    # anything would hold.
+    state = accepted
+    for item in manifests[1:4]:
+        state = verify_active_assignment_manifest(
+            item,
+            sign_manifest(item, keys),
+            context.policy,
+            state,
+            evaluation_epoch=item.issued_at_epoch + 1,
+        ).next_chain_state
+    assert state == caught_up
+
+    # Historical acceptance is still real verification: a bad signature, a
+    # wrong policy binding, or a foreign signer is refused.
+    bad_signature = ManifestHistoryEntry(
+        pointer=history[0].pointer,
+        manifest=history[0].manifest,
+        signatures=[
+            history[0].signatures[0],
+            history[0]
+            .signatures[1]
+            .model_copy(update={"signature_base64": history[0].signatures[0].signature_base64}),
+        ],
+    )
+    with pytest.raises(AssignmentProbeError) as failure:
+        replay_manifest_history(accepted, [bad_signature], context.policy, evaluation_epoch=now)
+    assert failure.value.code == "signature_invalid"
+    # Out of order, gapped, or duplicated history breaks the link.
+    for broken in ([history[1]], [history[0], history[2]], [history[0], history[0]]):
+        with pytest.raises(ManifestPublicationError) as failure:
+            replay_manifest_history(accepted, broken, context.policy, evaluation_epoch=now)
+        assert failure.value.code == "history_link_mismatch"
+    # A pointer copy that does not name exactly the fetched objects is refused.
+    mismatched = ManifestHistoryEntry(
+        pointer=history[1].pointer, manifest=history[0].manifest, signatures=history[0].signatures
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        replay_manifest_history(accepted, [mismatched], context.policy, evaluation_epoch=now)
+    assert failure.value.code == "history_pointer_mismatch"
+    # The catch-up span is bounded by the policy gap; beyond it the pointer
+    # precheck already refuses and the replay refuses too.
+    long_chain = _chain(context, 2 + context.policy.max_sequence_gap + 1)
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            build_manifest_latest_pointer(long_chain[-1], sign_manifest(long_chain[-1], keys)),
+            context.policy,
+            accepted,
+            evaluation_epoch=long_chain[-1].issued_at_epoch,
+        )
+    assert failure.value.code == "pointer_sequence_gap"
+    with pytest.raises(ManifestPublicationError) as failure:
+        replay_manifest_history(
+            accepted,
+            [_entry(item, keys) for item in long_chain[1:-1]],
+            context.policy,
+            evaluation_epoch=long_chain[-1].issued_at_epoch,
+        )
+    assert failure.value.code == "history_depth_exceeded"
+    # Historical verification judges signer validity at issuance, so a key
+    # revoked after a publication still authenticates that publication, but
+    # never one issued after the revocation.
+    rotated = build_policy(keys, revoked={"issuer": manifests[2].issued_at_epoch})
+    rotated_chain = [
+        build_manifest(
+            rotated,
+            fixture_deployments(),
+            sequence=item.sequence,
+            previous=None if item.sequence == 1 else previous_digest,
+            issued_at=item.issued_at_epoch,
+            expires_at=item.expires_at_epoch,
+            finalized_height=item.finalized_height,
+            finalized_block_hash=item.finalized_block_hash,
+        )
+        for item, previous_digest in _linked(manifests[:3], rotated)
+    ]
+    rotated_genesis = build_initial_manifest_chain_state(rotated)
+    early = verify_historical_active_assignment_manifest(
+        rotated_chain[0],
+        sign_manifest(rotated_chain[0], keys),
+        rotated,
+        rotated_genesis,
+        evaluation_epoch=now,
+    )
+    assert early.verified_signer_key_ids == ["auditor", "issuer"]
+    with pytest.raises(AssignmentProbeError) as failure:
+        verify_historical_active_assignment_manifest(
+            rotated_chain[2],
+            sign_manifest(rotated_chain[2], keys),
+            rotated,
+            verify_historical_active_assignment_manifest(
+                rotated_chain[1],
+                sign_manifest(rotated_chain[1], keys),
+                rotated,
+                early.next_chain_state,
+                evaluation_epoch=now,
+            ).next_chain_state,
+            evaluation_epoch=now,
+        )
+    assert failure.value.code == "signer_revoked"
+
+
+def _linked(
+    manifests: list[ActiveAssignmentManifest], policy: object
+) -> list[tuple[ActiveAssignmentManifest, str | None]]:
+    """Re-issue a chain under another policy, threading the previous digests."""
+
+    out: list[tuple[ActiveAssignmentManifest, str | None]] = []
+    previous: str | None = None
+    for item in manifests:
+        rebuilt = build_manifest(
+            policy,  # type: ignore[arg-type]
+            fixture_deployments(),
+            sequence=item.sequence,
+            previous=previous,
+            issued_at=item.issued_at_epoch,
+            expires_at=item.expires_at_epoch,
+            finalized_height=item.finalized_height,
+            finalized_block_hash=item.finalized_block_hash,
+        )
+        out.append((item, previous))
+        previous = rebuilt.manifest_digest_sha256
+    return out
+
+
+def test_onboarding_anchors_on_the_live_head_only_from_genesis() -> None:
+    context = make_context()
+    keys = signer_keys()
+    manifests = _chain(context, 4)
+    head = manifests[3]
+    head_signatures = sign_manifest(head, keys)
+    genesis = build_initial_manifest_chain_state(context.policy)
+    now = head.issued_at_epoch + 10
+    # Genesis alone refuses a head beyond sequence 1, as it always did.
+    with pytest.raises(AssignmentProbeError) as failure:
+        verify_active_assignment_manifest(
+            head, head_signatures, context.policy, genesis, evaluation_epoch=now
+        )
+    assert failure.value.code == "sequence_gap"
+    anchored = anchor_manifest_chain_state(
+        head, head_signatures, context.policy, genesis, evaluation_epoch=now
+    )
+    state = anchored.next_chain_state
+    assert anchored.reprobe is False
+    assert anchored.verified_signer_key_ids == ["auditor", "issuer"]
+    assert state.accepted_manifest_count == 1
+    assert state.last_sequence == 4
+    assert state.last_manifest_digest_sha256 == head.manifest_digest_sha256
+    assert state.last_finalized_height == head.finalized_height
+    assert state.last_finalized_block_hash == head.finalized_block_hash
+    assert state.last_finalized_epoch == head.finalized_epoch
+    assert state.last_issued_at_epoch == head.issued_at_epoch
+    assert state.last_expires_at_epoch == head.expires_at_epoch
+    # From the anchor the ordinary rules apply: re-probe, then the next
+    # sequence extends, and rollback is refused.
+    assert (
+        verify_active_assignment_manifest(
+            head, head_signatures, context.policy, state, evaluation_epoch=now
+        ).reprobe
+        is True
+    )
+    fifth = _chain(context, 5)[4]
+    assert (
+        verify_active_assignment_manifest(
+            fifth, sign_manifest(fifth, keys), context.policy, state, evaluation_epoch=now + 100
+        ).next_chain_state.last_sequence
+        == 5
+    )
+    with pytest.raises(AssignmentProbeError) as failure:
+        verify_active_assignment_manifest(
+            manifests[2],
+            sign_manifest(manifests[2], keys),
+            context.policy,
+            state,
+            evaluation_epoch=now,
+        )
+    assert failure.value.code == "sequence_rollback"
+    # Anchoring is complete live verification: stale heads and bad signatures
+    # are refused, and it is never available from a non-genesis state.
+    with pytest.raises(AssignmentProbeError) as failure:
+        anchor_manifest_chain_state(
+            head,
+            head_signatures,
+            context.policy,
+            genesis,
+            evaluation_epoch=head.issued_at_epoch + context.policy.max_manifest_age_seconds + 1,
+        )
+    assert failure.value.code == "manifest_stale"
+    with pytest.raises(AssignmentProbeError) as failure:
+        anchor_manifest_chain_state(
+            head, head_signatures[:1], context.policy, genesis, evaluation_epoch=now
+        )
+    assert failure.value.code == "threshold_not_met"
+    with pytest.raises(ManifestPublicationError) as failure:
+        anchor_manifest_chain_state(
+            head, head_signatures, context.policy, state, evaluation_epoch=now
+        )
+    assert failure.value.code == "anchor_state_not_genesis"
+    with pytest.raises(ManifestPublicationError) as failure:
+        anchor_manifest_chain_state(
+            head,
+            head_signatures,
+            context.policy,
+            build_initial_manifest_chain_state(build_policy(keys, threshold=1)),
+            evaluation_epoch=now,
+        )
+    assert failure.value.code == "rebind_state_policy_mismatch"
+    # Anchoring on sequence 1 is exactly the ordinary genesis acceptance.
+    assert (
+        anchor_manifest_chain_state(
+            context.manifest,
+            context.signatures,
+            context.policy,
+            genesis,
+            evaluation_epoch=EVALUATION_EPOCH,
+        ).next_chain_state
+        == context.verification.next_chain_state
+    )
+    assert isinstance(state, AssignmentManifestChainState)
+
+
 def test_key_rotation_reanchors_state_without_resetting_history() -> None:
     context = make_context()
     keys = signer_keys()
@@ -229,6 +667,7 @@ def test_key_rotation_reanchors_state_without_resetting_history() -> None:
     assert rebound.trust_policy_digest_sha256 == successor.trust_policy_digest_sha256
     assert rebound.last_sequence == accepted.last_sequence == 1
     assert rebound.last_manifest_digest_sha256 == accepted.last_manifest_digest_sha256
+    assert rebound.last_finalized_epoch == accepted.last_finalized_epoch == 42
     assert rebound.accepted_manifest_count == accepted.accepted_manifest_count
     assert rebound.state_digest_sha256 != accepted.state_digest_sha256
 

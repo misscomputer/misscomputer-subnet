@@ -11,18 +11,26 @@ Frozen rules
 1. **Invalid, unavailable, or stale manifest at window close => ABSTAIN.**
    A validator that cannot verify what is assigned right now must not zero
    everyone; it submits nothing and keeps whatever the chain already holds.
+   A manifest is stale at close when its *effective* horizon has passed: its
+   own expiry or the earliest assignment-ticket expiry it publishes, and it
+   is likewise stale when any published block lease has ended at the
+   registered set's finalized height.
 2. **Insufficient sampling coverage => ABSTAIN.** Fewer verified rounds than
-   ``min_verified_rounds``, or any assigned miner outside activation grace
-   whose fair-round-robin expected attributions are below
+   ``min_verified_rounds``, or any miner assigned at close and outside
+   activation grace whose fair-round-robin expected attributions are below
    ``min_expected_attributions``, means the validator's own sampling, not the
-   miner, is the reason no evidence exists.
+   miner, is the reason the window cannot be judged. This holds even for a
+   miner that did earn positive evidence: an under-sampled window is not a
+   basis for zeroing that miner's peers.
 3. **Assigned, sufficiently sampled, no verified serving evidence => zero.**
 4. **Registered but absent from the valid assignment manifest => zero, only
    when every safe precondition holds:** the terminal manifest verified and
-   unexpired at close; the registered set bound to a finalized metagraph view
-   at or after the manifest's finalized height and within
-   ``max_registered_height_gap``; rules 1 and 2 satisfied; the
-   mass-unassignment guard satisfied; and at least one positive attested row.
+   within its effective horizon at close; the registered set bound to a
+   finalized metagraph view that agrees with the manifest's chain view (same
+   hash and epoch at the same height, never behind it, never more than
+   ``max_registered_height_gap`` ahead, epoch never lower); rules 1 and 2
+   satisfied; the mass-unassignment guard satisfied; and at least one
+   positive attested row.
 5. **No positive verified evidence => no weight transaction.**
 6. **Activation grace.** A miner whose earliest sighting (across the window's
    accepted manifests, the terminal manifest, and any earlier sighting the
@@ -32,18 +40,34 @@ Frozen rules
    creates no weight: the miner earns weight from the first window in which
    it is attributed.
 7. **Finalized window closure.** Reports are admitted only with
-   ``window_start_epoch <= evaluation_epoch < window_end_epoch``; the terminal
-   manifest observation is taken at or after ``window_end_epoch``; the
-   registered set is a finalized view.
+   ``window_start_epoch <= evaluation_epoch < window_end_epoch`` and before
+   their manifest's effective horizon; the terminal manifest observation is
+   taken at or after ``window_end_epoch``; the registered set is a finalized
+   view.
 8. **Replicas need repeated probing.** Coverage is measured in expected
    attributions, ``opportunities / replica_count`` summed over the rounds a
    miner was published in, so a three-replica deployment needs at least
    ``3 * min_expected_attributions`` observations before its silent replica
    can be zeroed.
-9. **Deterministic boundary.** The sealed ``validator-weight-decision`` v1
-   document is the only input to ``weight_plan.build_weight_plan``; its
-   ``weight_plan_rows_digest_sha256`` commits to the exact rows and is
-   ``null`` on abstain, so an abstain record can never be turned into a plan.
+9. **Mass-unassignment baseline outlives the window.** The largest assigned
+   set the guard compares against includes the sealed baseline carried from
+   the previous decision, so a central mass-eviction that lands exactly on a
+   window boundary is still not miner evidence. The baseline decays after
+   ``assigned_baseline_max_age_seconds`` and is refreshed by every verified
+   terminal manifest.
+10. **One coherent manifest chain.** Every manifest in the window and the
+    terminal manifest must form one chain: one central authority, one
+    manifest per sequence, monotonic finalized height and epoch, one hash and
+    epoch per height. Two different manifests at one sequence are publisher
+    equivocation and the inputs are refused outright.
+11. **Deterministic, self-enforcing boundary.** The sealed
+    ``validator-weight-decision`` v1 document is the only input to the
+    decision-aware weight-plan builder. Every abstain reason and every row
+    classification is re-derived from the sealed fields on parse, so a record
+    that says ``submit`` while its own fields describe an outage, a coverage
+    gap, a mass drop, or an unbound registered view is rejected; its
+    ``weight_plan_rows_digest_sha256`` commits to the exact rows and is
+    ``null`` on abstain, so an abstain record can never be turned into a plan.
 
 This module is pure: no clock, network, file, process, environment, wallet,
 chain, randomness, or signing capability.
@@ -56,7 +80,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from typing import Annotated, Final, Literal, NoReturn, Self
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, ValidationError, model_validator
 
 from .assignment_probe import (
     MAX_EPOCH,
@@ -66,6 +90,9 @@ from .assignment_probe import (
     Epoch,
     Hotkey,
     PositiveEpoch,
+    ValidatorProbeReport,
+    manifest_earliest_lease_expires_at_block,
+    manifest_effective_expires_at_epoch,
 )
 from .contract_codec import (
     StrictFrozenModel,
@@ -93,9 +120,11 @@ DECISION_SCHEMA_VERSION: Final = 1
 DECISION_PURPOSE: Final = "public_validator_weight_decision_v1"
 MAX_DECISION_BYTES: Final = 64 * 1_024 * 1_024
 PERMILLE: Final = 1_000
+MAX_BASELINE_AGE_SECONDS: Final = 30 * 86_400
 
 ManifestFetchStatus = Literal["rejected", "unavailable", "verified"]
 Decision = Literal["abstain", "submit"]
+BaselineStatus = Literal["absent", "applied", "expired"]
 MinerClassification = Literal[
     "assigned_in_grace",
     "assigned_undersampled",
@@ -104,6 +133,7 @@ MinerClassification = Literal[
     "verified_serving",
 ]
 AbstainReason = Literal[
+    "assignment_lease_expired_at_close",
     "coverage_insufficient",
     "manifest_expired_at_close",
     "manifest_invalid",
@@ -114,13 +144,17 @@ AbstainReason = Literal[
     "rounds_insufficient",
 ]
 DecisionRejectionCode = Literal[
+    "decision_baseline_invalid",
     "decision_epoch_invalid",
     "decision_first_seen_after_sighting",
     "decision_manifest_authority_mismatch",
+    "decision_manifest_chain_incoherent",
     "decision_not_submittable",
     "decision_policy_grace_exceeds_window",
     "decision_registered_validator_mismatch",
+    "decision_round_after_horizon",
     "decision_round_after_terminal",
+    "decision_round_invalid",
     "decision_terminal_before_close",
     "decision_terminal_status_invalid",
 ]
@@ -145,18 +179,25 @@ class WeightDecisionPolicy(StrictFrozenModel):
     #: Verified probe rounds a window needs before any zero can be submitted.
     min_verified_rounds: int = Field(default=24, ge=1, le=MAX_ROUNDS)
     #: Fair-round-robin expected attributions an assigned miner outside grace
-    #: must have accrued before its silence counts as evidence.
+    #: must have accrued before the window can be judged at all.
     min_expected_attributions: int = Field(default=3, ge=1, le=MAX_ROUNDS)
     #: Seconds after a miner's earliest sighting during which its silence is
     #: neither evidence nor a reason to abstain.
     activation_grace_seconds: int = Field(default=1_800, ge=0, le=86_400)
     #: Abstain when the terminal manifest assigns fewer than
     #: ``(1000 - permille) / 1000`` of the largest assigned set seen in the
-    #: window: a central mass-eviction is not miner evidence.
+    #: window or carried in the baseline: a central mass-eviction is not
+    #: miner evidence.
     max_assigned_drop_permille: int = Field(default=500, ge=0, le=PERMILLE)
     #: The registered set's finalized height may not lead the terminal
     #: manifest's finalized height by more than this many blocks.
     max_registered_height_gap: int = Field(default=600, ge=0, le=1_000_000)
+    #: A baseline established longer ago than this before window close no
+    #: longer widens the mass-unassignment guard; the guard then falls back to
+    #: the window itself. Refreshed by every verified terminal manifest.
+    assigned_baseline_max_age_seconds: int = Field(
+        default=86_400, ge=0, le=MAX_BASELINE_AGE_SECONDS
+    )
 
 
 class RegisteredMinerSet(StrictFrozenModel):
@@ -189,6 +230,21 @@ class RegisteredMinerSet(StrictFrozenModel):
         return self
 
 
+class AssignedBaseline(StrictFrozenModel):
+    """The last verified assigned set a decision hands to its successor window.
+
+    ``established_at_epoch`` is the close of the window whose terminal
+    manifest established it; ``assigned_identity_digest_sha256`` is the digest
+    of the sorted ``[uid, hotkey]`` pairs assigned in that manifest.
+    """
+
+    established_at_epoch: Epoch
+    manifest_sequence: PositiveEpoch
+    manifest_digest_sha256: Digest
+    assigned_miner_count: int = Field(ge=0, le=MAX_REGISTERED_MINERS)
+    assigned_identity_digest_sha256: Digest
+
+
 @dataclass(frozen=True, slots=True)
 class TerminalManifestObservation:
     """What the coordinator observed when it fetched the manifest at window close."""
@@ -211,20 +267,116 @@ class WeightDecisionRow(StrictFrozenModel):
     expected_attributions_numerator: int = Field(ge=0)
     expected_attributions_denominator: int = Field(ge=1)
     first_seen_epoch: Epoch | None
+    #: Whether the terminal manifest (or, absent one, the latest accepted
+    #: manifest) assigns this miner. Sealed so that classification and the
+    #: coverage rule are re-derivable from the record alone.
+    assigned_at_close: bool
 
     @model_validator(mode="after")
     def canonical_row(self) -> Self:
         if (self.weight > 0.0) != (self.classification == "verified_serving"):
             raise ValueError("row_weight_classification_invalid")
-        if self.classification == "unassigned" and self.first_seen_epoch is not None:
+        if self.classification == "unassigned" and (
+            self.first_seen_epoch is not None or self.assigned_at_close
+        ):
             raise ValueError("row_unassigned_first_seen_invalid")
-        if self.classification.startswith("assigned_") and self.first_seen_epoch is None:
+        if self.classification.startswith("assigned_") and (
+            self.first_seen_epoch is None or not self.assigned_at_close
+        ):
+            raise ValueError("row_assigned_first_seen_missing")
+        if (
+            self.classification == "verified_serving"
+            and self.assigned_at_close
+            and (self.first_seen_epoch is None)
+        ):
             raise ValueError("row_assigned_first_seen_missing")
         return self
 
+    @property
+    def expected_attributions(self) -> Fraction:
+        return Fraction(
+            self.expected_attributions_numerator, self.expected_attributions_denominator
+        )
+
+
+def _in_grace(row: WeightDecisionRow, *, window_end_epoch: int, grace_seconds: int) -> bool:
+    return row.first_seen_epoch is not None and window_end_epoch - row.first_seen_epoch < (
+        grace_seconds
+    )
+
+
+def _derived_classification(
+    row: WeightDecisionRow, *, window_end_epoch: int, policy: WeightDecisionPolicy
+) -> MinerClassification:
+    if row.weight > 0.0:
+        return "verified_serving"
+    if not row.assigned_at_close:
+        return "unassigned"
+    if _in_grace(
+        row, window_end_epoch=window_end_epoch, grace_seconds=policy.activation_grace_seconds
+    ):
+        return "assigned_in_grace"
+    if row.expected_attributions < policy.min_expected_attributions:
+        return "assigned_undersampled"
+    return "assigned_unverified"
+
+
+def _coverage_insufficient(
+    rows: Sequence[WeightDecisionRow], *, window_end_epoch: int, policy: WeightDecisionPolicy
+) -> bool:
+    return any(
+        row.assigned_at_close
+        and not _in_grace(
+            row, window_end_epoch=window_end_epoch, grace_seconds=policy.activation_grace_seconds
+        )
+        and row.expected_attributions < policy.min_expected_attributions
+        for row in rows
+    )
+
+
+def _registered_set_unbound(
+    *,
+    registered_finalized_height: int,
+    registered_finalized_block_hash: str,
+    registered_finalized_epoch: int,
+    terminal_finalized_height: int,
+    terminal_finalized_block_hash: str,
+    terminal_finalized_epoch: int,
+    policy: WeightDecisionPolicy,
+) -> bool:
+    if registered_finalized_height < terminal_finalized_height:
+        return True
+    if registered_finalized_height - terminal_finalized_height > policy.max_registered_height_gap:
+        return True
+    if registered_finalized_height == terminal_finalized_height:
+        return (
+            registered_finalized_block_hash != terminal_finalized_block_hash
+            or registered_finalized_epoch != terminal_finalized_epoch
+        )
+    return registered_finalized_epoch < terminal_finalized_epoch
+
+
+def _baseline_status(
+    prior: AssignedBaseline | None, *, window_end_epoch: int, policy: WeightDecisionPolicy
+) -> BaselineStatus:
+    if prior is None:
+        return "absent"
+    if window_end_epoch - prior.established_at_epoch > policy.assigned_baseline_max_age_seconds:
+        return "expired"
+    return "applied"
+
+
+def _identity_digest(identities: set[tuple[int, str]]) -> str:
+    return digest([[uid, hotkey] for uid, hotkey in sorted(identities)])
+
 
 class ValidatorWeightDecision(StrictFrozenModel):
-    """Sealed, archivable outcome of one scoring window: abstain or submit."""
+    """Sealed, archivable outcome of one scoring window: abstain or submit.
+
+    Parsing re-derives every abstain reason and every row classification from
+    the sealed fields; a record is accepted only when the ``decision`` it
+    states is the one its own fields imply.
+    """
 
     contract_schema: Literal["miss.computer/misscomputer-subnet/validator-weight-decision"] = Field(
         alias="schema"
@@ -238,7 +390,7 @@ class ValidatorWeightDecision(StrictFrozenModel):
     window_start_epoch: Epoch
     window_end_epoch: PositiveEpoch
     decision: Decision
-    abstain_reasons: list[AbstainReason] = Field(max_length=8)
+    abstain_reasons: list[AbstainReason] = Field(max_length=9)
     decision_policy: WeightDecisionPolicy
     scoring_policy: ProbeScoringPolicy
     terminal_manifest_status: ManifestFetchStatus
@@ -247,13 +399,22 @@ class ValidatorWeightDecision(StrictFrozenModel):
     terminal_manifest_digest_sha256: Digest | None
     terminal_manifest_sequence: PositiveEpoch | None
     terminal_manifest_expires_at_epoch: PositiveEpoch | None
+    #: ``min(expires_at_epoch, earliest ticket expiry)`` of the terminal manifest.
+    terminal_manifest_effective_expires_at_epoch: PositiveEpoch | None
+    #: Earliest ``expires_at_block`` across the terminal manifest's replicas.
+    terminal_earliest_lease_expires_at_block: PositiveEpoch | None
     terminal_finalized_height: Epoch | None
+    terminal_finalized_block_hash: Digest | None
+    terminal_finalized_epoch: Epoch | None
     round_count: int = Field(ge=0, le=MAX_ROUNDS)
     observation_count: int = Field(ge=0)
     serving_observation_count: int = Field(ge=0)
     scoring_window_digest_sha256: Digest | None
+    prior_assigned_baseline: AssignedBaseline | None
+    prior_assigned_baseline_status: BaselineStatus
     max_assigned_miner_count: int = Field(ge=0, le=MAX_REGISTERED_MINERS)
     terminal_assigned_miner_count: int = Field(ge=0, le=MAX_REGISTERED_MINERS)
+    assigned_baseline: AssignedBaseline | None
     registered_finalized_height: Epoch
     registered_finalized_block_hash: Digest
     registered_finalized_epoch: Epoch
@@ -269,6 +430,10 @@ class ValidatorWeightDecision(StrictFrozenModel):
             raise ValueError("decision_window_invalid")
         if self.terminal_evaluated_at_epoch < self.window_end_epoch:
             raise ValueError("decision_terminal_before_close")
+        if self.decision_policy.activation_grace_seconds > (
+            self.window_end_epoch - self.window_start_epoch
+        ):
+            raise ValueError("decision_policy_grace_exceeds_window")
         if self.abstain_reasons != sorted(set(self.abstain_reasons)):
             raise ValueError("abstain_reasons_not_canonical")
         if (self.decision == "abstain") != bool(self.abstain_reasons):
@@ -278,12 +443,30 @@ class ValidatorWeightDecision(StrictFrozenModel):
             self.terminal_manifest_digest_sha256,
             self.terminal_manifest_sequence,
             self.terminal_manifest_expires_at_epoch,
+            self.terminal_manifest_effective_expires_at_epoch,
+            self.terminal_earliest_lease_expires_at_block,
             self.terminal_finalized_height,
+            self.terminal_finalized_block_hash,
+            self.terminal_finalized_epoch,
         )
         if verified != all(value is not None for value in terminal_fields):
             raise ValueError("terminal_manifest_fields_inconsistent")
         if verified != (self.terminal_manifest_rejection_code is None):
             raise ValueError("terminal_rejection_code_inconsistent")
+        terminal_sequence = self.terminal_manifest_sequence
+        if (
+            self.terminal_manifest_effective_expires_at_epoch is not None
+            and self.terminal_manifest_expires_at_epoch is not None
+            and self.terminal_manifest_effective_expires_at_epoch
+            > self.terminal_manifest_expires_at_epoch
+        ):
+            raise ValueError("terminal_manifest_fields_inconsistent")
+        if (
+            self.terminal_earliest_lease_expires_at_block is not None
+            and self.terminal_finalized_height is not None
+            and self.terminal_earliest_lease_expires_at_block <= self.terminal_finalized_height
+        ):
+            raise ValueError("terminal_manifest_fields_inconsistent")
         if (self.round_count == 0) != (self.scoring_window_digest_sha256 is None):
             raise ValueError("scoring_window_digest_inconsistent")
         if self.serving_observation_count > self.observation_count:
@@ -299,16 +482,106 @@ class ValidatorWeightDecision(StrictFrozenModel):
             uid for uid, _ in keys
         }:
             raise ValueError("rows_include_validator")
-        positive = any(item.weight > 0.0 for item in self.rows)
+        policy = self.decision_policy
+        for row in self.rows:
+            if row.classification != _derived_classification(
+                row, window_end_epoch=self.window_end_epoch, policy=policy
+            ):
+                raise ValueError("row_classification_not_derived")
+        assigned_rows = {(row.uid, row.hotkey) for row in self.rows if row.assigned_at_close}
+        if self.terminal_assigned_miner_count < len(assigned_rows):
+            raise ValueError("assigned_counts_invalid")
+        if self.max_assigned_miner_count < self.terminal_assigned_miner_count:
+            raise ValueError("assigned_counts_invalid")
+        status = _baseline_status(
+            self.prior_assigned_baseline, window_end_epoch=self.window_end_epoch, policy=policy
+        )
+        if status != self.prior_assigned_baseline_status:
+            raise ValueError("baseline_status_not_derived")
+        prior = self.prior_assigned_baseline
+        if prior is not None:
+            if prior.established_at_epoch > self.window_start_epoch:
+                raise ValueError("baseline_after_window_start")
+            if terminal_sequence is not None and prior.manifest_sequence > terminal_sequence:
+                raise ValueError("baseline_after_terminal")
+            if status == "applied" and self.max_assigned_miner_count < prior.assigned_miner_count:
+                raise ValueError("assigned_counts_invalid")
+        successor = self.assigned_baseline
+        if verified:
+            if (
+                successor is None
+                or successor.established_at_epoch != self.window_end_epoch
+                or successor.manifest_sequence != terminal_sequence
+                or successor.manifest_digest_sha256 != self.terminal_manifest_digest_sha256
+                or successor.assigned_miner_count != self.terminal_assigned_miner_count
+            ):
+                raise ValueError("assigned_baseline_not_derived")
+            if self.terminal_assigned_miner_count == len(assigned_rows) and (
+                successor.assigned_identity_digest_sha256 != _identity_digest(assigned_rows)
+            ):
+                raise ValueError("assigned_baseline_not_derived")
+        elif status == "applied":
+            if self.assigned_baseline != prior:
+                raise ValueError("assigned_baseline_not_derived")
+        elif self.assigned_baseline is not None:
+            raise ValueError("assigned_baseline_not_derived")
+        reasons = self._derived_reasons()
+        if sorted(reasons) != self.abstain_reasons:
+            raise ValueError("abstain_reasons_not_derived")
         if self.decision == "submit":
-            if not positive:
-                raise ValueError("submit_without_positive_evidence")
             if self.weight_plan_rows_digest_sha256 != digest(_plan_rows(self.rows)):
                 raise ValueError("weight_plan_rows_digest_mismatch")
         elif self.weight_plan_rows_digest_sha256 is not None:
             raise ValueError("abstain_with_plan_rows_digest")
         verify_model_digest(self, "decision_digest_sha256")
         return self
+
+    def _derived_reasons(self) -> set[AbstainReason]:
+        policy = self.decision_policy
+        reasons: set[AbstainReason] = set()
+        if self.terminal_manifest_status == "unavailable":
+            reasons.add("manifest_unavailable")
+        elif self.terminal_manifest_status == "rejected":
+            reasons.add("manifest_invalid")
+        else:
+            effective = self.terminal_manifest_effective_expires_at_epoch
+            lease_block = self.terminal_earliest_lease_expires_at_block
+            terminal_height = self.terminal_finalized_height
+            terminal_hash = self.terminal_finalized_block_hash
+            terminal_epoch = self.terminal_finalized_epoch
+            if (
+                effective is None
+                or lease_block is None
+                or terminal_height is None
+                or terminal_hash is None
+                or terminal_epoch is None
+            ):
+                raise ValueError("terminal_manifest_fields_inconsistent")
+            if effective <= self.terminal_evaluated_at_epoch:
+                reasons.add("manifest_expired_at_close")
+            if lease_block <= self.registered_finalized_height:
+                reasons.add("assignment_lease_expired_at_close")
+            if _registered_set_unbound(
+                registered_finalized_height=self.registered_finalized_height,
+                registered_finalized_block_hash=self.registered_finalized_block_hash,
+                registered_finalized_epoch=self.registered_finalized_epoch,
+                terminal_finalized_height=terminal_height,
+                terminal_finalized_block_hash=terminal_hash,
+                terminal_finalized_epoch=terminal_epoch,
+                policy=policy,
+            ):
+                reasons.add("registered_set_unbound")
+            if self.terminal_assigned_miner_count * PERMILLE < self.max_assigned_miner_count * (
+                PERMILLE - policy.max_assigned_drop_permille
+            ):
+                reasons.add("mass_unassignment_guard")
+        if self.round_count < policy.min_verified_rounds:
+            reasons.add("rounds_insufficient")
+        if _coverage_insufficient(self.rows, window_end_epoch=self.window_end_epoch, policy=policy):
+            reasons.add("coverage_insufficient")
+        if not any(row.weight > 0.0 for row in self.rows):
+            reasons.add("no_positive_evidence")
+        return reasons
 
 
 def _plan_rows(rows: Sequence[WeightDecisionRow]) -> list[dict[str, object]]:
@@ -318,7 +591,9 @@ def _plan_rows(rows: Sequence[WeightDecisionRow]) -> list[dict[str, object]]:
 def weight_plan_rows_for_submission(decision: ValidatorWeightDecision) -> list[dict[str, object]]:
     """The exact ``build_weight_plan`` rows a submit decision commits to.
 
-    Refuses an abstain record: there is structurally no digest to honour.
+    Refuses an abstain record: there is structurally no digest to honour. The
+    record is re-validated first, which re-derives every precondition; a
+    forged or defective ``submit`` never reaches this point.
     """
 
     decision = revalidate(decision, ValidatorWeightDecision)
@@ -357,6 +632,70 @@ def _record_sightings(
             endpoint_owner[replica.endpoint_id] = (replica.miner_uid, replica.miner_hotkey)
 
 
+def _revalidate_rounds(rounds: Sequence[ProbeRound]) -> list[ProbeRound]:
+    """Rebuild every round from its canonical document so later mutation cannot leak in.
+
+    Frozen models still hold mutable lists; a report whose ``observations``
+    were appended to after verification would otherwise be consumed with its
+    stale digest and declared counts. Re-validation re-runs every digest and
+    count check, so a tampered round is refused here.
+    """
+
+    fresh: list[ProbeRound] = []
+    for entry in rounds:
+        try:
+            fresh.append(
+                ProbeRound(
+                    manifest=revalidate(entry.manifest, ActiveAssignmentManifest),
+                    report=revalidate(entry.report, ValidatorProbeReport),
+                )
+            )
+        except (ValidationError, ValueError, TypeError, AttributeError):
+            _reject("decision_round_invalid")
+    return fresh
+
+
+def _verify_manifest_chain(
+    manifests: Sequence[ActiveAssignmentManifest],
+    registered: RegisteredMinerSet,
+) -> None:
+    """Refuse a window whose manifests are not one coherent chain from one authority."""
+
+    # One authority per window; the trust-policy digest may legitimately
+    # change inside a window at a key-rotation boundary, so it is not compared.
+    authorities = {manifest.central_authority_fingerprint_sha256 for manifest in manifests}
+    if len(authorities) > 1:
+        _reject("decision_manifest_authority_mismatch")
+    for manifest in manifests:
+        if manifest.network != registered.network or manifest.netuid != registered.netuid:
+            _reject("decision_manifest_authority_mismatch")
+    by_sequence: dict[int, ActiveAssignmentManifest] = {}
+    for manifest in manifests:
+        known = by_sequence.get(manifest.sequence)
+        if known is None:
+            by_sequence[manifest.sequence] = manifest
+        elif known.manifest_digest_sha256 != manifest.manifest_digest_sha256:
+            _reject("decision_manifest_chain_incoherent")
+    ordered = [by_sequence[sequence] for sequence in sorted(by_sequence)]
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        if (
+            current.finalized_height < previous.finalized_height
+            or current.finalized_epoch < previous.finalized_epoch
+            or current.issued_at_epoch < previous.issued_at_epoch
+        ):
+            _reject("decision_manifest_chain_incoherent")
+        if current.finalized_height == previous.finalized_height and (
+            current.finalized_block_hash != previous.finalized_block_hash
+            or current.finalized_epoch != previous.finalized_epoch
+        ):
+            _reject("decision_manifest_chain_incoherent")
+        if (
+            current.sequence == previous.sequence + 1
+            and current.previous_manifest_digest_sha256 != previous.manifest_digest_sha256
+        ):
+            _reject("decision_manifest_chain_incoherent")
+
+
 def decide_weight_submission(
     rounds: Sequence[ProbeRound],
     *,
@@ -367,6 +706,7 @@ def decide_weight_submission(
     decision_policy: WeightDecisionPolicy | None = None,
     scoring_policy: ProbeScoringPolicy | None = None,
     endpoint_first_seen_epoch: Mapping[str, int] | None = None,
+    prior_assigned_baseline: AssignedBaseline | None = None,
 ) -> ValidatorWeightDecision:
     """Apply the frozen rules to one closed window and seal the decision record.
 
@@ -375,6 +715,9 @@ def decide_weight_submission(
     ``endpoint_first_seen_epoch`` lets the coordinator supply earlier
     sightings of an endpoint incarnation from its own accepted-manifest
     archive; a supplied value may only be earlier than the in-window sighting.
+    ``prior_assigned_baseline`` is the ``assigned_baseline`` sealed by the
+    coordinator's previous decision; a coordinator that holds one must supply
+    it, and the record seals both what was supplied and how it was applied.
     """
 
     policy = revalidate(decision_policy or WeightDecisionPolicy(), WeightDecisionPolicy)
@@ -395,17 +738,47 @@ def decide_weight_submission(
     if terminal.status == "verified":
         if terminal.manifest is None or terminal.rejection_code is not None:
             _reject("decision_terminal_status_invalid")
-        terminal_manifest = revalidate(terminal.manifest, ActiveAssignmentManifest)
+        try:
+            terminal_manifest = revalidate(terminal.manifest, ActiveAssignmentManifest)
+        except (ValidationError, ValueError, TypeError, AttributeError):
+            _reject("decision_terminal_status_invalid")
     elif terminal.manifest is not None or not terminal.rejection_code:
         _reject("decision_terminal_status_invalid")
+    prior = (
+        None
+        if prior_assigned_baseline is None
+        else revalidate(prior_assigned_baseline, AssignedBaseline)
+    )
+    if prior is not None and prior.established_at_epoch > window_start_epoch:
+        _reject("decision_baseline_invalid")
+
+    rounds = _revalidate_rounds(rounds)
+    manifests = [entry.manifest for entry in rounds]
+    for entry in rounds:
+        if entry.report.evaluation_epoch >= manifest_effective_expires_at_epoch(entry.manifest):
+            _reject("decision_round_after_horizon")
+    chain = list(manifests)
+    if terminal_manifest is not None:
+        for manifest in manifests:
+            if manifest.sequence > terminal_manifest.sequence:
+                _reject("decision_round_after_terminal")
+        chain.append(terminal_manifest)
+    _verify_manifest_chain(chain, registered)
+    if prior is not None:
+        if terminal_manifest is not None and prior.manifest_sequence > terminal_manifest.sequence:
+            _reject("decision_baseline_invalid")
+        for manifest in chain:
+            if manifest.sequence < prior.manifest_sequence or (
+                manifest.sequence == prior.manifest_sequence
+                and manifest.manifest_digest_sha256 != prior.manifest_digest_sha256
+            ):
+                _reject("decision_baseline_invalid")
 
     reasons: set[AbstainReason] = set()
     if terminal.status == "unavailable":
         reasons.add("manifest_unavailable")
     elif terminal.status == "rejected":
         reasons.add("manifest_invalid")
-    elif terminal_manifest is not None and terminal_manifest.expires_at_epoch <= evaluated_at:
-        reasons.add("manifest_expired_at_close")
 
     window: ProbeScoringWindow | None = None
     vector: ProbeWeightVector | None = None
@@ -421,26 +794,10 @@ def decide_weight_submission(
     if len(rounds) < policy.min_verified_rounds:
         reasons.add("rounds_insufficient")
 
-    manifests = [entry.manifest for entry in rounds]
-    if terminal_manifest is not None:
-        for manifest in manifests:
-            if manifest.sequence > terminal_manifest.sequence:
-                _reject("decision_round_after_terminal")
-    authorities = {manifest.central_authority_fingerprint_sha256 for manifest in manifests}
-    if terminal_manifest is not None:
-        authorities.add(terminal_manifest.central_authority_fingerprint_sha256)
-    if len(authorities) > 1:
-        _reject("decision_manifest_authority_mismatch")
-    for manifest in manifests:
-        if manifest.network != registered.network or manifest.netuid != registered.netuid:
-            _reject("decision_manifest_authority_mismatch")
-
     endpoint_first_seen: dict[str, int] = {}
     endpoint_owner: dict[str, tuple[int, str]] = {}
-    for manifest in manifests:
+    for manifest in chain:
         _record_sightings(manifest, endpoint_first_seen, endpoint_owner)
-    if terminal_manifest is not None:
-        _record_sightings(terminal_manifest, endpoint_first_seen, endpoint_owner)
     for endpoint_id, supplied in (endpoint_first_seen_epoch or {}).items():
         derived = endpoint_first_seen.get(endpoint_id)
         if derived is None:
@@ -462,14 +819,30 @@ def decide_weight_submission(
     else:
         assigned = set()
     terminal_count = len(assigned)
-    max_count = max([*assigned_counts, terminal_count])
+    baseline_status = _baseline_status(prior, window_end_epoch=window_end_epoch, policy=policy)
+    baseline_counts = (
+        [prior.assigned_miner_count] if (prior is not None and baseline_status == "applied") else []
+    )
+    max_count = max([*assigned_counts, *baseline_counts, terminal_count])
+    terminal_effective_expiry: int | None = None
+    terminal_lease_block: int | None = None
     if terminal_manifest is not None:
+        terminal_effective_expiry = manifest_effective_expires_at_epoch(terminal_manifest)
+        terminal_lease_block = manifest_earliest_lease_expires_at_block(terminal_manifest)
+        if terminal_effective_expiry <= evaluated_at:
+            reasons.add("manifest_expired_at_close")
+        if terminal_lease_block <= registered.finalized_height:
+            reasons.add("assignment_lease_expired_at_close")
         if terminal_count * PERMILLE < max_count * (PERMILLE - policy.max_assigned_drop_permille):
             reasons.add("mass_unassignment_guard")
-        if (
-            registered.finalized_height < terminal_manifest.finalized_height
-            or registered.finalized_height - terminal_manifest.finalized_height
-            > policy.max_registered_height_gap
+        if _registered_set_unbound(
+            registered_finalized_height=registered.finalized_height,
+            registered_finalized_block_hash=registered.finalized_block_hash,
+            registered_finalized_epoch=registered.finalized_epoch,
+            terminal_finalized_height=terminal_manifest.finalized_height,
+            terminal_finalized_block_hash=terminal_manifest.finalized_block_hash,
+            terminal_finalized_epoch=terminal_manifest.finalized_epoch,
+            policy=policy,
         ):
             reasons.add("registered_set_unbound")
 
@@ -486,23 +859,27 @@ def decide_weight_submission(
                 if item.uid == miner.uid and item.hotkey == miner.hotkey:
                     weight = item.weight
         expected = tally.expected_attributions if tally is not None else Fraction(0)
+        assigned_at_close = key in assigned
         first_seen = miner_first_seen.get(key)
+        in_grace = first_seen is not None and window_end_epoch - first_seen < (
+            policy.activation_grace_seconds
+        )
         classification: MinerClassification
         if weight > 0.0:
             classification = "verified_serving"
             positive = True
-        elif key not in assigned:
+        elif not assigned_at_close:
             classification = "unassigned"
-            first_seen = None
-        elif first_seen is not None and window_end_epoch - first_seen < (
-            policy.activation_grace_seconds
-        ):
+        elif in_grace:
             classification = "assigned_in_grace"
         elif expected < policy.min_expected_attributions:
             classification = "assigned_undersampled"
-            reasons.add("coverage_insufficient")
         else:
             classification = "assigned_unverified"
+        if classification == "unassigned":
+            first_seen = None
+        if assigned_at_close and not in_grace and expected < policy.min_expected_attributions:
+            reasons.add("coverage_insufficient")
         rows.append(
             WeightDecisionRow(
                 uid=miner.uid,
@@ -514,10 +891,25 @@ def decide_weight_submission(
                 expected_attributions_numerator=expected.numerator,
                 expected_attributions_denominator=expected.denominator,
                 first_seen_epoch=first_seen,
+                assigned_at_close=assigned_at_close,
             )
         )
     if not positive:
         reasons.add("no_positive_evidence")
+
+    successor_baseline: dict[str, object] | None
+    if terminal_manifest is not None:
+        successor_baseline = {
+            "established_at_epoch": window_end_epoch,
+            "manifest_sequence": terminal_manifest.sequence,
+            "manifest_digest_sha256": terminal_manifest.manifest_digest_sha256,
+            "assigned_miner_count": terminal_count,
+            "assigned_identity_digest_sha256": _identity_digest(assigned),
+        }
+    elif prior is not None and baseline_status == "applied":
+        successor_baseline = model_document(prior)
+    else:
+        successor_baseline = None
 
     decision: Decision = "abstain" if reasons else "submit"
     unsigned: dict[str, object] = {
@@ -548,15 +940,26 @@ def decide_weight_submission(
         "terminal_manifest_expires_at_epoch": (
             None if terminal_manifest is None else terminal_manifest.expires_at_epoch
         ),
+        "terminal_manifest_effective_expires_at_epoch": terminal_effective_expiry,
+        "terminal_earliest_lease_expires_at_block": terminal_lease_block,
         "terminal_finalized_height": (
             None if terminal_manifest is None else terminal_manifest.finalized_height
+        ),
+        "terminal_finalized_block_hash": (
+            None if terminal_manifest is None else terminal_manifest.finalized_block_hash
+        ),
+        "terminal_finalized_epoch": (
+            None if terminal_manifest is None else terminal_manifest.finalized_epoch
         ),
         "round_count": len(rounds),
         "observation_count": 0 if window is None else window.observation_count,
         "serving_observation_count": 0 if window is None else window.serving_observation_count,
         "scoring_window_digest_sha256": None if window is None else digest(model_document(window)),
+        "prior_assigned_baseline": None if prior is None else model_document(prior),
+        "prior_assigned_baseline_status": baseline_status,
         "max_assigned_miner_count": max_count,
         "terminal_assigned_miner_count": terminal_count,
+        "assigned_baseline": successor_baseline,
         "registered_finalized_height": registered.finalized_height,
         "registered_finalized_block_hash": registered.finalized_block_hash,
         "registered_finalized_epoch": registered.finalized_epoch,

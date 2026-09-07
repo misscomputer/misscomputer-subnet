@@ -94,18 +94,27 @@ clock. For one attempt `assignment_probe.verify_active_assignment_manifest`:
 2. Requires the pinned trust-policy digest, network, netuid, authority
    fingerprint, `https` probe scheme, and an allow-listed route-host suffix.
 3. Enforces the policy validity window, manifest lifetime, future skew,
-   expiry, and maximum age at the supplied evaluation epoch.
+   expiry, and maximum age at the supplied evaluation epoch. Expiry is the
+   manifest's *effective* horizon: the earlier of `expires_at_epoch` and the
+   earliest `ticket_expires_at_epoch` it publishes. When the caller supplies
+   its own finalized height, every replica's `expires_at_block` is enforced
+   against it too (`manifest_replica_lease_expired`).
 4. Verifies every signature envelope against the domain-separated complete
    manifest with its pinned public key; rejects unknown, swapped, invalid,
    duplicate, wrong-purpose, not-yet-valid, expired, or revoked signers; then
    enforces the unique-key threshold and the required roles.
 5. Applies append-only rules against the local `assignment-manifest-chain-state`:
-   genesis accepts only sequence `1` with a null link; a repeat of the exact
-   last-accepted manifest is a **re-probe** and leaves the state unchanged; a
-   different manifest at the same sequence is equivocation; lower sequences,
-   gaps beyond the policy bound, broken previous links, finalized-height
-   rollback or excessive gaps, same-height forks, and issue-time rollback are
-   rejected with stable codes and produce no next state.
+   genesis accepts only sequence `1` with a null link (an operator onboarding
+   a validator on a later head uses the explicit anchoring procedure in
+   [`contract-checkpoint-v1.md`](contract-checkpoint-v1.md)); a repeat of the
+   exact last-accepted manifest is a **re-probe** and leaves the state
+   unchanged; a different manifest at the same sequence is equivocation;
+   lower sequences, gaps beyond the policy bound, broken previous links,
+   finalized-height or finalized-epoch rollback, excessive height gaps,
+   same-height forks (a second hash *or* a second epoch at one height), and
+   issue-time rollback are rejected with stable codes and produce no next
+   state. The state carries the last accepted finalized height, block hash,
+   and epoch.
 
 Only a verified manifest is probed.
 

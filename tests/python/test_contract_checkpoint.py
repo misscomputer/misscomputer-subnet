@@ -52,6 +52,11 @@ PARSERS: dict[str, Any] = {
 # The pre-existing manifest, probe, and weight-plan contracts are consumed by
 # the private producer byte-for-byte. This checkpoint extends around them and
 # must not move them; any change here is a compatibility event, not a fix.
+# Every schema and every golden fixture of those families is pinned. The one
+# declared compatibility event in this checkpoint is the chain state gaining
+# ``last_finalized_epoch`` (see docs/contract-checkpoint-v1.md); its schema and
+# fixture, and the probe-report fixture that carries a chain-state digest, are
+# pinned at their post-change bytes.
 FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
     "schemas/active-assignment-manifest.v1.schema.json": (
         "9a4f4c1ebd5cf25c3ab7670579041c9b35093d5d3fc3fbd528bb13c38c4d4180"
@@ -63,7 +68,7 @@ FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
         "4545017e4a018b0c8eab812d2ae1a11826eea0b72cf700ca325a8a0eb6e4c7d5"
     ),
     "schemas/assignment-manifest-chain-state.v1.schema.json": (
-        "352933d09738b50511b6875c983db6c3c269705188123f36dd0177a4e3eaea7e"
+        "a51d5253e047831d3a2e4e1bf5b8605086aa5bb4545fe7c339ac1929a384ad99"
     ),
     "schemas/miner-probe-attestation.v1.schema.json": (
         "a32d5fd52081ca9442fa393d3449102f852a0ebb18bd515f322377c08235b328"
@@ -76,6 +81,21 @@ FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
     ),
     "fixtures/active-assignment-manifest.v1.json": (
         "8d2ce1883d0081126af277266e48e38cfcabf6d4c89cd01fcc44a2eca9cb27ff"
+    ),
+    "fixtures/assignment-manifest-trust-policy.v1.json": (
+        "597cbf615201e437e375ba3284e5203b325e90d6f55dd9343e570b04c1985612"
+    ),
+    "fixtures/assignment-manifest-signature-envelope.v1.json": (
+        "09b671d14e1a38aaf6fa5c7ceeea0fcfb2d006a312e15e95bbc1acac914cb126"
+    ),
+    "fixtures/assignment-manifest-chain-state.v1.json": (
+        "5b081cdf1a23f0f94819f06da739120630c8729d61f2d966d557e6497b08cfa6"
+    ),
+    "fixtures/miner-probe-attestation.v1.json": (
+        "9b6d1d70f09a1817df1acbe2c885493cd1a742ee3a0b5d0e95468e79eb5b8ce7"
+    ),
+    "fixtures/validator-probe-report.v1.json": (
+        "b726a5ed9a160097244f669353080d53a9186ad05ce132806a02f0acd2e4f924"
     ),
     "fixtures/weight-plan.v1.json": (
         "c73297fd0c2ed35bcae2dec304d9e8e4c288d30f697026b3e43c143bc28a117c"
@@ -103,6 +123,77 @@ def test_pre_existing_contracts_are_untouched(path: str, expected: str) -> None:
 
 def _negative_files() -> list[Path]:
     return sorted(NEGATIVE.rglob("*.json"))
+
+
+EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
+    "active-assignment-snapshot": {
+        "endpoint-incarnation-mismatch",
+        "projected-vector-digest-mismatch",
+        "replica-activated-after-capture",
+        "replica-block-window-excludes-finalized-height",
+        "route-host-not-derived-from-suffix",
+        "self-digest-mismatch",
+        "unknown-field",
+        "wrong-network",
+    },
+    "assignment-manifest-latest-pointer": {
+        "genesis-with-previous-link",
+        "missing-signers",
+        "object-key-not-content-addressed",
+        "self-digest-mismatch",
+        "unknown-field",
+        "unsorted-signers",
+    },
+    "validator-weight-decision": {
+        "abstain-with-plan-rows-digest",
+        "plan-rows-digest-mismatch",
+        "prior-baseline-status-not-derived",
+        "row-classification-not-derived",
+        "self-digest-mismatch",
+        "submit-with-epoch-behind-terminal",
+        "submit-with-expired-block-lease",
+        "submit-with-expired-terminal",
+        "submit-with-insufficient-rounds",
+        "submit-with-mass-drop",
+        "submit-with-registered-view-behind-terminal",
+        "submit-with-rejected-terminal",
+        "submit-with-same-height-fork",
+        "submit-with-unavailable-terminal",
+        "submit-with-undersampled-positive-row",
+        "submit-with-undersampled-silent-row",
+        "submit-without-positive-evidence",
+        "successor-baseline-not-derived",
+        "terminal-before-close",
+        "unknown-abstain-reason",
+    },
+}
+
+
+def test_negative_fixture_inventory_is_complete() -> None:
+    on_disk: dict[str, set[str]] = {}
+    for path in _negative_files():
+        on_disk.setdefault(path.parent.name.removesuffix(".v1"), set()).add(path.stem)
+    assert on_disk == EXPECTED_NEGATIVE_CASES
+
+
+def test_forged_submit_records_are_self_consistent_yet_rejected() -> None:
+    """Every ``submit-with-*`` case carries valid digests; only the derived semantics reject it."""
+
+    for path in _negative_files():
+        if not path.stem.startswith("submit-with"):
+            continue
+        value = json.loads(path.read_bytes())
+        document = value["document"]
+        assert document["decision"] == "submit" and document["abstain_reasons"] == []
+        unsigned = {k: v for k, v in document.items() if k != "decision_digest_sha256"}
+        assert (
+            document["decision_digest_sha256"]
+            == hashlib.sha256(
+                json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("ascii")
+            ).hexdigest()
+        )
+        with pytest.raises(ValidationError, match=value["code"]):
+            ValidatorWeightDecision.model_validate(document)
 
 
 def test_negative_fixture_tree_is_pinned_and_canonical() -> None:

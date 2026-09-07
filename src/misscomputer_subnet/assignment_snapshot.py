@@ -98,6 +98,7 @@ MAX_SNAPSHOT_BYTES: Final = 64 * 1_024 * 1_024
 SnapshotRejectionCode = Literal[
     "snapshot_authority_mismatch",
     "snapshot_capture_rollback",
+    "snapshot_finalized_epoch_rollback",
     "snapshot_finalized_fork",
     "snapshot_finalized_rollback",
     "snapshot_manifest_chain_mismatch",
@@ -437,9 +438,9 @@ def verify_snapshot_succession(
     """Enforce the transactional ordering between two captures from one runtime.
 
     ``snapshot_sequence`` strictly increases; ``state_revision``, the capture
-    instant, and the finalized height never go backwards; an unchanged
-    revision must carry byte-identical deployments; one finalized height has
-    one block hash.
+    instant, the finalized height, and the finalized epoch never go
+    backwards; an unchanged revision must carry byte-identical deployments;
+    one finalized height has one block hash and one epoch.
     """
 
     previous = revalidate(previous, ActiveAssignmentSnapshot)
@@ -464,11 +465,13 @@ def verify_snapshot_succession(
         _reject("snapshot_capture_rollback")
     if current.finalized_height < previous.finalized_height:
         _reject("snapshot_finalized_rollback")
-    if (
-        current.finalized_height == previous.finalized_height
-        and current.finalized_block_hash != previous.finalized_block_hash
+    if current.finalized_height == previous.finalized_height and (
+        current.finalized_block_hash != previous.finalized_block_hash
+        or current.finalized_epoch != previous.finalized_epoch
     ):
         _reject("snapshot_finalized_fork")
+    if current.finalized_epoch < previous.finalized_epoch:
+        _reject("snapshot_finalized_epoch_rollback")
 
 
 def verify_manifest_derived_from_snapshot(

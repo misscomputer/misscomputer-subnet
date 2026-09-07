@@ -142,12 +142,16 @@ ProbeFailureCode = Literal[
 
 ProbeRejectionCode = Literal[
     "authority_mismatch",
+    "finalized_epoch_rollback",
     "finalized_height_gap",
     "finalized_height_rollback",
+    "history_depth_exceeded",
+    "history_sequence_gap",
     "issued_at_rollback",
     "manifest_expired",
     "manifest_future",
     "manifest_lifetime_invalid",
+    "manifest_replica_lease_expired",
     "manifest_stale",
     "network_mismatch",
     "observation_coverage_mismatch",
@@ -503,6 +507,10 @@ class AssignmentManifestChainState(_StrictFrozenModel):
     last_sequence: Epoch
     last_finalized_height: Epoch | None
     last_finalized_block_hash: Digest | None
+    #: Finalized epoch of the last accepted manifest. Carried so that a
+    #: publication whose finalized epoch goes backwards, or that pairs one
+    #: finalized height with two epochs, is rejected like a height fork.
+    last_finalized_epoch: Epoch | None
     last_issued_at_epoch: Epoch | None
     last_expires_at_epoch: Epoch | None
     last_manifest_digest_sha256: Digest | None
@@ -513,6 +521,7 @@ class AssignmentManifestChainState(_StrictFrozenModel):
         tail = (
             self.last_finalized_height,
             self.last_finalized_block_hash,
+            self.last_finalized_epoch,
             self.last_issued_at_epoch,
             self.last_expires_at_epoch,
             self.last_manifest_digest_sha256,
@@ -913,6 +922,7 @@ def build_initial_manifest_chain_state(
         "last_sequence": 0,
         "last_finalized_height": None,
         "last_finalized_block_hash": None,
+        "last_finalized_epoch": None,
         "last_issued_at_epoch": None,
         "last_expires_at_epoch": None,
         "last_manifest_digest_sha256": None,
@@ -974,6 +984,24 @@ def _verify_trust_and_freshness(
     *,
     evaluation_epoch: int,
 ) -> None:
+    _verify_policy_binding(manifest, policy, evaluation_epoch=evaluation_epoch)
+    if evaluation_epoch >= manifest_effective_expires_at_epoch(manifest):
+        _reject("manifest_expired")
+    if (
+        evaluation_epoch > manifest.issued_at_epoch
+        and evaluation_epoch - manifest.issued_at_epoch > policy.max_manifest_age_seconds
+    ):
+        _reject("manifest_stale")
+
+
+def _verify_policy_binding(
+    manifest: ActiveAssignmentManifest,
+    policy: AssignmentManifestTrustPolicy,
+    *,
+    evaluation_epoch: int,
+) -> None:
+    """Historical acceptance: everything in ``_verify_trust_and_freshness`` except freshness."""
+
     if manifest.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256:
         _reject("trust_policy_mismatch")
     if manifest.network != policy.network or manifest.netuid != policy.netuid:
@@ -997,13 +1025,48 @@ def _verify_trust_and_freshness(
         _reject("manifest_lifetime_invalid")
     if manifest.issued_at_epoch > evaluation_epoch + policy.max_future_skew_seconds:
         _reject("manifest_future")
-    if evaluation_epoch >= manifest.expires_at_epoch:
-        _reject("manifest_expired")
+
+
+def manifest_effective_expires_at_epoch(manifest: ActiveAssignmentManifest) -> int:
+    """The instant a manifest stops being valid: its own expiry or the earliest ticket expiry.
+
+    A replica whose signed assignment ticket has expired no longer holds the
+    authority the manifest advertises, so the manifest's validity can never
+    outlive the earliest ticket it publishes, whatever ``expires_at_epoch``
+    claims.
+    """
+
+    return min(
+        manifest.expires_at_epoch,
+        *(
+            replica.ticket_expires_at_epoch
+            for item in manifest.deployments
+            for replica in item.replicas
+        ),
+    )
+
+
+def manifest_earliest_lease_expires_at_block(manifest: ActiveAssignmentManifest) -> int:
+    """The first finalized height at which some published replica's block lease has ended."""
+
+    return min(
+        replica.expires_at_block for item in manifest.deployments for replica in item.replicas
+    )
+
+
+def verify_manifest_block_leases(
+    manifest: ActiveAssignmentManifest, *, current_finalized_height: int
+) -> None:
+    """Reject a manifest that publishes a replica whose block lease has already ended."""
+
     if (
-        evaluation_epoch > manifest.issued_at_epoch
-        and evaluation_epoch - manifest.issued_at_epoch > policy.max_manifest_age_seconds
+        isinstance(current_finalized_height, bool)
+        or not isinstance(current_finalized_height, int)
+        or not 0 <= current_finalized_height <= MAX_EPOCH
     ):
-        _reject("manifest_stale")
+        raise ValueError("current_finalized_height_invalid")
+    if manifest_earliest_lease_expires_at_block(manifest) <= current_finalized_height:
+        _reject("manifest_replica_lease_expired")
 
 
 def _trusted_public_keys(policy: AssignmentManifestTrustPolicy) -> dict[str, bytes]:
@@ -1014,6 +1077,48 @@ def _trusted_public_keys(policy: AssignmentManifestTrustPolicy) -> dict[str, byt
         }
     except Ed25519PublicKeyValidationError:
         _reject("signer_key_invalid")
+
+
+def verify_pointer_signer_set(
+    policy: AssignmentManifestTrustPolicy,
+    signer_key_ids: Sequence[str],
+    *,
+    issued_at_epoch: int,
+    expires_at_epoch: int,
+    evaluation_epoch: int,
+) -> list[ManifestRole]:
+    """The non-cryptographic half of signature verification, for pre-fetch checks.
+
+    Applies exactly the signer-set rules of :func:`_verify_signatures` to a
+    claimed set of signer key IDs: every ID pinned, purpose-bound, valid at
+    issuance, unexpired at evaluation, unrevoked, the unique-key threshold,
+    and every required role covered. A claimed signer set that fails here
+    could never verify, so a fetcher may refuse before downloading objects.
+    """
+
+    trusted = {item.key_id: item for item in policy.trusted_keys}
+    ordered = list(signer_key_ids)
+    if not ordered or ordered != sorted(set(ordered)):
+        _reject("signature_binding_mismatch")
+    roles: set[ManifestRole] = set()
+    for key_id in ordered:
+        key = trusted.get(key_id)
+        if key is None:
+            _reject("signer_untrusted")
+        if MANIFEST_PURPOSE not in key.purposes:
+            _reject("signer_purpose_mismatch")
+        if issued_at_epoch < key.valid_from_epoch:
+            _reject("signer_not_yet_valid")
+        if expires_at_epoch > key.valid_until_epoch or evaluation_epoch >= key.valid_until_epoch:
+            _reject("signer_expired")
+        if key.revoked_at_epoch is not None and key.revoked_at_epoch <= evaluation_epoch:
+            _reject("signer_revoked")
+        roles.update(key.roles)
+    if len(ordered) < policy.threshold:
+        _reject("threshold_not_met")
+    if not set(policy.required_roles) <= roles:
+        _reject("required_role_missing")
+    return sorted(roles)
 
 
 def _verify_signatures(
@@ -1116,11 +1221,14 @@ def advance_manifest_chain_state(
             _reject("finalized_height_rollback")
         if manifest.finalized_height - last_height > policy.max_finalized_height_gap:
             _reject("finalized_height_gap")
-        if (
-            manifest.finalized_height == last_height
-            and manifest.finalized_block_hash != state.last_finalized_block_hash
+        last_epoch = cast(int, state.last_finalized_epoch)
+        if manifest.finalized_height == last_height and (
+            manifest.finalized_block_hash != state.last_finalized_block_hash
+            or manifest.finalized_epoch != last_epoch
         ):
             _reject("same_height_fork")
+        if manifest.finalized_epoch < last_epoch:
+            _reject("finalized_epoch_rollback")
         if manifest.issued_at_epoch < last_issued:
             _reject("issued_at_rollback")
     unsigned: dict[str, object] = {
@@ -1135,6 +1243,7 @@ def advance_manifest_chain_state(
         "last_sequence": manifest.sequence,
         "last_finalized_height": manifest.finalized_height,
         "last_finalized_block_hash": manifest.finalized_block_hash,
+        "last_finalized_epoch": manifest.finalized_epoch,
         "last_issued_at_epoch": manifest.issued_at_epoch,
         "last_expires_at_epoch": manifest.expires_at_epoch,
         "last_manifest_digest_sha256": manifest.manifest_digest_sha256,
@@ -1147,6 +1256,15 @@ def advance_manifest_chain_state(
     )
 
 
+def _validate_evaluation_epoch(evaluation_epoch: int) -> None:
+    if (
+        isinstance(evaluation_epoch, bool)
+        or not isinstance(evaluation_epoch, int)
+        or not 0 <= evaluation_epoch <= MAX_EPOCH
+    ):
+        raise ValueError("evaluation_epoch_invalid")
+
+
 def verify_active_assignment_manifest(
     manifest: ActiveAssignmentManifest,
     signatures: Sequence[AssignmentManifestSignatureEnvelope],
@@ -1154,15 +1272,17 @@ def verify_active_assignment_manifest(
     prior_chain_state: AssignmentManifestChainState,
     *,
     evaluation_epoch: int,
+    current_finalized_height: int | None = None,
 ) -> ManifestVerificationResult:
-    """Verify one dependency-only manifest publication and derive the next state."""
+    """Verify one dependency-only manifest publication and derive the next state.
 
-    if (
-        isinstance(evaluation_epoch, bool)
-        or not isinstance(evaluation_epoch, int)
-        or not 0 <= evaluation_epoch <= MAX_EPOCH
-    ):
-        raise ValueError("evaluation_epoch_invalid")
+    Validity is bounded by :func:`manifest_effective_expires_at_epoch`, never by
+    ``expires_at_epoch`` alone. When the caller knows its own finalized chain
+    height it supplies ``current_finalized_height`` and every published block
+    lease is enforced against it as well.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
     policy = _revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
     trusted_public_keys = _trusted_public_keys(policy)
     value = _revalidate(manifest, ActiveAssignmentManifest)
@@ -1170,6 +1290,8 @@ def verify_active_assignment_manifest(
     if not 1 <= len(envelopes) <= MAX_KEYS:
         _reject("signature_binding_mismatch")
     _verify_trust_and_freshness(value, policy, evaluation_epoch=evaluation_epoch)
+    if current_finalized_height is not None:
+        verify_manifest_block_leases(value, current_finalized_height=current_finalized_height)
     signer_ids, roles = _verify_signatures(
         value,
         envelopes,
@@ -1178,6 +1300,55 @@ def verify_active_assignment_manifest(
         evaluation_epoch=evaluation_epoch,
     )
     next_state, reprobe = advance_manifest_chain_state(prior_chain_state, value, policy)
+    return ManifestVerificationResult(
+        manifest=value,
+        verified_signer_key_ids=signer_ids,
+        verified_roles=roles,
+        next_chain_state=next_state,
+        reprobe=reprobe,
+    )
+
+
+def verify_historical_active_assignment_manifest(
+    manifest: ActiveAssignmentManifest,
+    signatures: Sequence[AssignmentManifestSignatureEnvelope],
+    approved_trust_policy: AssignmentManifestTrustPolicy,
+    prior_chain_state: AssignmentManifestChainState,
+    *,
+    evaluation_epoch: int,
+) -> ManifestVerificationResult:
+    """Accept an already-superseded manifest as one link of the chain being caught up on.
+
+    Historical semantics differ from live acceptance in exactly two ways: the
+    manifest is not required to be fresh or unexpired at ``evaluation_epoch``,
+    and signer validity and revocation are judged at the manifest's own
+    ``issued_at_epoch``. Everything else is identical: canonical form, policy
+    binding, purpose, threshold, roles, real Ed25519 verification, and the
+    append-only chain rules, which here additionally require the manifest to
+    be exactly the next sequence. A historical manifest is never probed; it
+    exists only to close the gap to a live head, whose fresh verification then
+    authenticates the whole replayed span through its ``previous`` links.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
+    policy = _revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
+    trusted_public_keys = _trusted_public_keys(policy)
+    value = _revalidate(manifest, ActiveAssignmentManifest)
+    state = _revalidate(prior_chain_state, AssignmentManifestChainState)
+    envelopes = [_revalidate(item, AssignmentManifestSignatureEnvelope) for item in signatures]
+    if not 1 <= len(envelopes) <= MAX_KEYS:
+        _reject("signature_binding_mismatch")
+    _verify_policy_binding(value, policy, evaluation_epoch=evaluation_epoch)
+    if value.sequence != state.last_sequence + 1:
+        _reject("history_sequence_gap")
+    signer_ids, roles = _verify_signatures(
+        value,
+        envelopes,
+        policy,
+        trusted_public_keys,
+        evaluation_epoch=value.issued_at_epoch,
+    )
+    next_state, reprobe = advance_manifest_chain_state(state, value, policy)
     return ManifestVerificationResult(
         manifest=value,
         verified_signer_key_ids=signer_ids,

@@ -46,7 +46,14 @@ from dataclasses import dataclass
 from fractions import Fraction
 from typing import Annotated, Final, Literal, NoReturn, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from .assignment_probe import (
     ActiveAssignmentManifest,
@@ -72,6 +79,7 @@ ScoringRejectionCode = Literal[
     "scoring_report_duplicate",
     "scoring_report_identity_mismatch",
     "scoring_report_outside_window",
+    "scoring_round_invalid",
     "scoring_rounds_empty",
     "scoring_rounds_overflow",
     "scoring_unpublished_attribution",
@@ -312,6 +320,22 @@ class _MutableTally:
     total_latency_millis: int = 0
 
 
+def _revalidated_rounds(rounds: Sequence[ProbeRound]) -> list[ProbeRound]:
+    fresh: list[ProbeRound] = []
+    for entry in rounds:
+        try:
+            manifest = ActiveAssignmentManifest.model_validate(
+                entry.manifest.model_dump(mode="json", by_alias=True)
+            )
+            report = ValidatorProbeReport.model_validate(
+                entry.report.model_dump(mode="json", by_alias=True)
+            )
+        except (ValidationError, ValueError, TypeError, AttributeError):
+            _reject("scoring_round_invalid")
+        fresh.append(ProbeRound(manifest=manifest, report=report))
+    return fresh
+
+
 def accumulate_scoring_window(
     rounds: Sequence[ProbeRound],
     *,
@@ -326,7 +350,10 @@ def accumulate_scoring_window(
     that manifest. Callers are expected to have verified both already, through
     ``verify_active_assignment_manifest`` and the report's own canonical
     validators; this function re-derives every binding it depends on rather
-    than trusting that it was done.
+    than trusting that it was done, and it re-validates both documents from
+    their canonical form first, so a report whose nested observation list was
+    mutated after validation is refused rather than counted against its
+    stale digest and declared counts.
     """
 
     if not rounds:
@@ -335,6 +362,7 @@ def accumulate_scoring_window(
         _reject("scoring_rounds_overflow")
     if window_end_epoch <= window_start_epoch:
         _reject("scoring_window_invalid")
+    rounds = _revalidated_rounds(rounds)
 
     tallies: dict[tuple[int, str], _MutableTally] = {}
     uid_to_hotkey: dict[int, str] = {}

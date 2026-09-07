@@ -287,6 +287,7 @@ def execute(request: dict[str, object]) -> dict[str, object]:
             evaluation_epoch=arguments["evaluation_epoch"],
         )
         return {
+            "history_depth": verdict.history_depth,
             "manifest_object_key": verdict.manifest_object_key,
             "reprobe": verdict.reprobe,
             "signature_object_keys": list(verdict.signature_object_keys),
@@ -295,6 +296,7 @@ def execute(request: dict[str, object]) -> dict[str, object]:
         bind_latest_pointer_to_manifest(
             _model(AssignmentManifestLatestPointer, arguments["pointer"]),
             _model(ActiveAssignmentManifest, arguments["manifest"]),
+            [_model(AssignmentManifestSignatureEnvelope, item) for item in arguments["signatures"]],
         )
         return {"value": True}
     if operation == "rebind_manifest_state_trust_policy":

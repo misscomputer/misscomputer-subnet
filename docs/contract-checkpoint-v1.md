@@ -10,8 +10,9 @@ code, golden and negative fixtures, and cross-language parity tests. It
 deliberately implements no runtime endpoint, no publisher daemon, no
 coordinator loop, no service wiring, and no weight submission.
 
-Three contracts are added; every pre-existing contract is unchanged and
-byte-pinned by the test suite:
+Three contracts are added. Every pre-existing contract is byte-pinned by the
+test suite, with one declared compatibility event: `assignment-manifest-chain-state`
+gains `last_finalized_epoch` (see "Compatibility matrix").
 
 | Contract | Version | Producer | Consumer | Module |
 | --- | --- | --- | --- | --- |
@@ -81,13 +82,15 @@ golden fixture is scanned for each of those.
 
 `verify_snapshot_succession(previous, current)` is the transactional rule a
 publisher applies between captures: `snapshot_sequence` strictly increases;
-`state_revision`, `captured_at_epoch`, and `finalized_height` never decrease;
-an unchanged `state_revision` must carry identical `deployments`; one
-finalized height has one block hash; authority and network never change.
-Codes: `snapshot_sequence_not_increasing`, `snapshot_revision_rollback`,
+`state_revision`, `captured_at_epoch`, `finalized_height`, and
+`finalized_epoch` never decrease; an unchanged `state_revision` must carry
+identical `deployments`; one finalized height has one block hash and one
+epoch; authority and network never change. Codes:
+`snapshot_sequence_not_increasing`, `snapshot_revision_rollback`,
 `snapshot_revision_content_divergence`, `snapshot_capture_rollback`,
-`snapshot_finalized_rollback`, `snapshot_finalized_fork`,
-`snapshot_authority_mismatch`, `snapshot_network_mismatch`.
+`snapshot_finalized_rollback`, `snapshot_finalized_epoch_rollback`,
+`snapshot_finalized_fork`, `snapshot_authority_mismatch`,
+`snapshot_network_mismatch`.
 
 An empty snapshot is a valid state meaning "nothing is route-active". A
 manifest cannot be derived from it (manifest v1 requires at least one
@@ -108,8 +111,9 @@ the publisher's chain state and trust policy exactly as today.
 
 ## 2. Signed public manifest: publication contract
 
-`active-assignment-manifest` v1 and its envelope, trust policy, and chain
-state are unchanged. This section freezes what surrounds them.
+`active-assignment-manifest` v1, its envelope, and the trust policy are
+unchanged; the chain state gains `last_finalized_epoch`. This section freezes
+what surrounds them.
 
 | Property | Frozen behaviour |
 | --- | --- |
@@ -117,36 +121,81 @@ state are unchanged. This section freezes what surrounds them.
 | Signer and key IDs | `signer_key_id` slug (`^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$`) resolved against `trusted_keys[].key_id`; raw Ed25519 public key (base64) plus `public_key_sha256`; small-order keys rejected |
 | Threshold and trust policy | `threshold` distinct verified keys and every `required_roles` entry covered; roles are `assignment_issuer`, `assignment_auditor`, `assignment_security`; per-key validity window and `revoked_at_epoch`; purpose fixed to `active_assignment_manifest_publication_v1` |
 | Sequence and linkage | `sequence` starts at 1, `previous_manifest_digest_sha256` is `null` exactly at 1 and otherwise equals the previous accepted manifest digest; gaps above `max_sequence_gap` rejected |
-| Finalized-chain binding | `finalized_height`/`finalized_block_hash`/`finalized_epoch` copied from the snapshot; height never decreases, gaps above `max_finalized_height_gap` rejected, same height implies same hash |
+| Finalized-chain binding | `finalized_height`/`finalized_block_hash`/`finalized_epoch` copied from the snapshot; height and epoch never decrease, gaps above `max_finalized_height_gap` rejected, same height implies same hash and same epoch; the chain state carries all three (`last_finalized_height`, `last_finalized_block_hash`, `last_finalized_epoch`) |
 | Issued/expiry | `issued_at_epoch == captured_at_epoch`; `expires_at_epoch - issued_at_epoch <= max_manifest_lifetime_seconds`; not future beyond `max_future_skew_seconds`; not older than `max_manifest_age_seconds` at evaluation |
-| Immutable objects | `v1/manifests/<manifest_digest>.json` and `v1/manifests/<manifest_digest>.<signer_key_id>.signature.json`; content-addressed, never modified or deleted while referenced |
-| Atomic latest pointer | `v1/latest.json` is an `assignment-manifest-latest-pointer` v1 written only after every object it names is readable; replaced atomically; never rewritten to a lower sequence |
-| Replay / rollback / fork | an identical re-fetch is a **re-probe** (state unchanged); a different manifest at an accepted sequence is `same_sequence_divergence`; lower sequences, broken links, height rollback, and same-height forks are rejected with stable codes; the pointer pre-check mirrors these as `pointer_equivocation`, `pointer_rollback`, `pointer_sequence_gap` |
+| Effective horizon | a manifest is valid only until `min(expires_at_epoch, min(replicas[].ticket_expires_at_epoch))` (`manifest_effective_expires_at_epoch`); a verifier that knows its finalized height also enforces every `replicas[].expires_at_block` against it (`manifest_replica_lease_expired`); expired assignment authority is never scoreable, whatever `expires_at_epoch` claims. A publisher should set `expires_at_epoch` no later than the earliest ticket expiry; the verifier does not rely on it doing so |
+| Immutable objects | `v1/manifests/<manifest_digest>.json`, `v1/manifests/<manifest_digest>.<signer_key_id>.signature.json`, and `v1/manifests/<manifest_digest>.pointer.json` (the pointer as published for that manifest); content-addressed, never modified or deleted while any validator could still need them to catch up |
+| Atomic latest pointer | `v1/latest.json` is an `assignment-manifest-latest-pointer` v1 written only after every object it names, including the immutable pointer copy, is readable; replaced atomically; never rewritten to a lower sequence |
+| Replay / rollback / fork | an identical re-fetch is a **re-probe** (state unchanged); a different manifest at an accepted sequence is `same_sequence_divergence`; lower sequences, broken links, height or epoch rollback, and same-height forks are rejected with stable codes; the pointer pre-check mirrors these on the pointer's copied chain fields as `pointer_equivocation`, `pointer_rollback`, `pointer_sequence_gap` |
+| Signer provenance | the pointer's `signer_key_ids` are checked before any fetch exactly as the envelopes will be, minus the cryptography: pinned, purpose-bound, valid at `issued_at_epoch`, unexpired and unrevoked at evaluation, threshold met, every required role covered (`pointer_signer_untrusted`, `pointer_signer_invalid`, `pointer_threshold_not_met`, `pointer_required_role_missing`); after the fetch the envelopes must be exactly that set, in order, over that digest (`pointer_signature_mismatch`) |
 | Cache behaviour | immutable objects `Cache-Control: public, max-age=31536000, immutable`; pointer `public, max-age=60, must-revalidate`; fetchers send `Cache-Control: no-cache` for the pointer; a cache can only withhold, never widen acceptance |
+| Onboarding / catch-up | see below |
 | Key rotation | see below |
-| Compatibility | manifest v1 bytes, schema, and boundary operations unchanged; new pointer object is additive |
+| Compatibility | manifest v1 bytes and schema unchanged; chain state v1 gains one field (declared below); new pointer object is additive |
 
 ### Latest pointer
 
 `assignment-manifest-latest-pointer` v1 copies `sequence`,
-`previous_manifest_digest_sha256`, `manifest_digest_sha256`, finalized height
-and hash, `issued_at_epoch`, `expires_at_epoch`, authority, trust-policy
-digest, and network from the manifest, adds `manifest_object_key` (which must
-equal the content-addressed key of the digest) and the sorted
-`signer_key_ids` published beside it, and seals itself with
-`pointer_digest_sha256`. It is not independently signed: every field is
-re-checked against the signed manifest by `bind_latest_pointer_to_manifest`,
-and `verify_manifest_latest_pointer` refuses, before any object fetch, a
-pointer whose authority, policy, network, signer set, threshold, freshness,
-or chain position could not lead to an acceptable manifest.
+`previous_manifest_digest_sha256`, `manifest_digest_sha256`, finalized
+height, hash, and epoch, `issued_at_epoch`, `expires_at_epoch`, authority,
+trust-policy digest, and network from the manifest, adds
+`manifest_object_key` (which must equal the content-addressed key of the
+digest) and the sorted `signer_key_ids` published beside it, and seals itself
+with `pointer_digest_sha256`. It is not independently signed: every field is
+re-checked against the signed manifest and the fetched envelopes by
+`bind_latest_pointer_to_manifest`, and `verify_manifest_latest_pointer`
+refuses, before any object fetch, a pointer whose authority, policy, network,
+signer set (identity, key validity, revocation, threshold, roles),
+freshness, or chain position could not lead to an acceptable manifest.
 
 Fetch procedure (frozen): fetch `v1/latest.json` with `no-cache`; parse
-canonical bytes; `verify_manifest_latest_pointer`; fetch the named manifest
-object and exactly the named signature objects; parse each as canonical
-bytes; `bind_latest_pointer_to_manifest`;
-`verify_active_assignment_manifest`; persist the next chain state before
+canonical bytes; `verify_manifest_latest_pointer` (the verdict's
+`history_depth` says how many publications lie between the local state and
+the pointer); if `history_depth > 0`, run the catch-up procedure below first;
+fetch the named manifest object and exactly the named signature objects;
+parse each as canonical bytes; `bind_latest_pointer_to_manifest(pointer,
+manifest, signatures)`; `verify_active_assignment_manifest` with the
+validator's current finalized height; persist the next chain state before
 using the manifest. Any failure is "manifest unavailable or invalid" for the
 decision rules below.
+
+### Onboarding and catch-up
+
+A chain state advances only by consecutive accepted sequences, so a validator
+needs a defined, authenticated way to start and to recover from missed
+publications:
+
+- **Onboarding (genesis).** Ordinary verification from a genesis state accepts
+  only sequence 1. A validator joining later calls
+  `anchor_manifest_chain_state(head, signatures, policy, genesis,
+  evaluation_epoch, current_finalized_height)`, which performs the complete
+  live verification of the head (canonical form, policy binding, threshold,
+  roles, real Ed25519 verification, freshness, effective horizon, block
+  leases) and yields a chain state with one accepted manifest at the head's
+  sequence. It is refused from any non-genesis state
+  (`anchor_state_not_genesis`), so it can never skip history a validator
+  already holds; the validator's non-equivocation history begins at the
+  anchor. An operator may equivalently distribute an anchored chain state
+  beside the trust policy; both travel over the same out-of-band trust
+  channel that already roots everything else.
+- **Catch-up.** A validator whose pointer verdict has `history_depth > 0`
+  walks `previous_manifest_digest_sha256` back from the head, fetching for
+  each sequence the immutable manifest object, its `.pointer.json` copy, and
+  exactly the signature objects the copy names, until it reaches its own
+  `last_manifest_digest_sha256`. `replay_manifest_history(state, entries,
+  policy, evaluation_epoch)` verifies the span in ascending order: each entry
+  is bound pointer-to-objects, its signer set checked against the policy as
+  of its `issued_at_epoch`, then accepted by
+  `verify_historical_active_assignment_manifest`, which differs from live
+  acceptance in exactly two ways (no freshness/expiry requirement; signer
+  validity and revocation judged at the manifest's own issuance) and
+  additionally requires the manifest to be exactly the next sequence
+  (`history_sequence_gap`, `history_link_mismatch`). The head is then
+  verified live from the replayed state, which authenticates the whole span
+  through its `previous` links. Historical manifests are never probed. The
+  span is bounded by the policy's `max_sequence_gap`
+  (`history_depth_exceeded`, `pointer_sequence_gap`); a validator further
+  behind is re-anchored by its operator, never silently resynchronised.
 
 ### Key rotation
 
@@ -177,19 +226,37 @@ Rotation is a re-anchoring event, never a reset:
 `validator_decision.decide_weight_submission` applies the frozen rules to one
 closed scoring window and seals a `validator-weight-decision` v1 record. The
 record, not the raw weight vector, is the only input to
-`weight_plan.build_weight_plan`.
+`weight_plan.build_weight_plan_from_decision`, which is the only path to
+`build_weight_plan`.
 
 | Situation | Outcome | Reason code |
 | --- | --- | --- |
 | Terminal manifest fetch at window close unavailable | ABSTAIN | `manifest_unavailable` |
 | Terminal manifest rejected (signature, freshness, chain, policy, pointer) | ABSTAIN | `manifest_invalid` (rejection code recorded) |
-| Terminal manifest expired at the close evaluation instant | ABSTAIN | `manifest_expired_at_close` |
+| Terminal manifest's effective horizon (own expiry or earliest ticket expiry) reached at the close evaluation instant | ABSTAIN | `manifest_expired_at_close` |
+| Any terminal-manifest replica's `expires_at_block` at or below the registered set's finalized height | ABSTAIN | `assignment_lease_expired_at_close` |
 | Fewer verified rounds than `min_verified_rounds` | ABSTAIN | `rounds_insufficient` |
-| Any assigned miner outside activation grace with expected attributions below `min_expected_attributions` | ABSTAIN | `coverage_insufficient` |
-| Registered set not bound to the terminal manifest's chain view (behind it, or ahead by more than `max_registered_height_gap`) | ABSTAIN | `registered_set_unbound` |
-| Terminal assigned-miner count below `(1000 - max_assigned_drop_permille)/1000` of the largest assigned set seen in the window | ABSTAIN | `mass_unassignment_guard` |
+| Any miner assigned at close and outside activation grace with expected attributions below `min_expected_attributions`, whether or not it earned positive evidence | ABSTAIN | `coverage_insufficient` |
+| Registered set not bound to the terminal manifest's chain view: behind it; ahead by more than `max_registered_height_gap`; at the same height with a different block hash or epoch; or ahead with a lower epoch | ABSTAIN | `registered_set_unbound` |
+| Terminal assigned-miner count below `(1000 - max_assigned_drop_permille)/1000` of the largest assigned set seen in the window or carried in an applied prior baseline | ABSTAIN | `mass_unassignment_guard` |
 | No registered miner has positive verified evidence | ABSTAIN | `no_positive_evidence` |
 | None of the above | SUBMIT | (none) |
+
+Inputs that are not a judgement about miners but an inconsistency in what the
+coordinator supplied are refused outright rather than recorded as
+abstentions: a round whose report post-dates its manifest's effective horizon
+(`decision_round_after_horizon`); a manifest or report that no longer
+re-validates from its canonical form, for example because a nested list was
+mutated after verification (`decision_round_invalid`,
+`decision_terminal_status_invalid`); window and terminal manifests that are
+not one coherent chain (`decision_manifest_chain_incoherent`: two different
+manifests at one sequence, a broken link between consecutive sequences,
+finalized height or epoch going backwards, a second hash or epoch at one
+height, issue time going backwards); more than one authority or trust policy
+(`decision_manifest_authority_mismatch`); and a prior baseline that
+post-dates the window start, names a sequence beyond the terminal, or names a
+different manifest at a sequence the window also saw
+(`decision_baseline_invalid`).
 
 Per-miner classification in the record:
 
@@ -201,17 +268,61 @@ Per-miner classification in the record:
 | `assigned_undersampled` | assigned at close, outside grace, under-sampled | zero in the record, forces ABSTAIN |
 | `unassigned` | registered but absent from the terminal manifest | zero |
 
+Every row also seals `assigned_at_close`, and the record seals the terminal
+manifest's digest, sequence, expiry, effective horizon, earliest block lease,
+and finalized height/hash/epoch, the registered view's height/hash/epoch and
+fingerprint, the prior baseline and how it was applied, and the successor
+baseline (below).
+
 Frozen invariants:
 
 - **Zero for absent miners is only submitted under the safe preconditions**:
-  terminal manifest verified and unexpired at close, registered set bound,
-  coverage sufficient, mass-unassignment guard satisfied, positive evidence
-  present. Otherwise the validator abstains and the chain keeps its previous
-  weights.
+  terminal manifest verified and within its effective horizon and leases at
+  close, registered set bound, coverage sufficient, mass-unassignment guard
+  satisfied, positive evidence present. Otherwise the validator abstains and
+  the chain keeps its previous weights.
+- **The sealed record is self-enforcing.** Parsing a
+  `validator-weight-decision` re-derives every abstain reason and every row
+  classification from the sealed fields and accepts the record only if the
+  `decision` and `abstain_reasons` it states are exactly the ones its own
+  fields imply (`abstain_reasons_not_derived`,
+  `row_classification_not_derived`, `assigned_baseline_not_derived`,
+  `baseline_status_not_derived`). A digest-valid record that says `submit`
+  while describing an outage, an expired horizon, too few rounds, an
+  under-sampled assigned miner, a mass drop, or an unbound registered view
+  is rejected before it can reach a plan; the `contracts/negative/`
+  `submit-with-*` fixtures are exactly such records.
 - **No positive verified evidence, no transaction**: an abstain record has
   `weight_plan_rows_digest_sha256 = null`, and
   `weight_plan_rows_for_submission` refuses it; a submit record commits to the
   exact `[{miner_hotkey, weight}]` rows by digest.
+- **The decision is bound to one metagraph view.**
+  `build_weight_plan_from_decision(decision, snapshot,
+  finalized_block_hash, version_key)` checks the snapshot's network, netuid,
+  finalized flag, block (= `registered_finalized_height`), epoch
+  (= `registered_finalized_epoch`), the supplied block hash
+  (= `registered_finalized_block_hash`), the validator UID/hotkey, every row's
+  UID/hotkey mapping, and the complete `snapshot_identity_fingerprint`
+  (= `metagraph_identity_fingerprint_sha256`) before the unchanged
+  `build_weight_plan` sees a row. A decision cannot be replayed against a
+  different chain segment, a reorganised metagraph, or a remapped UID.
+- **Mass-unassignment baseline outlives the window.** Every decision seals an
+  `assigned_baseline` (the verified terminal manifest's assigned set: count,
+  identity digest, sequence, digest, and the window close that established
+  it; carried forward unchanged through an outage). A coordinator that holds
+  one supplies it as `prior_assigned_baseline` to the next window, and the
+  record seals both the supplied value and its status: `applied` (widens the
+  guard's largest-set baseline), `expired` (established more than
+  `assigned_baseline_max_age_seconds` before window close; ignored and
+  dropped so the successor starts clean), or `absent` (a coordinator's first
+  window). A central mass-eviction at a window boundary therefore still
+  abstains; a legitimate long-term shrink is accepted once the old baseline
+  has aged out or the drop policy is relaxed.
+- **Evidence is re-validated before use.** Every round's manifest and report,
+  and the terminal manifest, are rebuilt from their canonical documents
+  (re-running every digest and count check) before scoring, both in
+  `decide_weight_submission` and in `accumulate_scoring_window`; a frozen
+  model whose nested list was mutated after verification is refused.
 - **Activation grace** anchors on the miner's earliest sighting across the
   window's accepted manifests, the terminal manifest, and any earlier
   archived sighting the coordinator supplies (a supplied sighting may only be
@@ -237,24 +348,32 @@ Frozen invariants:
   becomes zero in the next window.
 
 Default policy: 24 verified rounds, 3 expected attributions, 1800s grace,
-500‰ drop guard, 600-block registered gap. These are defaults, not consensus.
+500‰ drop guard, 600-block registered gap, 86400s baseline age. These are
+defaults, not consensus.
 
 ## Threat and failure semantics
 
 | Threat or failure | Effect | Why it is safe |
 | --- | --- | --- |
-| Publisher or object store down; pointer unreachable | validators re-probe the last accepted manifest until it expires, then abstain | no zeros are ever derived from absence of a manifest |
-| Stale cache serves an old pointer | re-probe (identical) or `pointer_rollback`/`pointer_stale`; abstain after freshness bound | pointer fields are re-verified against the signed manifest and chain state |
+| Publisher or object store down; pointer unreachable | validators re-probe the last accepted manifest until its effective horizon, then abstain | no zeros are ever derived from absence of a manifest |
+| Stale cache serves an old pointer | re-probe (identical) or `pointer_rollback`/`pointer_stale`; abstain after freshness bound | pointer fields are re-verified against the signed manifest, envelopes, and chain state |
+| Pointer names a signer set the policy could not accept, or the fetched envelopes differ from it | `pointer_signer_invalid`/`pointer_required_role_missing`/`pointer_signature_mismatch` before verification; abstain | signer provenance is bound end to end, not just counted |
 | Compromised object store serves a forged or altered manifest | `signature_invalid`/`document_not_canonical`; abstain | only pinned Ed25519 keys under threshold and roles can sign |
-| Publisher equivocates (two manifests at one sequence) | `same_sequence_divergence` on validators that saw the first; both are archived evidence | append-only chain state is never rewound |
-| Publisher rolls back sequence or finalized height, or forks a height | `sequence_rollback`/`finalized_height_rollback`/`same_height_fork`; abstain | monotonic rules bound by policy gaps |
+| Publisher equivocates (two manifests at one sequence) | `same_sequence_divergence` on validators that saw the first; `decision_manifest_chain_incoherent` if both reach one window; both are archived evidence | append-only chain state is never rewound; the decision refuses incoherent input |
+| Publisher rolls back sequence, finalized height, or finalized epoch, or forks a height | `sequence_rollback`/`finalized_height_rollback`/`finalized_epoch_rollback`/`same_height_fork`; abstain | monotonic rules bound by policy gaps, carried in the chain state |
+| Manifest claims validity beyond its tickets or block leases | `manifest_expired`/`manifest_replica_lease_expired` at the verifier; `manifest_expired_at_close`/`assignment_lease_expired_at_close` at the decision | assignment authority, not the manifest's own claim, bounds what is scoreable |
+| Validator missed publications | `history_depth > 0`; catch-up replays the span under historical semantics, then the head verifies live | the head's link chain authenticates the span; no gap is ever accepted silently |
+| New validator, no history | operator anchors on the live head from genesis only | complete live verification; history starts at the anchor and cannot be reset later |
+| Sealed decision rewritten or produced by a defective coordinator | `abstain_reasons_not_derived` and companions on parse; never reaches a plan | every precondition is re-derived from the record itself |
+| Decision applied to a different metagraph view | `build_weight_plan_from_decision` refuses | height, hash, epoch, fingerprint, and every UID/hotkey are checked |
+| Verified report mutated in memory after validation | `decision_round_invalid`/`scoring_round_invalid` | evidence is rebuilt from canonical form before use |
 | Runtime snapshot torn or inconsistent | `snapshot_revision_content_divergence` or manifest derivation mismatch; publisher refuses to sign | one-revision read is a contract, and the projection digest binds manifest to snapshot |
 | Snapshot leaks material | structurally impossible: digests only; fixture scanned for forbidden terms | private retained bytes never enter the public contract |
-| Central mass-eviction or empty snapshot | `mass_unassignment_guard` or manifest expiry; abstain | central failure is not miner evidence |
+| Central mass-eviction or empty snapshot, including exactly at a window boundary | `mass_unassignment_guard` (within the window or against the carried baseline) or manifest expiry; abstain | central failure is not miner evidence |
 | Validator sampling too sparse | `rounds_insufficient`/`coverage_insufficient`; abstain | the validator's gap never becomes a miner's zero |
 | Miner newly activated late in a window | `assigned_in_grace`; window still submits | new miners cannot stall the network |
 | Miner registered but never assigned | `unassigned`, zero under safe preconditions | assignment is the central authority's prerogative; weight follows serving |
-| Registered set from a different chain segment | `registered_set_unbound`; abstain | plan and manifest views must agree |
+| Registered set from a different chain segment (behind, too far ahead, same height with another hash or epoch, lower epoch) | `registered_set_unbound`; abstain | plan and manifest views must agree |
 | Key rotation half-applied | `trust_policy_mismatch`; abstain until re-anchored | rotation never resets non-equivocation history |
 | Clock skew | bounded by `max_future_skew_seconds`; capture-side ticket skew bounded at 30s | all time is explicit input to pure code |
 
@@ -262,15 +381,22 @@ Default policy: 24 verified rounds, 3 expected attributions, 1800s grace,
 
 | Artifact | Status in this checkpoint | Consumers to update |
 | --- | --- | --- |
-| `active-assignment-manifest.v1` and companions | unchanged, digest-pinned in tests | none |
-| `validator-probe-report.v1`, `miner-probe-attestation.v1` | unchanged | none |
-| `weight-plan.v1` | unchanged | none |
-| `misscomputer-checkpoint-boundary` protocol `misscomputer.checkpoint-boundary.v1` | additive operations only; existing operations and response shapes unchanged | private producer may adopt the new operations |
-| `active-assignment-snapshot.v1` | new; Go and Python parity locked | runtime snapshot endpoint (Go), publisher |
-| `assignment-manifest-latest-pointer.v1` | new | publisher, validator fetcher |
-| `validator-weight-decision.v1` | new | validator coordinator |
-| `contracts/negative/` | new convention: golden invalid documents with pinned rejection reasons | contract test suites |
+| `active-assignment-manifest.v1`, `assignment-manifest-trust-policy.v1`, `assignment-manifest-signature-envelope.v1` | unchanged; schema and fixture digest-pinned in tests | none |
+| `assignment-manifest-chain-state.v1` | **declared compatibility event**: gains required `last_finalized_epoch` (`null` at genesis); schema and fixture re-pinned; previously persisted states must be re-anchored (no validator is live on the old form) | private producer and every chain-state holder re-vendor; `advance_manifest_chain_state`/`rebind_manifest_chain_state_trust_policy` produce the new form |
+| `validator-probe-report.v1`, `miner-probe-attestation.v1` | schemas unchanged and pinned; the probe-report fixture is re-pinned because it embeds chain-state digests | none |
+| `weight-plan.v1` | unchanged, pinned; `build_weight_plan` unchanged, `build_weight_plan_from_decision` added in front of it | validator coordinator uses the decision-aware builder |
+| Manifest verification (`verify_active_assignment_manifest`) | effective horizon replaces `expires_at_epoch` as the validity bound; optional `current_finalized_height`; historical variant added | fetchers pass their finalized height |
+| `misscomputer-checkpoint-boundary` protocol `misscomputer.checkpoint-boundary.v1` | additive operations; `bind_latest_pointer_to_manifest` takes `signatures`; `verify_manifest_latest_pointer` response adds `history_depth`; existing operations and response shapes unchanged | private producer may adopt the new operations |
+| `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity | runtime snapshot endpoint (Go), publisher |
+| `assignment-manifest-latest-pointer.v1` | new; carries `finalized_epoch`; immutable `.pointer.json` copy per manifest | publisher, validator fetcher |
+| `validator-weight-decision.v1` | new; self-enforcing on parse; carries terminal hash/epoch/horizon/lease, `assigned_at_close`, baselines | validator coordinator |
+| `contracts/negative/` | new convention: golden invalid documents with pinned rejection reasons, including digest-valid forged `submit-with-*` decisions | contract test suites |
 | Go `pkg/assignment` | new package; no existing Go API changed | runtime snapshot endpoint |
+
+Every schema and every golden fixture of the seven pre-existing contract
+families is SHA-256 pinned in `test_contract_checkpoint.py`; the three new
+contracts are pinned by regeneration equality with their generators and by the
+negative-fixture inventory.
 
 Private-side note: the private producer's `central-active-assignment-snapshot`
 (retained ticket and receipt bytes) remains a private, never-published input.
@@ -294,9 +420,9 @@ contract shape.
    one-hour window, and the policy enforces only `grace <= window`.
 4. **Archive-derived first-seen sightings.** A coordinator may or may not
    supply earlier endpoint sightings from its archive; both are conforming.
-5. **Cross-window mass-unassignment comparison.** The guard compares within
-   the window; comparing against the previous window's terminal manifest is
-   a coordinator refinement that would only add abstentions.
+   Cross-window mass-unassignment protection is not an open choice: the
+   sealed baseline is part of the v1 record and a coordinator that holds one
+   must supply it.
 
 ## Files
 
@@ -308,7 +434,9 @@ contract shape.
   `tests/python/contract_checkpoint_context.py`;
 - `contracts/negative/<contract>.v1/*.json` golden invalid documents, each
   naming the contract, the expected rejection layer (`schema` or `model`),
-  and the rejection code;
+  and the rejection code; the `validator-weight-decision.v1/submit-with-*`
+  cases carry valid self and row digests and are rejected only by the
+  derived semantics;
 - `tests/python/test_contract_checkpoint.py`, `test_assignment_snapshot.py`,
   `test_manifest_publication.py`, `test_validator_decision.py`,
   `test_checkpoint_boundary_contracts.py`.

@@ -38,6 +38,19 @@
       ],
       "title": "Last Finalized Block Hash"
     },
+    "last_finalized_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Finalized Epoch"
+    },
     "last_finalized_height": {
       "anyOf": [
         {
@@ -130,6 +143,7 @@
     "last_sequence",
     "last_finalized_height",
     "last_finalized_block_hash",
+    "last_finalized_epoch",
     "last_issued_at_epoch",
     "last_expires_at_epoch",
     "last_manifest_digest_sha256",
