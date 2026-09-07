@@ -2,7 +2,7 @@
   "$defs": {
     "AssignedBaseline": {
       "additionalProperties": false,
-      "description": "The last verified assigned set a decision hands to its successor window.\n\n``established_at_epoch`` is the close of the window whose terminal\nmanifest established it; ``assigned_identity_digest_sha256`` is the digest\nof the sorted ``[uid, hotkey]`` pairs assigned in that manifest.",
+      "description": "The largest verified assigned set a decision hands to its successor window.\n\n``established_at_epoch`` is the close of the window that established it;\n``assigned_identity_digest_sha256`` is the digest of the sorted\n``[uid, hotkey]`` pairs of *registered* miners assigned in that manifest,\nand ``assigned_miner_count`` counts exactly those pairs.",
       "properties": {
         "assigned_identity_digest_sha256": {
           "pattern": "^[0-9a-f]{64}$",

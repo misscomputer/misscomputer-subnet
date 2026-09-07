@@ -50,8 +50,13 @@ envelopes and the pinned policy; the transport is not a trust anchor.
 
 Obtain `--evaluation-epoch` from the validator's trusted time procedure
 (`date -u +%s` on a host with disciplined time is acceptable; record its
-source). The CLI never reads the host clock for verification. `--validator-uid`
-and `--validator-hotkey` only label the report; they authorize nothing.
+source). The CLI never reads the host clock for verification. Obtain
+`--finalized-height` from the validator's own finalized chain view (the same
+finalized block the validator's weight plan is built against); it is required,
+and every replica's `expires_at_block` in the manifest is enforced against it
+before any request is sent (`manifest_replica_lease_expired`). The CLI never
+reads the chain for it. `--validator-uid` and `--validator-hotkey` only label
+the report; they authorize nothing.
 
 ## State root and anchor
 
@@ -87,6 +92,7 @@ misscomputer-assignment-probe \
   --signature-url https://<publication-host>/assignments/auditor.json \
   --signature-url https://<publication-host>/assignments/issuer.json \
   --evaluation-epoch <trusted-unix-epoch> \
+  --finalized-height <validator-finalized-block-height> \
   --validator-uid <uid> \
   --validator-hotkey <hotkey> \
   --state-root /secure/probe-state \

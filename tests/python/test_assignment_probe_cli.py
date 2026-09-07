@@ -339,6 +339,7 @@ def probe_config(
     name: str = "run",
     anchor: str = "genesis",
     evaluation_epoch: int = EVALUATION_EPOCH,
+    current_finalized_height: int = FINALIZED_HEIGHT,
     manifest: ManifestSource | None = None,
     signatures: tuple[SignatureSource, ...] | None = None,
     edge_origin: str | None = None,
@@ -352,6 +353,7 @@ def probe_config(
         signatures=signatures
         or tuple(SignatureSource(file=item) for item in publication.signature_files),
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=current_finalized_height,
         validator_uid=7,
         validator_hotkey="ValidatorA",
         state_root=str(tmp_path / "state"),
@@ -386,6 +388,8 @@ def config_argv(config: AssignmentProbeCLIConfig) -> list[str]:
     values += [
         "--evaluation-epoch",
         str(config.evaluation_epoch),
+        "--finalized-height",
+        str(config.current_finalized_height),
         "--validator-uid",
         str(config.validator_uid),
         "--validator-hotkey",
@@ -908,3 +912,45 @@ def test_probe_transport_classifies_failures_without_raising(tmp_path: Path) -> 
     assert result.code == "connection_failed"
     assert json.dumps(result.code)
     del tmp_path
+
+
+def test_probe_requires_the_finalized_height_and_refuses_expired_leases(
+    tmp_path: Path, tls_server: TLSFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI cannot run without the operator's finalized height, and a lapsed lease is fatal."""
+
+    context = make_context()
+    publication = write_publication(tmp_path / "publication", context)
+    configure_routes(tls_server, context.manifest)
+    earliest = min(
+        replica.expires_at_block
+        for item in context.manifest.deployments
+        for replica in item.replicas
+    )
+    config = probe_config(publication, tls_server, tmp_path)
+    argv = config_argv(config)
+    index = argv.index("--finalized-height")
+    assert run_cli([*argv[:index], *argv[index + 2 :]]) == EXIT_USAGE
+    assert capsys.readouterr().err == "REJECTED usage\n"
+    assert run_cli([*argv[:index], "--finalized-height", "-1", *argv[index + 2 :]]) == EXIT_USAGE
+    capsys.readouterr()
+    state_path = Path(config.state_root) / "state.json"
+    assert not state_path.exists()
+    expired = probe_config(
+        publication, tls_server, tmp_path, name="expired", current_finalized_height=earliest
+    )
+    with pytest.raises(probe_cli.AssignmentProbeError) as lease:
+        execute_assignment_probe(expired)
+    assert lease.value.code == "manifest_replica_lease_expired"
+    assert not state_path.exists()
+    assert not Path(expired.report_output).exists()
+    assert_cli_rejected(
+        "operator_context_invalid",
+        lambda: execute_assignment_probe(replace(expired, current_finalized_height=-1)),
+    )
+    leased = probe_config(
+        publication, tls_server, tmp_path, name="leased", current_finalized_height=earliest - 1
+    )
+    result = execute_assignment_probe(leased)
+    assert result.state_advanced is True
+    assert state_path.exists()

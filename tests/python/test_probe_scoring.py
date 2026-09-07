@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from assignment_probe_context import (
     BASE_EPOCH,
+    FINALIZED_HEIGHT,
     MINERS,
     ROOT,
     build_deployment,
@@ -83,6 +84,7 @@ def build_round(
         policy,
         state,
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     observations = []
     for deployment in manifest.deployments:

@@ -1054,17 +1054,21 @@ def manifest_earliest_lease_expires_at_block(manifest: ActiveAssignmentManifest)
     )
 
 
-def verify_manifest_block_leases(
-    manifest: ActiveAssignmentManifest, *, current_finalized_height: int
-) -> None:
-    """Reject a manifest that publishes a replica whose block lease has already ended."""
-
+def _validate_current_finalized_height(current_finalized_height: int) -> None:
     if (
         isinstance(current_finalized_height, bool)
         or not isinstance(current_finalized_height, int)
         or not 0 <= current_finalized_height <= MAX_EPOCH
     ):
         raise ValueError("current_finalized_height_invalid")
+
+
+def verify_manifest_block_leases(
+    manifest: ActiveAssignmentManifest, *, current_finalized_height: int
+) -> None:
+    """Reject a manifest that publishes a replica whose block lease has already ended."""
+
+    _validate_current_finalized_height(current_finalized_height)
     if manifest_earliest_lease_expires_at_block(manifest) <= current_finalized_height:
         _reject("manifest_replica_lease_expired")
 
@@ -1272,17 +1276,20 @@ def verify_active_assignment_manifest(
     prior_chain_state: AssignmentManifestChainState,
     *,
     evaluation_epoch: int,
-    current_finalized_height: int | None = None,
+    current_finalized_height: int,
 ) -> ManifestVerificationResult:
     """Verify one dependency-only manifest publication and derive the next state.
 
     Validity is bounded by :func:`manifest_effective_expires_at_epoch`, never by
-    ``expires_at_epoch`` alone. When the caller knows its own finalized chain
-    height it supplies ``current_finalized_height`` and every published block
-    lease is enforced against it as well.
+    ``expires_at_epoch`` alone, and every published block lease is enforced
+    against the caller's own finalized chain height,
+    ``current_finalized_height``, which is required: a live consumer that
+    cannot state its finalized height cannot tell whether the assignments it
+    is about to probe are still leased, so there is no opt-out.
     """
 
     _validate_evaluation_epoch(evaluation_epoch)
+    _validate_current_finalized_height(current_finalized_height)
     policy = _revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
     trusted_public_keys = _trusted_public_keys(policy)
     value = _revalidate(manifest, ActiveAssignmentManifest)
@@ -1290,8 +1297,7 @@ def verify_active_assignment_manifest(
     if not 1 <= len(envelopes) <= MAX_KEYS:
         _reject("signature_binding_mismatch")
     _verify_trust_and_freshness(value, policy, evaluation_epoch=evaluation_epoch)
-    if current_finalized_height is not None:
-        verify_manifest_block_leases(value, current_finalized_height=current_finalized_height)
+    verify_manifest_block_leases(value, current_finalized_height=current_finalized_height)
     signer_ids, roles = _verify_signatures(
         value,
         envelopes,

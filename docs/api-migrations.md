@@ -4,8 +4,12 @@
 
 This release adds three versioned contracts and their pure verification code;
 see [`contract-checkpoint-v1.md`](contract-checkpoint-v1.md). It contains one
-declared compatibility event and otherwise leaves every existing contract,
-schema, fixture, Go API, and boundary operation unchanged.
+declared contract compatibility event, makes the block-lease check mandatory
+for every live manifest consumer (a breaking signature change for
+`verify_active_assignment_manifest`, `anchor_manifest_chain_state`, the
+`verify_manifest` boundary operation, and the `misscomputer-assignment-probe`
+CLI), and otherwise leaves every existing contract, schema, fixture, and Go
+API unchanged.
 
 ### `assignment-manifest-chain-state` v1 gains `last_finalized_epoch` (breaking)
 
@@ -27,9 +31,19 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   `min(expires_at_epoch, min(ticket_expires_at_epoch))`; a manifest whose
   tickets have all expired is `manifest_expired` even if `expires_at_epoch`
   lies ahead.
-- `verify_active_assignment_manifest` accepts an optional
-  `current_finalized_height`; when supplied, every replica's `expires_at_block`
-  is enforced (`manifest_replica_lease_expired`).
+- `verify_active_assignment_manifest` requires the keyword argument
+  `current_finalized_height` (**breaking**): every replica's `expires_at_block`
+  is enforced against it (`manifest_replica_lease_expired`), and an invalid
+  value is `current_finalized_height_invalid`. A caller that cannot state its
+  finalized height cannot verify live; there is no opt-out. Historical
+  verification (`verify_historical_active_assignment_manifest`,
+  `replay_manifest_history`) is unchanged and lease-free, because superseded
+  manifests are never probed. `anchor_manifest_chain_state` requires the same
+  argument.
+- `misscomputer-assignment-probe` requires `--finalized-height`
+  (**breaking**); `AssignmentProbeCLIConfig` gains the required field
+  `current_finalized_height`, validated like `evaluation_epoch`
+  (`operator_context_invalid`).
 - New pure helpers: `manifest_effective_expires_at_epoch`,
   `manifest_earliest_lease_expires_at_block`, `verify_manifest_block_leases`,
   `verify_pointer_signer_set`, and
@@ -58,9 +72,33 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   `assigned_at_close`, the policy field `assigned_baseline_max_age_seconds`,
   and the abstain reason `assignment_lease_expired_at_close`. Parsing re-derives
   every abstain reason and row classification from the sealed fields.
-- `decide_weight_submission` accepts `prior_assigned_baseline`.
+- Parsing also enforces sealed serving evidence: a positive row needs at least
+  `scoring_policy.min_attributions` attributions, no more attributions than
+  opportunities, no more opportunities than the record's `observation_count`,
+  row attributions summing to at most `serving_observation_count`, and the
+  positive weights forming one normalized distribution
+  (`row_positive_weight_without_evidence`, `row_weight_below_min_attributions`,
+  `row_attributions_exceed_opportunities`,
+  `row_expected_attributions_inconsistent`, `observation_counts_invalid`,
+  `weights_not_normalized`).
+- Assigned sets are counted in registered identities only:
+  `terminal_assigned_miner_count` must equal the rows sealed
+  `assigned_at_close` (`assigned_counts_invalid`), and the successor
+  `assigned_baseline` identity digest is always checked. A record whose
+  `mass_unassignment_guard` fired must carry the largest set (the applied prior
+  baseline, or a manifest of the window at a sequence below the terminal)
+  rather than the reduced terminal set (`assigned_baseline_not_derived`).
+- `decide_weight_submission` accepts `prior_assigned_baseline` and
+  `archived_manifests`. The window's manifests, the archived manifests, and
+  the terminal must occupy consecutive sequences with every `previous` link
+  verified; a missing intermediate sequence is `decision_manifest_chain_gap`,
+  an archived manifest that does not re-validate or lies beyond the terminal
+  is `decision_archived_manifest_invalid`.
 - `weight_plan.build_weight_plan_from_decision` is the only path from a
-  decision to a plan; `build_weight_plan` itself is unchanged.
+  decision to a plan; `build_weight_plan` itself is unchanged. The decision's
+  rows must be exactly `weight_plan.eligible_weight_targets(snapshot,
+  validator_hotkey)` (every active neuron other than the validator), so a
+  decision that omits an eligible miner is refused.
 - `probe_scoring.accumulate_scoring_window` re-validates every round
   (`scoring_round_invalid`).
 - `assignment_snapshot.verify_snapshot_succession` adds
@@ -78,10 +116,12 @@ Protocol `misscomputer.checkpoint-boundary.v1` gains the operations
 `signatures`), and `rebind_manifest_state_trust_policy`, and the `validate`
 operation accepts the models `active_assignment_snapshot` and
 `assignment_manifest_latest_pointer`. The `verify_manifest_latest_pointer`
-response carries `history_depth`. Every pre-existing operation, argument, and
-response shape is unchanged, so a producer pinned to the previous snapshot
-keeps working; chain-state documents it exchanges follow the compatibility
-event above.
+response carries `history_depth`. The `verify_manifest` operation requires the
+argument `current_finalized_height` (**breaking**; a request without it is
+rejected with `current_finalized_height_required`, and the manifest's block
+leases are enforced against it). Every other pre-existing operation, argument,
+and response shape is unchanged; chain-state documents a producer exchanges
+follow the compatibility event above.
 
 ### Go `pkg/assignment`
 

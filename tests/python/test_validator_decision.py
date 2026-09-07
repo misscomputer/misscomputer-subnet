@@ -53,6 +53,7 @@ from misscomputer_subnet.probe_scoring import (
     ProbeRound,
     ProbeScoringError,
     ProbeScoringPolicy,
+    RegisteredMiner,
     accumulate_scoring_window,
 )
 from misscomputer_subnet.validator_decision import (
@@ -71,6 +72,8 @@ from misscomputer_subnet.weight_plan import (
     WeightPlanError,
     build_weight_plan,
     build_weight_plan_from_decision,
+    eligible_weight_targets,
+    snapshot_identity_fingerprint,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -402,9 +405,15 @@ def test_manifest_validity_never_outlives_ticket_or_block_leases() -> None:
         policy,
         context.states[2],
         evaluation_epoch=BASE_EPOCH + 3_000,
+        current_finalized_height=FINALIZED_HEIGHT,
     ).next_chain_state
     verify_active_assignment_manifest(
-        short, sign_manifest(short, keys), policy, state_three, evaluation_epoch=WINDOW_END
+        short,
+        sign_manifest(short, keys),
+        policy,
+        state_three,
+        evaluation_epoch=WINDOW_END,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     with pytest.raises(AssignmentProbeError) as failure:
         verify_active_assignment_manifest(
@@ -413,6 +422,7 @@ def test_manifest_validity_never_outlives_ticket_or_block_leases() -> None:
             policy,
             state_three,
             evaluation_epoch=WINDOW_END + 1,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "manifest_expired"
     with pytest.raises(AssignmentProbeError) as failure:
@@ -674,6 +684,11 @@ def test_safe_preconditions_for_zeroing_absent_miners() -> None:
     # Verified evidence keeps its weight even when the miner is no longer assigned.
     assert classes(guarded)["MinerA"] == "verified_serving"
     assert classes(guarded)["MinerF"] == "unassigned"
+    # A first window with an in-window drop seals the window's largest set
+    # (manifest 3) as the baseline, not the reduced terminal set.
+    assert guarded.assigned_baseline == assigned_baseline(
+        terminal_manifest, established_at_epoch=WINDOW_END
+    )
     permissive = decide(
         context.registered,
         terminal=TerminalManifestObservation(
@@ -682,51 +697,91 @@ def test_safe_preconditions_for_zeroing_absent_miners() -> None:
         policy=WeightDecisionPolicy(max_assigned_drop_permille=1_000),
     )
     assert permissive.decision == "submit"
+    # Only a terminal manifest that clears the guard refreshes the baseline.
+    assert permissive.assigned_baseline == assigned_baseline(
+        shrunken, established_at_epoch=WINDOW_END
+    )
+
+
+def _reduced_manifest(context: Any, *, sequence: int, previous: str, issued_at: int) -> Any:
+    """A manifest at ``sequence`` that assigns MinerA alone."""
+
+    reduced_alpha = build_deployment(
+        "fixture-alpha",
+        MINERS[:1],
+        campaign_sequence=1,
+        expires_at_block=FINALIZED_HEIGHT + 2_000,
+        ticket_expires_at_epoch=issued_at + 7_200,
+    )
+    return build_probe_manifest(
+        context.policy,
+        [reduced_alpha],
+        sequence=sequence,
+        previous=previous,
+        issued_at=issued_at,
+        expires_at=issued_at + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 5 * (sequence + 5),
+        finalized_block_hash=label_digest(f"block-{sequence}"),
+    )
 
 
 def _reduced_window(
-    context: Any, *, prior: AssignedBaseline | None, policy: WeightDecisionPolicy | None = None
+    context: Any,
+    *,
+    prior: AssignedBaseline | None,
+    policy: WeightDecisionPolicy | None = None,
+    sequence: int = 4,
+    window_start: int = WINDOW_END,
+    chain: tuple[Any, ...] = (),
 ) -> ValidatorWeightDecision:
-    """A new window whose very first manifest is already reduced to MinerA."""
+    """A new window whose very first manifest is already reduced to MinerA.
 
-    reduced_alpha = window_deployment("fixture-alpha", MINERS[:1], campaign_sequence=1)
-    reduced = build_probe_manifest(
-        context.policy,
-        [reduced_alpha],
-        sequence=4,
-        previous=context.manifests[2].manifest_digest_sha256,
-        issued_at=WINDOW_END,
-        expires_at=WINDOW_END + 3_600,
-        finalized_height=FINALIZED_HEIGHT + 45,
-        finalized_block_hash=label_digest("block-four"),
-    )
-    state_three = verify_active_assignment_manifest(
+    ``chain`` lists the manifests accepted after the golden window's manifest
+    3 and before this window's reduced manifest, in sequence order.
+    """
+
+    state = verify_active_assignment_manifest(
         context.manifests[2],
         sign_manifest(context.manifests[2], context.keys),
         context.policy,
         context.states[2],
         evaluation_epoch=BASE_EPOCH + 3_000,
+        current_finalized_height=FINALIZED_HEIGHT,
     ).next_chain_state
+    previous = context.manifests[2].manifest_digest_sha256
+    for manifest in chain:
+        state = verify_active_assignment_manifest(
+            manifest,
+            sign_manifest(manifest, context.keys),
+            context.policy,
+            state,
+            evaluation_epoch=manifest.issued_at_epoch,
+            current_finalized_height=FINALIZED_HEIGHT,
+        ).next_chain_state
+        previous = manifest.manifest_digest_sha256
+    reduced = _reduced_manifest(
+        context, sequence=sequence, previous=previous, issued_at=window_start
+    )
     rounds = [
         build_round(
             context.policy,
             reduced,
-            state_three,
+            state,
             context.keys,
             responders={"fixture-alpha": "MinerA"},
-            label=f"reduced-{index}",
-            evaluation_epoch=WINDOW_END + 60 + 60 * index,
+            label=f"reduced-{sequence}-{index}",
+            evaluation_epoch=window_start + 60 + 60 * index,
         )
         for index in range(24)
     ]
     return decide_weight_submission(
         rounds,
         terminal=TerminalManifestObservation(
-            status="verified", evaluated_at_epoch=WINDOW_END + 3_000, manifest=reduced
+            status="verified", evaluated_at_epoch=window_start + 3_000, manifest=reduced
         ),
-        registered=registered_set(finalized_height=FINALIZED_HEIGHT + 60),
-        window_start_epoch=WINDOW_END,
-        window_end_epoch=WINDOW_END + 3_000,
+        registered=registered_set(finalized_height=reduced.finalized_height + 15),
+        window_start_epoch=window_start,
+        window_end_epoch=window_start + 3_000,
         decision_policy=policy,
         prior_assigned_baseline=prior,
     )
@@ -753,10 +808,12 @@ def test_mass_unassignment_baseline_survives_the_window_boundary() -> None:
         "MinerF": "unassigned",
         "MinerG": "unassigned",
     }
-    # The successor baseline is the verified terminal set, even on abstain.
-    assert guarded.assigned_baseline is not None
-    assert guarded.assigned_baseline.assigned_miner_count == 1
-    assert guarded.assigned_baseline.manifest_sequence == 4
+    # A guarded drop never anchors the baseline: the pre-drop set is carried
+    # forward untouched, so the reduced set cannot become the comparison
+    # point for the next window.
+    assert guarded.assigned_baseline == carried
+    assert guarded.assigned_baseline.assigned_miner_count == 6
+    assert guarded.assigned_baseline.manifest_sequence == 3
 
     # The first window of a coordinator has nothing to compare against and
     # says so in the record.
@@ -1071,7 +1128,12 @@ def test_decision_bytes_round_trip_and_reject_malleability() -> None:
     with pytest.raises(ValidationError, match="decision_digest_sha256_mismatch"):
         ValidatorWeightDecision.model_validate(document)
     document = json.loads(rendered)
-    document["rows"][0]["weight"] = 0.5
+    # Move weight between two attested rows so the vector stays normalized:
+    # the rows no longer match the digest they were sealed under.
+    shifted = 0.2 - document["rows"][0]["weight"]
+    document["rows"][0]["weight"] = 0.2
+    document["rows"][1]["weight"] -= shifted
+    assert document["rows"][1]["weight"] > 0.0
     with pytest.raises(ValidationError, match="weight_plan_rows_digest_mismatch"):
         ValidatorWeightDecision.model_validate(document)
     with pytest.raises(ValueError, match="document_not_canonical"):
@@ -1080,3 +1142,551 @@ def test_decision_bytes_round_trip_and_reject_malleability() -> None:
         build_initial_manifest_chain_state(make_window_context().policy).last_finalized_epoch
         is None
     )
+
+
+def test_guarded_drop_cannot_redirect_the_next_window() -> None:
+    """The baseline a guarded window hands on is the pre-drop set, so the drop stays guarded."""
+
+    context = make_window_context()
+    carried = context.decision.assigned_baseline
+    assert carried is not None and carried.assigned_miner_count == 6
+    guarded = _reduced_window(context, prior=carried)
+    assert guarded.abstain_reasons == ["mass_unassignment_guard"]
+    assert guarded.assigned_baseline == carried
+    assert guarded.terminal_manifest_sequence == 4
+
+    # The window after the drop inherits the pre-drop baseline, so the
+    # unchanged reduced assignment is guarded again rather than accepted as
+    # the new normal; MinerA never receives the whole vector.
+    reduced_four = _reduced_manifest(
+        context,
+        sequence=4,
+        previous=context.manifests[2].manifest_digest_sha256,
+        issued_at=WINDOW_END,
+    )
+    following = _reduced_window(
+        context,
+        prior=guarded.assigned_baseline,
+        sequence=5,
+        window_start=WINDOW_END + 3_000,
+        chain=(reduced_four,),
+    )
+    assert following.abstain_reasons == ["mass_unassignment_guard"]
+    assert following.prior_assigned_baseline == carried
+    assert following.prior_assigned_baseline_status == "applied"
+    assert following.max_assigned_miner_count == 6
+    assert following.assigned_baseline == carried
+    # Had the guarded window refreshed its baseline to the reduced set, the
+    # very next window would have redirected every weight to MinerA.
+    refreshed_to_drop = assigned_baseline(reduced_four, established_at_epoch=WINDOW_END + 3_000)
+    assert refreshed_to_drop.assigned_miner_count == 1
+    redirected = _reduced_window(
+        context,
+        prior=refreshed_to_drop,
+        sequence=5,
+        window_start=WINDOW_END + 3_000,
+        chain=(reduced_four,),
+    )
+    assert redirected.decision == "submit"
+    assert [row.hotkey for row in redirected.rows if row.weight > 0.0] == ["MinerA"]
+    # The guard only releases once the baseline ages out by policy, which is
+    # the operator's declared tolerance, never a consequence of the drop itself.
+    aged = _reduced_window(
+        context,
+        prior=carried.model_copy(update={"established_at_epoch": WINDOW_END + 3_000 - 86_401}),
+        sequence=5,
+        window_start=WINDOW_END + 3_000,
+        chain=(reduced_four,),
+    )
+    assert aged.prior_assigned_baseline_status == "expired"
+    assert aged.decision == "submit"
+
+    # The sealed record enforces the same rule: a guarded record whose
+    # successor baseline is the reduced terminal set is refused, while the
+    # honest carried form is accepted and unsubmittable.
+    rendered = (FIXTURES / "validator-weight-decision.v1.json").read_bytes()
+    document = json.loads(rendered)
+    dropped_rows = [
+        {
+            **row,
+            "assigned_at_close": row["hotkey"] == "MinerA",
+            "first_seen_epoch": row["first_seen_epoch"] if row["hotkey"] == "MinerA" else None,
+            "classification": (
+                "verified_serving"
+                if row["weight"] > 0.0
+                else ("assigned_in_grace" if row["hotkey"] == "MinerA" else "unassigned")
+            ),
+        }
+        for row in document["rows"]
+    ]
+    refreshed = forged_decision(
+        rendered,
+        decision="abstain",
+        abstain_reasons=["mass_unassignment_guard"],
+        rows=dropped_rows,
+        terminal_assigned_miner_count=1,
+        assigned_baseline={
+            **document["assigned_baseline"],
+            "assigned_miner_count": 1,
+            "assigned_identity_digest_sha256": canonical_digest([[10, "MinerA"]]),
+        },
+    )
+    with pytest.raises(ValidationError, match="assigned_baseline_not_derived"):
+        ValidatorWeightDecision.model_validate(refreshed)
+    honest = forged_decision(
+        rendered,
+        decision="abstain",
+        abstain_reasons=["mass_unassignment_guard"],
+        rows=dropped_rows,
+        terminal_assigned_miner_count=1,
+        assigned_baseline={
+            **document["assigned_baseline"],
+            "manifest_sequence": 2,
+            "manifest_digest_sha256": context.manifests[1].manifest_digest_sha256,
+        },
+    )
+    parsed = ValidatorWeightDecision.model_validate(honest)
+    assert parsed.assigned_baseline is not None
+    assert parsed.assigned_baseline.assigned_miner_count == 6
+    with pytest.raises(WeightDecisionError):
+        weight_plan_rows_for_submission(parsed)
+    # A carried baseline that is not the largest set, or that names the
+    # terminal sequence, is equally refused.
+    for successor in (
+        {**document["assigned_baseline"], "manifest_sequence": 2, "assigned_miner_count": 5},
+        {**document["assigned_baseline"], "established_at_epoch": WINDOW_START},
+        {**document["assigned_baseline"], "manifest_sequence": 4},
+    ):
+        with pytest.raises(ValidationError, match="assigned_baseline_not_derived"):
+            ValidatorWeightDecision.model_validate(
+                forged_decision(
+                    rendered,
+                    decision="abstain",
+                    abstain_reasons=["mass_unassignment_guard"],
+                    rows=dropped_rows,
+                    terminal_assigned_miner_count=1,
+                    assigned_baseline=successor,
+                )
+            )
+
+
+def test_mass_guard_counts_registered_identities_only() -> None:
+    """Padding a manifest with unregistered identities does not hide a registered drop."""
+
+    context = make_window_context()
+    ghosts = [(900 + index, f"Ghost{index}") for index in range(5)]
+    padded_alpha = build_deployment(
+        "fixture-alpha",
+        [MINERS[0], *ghosts],
+        campaign_sequence=1,
+        expires_at_block=FINALIZED_HEIGHT + 2_000,
+        ticket_expires_at_epoch=WINDOW_END + 3_600,
+    )
+    padded = build_probe_manifest(
+        context.policy,
+        [padded_alpha],
+        sequence=4,
+        previous=context.manifests[2].manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 3_400,
+        expires_at=BASE_EPOCH + 3_400 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 45,
+        finalized_block_hash=label_digest("padded"),
+    )
+    assert len({r.miner_hotkey for d in padded.deployments for r in d.replicas}) == 6
+
+    def decide(policy: WeightDecisionPolicy | None = None) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            context.rounds,
+            terminal=TerminalManifestObservation(
+                status="verified", evaluated_at_epoch=WINDOW_END, manifest=padded
+            ),
+            registered=context.registered,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+            decision_policy=policy,
+        )
+
+    decision = decide()
+    assert decision.abstain_reasons == ["mass_unassignment_guard"]
+    assert decision.terminal_assigned_miner_count == 1
+    assert decision.max_assigned_miner_count == 6
+    assert {row.hotkey for row in decision.rows if row.assigned_at_close} == {"MinerA"}
+    assert decision.assigned_baseline == assigned_baseline(
+        context.manifests[2], established_at_epoch=WINDOW_END
+    )
+    # Even with the guard disabled, the sealed terminal set names registered
+    # identities only, so the padding never enters a baseline either.
+    permissive = decide(WeightDecisionPolicy(max_assigned_drop_permille=1_000))
+    assert permissive.decision == "submit"
+    assert permissive.assigned_baseline is not None
+    assert permissive.assigned_baseline.assigned_miner_count == 1
+    assert permissive.assigned_baseline.assigned_identity_digest_sha256 == canonical_digest(
+        [[10, "MinerA"]]
+    )
+    # A record that claims a larger terminal set than its rows assign is a
+    # forgery: the count is exactly the rows assigned at close.
+    rendered = (FIXTURES / "validator-weight-decision.v1.json").read_bytes()
+    document = json.loads(rendered)
+    for terminal_count in (7, 5):
+        with pytest.raises(ValidationError, match="assigned_counts_invalid"):
+            ValidatorWeightDecision.model_validate(
+                forged_decision(
+                    rendered,
+                    terminal_assigned_miner_count=terminal_count,
+                    max_assigned_miner_count=max(terminal_count, 6),
+                    assigned_baseline={
+                        **document["assigned_baseline"],
+                        "assigned_miner_count": terminal_count,
+                    },
+                )
+            )
+    # And the successor baseline's identity digest is always checked.
+    with pytest.raises(ValidationError, match="assigned_baseline_not_derived"):
+        ValidatorWeightDecision.model_validate(
+            forged_decision(
+                rendered,
+                assigned_baseline={
+                    **document["assigned_baseline"],
+                    "assigned_identity_digest_sha256": canonical_digest([[10, "MinerA"]]),
+                },
+            )
+        )
+
+
+def test_manifest_chain_must_be_unbroken_across_omitted_sequences() -> None:
+    """Rounds from one chain cannot meet a terminal from a fork by omitting the divergence."""
+
+    context = make_window_context()
+    policy = context.policy
+    alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
+    fork_two = build_probe_manifest(
+        policy,
+        [alpha],
+        sequence=2,
+        previous=context.manifests[0].manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 1_500,
+        expires_at=BASE_EPOCH + 1_500 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 20,
+        finalized_block_hash=label_digest("fork-two"),
+    )
+    fork_three = build_probe_manifest(
+        policy,
+        [alpha],
+        sequence=3,
+        previous=fork_two.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 3_000,
+        expires_at=BASE_EPOCH + 3_000 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 40,
+        finalized_block_hash=label_digest("fork-three"),
+    )
+    assert fork_two.manifest_digest_sha256 != context.manifests[1].manifest_digest_sha256
+    one_only = context.rounds[:24]
+
+    def decide(
+        rounds: list[ProbeRound],
+        terminal_manifest: Any,
+        archived: list[Any] | None = None,
+        **changes: Any,
+    ) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            rounds,
+            terminal=TerminalManifestObservation(
+                status="verified", evaluated_at_epoch=WINDOW_END, manifest=terminal_manifest
+            ),
+            registered=context.registered,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+            archived_manifests=archived or [],
+            **changes,
+        )
+
+    # Sequence 1 probed, sequence 2 omitted, terminal from the fork at 3:
+    # the missing sequence is a gap, never a pass.
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(one_only, fork_three)
+    assert failure.value.code == "decision_manifest_chain_gap"
+    # Supplying the sequence-2 manifest the coordinator really accepted
+    # exposes the fork through the broken link.
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(one_only, fork_three, [context.manifests[1]])
+    assert failure.value.code == "decision_manifest_chain_incoherent"
+    # The same gap on the honest chain: probing 1 and 3 but not 2.
+    one_and_three = [*context.rounds[:24], *context.rounds[36:]]
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(one_and_three, context.manifests[2])
+    assert failure.value.code == "decision_manifest_chain_gap"
+    # The archived intermediate closes it and the window is judged normally.
+    honest = decide(one_and_three, context.manifests[2], [context.manifests[1]])
+    assert honest.decision == "submit"
+    assert honest.round_count == 33
+    assert classes(honest)["MinerE"] == "verified_serving"
+    # Archived manifests are ordinary chain members: they may not lie beyond
+    # the terminal, must re-validate, and contribute sightings and assigned
+    # set sizes but no evidence.
+    beyond = build_probe_manifest(
+        policy,
+        list(context.manifests[2].deployments),
+        sequence=4,
+        previous=context.manifests[2].manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 3_300,
+        expires_at=BASE_EPOCH + 3_300 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 45,
+        finalized_block_hash=label_digest("block-four"),
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(one_and_three, context.manifests[2], [context.manifests[1], beyond])
+    assert failure.value.code == "decision_archived_manifest_invalid"
+    tampered = type(context.manifests[1]).model_validate(
+        context.manifests[1].model_dump(mode="json", by_alias=True)
+    )
+    tampered.deployments.pop()
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(one_and_three, context.manifests[2], [tampered])
+    assert failure.value.code == "decision_archived_manifest_invalid"
+    shrunken = build_probe_manifest(
+        policy,
+        [window_deployment("fixture-gamma", EXTRA_MINERS[:1], campaign_sequence=3)],
+        sequence=4,
+        previous=context.manifests[2].manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 3_400,
+        expires_at=BASE_EPOCH + 3_400 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 45,
+        finalized_block_hash=label_digest("block-four"),
+    )
+    widened = decide(one_only, shrunken, [context.manifests[1], context.manifests[2]])
+    assert "mass_unassignment_guard" in widened.abstain_reasons
+    assert widened.max_assigned_miner_count == 6
+    assert widened.round_count == 24
+    assert {row.hotkey: row.first_seen_epoch for row in widened.rows}["MinerE"] == (
+        BASE_EPOCH + 1_500
+    )
+    assert widened.assigned_baseline == assigned_baseline(
+        context.manifests[2], established_at_epoch=WINDOW_END
+    )
+    # A fully linked alternate chain from the same authority is coherent on
+    # its own; detecting that it is not the chain the validator accepted is
+    # the chain state's job, which is why the archive must be the real one.
+    forked = decide(one_only, fork_three, [fork_two])
+    assert forked.terminal_manifest_digest_sha256 == fork_three.manifest_digest_sha256
+
+
+def test_positive_weight_requires_sealed_serving_evidence() -> None:
+    """A digest-valid submit record cannot weight a miner it never observed serving."""
+
+    rendered = (FIXTURES / "validator-weight-decision.v1.json").read_bytes()
+    document = json.loads(rendered)
+    golden = ValidatorWeightDecision.model_validate(document)
+    positive = [row for row in golden.rows if row.weight > 0.0]
+    assert positive and all(row.attributions >= 1 for row in positive)
+    assert sum(row.attributions for row in golden.rows) <= golden.serving_observation_count
+    rows = document["rows"]
+
+    def refuse(code: str, **changes: Any) -> None:
+        forged = forged_decision(rendered, **changes)
+        assert forged["decision"] == "submit"
+        with pytest.raises(ValidationError, match=code):
+            ValidatorWeightDecision.model_validate(forged)
+
+    # Every positive row with its attributions zeroed.
+    refuse(
+        "row_positive_weight_without_evidence",
+        rows=[{**row, "attributions": 0} for row in rows],
+    )
+    # The rows keep their attributions but the record says nothing served,
+    # nothing was observed, or no round ran.
+    refuse("observation_counts_invalid", serving_observation_count=0)
+    refuse("observation_counts_invalid", observation_count=0, serving_observation_count=0)
+    refuse("observation_counts_invalid", round_count=0, scoring_window_digest_sha256=None)
+    refuse(
+        "observation_counts_invalid",
+        serving_observation_count=sum(row["attributions"] for row in rows) - 1,
+    )
+    # A row attributed more often than it could answer, or given more
+    # opportunities than the window had observations.
+    refuse(
+        "row_attributions_exceed_opportunities",
+        rows=[
+            {**row, "opportunities": row["attributions"] - 1} if row["hotkey"] == "MinerE" else row
+            for row in rows
+        ],
+    )
+    refuse(
+        "observation_counts_invalid",
+        rows=[
+            {**row, "opportunities": document["observation_count"] + 1}
+            if row["hotkey"] == "MinerA"
+            else row
+            for row in rows
+        ],
+    )
+    refuse(
+        "row_expected_attributions_inconsistent",
+        rows=[
+            {**row, "expected_attributions_numerator": 0} if row["hotkey"] == "MinerA" else row
+            for row in rows
+        ],
+    )
+    # Positive weight below the sealed scoring policy's own minimum.
+    refuse(
+        "row_weight_below_min_attributions",
+        scoring_policy={**document["scoring_policy"], "min_attributions": 22},
+    )
+    # The positive weights must be one normalized distribution.
+    refuse(
+        "weights_not_normalized",
+        rows=[
+            {**row, "weight": row["weight"] / 2} if row["hotkey"] == "MinerA" else row
+            for row in rows
+        ],
+    )
+    # Moving MinerA's weight to MinerG, which was never assigned or probed.
+    moved = {row["hotkey"]: row for row in rows}
+    refuse(
+        "row_positive_weight_without_evidence",
+        rows=[
+            {**row, "weight": 0.0, "classification": "assigned_unverified"}
+            if row["hotkey"] == "MinerA"
+            else {**row, "weight": moved["MinerA"]["weight"], "classification": "verified_serving"}
+            if row["hotkey"] == "MinerG"
+            else row
+            for row in rows
+        ],
+    )
+    # The honest direction: a stricter sealed scoring minimum zeroes the
+    # rows below it and the resulting record parses and builds a plan.
+    context = make_window_context()
+    strict = decide_weight_submission(
+        context.rounds,
+        terminal=context.terminal,
+        registered=context.registered,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+        scoring_policy=ProbeScoringPolicy(min_attributions=16),
+    )
+    assert strict.decision == "submit"
+    assert [row.hotkey for row in strict.rows if row.weight > 0.0] == [
+        "MinerB",
+        "MinerC",
+        "MinerE",
+    ]
+    assert classes(strict)["MinerA"] == classes(strict)["MinerD"] == "assigned_unverified"
+    parsed = parse_validator_weight_decision(validator_weight_decision_bytes(strict))
+    plan = build_weight_plan_from_decision(
+        parsed,
+        snapshot=metagraph_view(),  # type: ignore[arg-type]
+        finalized_block_hash=context.registered.finalized_block_hash,
+        version_key=1,
+    )
+    assert [entry.hotkey for entry in plan.weights] == ["MinerB", "MinerC", "MinerE"]
+
+
+def _bound_registered(
+    miners: list[tuple[int, str]], view: Any, *, reference: RegisteredMinerSet
+) -> RegisteredMinerSet:
+    """A registered set over ``miners`` that names ``view``'s complete fingerprint."""
+
+    return RegisteredMinerSet(
+        network="finney",
+        netuid=24,
+        finalized=True,
+        finalized_height=reference.finalized_height,
+        finalized_block_hash=reference.finalized_block_hash,
+        finalized_epoch=reference.finalized_epoch,
+        validator_uid=reference.validator_uid,
+        validator_hotkey=reference.validator_hotkey,
+        miners=[RegisteredMiner(uid=uid, hotkey=hotkey) for uid, hotkey in miners],
+        metagraph_identity_fingerprint_sha256=snapshot_identity_fingerprint(view),
+    )
+
+
+def test_decision_rows_must_cover_the_complete_eligible_set() -> None:
+    """A decision that silently omits an eligible miner cannot become a plan."""
+
+    context = make_window_context()
+    view = metagraph_view()
+    hash_ = context.registered.finalized_block_hash
+    assert eligible_weight_targets(view, validator_hotkey=VALIDATOR_HOTKEY) == frozenset(  # type: ignore[arg-type]
+        REGISTERED_MINERS
+    )
+
+    def decide(registered: RegisteredMinerSet) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            context.rounds,
+            terminal=context.terminal,
+            registered=registered,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+
+    def build(decision: ValidatorWeightDecision, snapshot: Any) -> Any:
+        return build_weight_plan_from_decision(
+            decision, snapshot=snapshot, finalized_block_hash=hash_, version_key=1
+        )
+
+    # MinerG is registered and eligible, the fingerprint names the complete
+    # snapshot, but the coordinator left G out of the judgement.
+    omitting = _bound_registered(
+        [item for item in REGISTERED_MINERS if item[1] != "MinerG"],
+        view,
+        reference=context.registered,
+    )
+    omitted = decide(omitting)
+    assert omitted.decision == "submit" and "MinerG" not in classes(omitted)
+    assert omitted.metagraph_identity_fingerprint_sha256 == snapshot_identity_fingerprint(view)  # type: ignore[arg-type]
+    with pytest.raises(WeightPlanError, match="complete eligible miner set"):
+        build(omitted, view)
+    # The raw rows alone would have been accepted, which is exactly why the
+    # decision path must demand complete coverage.
+    build_weight_plan(
+        snapshot=view,  # type: ignore[arg-type]
+        validator_hotkey=VALIDATOR_HOTKEY,
+        rows=weight_plan_rows_for_submission(omitted),
+        version_key=1,
+    )
+    # An inactive neuron is not eligible: a decision over the active set
+    # builds against a snapshot that carries it, and one that judged it does not.
+    dormant = MetagraphNeuron(
+        uid=99, hotkey="MinerZ", validator_permit=False, tao_stake=1.0, axon=None, active=False
+    )
+    with_dormant = replace(view, neurons=(*view.neurons, dormant))
+    assert eligible_weight_targets(with_dormant, validator_hotkey=VALIDATOR_HOTKEY) == (  # type: ignore[arg-type]
+        frozenset(REGISTERED_MINERS)
+    )
+    complete = decide(
+        _bound_registered(list(REGISTERED_MINERS), with_dormant, reference=context.registered)
+    )
+    assert build(complete, with_dormant).snapshot.identity_fingerprint == (
+        complete.metagraph_identity_fingerprint_sha256
+    )
+    judged_dormant = decide(
+        _bound_registered(
+            [*REGISTERED_MINERS, (99, "MinerZ")], with_dormant, reference=context.registered
+        )
+    )
+    with pytest.raises(WeightPlanError, match="complete eligible miner set"):
+        build(judged_dormant, with_dormant)
+    # Another active validator is an eligible target and must be judged; the
+    # deciding validator itself never is.
+    peer = MetagraphNeuron(
+        uid=98, hotkey="ValidatorB", validator_permit=True, tao_stake=500.0, axon=None
+    )
+    with_peer = replace(view, neurons=(*view.neurons, peer))
+    targets = eligible_weight_targets(with_peer, validator_hotkey=VALIDATOR_HOTKEY)  # type: ignore[arg-type]
+    assert (98, "ValidatorB") in targets and (VALIDATOR_UID, VALIDATOR_HOTKEY) not in targets
+    with pytest.raises(WeightPlanError, match="complete eligible miner set"):
+        build(
+            decide(
+                _bound_registered(list(REGISTERED_MINERS), with_peer, reference=context.registered)
+            ),
+            with_peer,
+        )
+    assert build(
+        decide(
+            _bound_registered(
+                sorted([*REGISTERED_MINERS, (98, "ValidatorB")]),
+                with_peer,
+                reference=context.registered,
+            )
+        ),
+        with_peer,
+    ).snapshot.identity_fingerprint == snapshot_identity_fingerprint(with_peer)  # type: ignore[arg-type]

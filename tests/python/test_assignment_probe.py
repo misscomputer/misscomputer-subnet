@@ -131,6 +131,7 @@ def verify(
         policy or context.policy,
         state or context.state,
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
 
 
@@ -158,7 +159,12 @@ def verify_publication(
     state: AssignmentManifestChainState,
 ) -> Any:
     return verify_active_assignment_manifest(
-        manifest, signatures, policy, state, evaluation_epoch=EVALUATION_EPOCH
+        manifest,
+        signatures,
+        policy,
+        state,
+        evaluation_epoch=EVALUATION_EPOCH,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
 
 
@@ -972,6 +978,7 @@ def test_golden_fixtures_are_reproducible_and_verify_with_external_signatures() 
         policy,
         genesis,
         evaluation_epoch=EVALUATION_EPOCH,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     assert assignment_manifest_chain_state_bytes(result.next_chain_state) == (
         (FIXTURES / "assignment-manifest-chain-state.v1.json").read_bytes()

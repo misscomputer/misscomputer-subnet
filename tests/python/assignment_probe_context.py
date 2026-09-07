@@ -414,6 +414,7 @@ def make_context(
         policy,
         state,
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     alpha = manifest.deployments[0]
     attestation = sign_attestation(alpha, alpha.replicas[0], probe_nonce=FIXTURE_PROBE_NONCE)

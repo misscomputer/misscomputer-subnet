@@ -439,6 +439,26 @@ def build_weight_plan(
     )
 
 
+def eligible_weight_targets(
+    snapshot: MetagraphSnapshot, *, validator_hotkey: str
+) -> frozenset[tuple[int, str]]:
+    """Every ``(uid, hotkey)`` a decision must judge: active neurons other than the validator.
+
+    This is exactly the set :func:`build_weight_plan` would accept a row for,
+    so a decision whose rows cover it has classified every miner the plan
+    could weight; a decision that omits one has silently left a miner out of
+    the judgement while still naming the complete snapshot fingerprint.
+    """
+
+    validator_hotkey = _validate_text(validator_hotkey, field_name="validator hotkey")
+    targets: set[tuple[int, str]] = set()
+    for neuron in snapshot.neurons:
+        uid, hotkey, _ = _validate_snapshot_neuron(neuron)
+        if hotkey != validator_hotkey and neuron.active:
+            targets.add((uid, hotkey))
+    return frozenset(targets)
+
+
 def build_weight_plan_from_decision(
     decision: ValidatorWeightDecision,
     *,
@@ -454,7 +474,11 @@ def build_weight_plan_from_decision(
     All of it is checked against the snapshot the plan will be built from
     before the unchanged :func:`build_weight_plan` sees a single row, so a
     decision can never be replayed against a different chain segment, a
-    reorganised metagraph, or a remapped UID.
+    reorganised metagraph, or a remapped UID. The decision's rows must also be
+    exactly the snapshot's eligible weight targets
+    (:func:`eligible_weight_targets`): a decision that omits an eligible miner
+    is refused, so no miner can be left out of the judgement while the
+    fingerprint still names the complete set.
     """
 
     rows = weight_plan_rows_for_submission(decision)
@@ -491,6 +515,11 @@ def build_weight_plan_from_decision(
             raise WeightPlanError("decision row identity is absent from or remapped in snapshot")
     if snapshot_identity_fingerprint(snapshot) != decision.metagraph_identity_fingerprint_sha256:
         raise WeightPlanError("decision metagraph fingerprint does not match the snapshot")
+    row_identities = frozenset((row.uid, row.hotkey) for row in decision.rows)
+    if row_identities != eligible_weight_targets(
+        snapshot, validator_hotkey=decision.validator_hotkey
+    ):
+        raise WeightPlanError("decision rows do not cover the complete eligible miner set")
     return build_weight_plan(
         snapshot=snapshot,
         validator_hotkey=decision.validator_hotkey,

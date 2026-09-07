@@ -510,16 +510,17 @@ def anchor_manifest_chain_state(
     genesis_chain_state: AssignmentManifestChainState,
     *,
     evaluation_epoch: int,
-    current_finalized_height: int | None = None,
+    current_finalized_height: int,
 ) -> ManifestVerificationResult:
     """Onboard a validator with no history on the current live head, at any sequence.
 
     This is the one deliberate exception to "genesis accepts only sequence 1"
     and it is available only from a genesis state, so it can never be used to
     skip past history a validator already holds. The head must pass complete
-    live verification; the resulting state records one accepted manifest at
-    the head's sequence, and every later publication must extend it through
-    the ordinary append-only rules.
+    live verification, including its block leases against the validator's
+    ``current_finalized_height``; the resulting state records one accepted
+    manifest at the head's sequence, and every later publication must extend
+    it through the ordinary append-only rules.
     """
 
     _validate_evaluation_epoch(evaluation_epoch)

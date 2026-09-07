@@ -231,12 +231,17 @@ def execute(request: dict[str, object]) -> dict[str, object]:
         )
         return {"reprobe": reprobe, "value": _document(next_manifest_state)}
     if operation == "verify_manifest":
+        # Live verification always enforces block leases; a caller that does
+        # not state its finalized height is refused rather than waved through.
+        if "current_finalized_height" not in arguments:
+            raise ValueError("current_finalized_height_required")
         verification = verify_active_assignment_manifest(
             _model(ActiveAssignmentManifest, arguments["manifest"]),
             [_model(AssignmentManifestSignatureEnvelope, item) for item in arguments["signatures"]],
             _model(AssignmentManifestTrustPolicy, arguments["trust_policy"]),
             _model(AssignmentManifestChainState, arguments["prior_chain_state"]),
             evaluation_epoch=arguments["evaluation_epoch"],
+            current_finalized_height=arguments["current_finalized_height"],
         )
         return {
             "next_chain_state": _document(verification.next_chain_state),

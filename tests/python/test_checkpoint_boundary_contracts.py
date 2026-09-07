@@ -157,3 +157,35 @@ def test_publication_operations_round_trip_through_the_boundary() -> None:
     )
     with pytest.raises(ValueError, match="operation_invalid"):
         call("decide_weight_submission")
+
+
+def test_verify_manifest_boundary_requires_and_enforces_the_finalized_height() -> None:
+    """The shipped boundary cannot omit or ignore the block-lease check."""
+
+    context = make_context()
+    manifest = document(context.manifest)
+    signatures = [document(item) for item in context.signatures]
+    genesis = call("build_manifest_initial_state", trust_policy=document(context.policy))["value"]
+    earliest = min(
+        replica["expires_at_block"]
+        for item in manifest["deployments"]
+        for replica in item["replicas"]
+    )
+    arguments = {
+        "manifest": manifest,
+        "signatures": signatures,
+        "trust_policy": document(context.policy),
+        "prior_chain_state": genesis,
+        "evaluation_epoch": EVALUATION_EPOCH,
+    }
+    with pytest.raises(ValueError, match="current_finalized_height_required"):
+        call("verify_manifest", **arguments)
+    verified = call("verify_manifest", **arguments, current_finalized_height=earliest - 1)
+    assert verified["next_chain_state"]["last_sequence"] == 1
+    assert verified["reprobe"] is False
+    with pytest.raises(ValueError, match="manifest_replica_lease_expired"):
+        call("verify_manifest", **arguments, current_finalized_height=earliest)
+    with pytest.raises(ValueError, match="current_finalized_height_invalid"):
+        call("verify_manifest", **arguments, current_finalized_height="soon")
+    with pytest.raises(ValueError, match="current_finalized_height_invalid"):
+        call("verify_manifest", **arguments, current_finalized_height=None)

@@ -11,6 +11,7 @@ import pytest
 from assignment_probe_context import (
     BASE_EPOCH,
     EVALUATION_EPOCH,
+    FINALIZED_HEIGHT,
     build_manifest,
     build_policy,
     fixture_deployments,
@@ -167,6 +168,7 @@ def test_pointer_precheck_mirrors_manifest_acceptance() -> None:
         context.policy,
         accepted,
         evaluation_epoch=EVALUATION_EPOCH,
+        current_finalized_height=FINALIZED_HEIGHT,
     ).next_chain_state
     equivocating = build_manifest(
         context.policy,
@@ -411,7 +413,12 @@ def test_catch_up_replays_missed_publications_under_historical_semantics() -> No
     # broken) and the intermediates are expired or stale by now.
     with pytest.raises(AssignmentProbeError) as failure:
         verify_active_assignment_manifest(
-            head, head_signatures, context.policy, accepted, evaluation_epoch=now
+            head,
+            head_signatures,
+            context.policy,
+            accepted,
+            evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "previous_link_mismatch"
     with pytest.raises(AssignmentProbeError) as failure:
@@ -421,6 +428,7 @@ def test_catch_up_replays_missed_publications_under_historical_semantics() -> No
             context.policy,
             accepted,
             evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "manifest_stale"
     history = [_entry(item, keys) for item in manifests[1:4]]
@@ -430,7 +438,12 @@ def test_catch_up_replays_missed_publications_under_historical_semantics() -> No
     assert caught_up.last_manifest_digest_sha256 == manifests[3].manifest_digest_sha256
     assert caught_up.last_finalized_epoch == manifests[3].finalized_epoch
     live = verify_active_assignment_manifest(
-        head, head_signatures, context.policy, caught_up, evaluation_epoch=now
+        head,
+        head_signatures,
+        context.policy,
+        caught_up,
+        evaluation_epoch=now,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     assert live.next_chain_state.last_sequence == 5
     assert live.reprobe is False
@@ -444,6 +457,7 @@ def test_catch_up_replays_missed_publications_under_historical_semantics() -> No
             context.policy,
             state,
             evaluation_epoch=item.issued_at_epoch + 1,
+            current_finalized_height=FINALIZED_HEIGHT,
         ).next_chain_state
     assert state == caught_up
 
@@ -570,11 +584,21 @@ def test_onboarding_anchors_on_the_live_head_only_from_genesis() -> None:
     # Genesis alone refuses a head beyond sequence 1, as it always did.
     with pytest.raises(AssignmentProbeError) as failure:
         verify_active_assignment_manifest(
-            head, head_signatures, context.policy, genesis, evaluation_epoch=now
+            head,
+            head_signatures,
+            context.policy,
+            genesis,
+            evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "sequence_gap"
     anchored = anchor_manifest_chain_state(
-        head, head_signatures, context.policy, genesis, evaluation_epoch=now
+        head,
+        head_signatures,
+        context.policy,
+        genesis,
+        evaluation_epoch=now,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     state = anchored.next_chain_state
     assert anchored.reprobe is False
@@ -591,14 +615,24 @@ def test_onboarding_anchors_on_the_live_head_only_from_genesis() -> None:
     # sequence extends, and rollback is refused.
     assert (
         verify_active_assignment_manifest(
-            head, head_signatures, context.policy, state, evaluation_epoch=now
+            head,
+            head_signatures,
+            context.policy,
+            state,
+            evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         ).reprobe
         is True
     )
     fifth = _chain(context, 5)[4]
     assert (
         verify_active_assignment_manifest(
-            fifth, sign_manifest(fifth, keys), context.policy, state, evaluation_epoch=now + 100
+            fifth,
+            sign_manifest(fifth, keys),
+            context.policy,
+            state,
+            evaluation_epoch=now + 100,
+            current_finalized_height=FINALIZED_HEIGHT,
         ).next_chain_state.last_sequence
         == 5
     )
@@ -609,6 +643,7 @@ def test_onboarding_anchors_on_the_live_head_only_from_genesis() -> None:
             context.policy,
             state,
             evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "sequence_rollback"
     # Anchoring is complete live verification: stale heads and bad signatures
@@ -620,16 +655,27 @@ def test_onboarding_anchors_on_the_live_head_only_from_genesis() -> None:
             context.policy,
             genesis,
             evaluation_epoch=head.issued_at_epoch + context.policy.max_manifest_age_seconds + 1,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "manifest_stale"
     with pytest.raises(AssignmentProbeError) as failure:
         anchor_manifest_chain_state(
-            head, head_signatures[:1], context.policy, genesis, evaluation_epoch=now
+            head,
+            head_signatures[:1],
+            context.policy,
+            genesis,
+            evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "threshold_not_met"
     with pytest.raises(ManifestPublicationError) as failure:
         anchor_manifest_chain_state(
-            head, head_signatures, context.policy, state, evaluation_epoch=now
+            head,
+            head_signatures,
+            context.policy,
+            state,
+            evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "anchor_state_not_genesis"
     with pytest.raises(ManifestPublicationError) as failure:
@@ -639,6 +685,7 @@ def test_onboarding_anchors_on_the_live_head_only_from_genesis() -> None:
             context.policy,
             build_initial_manifest_chain_state(build_policy(keys, threshold=1)),
             evaluation_epoch=now,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "rebind_state_policy_mismatch"
     # Anchoring on sequence 1 is exactly the ordinary genesis acceptance.
@@ -649,6 +696,7 @@ def test_onboarding_anchors_on_the_live_head_only_from_genesis() -> None:
             context.policy,
             genesis,
             evaluation_epoch=EVALUATION_EPOCH,
+            current_finalized_height=FINALIZED_HEIGHT,
         ).next_chain_state
         == context.verification.next_chain_state
     )
@@ -685,6 +733,7 @@ def test_key_rotation_reanchors_state_without_resetting_history() -> None:
         successor,
         rebound,
         evaluation_epoch=EVALUATION_EPOCH,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     assert result.next_chain_state.last_sequence == 2
     # Without the re-anchor the successor policy rejects even a valid chain.
@@ -695,6 +744,7 @@ def test_key_rotation_reanchors_state_without_resetting_history() -> None:
             successor,
             accepted,
             evaluation_epoch=EVALUATION_EPOCH,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "trust_policy_mismatch"
     # A rebound state does not accept a sequence-1 replay or a rollback.
@@ -705,6 +755,7 @@ def test_key_rotation_reanchors_state_without_resetting_history() -> None:
             successor,
             rebound,
             evaluation_epoch=EVALUATION_EPOCH,
+            current_finalized_height=FINALIZED_HEIGHT,
         )
     assert failure.value.code == "same_sequence_divergence"
 
@@ -743,3 +794,99 @@ def test_pointer_bytes_round_trip_and_reject_malleability() -> None:
         parse_assignment_manifest_latest_pointer(json.dumps(document).encode("ascii") + b"\n")
     with pytest.raises(ValueError, match="document_size_invalid"):
         parse_assignment_manifest_latest_pointer(rendered + b" " * 16 * 1_024)
+
+
+def test_live_verification_always_enforces_block_leases() -> None:
+    """No live consumer can skip the lease check: the finalized height is required input."""
+
+    context = make_context()
+    keys = signer_keys()
+    genesis = build_initial_manifest_chain_state(context.policy)
+    earliest = min(
+        replica.expires_at_block
+        for item in context.manifest.deployments
+        for replica in item.replicas
+    )
+    assert earliest > context.manifest.finalized_height
+    # There is no opt-out: omitting the height is a programming error, not a pass.
+    with pytest.raises(TypeError):
+        verify_active_assignment_manifest(  # type: ignore[call-arg]
+            context.manifest,
+            context.signatures,
+            context.policy,
+            genesis,
+            evaluation_epoch=EVALUATION_EPOCH,
+        )
+    with pytest.raises(TypeError):
+        anchor_manifest_chain_state(  # type: ignore[call-arg]
+            context.manifest,
+            context.signatures,
+            context.policy,
+            genesis,
+            evaluation_epoch=EVALUATION_EPOCH,
+        )
+    # The last leased height verifies; the first expired height is refused,
+    # and no next state is produced.
+    live = verify_active_assignment_manifest(
+        context.manifest,
+        context.signatures,
+        context.policy,
+        genesis,
+        evaluation_epoch=EVALUATION_EPOCH,
+        current_finalized_height=earliest - 1,
+    )
+    assert live.next_chain_state.last_sequence == 1
+    for height in (earliest, earliest + 1_000):
+        with pytest.raises(AssignmentProbeError) as failure:
+            verify_active_assignment_manifest(
+                context.manifest,
+                context.signatures,
+                context.policy,
+                genesis,
+                evaluation_epoch=EVALUATION_EPOCH,
+                current_finalized_height=height,
+            )
+        assert failure.value.code == "manifest_replica_lease_expired"
+    for bad_height in (-1, True, "12", 1.5, None):
+        with pytest.raises(ValueError, match="current_finalized_height_invalid"):
+            verify_active_assignment_manifest(
+                context.manifest,
+                context.signatures,
+                context.policy,
+                genesis,
+                evaluation_epoch=EVALUATION_EPOCH,
+                current_finalized_height=bad_height,  # type: ignore[arg-type]
+            )
+    # Onboarding on a later head is the same live verification, leases included.
+    head = _chain(context, 3)[2]
+    head_signatures = sign_manifest(head, keys)
+    now = head.issued_at_epoch + 10
+    anchored = anchor_manifest_chain_state(
+        head,
+        head_signatures,
+        context.policy,
+        genesis,
+        evaluation_epoch=now,
+        current_finalized_height=earliest - 1,
+    )
+    assert anchored.next_chain_state.last_sequence == 3
+    with pytest.raises(AssignmentProbeError) as failure:
+        anchor_manifest_chain_state(
+            head,
+            head_signatures,
+            context.policy,
+            genesis,
+            evaluation_epoch=now,
+            current_finalized_height=earliest,
+        )
+    assert failure.value.code == "manifest_replica_lease_expired"
+    # Historical replay is deliberately lease-free: the manifests are already
+    # superseded and are never probed; only the live head is leased.
+    history = [_entry(item, keys) for item in _chain(context, 3)[1:2]]
+    replayed = replay_manifest_history(
+        context.verification.next_chain_state,
+        history,
+        context.policy,
+        evaluation_epoch=now,
+    )
+    assert replayed.last_sequence == 2

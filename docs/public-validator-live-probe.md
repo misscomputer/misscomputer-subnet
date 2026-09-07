@@ -96,9 +96,10 @@ clock. For one attempt `assignment_probe.verify_active_assignment_manifest`:
 3. Enforces the policy validity window, manifest lifetime, future skew,
    expiry, and maximum age at the supplied evaluation epoch. Expiry is the
    manifest's *effective* horizon: the earlier of `expires_at_epoch` and the
-   earliest `ticket_expires_at_epoch` it publishes. When the caller supplies
-   its own finalized height, every replica's `expires_at_block` is enforced
-   against it too (`manifest_replica_lease_expired`).
+   earliest `ticket_expires_at_epoch` it publishes. The caller's own finalized
+   height (`current_finalized_height`; `--finalized-height` for the CLI) is
+   required input, and every replica's `expires_at_block` is enforced against
+   it (`manifest_replica_lease_expired`); there is no lease-free live path.
 4. Verifies every signature envelope against the domain-separated complete
    manifest with its pinned public key; rejects unknown, swapped, invalid,
    duplicate, wrong-purpose, not-yet-valid, expired, or revoked signers; then

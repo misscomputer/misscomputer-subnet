@@ -282,6 +282,7 @@ def build_round(
         policy,
         verification_state,
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     observations = []
     for deployment in manifest.deployments:
@@ -419,6 +420,7 @@ def make_window_context(
         policy,
         genesis,
         evaluation_epoch=BASE_EPOCH,
+        current_finalized_height=FINALIZED_HEIGHT,
     ).next_chain_state
     state_two = verify_active_assignment_manifest(
         manifest_two,
@@ -426,6 +428,7 @@ def make_window_context(
         policy,
         state_one,
         evaluation_epoch=BASE_EPOCH + 1_500,
+        current_finalized_height=FINALIZED_HEIGHT,
     ).next_chain_state
     rounds: list[ProbeRound] = []
     alpha_hotkeys = [hotkey for _, hotkey in MINERS[:3]]
@@ -917,6 +920,91 @@ def negative_documents() -> dict[str, bytes]:
                 "manifest_sequence": 1,
             },
             prior_assigned_baseline_status="applied",
+        ),
+    )
+    # Positive weight without sealed serving evidence, in every forgeable form.
+    add(
+        "validator-weight-decision",
+        "submit-with-positive-weight-without-attributions",
+        "model",
+        "row_positive_weight_without_evidence",
+        forged_decision(
+            decision, rows=[{**row, "attributions": 0} for row in decision_doc["rows"]]
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-positive-weight-without-serving-observations",
+        "model",
+        "observation_counts_invalid",
+        forged_decision(decision, serving_observation_count=0),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-positive-weight-below-min-attributions",
+        "model",
+        "row_weight_below_min_attributions",
+        forged_decision(
+            decision,
+            scoring_policy={**decision_doc["scoring_policy"], "min_attributions": 22},
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-unnormalized-weights",
+        "model",
+        "weights_not_normalized",
+        forged_decision(
+            decision,
+            rows=[
+                {**row, "weight": row["weight"] / 2} if row["hotkey"] == "MinerA" else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
+    # A terminal set padded beyond the rows assigned at close.
+    add(
+        "validator-weight-decision",
+        "submit-with-padded-terminal-count",
+        "model",
+        "assigned_counts_invalid",
+        forged_decision(
+            decision,
+            terminal_assigned_miner_count=decision_doc["terminal_assigned_miner_count"] + 1,
+            max_assigned_miner_count=decision_doc["max_assigned_miner_count"] + 1,
+            assigned_baseline={
+                **decision_doc["assigned_baseline"],
+                "assigned_miner_count": decision_doc["assigned_baseline"]["assigned_miner_count"]
+                + 1,
+            },
+        ),
+    )
+    # A guarded drop whose successor baseline is the reduced terminal set.
+    dropped_rows = [
+        {
+            **row,
+            "assigned_at_close": row["hotkey"] == "MinerA",
+            "first_seen_epoch": row["first_seen_epoch"] if row["hotkey"] == "MinerA" else None,
+            "classification": ("verified_serving" if row["weight"] > 0.0 else "unassigned"),
+        }
+        for row in decision_doc["rows"]
+    ]
+    add(
+        "validator-weight-decision",
+        "guarded-drop-refreshes-baseline",
+        "model",
+        "assigned_baseline_not_derived",
+        forged_decision(
+            decision,
+            decision="abstain",
+            abstain_reasons=["mass_unassignment_guard"],
+            rows=dropped_rows,
+            terminal_assigned_miner_count=1,
+            assigned_baseline={
+                **decision_doc["assigned_baseline"],
+                "assigned_miner_count": 1,
+                "assigned_identity_digest_sha256": canonical_digest([[10, "MinerA"]]),
+            },
         ),
     )
     add(
