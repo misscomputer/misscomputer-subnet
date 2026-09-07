@@ -594,6 +594,46 @@ def test_positive_evidence_does_not_bypass_minimum_coverage() -> None:
     )
 
 
+def test_sealed_first_seen_rejects_later_rewrite_and_accepts_earlier_archive() -> None:
+    rendered = validator_weight_decision_bytes(make_window_context().decision)
+    document = json.loads(rendered)
+    shifted = forged_decision(
+        rendered,
+        decision_policy={
+            **document["decision_policy"],
+            "min_expected_attributions": 16,
+        },
+        rows=[
+            {
+                **row,
+                "first_seen_epoch": WINDOW_END
+                - document["decision_policy"]["activation_grace_seconds"]
+                + 1,
+            }
+            if row["hotkey"] in {"MinerA", "MinerD"}
+            else row
+            for row in document["rows"]
+        ],
+    )
+    with pytest.raises(ValidationError, match="row_first_seen_not_derived"):
+        ValidatorWeightDecision.model_validate(shifted)
+
+    earlier = forged_decision(
+        rendered,
+        rows=[
+            {**row, "first_seen_epoch": WINDOW_START - 1} if row["hotkey"] == "MinerA" else row
+            for row in document["rows"]
+        ],
+    )
+    parsed = parse_validator_weight_decision(
+        json.dumps(earlier, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+    )
+    assert parsed.decision == "submit"
+    assert next(row for row in parsed.rows if row.hotkey == "MinerA").first_seen_epoch == (
+        WINDOW_START - 1
+    )
+
+
 def test_no_positive_evidence_means_no_transaction() -> None:
     context = make_window_context()
     empty = decide_weight_submission(

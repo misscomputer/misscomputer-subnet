@@ -898,6 +898,26 @@ class ValidatorWeightDecision(StrictFrozenModel):
                 if row_values != tally_values or row.weight != weights[identity]:
                     raise ValueError("scoring_window_evidence_inconsistent")
 
+        earliest_sighting_by_identity: dict[tuple[int, str], int] = {}
+        for item in evidence:
+            issued_at = item.manifest.issued_at_epoch
+            for identity in _evidence_identities(item, registered_keys):
+                previous_sighting = earliest_sighting_by_identity.get(identity)
+                if previous_sighting is None or issued_at < previous_sighting:
+                    earliest_sighting_by_identity[identity] = issued_at
+        # A coordinator may retain an earlier archived sighting, but a sealed
+        # row can never post-date the earliest manifest evidence for its identity.
+        for row in self.rows:
+            if row.classification == "unassigned":
+                continue
+            earliest_sighting = earliest_sighting_by_identity.get((row.uid, row.hotkey))
+            if (
+                row.first_seen_epoch is None
+                or earliest_sighting is None
+                or row.first_seen_epoch > earliest_sighting
+            ):
+                raise ValueError("row_first_seen_not_derived")
+
         nonterminal_evidence = [item for item in evidence if item is not terminal_evidence]
         largest_window = (
             max(

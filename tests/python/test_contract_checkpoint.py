@@ -156,6 +156,7 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "submit-with-expired-terminal",
         "submit-with-expected-attributions-exceeding-opportunities",
         "submit-with-insufficient-rounds",
+        "submit-with-late-first-seen",
         "submit-with-mass-drop",
         "submit-with-noncanonical-expected-attribution",
         "submit-with-padded-terminal-count",

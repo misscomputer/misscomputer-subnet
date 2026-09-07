@@ -834,6 +834,30 @@ def negative_documents() -> dict[str, bytes]:
     )
     add(
         "validator-weight-decision",
+        "submit-with-late-first-seen",
+        "model",
+        "row_first_seen_not_derived",
+        forged_decision(
+            decision,
+            decision_policy={
+                **decision_doc["decision_policy"],
+                "min_expected_attributions": 16,
+            },
+            rows=[
+                {
+                    **row,
+                    "first_seen_epoch": WINDOW_END
+                    - decision_doc["decision_policy"]["activation_grace_seconds"]
+                    + 1,
+                }
+                if row["hotkey"] in {"MinerA", "MinerD"}
+                else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
+    add(
+        "validator-weight-decision",
         "submit-with-mass-drop",
         "model",
         "assigned_counts_invalid",

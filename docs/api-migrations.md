@@ -95,6 +95,10 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   `row_attributions_exceed_opportunities`,
   `row_expected_attributions_inconsistent`, `observation_counts_invalid`,
   `weights_not_normalized`).
+- Parsing derives each registered identity's earliest sealed manifest sighting
+  and rejects a non-`unassigned` row whose `first_seen_epoch` is absent or later
+  (`row_first_seen_not_derived`). An earlier sighting supplied from the
+  coordinator's archive remains valid.
 - Assigned sets are counted in registered identities only:
   `terminal_assigned_miner_count` must equal the rows sealed
   `assigned_at_close` (`assigned_counts_invalid`), and the successor
