@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import hashlib
 from collections.abc import Sequence
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -243,6 +244,10 @@ def test_miner_dark_for_the_whole_window_scores_zero() -> None:
     # It had every opportunity and took none of them.
     assert dark.opportunities == 10
     assert dark.attributions == 0
+    assert dark.expected_attributions == Fraction(10, 3)
+    assert [(item.replica_count, item.opportunity_count) for item in dark.replica_share_counts] == [
+        (3, 10)
+    ]
     assert dark.coverage() == 0
 
 

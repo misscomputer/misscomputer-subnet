@@ -70,6 +70,29 @@
       "title": "ProbeScoringPolicy",
       "type": "object"
     },
+    "ReplicaShareCount": {
+      "additionalProperties": false,
+      "description": "Opportunity count accumulated at one exact published replica-set size.",
+      "properties": {
+        "opportunity_count": {
+          "minimum": 1,
+          "title": "Opportunity Count",
+          "type": "integer"
+        },
+        "replica_count": {
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Replica Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "replica_count",
+        "opportunity_count"
+      ],
+      "title": "ReplicaShareCount",
+      "type": "object"
+    },
     "WeightDecisionPolicy": {
       "additionalProperties": false,
       "description": "Validator-local decision thresholds. Each validator decides independently.",
@@ -177,6 +200,14 @@
           "title": "Opportunities",
           "type": "integer"
         },
+        "replica_share_counts": {
+          "items": {
+            "$ref": "#/$defs/ReplicaShareCount"
+          },
+          "maxItems": 8,
+          "title": "Replica Share Counts",
+          "type": "array"
+        },
         "uid": {
           "maximum": 65535,
           "minimum": 0,
@@ -199,6 +230,7 @@
         "opportunities",
         "expected_attributions_numerator",
         "expected_attributions_denominator",
+        "replica_share_counts",
         "first_seen_epoch",
         "assigned_at_close"
       ],

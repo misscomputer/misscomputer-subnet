@@ -58,7 +58,9 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
 - `verify_manifest_latest_pointer` checks the claimed signer set against key
   validity windows, revocations, threshold, and required roles
   (`pointer_signer_invalid`, `pointer_required_role_missing`) and mirrors the
-  chain-view rules; its verdict gains `history_depth`.
+  chain-view rules. Its verdict gains `history_depth`, which is zero for a
+  direct digest link and otherwise is the maximum number of immutable history
+  entries to walk, not a count inferred from possibly jumping sequence values.
 - New: `pointer_object_key`, `ManifestHistoryEntry`,
   `replay_manifest_history` (catch-up), and `anchor_manifest_chain_state`
   (onboarding).
@@ -69,14 +71,17 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   `terminal_finalized_epoch`, `terminal_manifest_effective_expires_at_epoch`,
   `terminal_earliest_lease_expires_at_block`, `prior_assigned_baseline`,
   `prior_assigned_baseline_status`, `assigned_baseline`, the row field
-  `assigned_at_close`, the policy field `assigned_baseline_max_age_seconds`,
-  and the abstain reason `assignment_lease_expired_at_close`. Parsing re-derives
-  every abstain reason and row classification from the sealed fields.
+  `assigned_at_close`, the row aggregation `replica_share_counts`, the policy
+  field `assigned_baseline_max_age_seconds`, and the abstain reason
+  `assignment_lease_expired_at_close`. Parsing re-derives every abstain reason
+  and row classification from the sealed fields.
 - Parsing also enforces sealed serving evidence: a positive row needs at least
   `scoring_policy.min_attributions` attributions, no more attributions than
   opportunities, no more opportunities than the record's `observation_count`,
-  row attributions summing to at most `serving_observation_count`, and the
-  positive weights forming one normalized distribution
+  no more rounds than observations, row attributions summing to at most
+  `serving_observation_count`, and an exact reduced expected-attribution
+  fraction recomputed from the row's canonical `replica_share_counts` buckets.
+  Positive weights form one normalized distribution
   (`row_positive_weight_without_evidence`, `row_weight_below_min_attributions`,
   `row_attributions_exceed_opportunities`,
   `row_expected_attributions_inconsistent`, `observation_counts_invalid`,
@@ -90,15 +95,18 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   rather than the reduced terminal set (`assigned_baseline_not_derived`).
 - `decide_weight_submission` accepts `prior_assigned_baseline` and
   `archived_manifests`. The window's manifests, the archived manifests, and
-  the terminal must occupy consecutive sequences with every `previous` link
-  verified; a missing intermediate sequence is `decision_manifest_chain_gap`,
+  the terminal must include every actual digest-linked transition; bounded
+  sequence jumps do not imply intermediate publications. A missing actual
+  predecessor is `decision_manifest_chain_gap`,
   an archived manifest that does not re-validate or lies beyond the terminal
   is `decision_archived_manifest_invalid`.
 - `weight_plan.build_weight_plan_from_decision` is the only path from a
   decision to a plan; `build_weight_plan` itself is unchanged. The decision's
   rows must be exactly `weight_plan.eligible_weight_targets(snapshot,
   validator_hotkey)` (every active neuron other than the validator), so a
-  decision that omits an eligible miner is refused.
+  decision that omits an eligible miner is refused. The builder deep-validates
+  once into a private decision and immutable row snapshot, so concurrent
+  mutation of a caller-owned nested row list cannot split these checks.
 - `probe_scoring.accumulate_scoring_window` re-validates every round
   (`scoring_round_invalid`).
 - `assignment_snapshot.verify_snapshot_succession` adds

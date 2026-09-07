@@ -16,7 +16,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urlsplit
 
-from .validator_decision import ValidatorWeightDecision, weight_plan_rows_for_submission
+from .validator_decision import (
+    ValidatorWeightDecision,
+    _validated_weight_submission,
+)
 
 if TYPE_CHECKING:
     from .chain import MetagraphSnapshot, NeuronRecord
@@ -481,7 +484,13 @@ def build_weight_plan_from_decision(
     fingerprint still names the complete set.
     """
 
-    rows = weight_plan_rows_for_submission(decision)
+    # ``frozen=True`` prevents attribute assignment but does not make a
+    # Pydantic model's nested lists immutable. Snapshot the complete sealed
+    # decision once, then consult only that private copy: a caller mutating
+    # ``decision.rows`` concurrently cannot make the identity checks observe
+    # different rows from the ones committed to ``rows``.
+    decision, row_values = _validated_weight_submission(decision)
+    rows = tuple({"miner_hotkey": hotkey, "weight": weight} for hotkey, weight in row_values)
     if snapshot.finalized is not True:
         raise WeightPlanError("weight plans require a finalized metagraph snapshot")
     if (

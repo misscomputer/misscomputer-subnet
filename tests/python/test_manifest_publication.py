@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -488,17 +489,48 @@ def test_catch_up_replays_missed_publications_under_historical_semantics() -> No
     with pytest.raises(ManifestPublicationError) as failure:
         replay_manifest_history(accepted, [mismatched], context.policy, evaluation_epoch=now)
     assert failure.value.code == "history_pointer_mismatch"
-    # The catch-up span is bounded by the policy gap; beyond it the pointer
-    # precheck already refuses and the replay refuses too.
+    # The inclusive history-entry limit is not consumed by the separately
+    # verified live head: exactly max_sequence_gap intermediate publications
+    # are permitted (the former pointer check rejected this off by one).
+    boundary_chain = _chain(context, context.policy.max_sequence_gap + 2)
+    boundary_head = boundary_chain[-1]
+    boundary_verdict = verify_manifest_latest_pointer(
+        build_manifest_latest_pointer(boundary_head, sign_manifest(boundary_head, keys)),
+        context.policy,
+        accepted,
+        evaluation_epoch=boundary_head.issued_at_epoch,
+    )
+    assert boundary_verdict.history_depth == context.policy.max_sequence_gap
+    boundary_state = replay_manifest_history(
+        accepted,
+        [_entry(item, keys) for item in boundary_chain[1:-1]],
+        context.policy,
+        evaluation_epoch=boundary_head.issued_at_epoch,
+    )
+    assert (
+        verify_active_assignment_manifest(
+            boundary_head,
+            sign_manifest(boundary_head, keys),
+            context.policy,
+            boundary_state,
+            evaluation_epoch=boundary_head.issued_at_epoch,
+            current_finalized_height=FINALIZED_HEIGHT,
+        ).next_chain_state.last_sequence
+        == boundary_head.sequence
+    )
+    # The pointer cannot infer how many actual publications occupy a numeric
+    # sequence span. It returns the safe walk budget; replay enforces that
+    # budget against the entries actually fetched.
     long_chain = _chain(context, 2 + context.policy.max_sequence_gap + 1)
-    with pytest.raises(ManifestPublicationError) as failure:
+    assert (
         verify_manifest_latest_pointer(
             build_manifest_latest_pointer(long_chain[-1], sign_manifest(long_chain[-1], keys)),
             context.policy,
             accepted,
             evaluation_epoch=long_chain[-1].issued_at_epoch,
-        )
-    assert failure.value.code == "pointer_sequence_gap"
+        ).history_depth
+        == context.policy.max_sequence_gap
+    )
     with pytest.raises(ManifestPublicationError) as failure:
         replay_manifest_history(
             accepted,
@@ -507,6 +539,46 @@ def test_catch_up_replays_missed_publications_under_historical_semantics() -> No
             evaluation_epoch=long_chain[-1].issued_at_epoch,
         )
     assert failure.value.code == "history_depth_exceeded"
+
+    class UnderreportedHistory(Sequence[ManifestHistoryEntry]):
+        def __init__(self, entries: list[ManifestHistoryEntry]) -> None:
+            self.entries = entries
+
+        def __len__(self) -> int:
+            return 0
+
+        def __getitem__(self, index: int) -> ManifestHistoryEntry:
+            return self.entries[index]
+
+    # Bound what is actually replayed, not a mutable/custom sequence's stale
+    # or dishonest length report.
+    with pytest.raises(ManifestPublicationError) as failure:
+        replay_manifest_history(
+            accepted,
+            UnderreportedHistory([_entry(item, keys) for item in long_chain[1:-1]]),
+            context.policy,
+            evaluation_epoch=long_chain[-1].issued_at_epoch,
+        )
+    assert failure.value.code == "history_depth_exceeded"
+    # A numeric span whose shortest possible bounded-jump chain would itself
+    # exceed the entry budget can still be rejected before fetching objects.
+    impossible = build_manifest(
+        context.policy,
+        fixture_deployments(),
+        sequence=accepted.last_sequence
+        + context.policy.max_sequence_gap * (context.policy.max_sequence_gap + 1)
+        + 1,
+        previous=label_digest("unreachable-predecessor"),
+        issued_at=BASE_EPOCH + 100,
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            build_manifest_latest_pointer(impossible, sign_manifest(impossible, keys)),
+            context.policy,
+            accepted,
+            evaluation_epoch=impossible.issued_at_epoch,
+        )
+    assert failure.value.code == "pointer_sequence_gap"
     # Historical verification judges signer validity at issuance, so a key
     # revoked after a publication still authenticates that publication, but
     # never one issued after the revocation.
@@ -548,6 +620,137 @@ def test_catch_up_replays_missed_publications_under_historical_semantics() -> No
             evaluation_epoch=now,
         )
     assert failure.value.code == "signer_revoked"
+
+
+def test_catch_up_uses_digest_linked_jump_and_height_bounds_per_transition() -> None:
+    """Cumulative sequence/height movement is not mistaken for a single hop."""
+
+    keys = signer_keys()
+    policy = build_policy(keys, max_age=600, max_finalized_height_gap=5)
+    deployments = fixture_deployments()
+    first = build_manifest(policy, deployments)
+    state = verify_active_assignment_manifest(
+        first,
+        sign_manifest(first, keys),
+        policy,
+        build_initial_manifest_chain_state(policy),
+        evaluation_epoch=BASE_EPOCH + 1,
+        current_finalized_height=FINALIZED_HEIGHT,
+    ).next_chain_state
+    jump = policy.max_sequence_gap
+    middle = build_manifest(
+        policy,
+        deployments,
+        sequence=first.sequence + jump,
+        previous=first.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 100,
+        expires_at=BASE_EPOCH + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 5,
+        finalized_block_hash=label_digest("bounded-jump-middle"),
+    )
+    head = build_manifest(
+        policy,
+        deployments,
+        sequence=middle.sequence + jump,
+        previous=middle.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 200,
+        expires_at=BASE_EPOCH + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 10,
+        finalized_block_hash=label_digest("bounded-jump-head"),
+    )
+
+    # A direct pointer follows the local digest and therefore has no history,
+    # even though its sequence advances by more than one.
+    direct = verify_manifest_latest_pointer(
+        build_manifest_latest_pointer(middle, sign_manifest(middle, keys)),
+        policy,
+        state,
+        evaluation_epoch=BASE_EPOCH + 201,
+    )
+    assert direct.history_depth == 0
+    assert direct.reprobe is False
+
+    # The head is two individually valid hops away. Its cumulative +8 sequence
+    # and +10 height deltas exceed either per-hop bound, but must not be
+    # compared to those bounds as though this pointer directly extended state.
+    verdict = verify_manifest_latest_pointer(
+        build_manifest_latest_pointer(head, sign_manifest(head, keys)),
+        policy,
+        state,
+        evaluation_epoch=BASE_EPOCH + 201,
+    )
+    assert verdict.history_depth == policy.max_sequence_gap
+    replayed = replay_manifest_history(
+        state,
+        [_entry(middle, keys)],
+        policy,
+        evaluation_epoch=BASE_EPOCH + 201,
+    )
+    live = verify_active_assignment_manifest(
+        head,
+        sign_manifest(head, keys),
+        policy,
+        replayed,
+        evaluation_epoch=BASE_EPOCH + 201,
+        current_finalized_height=FINALIZED_HEIGHT,
+    )
+    assert live.next_chain_state.last_sequence == head.sequence
+    assert live.next_chain_state.accepted_manifest_count == 3
+
+    overbound = build_manifest(
+        policy,
+        deployments,
+        sequence=first.sequence + jump + 1,
+        previous=first.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 100,
+        expires_at=BASE_EPOCH + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 5,
+        finalized_block_hash=label_digest("overbound-history-jump"),
+    )
+    with pytest.raises(AssignmentProbeError) as failure:
+        verify_historical_active_assignment_manifest(
+            overbound,
+            sign_manifest(overbound, keys),
+            policy,
+            state,
+            evaluation_epoch=BASE_EPOCH + 201,
+        )
+    assert failure.value.code == "history_sequence_gap"
+    with pytest.raises(ManifestPublicationError) as failure:
+        replay_manifest_history(
+            state,
+            [_entry(overbound, keys)],
+            policy,
+            evaluation_epoch=BASE_EPOCH + 201,
+        )
+    assert failure.value.code == "history_link_mismatch"
+
+    overheight = build_manifest(
+        policy,
+        deployments,
+        sequence=first.sequence + jump,
+        previous=first.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 100,
+        expires_at=BASE_EPOCH + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 6,
+        finalized_block_hash=label_digest("overbound-height-jump"),
+    )
+    with pytest.raises(ManifestPublicationError) as failure:
+        verify_manifest_latest_pointer(
+            build_manifest_latest_pointer(overheight, sign_manifest(overheight, keys)),
+            policy,
+            state,
+            evaluation_epoch=BASE_EPOCH + 201,
+        )
+    assert failure.value.code == "pointer_sequence_gap"
+    with pytest.raises(AssignmentProbeError) as failure:
+        replay_manifest_history(
+            state,
+            [_entry(overheight, keys)],
+            policy,
+            evaluation_epoch=BASE_EPOCH + 201,
+        )
+    assert failure.value.code == "finalized_height_gap"
 
 
 def _linked(

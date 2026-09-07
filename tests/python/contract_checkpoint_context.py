@@ -807,8 +807,10 @@ def negative_documents() -> dict[str, bytes]:
                     **row,
                     "classification": "assigned_undersampled",
                     "first_seen_epoch": WINDOW_START,
+                    "opportunities": 2,
                     "expected_attributions_numerator": 2,
                     "expected_attributions_denominator": 1,
+                    "replica_share_counts": [{"opportunity_count": 2, "replica_count": 1}],
                 }
                 if row["hotkey"] == "MinerF"
                 else row
@@ -823,16 +825,10 @@ def negative_documents() -> dict[str, bytes]:
         "abstain_reasons_not_derived",
         forged_decision(
             decision,
-            rows=[
-                {
-                    **row,
-                    "expected_attributions_numerator": 2,
-                    "expected_attributions_denominator": 1,
-                }
-                if row["hotkey"] == "MinerE"
-                else row
-                for row in decision_doc["rows"]
-            ],
+            decision_policy={
+                **decision_doc["decision_policy"],
+                "min_expected_attributions": 16,
+            },
         ),
     )
     add(
@@ -938,6 +934,72 @@ def negative_documents() -> dict[str, bytes]:
         "model",
         "observation_counts_invalid",
         forged_decision(decision, serving_observation_count=0),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-rounds-exceeding-observations",
+        "model",
+        "observation_counts_invalid",
+        forged_decision(decision, round_count=decision_doc["observation_count"] + 1),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-expected-attributions-exceeding-opportunities",
+        "model",
+        "row_expected_attributions_inconsistent",
+        forged_decision(
+            decision,
+            rows=[
+                {
+                    **row,
+                    "expected_attributions_numerator": row["opportunities"] + 1,
+                    "expected_attributions_denominator": 1,
+                }
+                if row["hotkey"] == "MinerA"
+                else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-replica-share-aggregation-mismatch",
+        "model",
+        "row_expected_attributions_inconsistent",
+        forged_decision(
+            decision,
+            rows=[
+                {
+                    **row,
+                    "replica_share_counts": [
+                        {"opportunity_count": row["opportunities"], "replica_count": 2}
+                    ],
+                }
+                if row["hotkey"] == "MinerA"
+                else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-noncanonical-expected-attribution",
+        "model",
+        "row_expected_attributions_inconsistent",
+        forged_decision(
+            decision,
+            rows=[
+                {
+                    **row,
+                    "expected_attributions_numerator": row["expected_attributions_numerator"] * 2,
+                    "expected_attributions_denominator": row["expected_attributions_denominator"]
+                    * 2,
+                }
+                if row["hotkey"] == "MinerA"
+                else row
+                for row in decision_doc["rows"]
+            ],
+        ),
     )
     add(
         "validator-weight-decision",

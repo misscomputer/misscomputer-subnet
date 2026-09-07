@@ -63,11 +63,12 @@ Frozen rules
 10. **One coherent, unbroken manifest chain.** Every manifest in the window,
     every archived manifest the coordinator accepted between them, and the
     terminal manifest must form one chain: one central authority, one
-    manifest per sequence, consecutive sequences from the window's first to
-    the terminal with every ``previous`` link verified, monotonic finalized
-    height and epoch, one hash and epoch per height. Two different manifests
-    at one sequence are publisher equivocation and a missing intermediate
-    sequence is a gap; both refuse the inputs outright.
+    manifest per sequence and every actual digest-linked transition supplied
+    from the window's first to the terminal, with monotonic finalized height
+    and epoch and one hash and epoch per height. Sequence values may make the
+    bounded jumps already enforced when each publication was accepted. Two
+    different manifests at one sequence are publisher equivocation and a
+    missing actual predecessor is a gap; both refuse the inputs outright.
 11. **Deterministic, self-enforcing boundary.** The sealed
     ``validator-weight-decision`` v1 document is the only input to the
     decision-aware weight-plan builder. Every abstain reason and every row
@@ -79,8 +80,10 @@ Frozen rules
 12. **Positive weight needs sealed serving evidence.** A positive row must
     carry at least ``scoring_policy.min_attributions`` attributions, bounded
     by its opportunities and by the record's serving observation count, and
-    the positive weights must be one normalized distribution; a digest-valid
-    record cannot assign weight to a miner it never observed serving.
+    its expected attributions are recomputed exactly from sealed
+    replica-cardinality opportunity buckets. The positive weights must be one
+    normalized distribution; a digest-valid record cannot assign weight to a
+    miner it never observed serving.
 
 This module is pure: no clock, network, file, process, environment, wallet,
 chain, randomness, or signing capability.
@@ -97,6 +100,7 @@ from pydantic import Field, StringConstraints, ValidationError, model_validator
 
 from .assignment_probe import (
     MAX_EPOCH,
+    MAX_REPLICAS,
     UID,
     ActiveAssignmentManifest,
     Digest,
@@ -124,6 +128,7 @@ from .probe_scoring import (
     ProbeScoringWindow,
     ProbeWeightVector,
     RegisteredMiner,
+    ReplicaShareCount,
     accumulate_scoring_window,
     build_probe_weight_vector,
 )
@@ -283,6 +288,10 @@ class WeightDecisionRow(StrictFrozenModel):
     opportunities: int = Field(ge=0)
     expected_attributions_numerator: int = Field(ge=0)
     expected_attributions_denominator: int = Field(ge=1)
+    #: Counts of opportunities grouped by the published replica-set size.
+    #: These buckets make the fair-share expectation independently
+    #: recomputable from the sealed decision instead of trusting its fraction.
+    replica_share_counts: list[ReplicaShareCount] = Field(max_length=MAX_REPLICAS)
     first_seen_epoch: Epoch | None
     #: Whether the terminal manifest (or, absent one, the latest accepted
     #: manifest) assigns this miner. Sealed so that classification and the
@@ -295,7 +304,24 @@ class WeightDecisionRow(StrictFrozenModel):
             raise ValueError("row_weight_classification_invalid")
         if self.attributions > self.opportunities:
             raise ValueError("row_attributions_exceed_opportunities")
-        if (self.opportunities == 0) != (self.expected_attributions == 0):
+        replica_counts = [item.replica_count for item in self.replica_share_counts]
+        if replica_counts != sorted(set(replica_counts)):
+            raise ValueError("row_replica_share_counts_not_canonical")
+        if sum(item.opportunity_count for item in self.replica_share_counts) != (
+            self.opportunities
+        ):
+            raise ValueError("row_expected_attributions_inconsistent")
+        recomputed_expected = sum(
+            (
+                Fraction(item.opportunity_count, item.replica_count)
+                for item in self.replica_share_counts
+            ),
+            Fraction(0),
+        )
+        if self.expected_attributions > self.opportunities or (
+            self.expected_attributions_numerator,
+            self.expected_attributions_denominator,
+        ) != (recomputed_expected.numerator, recomputed_expected.denominator):
             raise ValueError("row_expected_attributions_inconsistent")
         if self.weight > 0.0 and self.attributions == 0:
             raise ValueError("row_positive_weight_without_evidence")
@@ -507,6 +533,8 @@ class ValidatorWeightDecision(StrictFrozenModel):
             raise ValueError("scoring_window_digest_inconsistent")
         if self.serving_observation_count > self.observation_count:
             raise ValueError("observation_counts_invalid")
+        if self.round_count > self.observation_count:
+            raise ValueError("observation_counts_invalid")
         if self.round_count == 0 and self.observation_count > 0:
             raise ValueError("observation_counts_invalid")
         if self.observation_count == 0 and any(row.opportunities > 0 for row in self.rows):
@@ -661,6 +689,21 @@ def _plan_rows(rows: Sequence[WeightDecisionRow]) -> list[dict[str, object]]:
     return [{"miner_hotkey": item.hotkey, "weight": item.weight} for item in rows]
 
 
+def _validated_weight_submission(
+    decision: ValidatorWeightDecision,
+) -> tuple[ValidatorWeightDecision, tuple[tuple[str, float], ...]]:
+    """Snapshot a sealed submission and its committed rows into private immutable values."""
+
+    decision = revalidate(decision, ValidatorWeightDecision)
+    if decision.decision != "submit" or decision.weight_plan_rows_digest_sha256 is None:
+        _reject("decision_not_submittable")
+    row_values = tuple((row.hotkey, row.weight) for row in decision.rows)
+    rows = [{"miner_hotkey": hotkey, "weight": weight} for hotkey, weight in row_values]
+    if digest(rows) != decision.weight_plan_rows_digest_sha256:
+        _reject("decision_not_submittable")
+    return decision, row_values
+
+
 def weight_plan_rows_for_submission(decision: ValidatorWeightDecision) -> list[dict[str, object]]:
     """The exact ``build_weight_plan`` rows a submit decision commits to.
 
@@ -669,13 +712,8 @@ def weight_plan_rows_for_submission(decision: ValidatorWeightDecision) -> list[d
     forged or defective ``submit`` never reaches this point.
     """
 
-    decision = revalidate(decision, ValidatorWeightDecision)
-    if decision.decision != "submit" or decision.weight_plan_rows_digest_sha256 is None:
-        _reject("decision_not_submittable")
-    rows = _plan_rows(decision.rows)
-    if digest(rows) != decision.weight_plan_rows_digest_sha256:
-        _reject("decision_not_submittable")
-    return rows
+    _, row_values = _validated_weight_submission(decision)
+    return [{"miner_hotkey": hotkey, "weight": weight} for hotkey, weight in row_values]
 
 
 def _validate_epoch(value: int) -> int:
@@ -757,14 +795,14 @@ def _verify_manifest_chain(
 ) -> None:
     """Refuse a window whose manifests are not one unbroken chain from one authority.
 
-    The manifests must occupy consecutive sequences from the lowest to the
-    highest supplied, and every manifest's ``previous`` link must name the
-    manifest at the sequence before it. A validator's chain state only ever
-    advances by consecutive accepted sequences, so the coordinator always
-    holds every intermediate manifest; one it did not probe is supplied as an
-    archived manifest. Without this, rounds probed on one chain could be
-    combined with a terminal manifest from a fork simply by omitting the
-    sequence at which the two chains diverge.
+    Every manifest's ``previous`` link must name the preceding supplied
+    manifest. Sequence numbers may make the bounded positive jumps permitted
+    by the trust policy when each publication was accepted; a skipped integer
+    is not evidence that an intermediate publication existed. The coordinator
+    must supply every *actual* digest-linked transition, using an archived
+    manifest for one it did not probe. Without this, rounds probed on one chain
+    could be combined with a terminal manifest from a fork simply by omitting
+    the transition at which the two chains diverge.
     """
 
     # One authority per window; the trust-policy digest may legitimately
@@ -784,9 +822,9 @@ def _verify_manifest_chain(
             _reject("decision_manifest_chain_incoherent")
     ordered = [by_sequence[sequence] for sequence in sorted(by_sequence)]
     for previous, current in zip(ordered, ordered[1:], strict=False):
-        if current.sequence != previous.sequence + 1:
-            _reject("decision_manifest_chain_gap")
         if current.previous_manifest_digest_sha256 != previous.manifest_digest_sha256:
+            if current.sequence - previous.sequence > 1:
+                _reject("decision_manifest_chain_gap")
             _reject("decision_manifest_chain_incoherent")
         if (
             current.finalized_height < previous.finalized_height
@@ -818,14 +856,15 @@ def decide_weight_submission(
 
     ``rounds`` are the verified ``(manifest, report)`` pairs probed inside the
     window. ``terminal`` is the manifest fetch made at or after window close.
-    ``archived_manifests`` are the manifests the coordinator accepted into its
-    chain state between the window's first probed sequence and the terminal
-    but did not probe; the whole span must be one unbroken chain, so every
-    intermediate sequence has to be supplied. They contribute sightings and
-    assigned-set sizes but no evidence. ``endpoint_first_seen_epoch`` lets the
-    coordinator supply earlier sightings of an endpoint incarnation from its
-    own accepted-manifest archive; a supplied value may only be earlier than
-    the in-window sighting. ``prior_assigned_baseline`` is the
+    ``archived_manifests`` are the actual publications the coordinator accepted
+    into its chain state between the window's first probed manifest and the
+    terminal but did not probe; the whole span must be one unbroken digest
+    chain, so every intermediate publication has to be supplied. They
+    contribute sightings and assigned-set sizes but no evidence.
+    ``endpoint_first_seen_epoch`` lets the coordinator supply earlier sightings
+    of an endpoint incarnation from its own accepted-manifest archive; a
+    supplied value may only be earlier than the in-window sighting.
+    ``prior_assigned_baseline`` is the
     ``assigned_baseline`` sealed by the coordinator's previous decision; a
     coordinator that holds one must supply it, and the record seals both what
     was supplied and how it was applied.
@@ -1019,6 +1058,7 @@ def decide_weight_submission(
                 opportunities=0 if tally is None else tally.opportunities,
                 expected_attributions_numerator=expected.numerator,
                 expected_attributions_denominator=expected.denominator,
+                replica_share_counts=([] if tally is None else list(tally.replica_share_counts)),
                 first_seen_epoch=first_seen,
                 assigned_at_close=assigned_at_close,
             )

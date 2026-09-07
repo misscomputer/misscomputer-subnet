@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import json
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -40,6 +43,7 @@ from contract_checkpoint_context import (
 )
 from pydantic import ValidationError
 
+from misscomputer_subnet import weight_plan as weight_plan_module
 from misscomputer_subnet.assignment_probe import (
     AssignmentProbeError,
     ProbeObservation,
@@ -1354,7 +1358,7 @@ def test_mass_guard_counts_registered_identities_only() -> None:
 
 
 def test_manifest_chain_must_be_unbroken_across_omitted_sequences() -> None:
-    """Rounds from one chain cannot meet a terminal from a fork by omitting the divergence."""
+    """Only actual digest-linked transitions are required across a decision window."""
 
     context = make_window_context()
     policy = context.policy
@@ -1420,6 +1424,22 @@ def test_manifest_chain_must_be_unbroken_across_omitted_sequences() -> None:
     assert honest.decision == "submit"
     assert honest.round_count == 33
     assert classes(honest)["MinerE"] == "verified_serving"
+    # Sequence values may jump without an intermediate publication. A
+    # terminal that directly links the last probed digest is therefore a
+    # complete chain even when its sequence is not previous + 1.
+    direct_jump = build_probe_manifest(
+        policy,
+        list(context.manifests[2].deployments),
+        sequence=context.manifests[0].sequence + policy.max_sequence_gap,
+        previous=context.manifests[0].manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 3_000,
+        expires_at=BASE_EPOCH + 3_000 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 40,
+        finalized_block_hash=label_digest("direct-bounded-jump"),
+    )
+    jumped = decide(one_only, direct_jump)
+    assert jumped.terminal_manifest_sequence == direct_jump.sequence
+    assert jumped.terminal_manifest_digest_sha256 == direct_jump.manifest_digest_sha256
     # Archived manifests are ordinary chain members: they may not lie beyond
     # the terminal, must re-validate, and contribute sightings and assigned
     # set sizes but no evidence.
@@ -1479,6 +1499,23 @@ def test_positive_weight_requires_sealed_serving_evidence() -> None:
     positive = [row for row in golden.rows if row.weight > 0.0]
     assert positive and all(row.attributions >= 1 for row in positive)
     assert sum(row.attributions for row in golden.rows) <= golden.serving_observation_count
+    assert golden.round_count <= golden.observation_count
+    for row in golden.rows:
+        recomputed = sum(
+            (
+                Fraction(item.opportunity_count, item.replica_count)
+                for item in row.replica_share_counts
+            ),
+            Fraction(0),
+        )
+        assert sum(item.opportunity_count for item in row.replica_share_counts) == (
+            row.opportunities
+        )
+        assert (row.expected_attributions_numerator, row.expected_attributions_denominator) == (
+            recomputed.numerator,
+            recomputed.denominator,
+        )
+        assert recomputed <= row.opportunities
     rows = document["rows"]
 
     def refuse(code: str, **changes: Any) -> None:
@@ -1497,6 +1534,7 @@ def test_positive_weight_requires_sealed_serving_evidence() -> None:
     refuse("observation_counts_invalid", serving_observation_count=0)
     refuse("observation_counts_invalid", observation_count=0, serving_observation_count=0)
     refuse("observation_counts_invalid", round_count=0, scoring_window_digest_sha256=None)
+    refuse("observation_counts_invalid", round_count=document["observation_count"] + 1)
     refuse(
         "observation_counts_invalid",
         serving_observation_count=sum(row["attributions"] for row in rows) - 1,
@@ -1513,7 +1551,18 @@ def test_positive_weight_requires_sealed_serving_evidence() -> None:
     refuse(
         "observation_counts_invalid",
         rows=[
-            {**row, "opportunities": document["observation_count"] + 1}
+            {
+                **row,
+                "opportunities": document["observation_count"] + 1,
+                "expected_attributions_numerator": document["observation_count"] + 1,
+                "expected_attributions_denominator": 3,
+                "replica_share_counts": [
+                    {
+                        "opportunity_count": document["observation_count"] + 1,
+                        "replica_count": 3,
+                    }
+                ],
+            }
             if row["hotkey"] == "MinerA"
             else row
             for row in rows
@@ -1523,6 +1572,48 @@ def test_positive_weight_requires_sealed_serving_evidence() -> None:
         "row_expected_attributions_inconsistent",
         rows=[
             {**row, "expected_attributions_numerator": 0} if row["hotkey"] == "MinerA" else row
+            for row in rows
+        ],
+    )
+    # Expected attribution is no larger than opportunities and is the exact,
+    # reduced rational sum of the sealed replica-cardinality buckets.
+    refuse(
+        "row_expected_attributions_inconsistent",
+        rows=[
+            {
+                **row,
+                "expected_attributions_numerator": row["opportunities"] + 1,
+                "expected_attributions_denominator": 1,
+            }
+            if row["hotkey"] == "MinerA"
+            else row
+            for row in rows
+        ],
+    )
+    refuse(
+        "row_expected_attributions_inconsistent",
+        rows=[
+            {
+                **row,
+                "replica_share_counts": [
+                    {"opportunity_count": row["opportunities"], "replica_count": 2}
+                ],
+            }
+            if row["hotkey"] == "MinerA"
+            else row
+            for row in rows
+        ],
+    )
+    refuse(
+        "row_expected_attributions_inconsistent",
+        rows=[
+            {
+                **row,
+                "expected_attributions_numerator": row["expected_attributions_numerator"] * 2,
+                "expected_attributions_denominator": row["expected_attributions_denominator"] * 2,
+            }
+            if row["hotkey"] == "MinerA"
+            else row
             for row in rows
         ],
     )
@@ -1599,7 +1690,7 @@ def _bound_registered(
     )
 
 
-def test_decision_rows_must_cover_the_complete_eligible_set() -> None:
+def test_decision_rows_must_cover_the_complete_eligible_set(monkeypatch: Any) -> None:
     """A decision that silently omits an eligible miner cannot become a plan."""
 
     context = make_window_context()
@@ -1643,6 +1734,32 @@ def test_decision_rows_must_cover_the_complete_eligible_set() -> None:
         rows=weight_plan_rows_for_submission(omitted),
         version_key=1,
     )
+    # The Pydantic decision is frozen only at its outer shell. Prove that an
+    # adversarial concurrent append after committed plan rows were captured
+    # cannot make later coverage checks see a different nested list. The old
+    # implementation accepted the omitted rows as a plan after this append.
+    real_fingerprint = weight_plan_module.snapshot_identity_fingerprint
+    fingerprint_entered = Event()
+    mutation_complete = Event()
+    fingerprint_calls = 0
+
+    def racing_fingerprint(snapshot: Any) -> str:
+        nonlocal fingerprint_calls
+        fingerprint_calls += 1
+        if fingerprint_calls == 1:
+            fingerprint_entered.set()
+            assert mutation_complete.wait(timeout=5)
+        return real_fingerprint(snapshot)
+
+    monkeypatch.setattr(weight_plan_module, "snapshot_identity_fingerprint", racing_fingerprint)
+    complete_g = next(row for row in context.decision.rows if row.hotkey == "MinerG")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(build, omitted, view)
+        assert fingerprint_entered.wait(timeout=5)
+        omitted.rows.append(complete_g)
+        mutation_complete.set()
+        with pytest.raises(WeightPlanError, match="complete eligible miner set"):
+            future.result(timeout=5)
     # An inactive neuron is not eligible: a decision over the active set
     # builds against a snapshot that carries it, and one that judged it does not.
     dormant = MetagraphNeuron(

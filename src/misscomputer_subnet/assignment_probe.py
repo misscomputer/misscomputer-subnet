@@ -1331,7 +1331,10 @@ def verify_historical_active_assignment_manifest(
     ``issued_at_epoch``. Everything else is identical: canonical form, policy
     binding, purpose, threshold, roles, real Ed25519 verification, and the
     append-only chain rules, which here additionally require the manifest to
-    be exactly the next sequence. A historical manifest is never probed; it
+    be the next digest-linked transition supplied by the history walker. Like
+    a live transition, its sequence may advance by any positive delta up to
+    ``max_sequence_gap``; sequence numbers do not imply that an unpublished
+    intermediate manifest exists. A historical manifest is never probed; it
     exists only to close the gap to a live head, whose fresh verification then
     authenticates the whole replayed span through its ``previous`` links.
     """
@@ -1345,7 +1348,12 @@ def verify_historical_active_assignment_manifest(
     if not 1 <= len(envelopes) <= MAX_KEYS:
         _reject("signature_binding_mismatch")
     _verify_policy_binding(value, policy, evaluation_epoch=evaluation_epoch)
-    if value.sequence != state.last_sequence + 1:
+    if state.accepted_manifest_count == 0:
+        sequence_gap = value.sequence != 1
+    else:
+        sequence_delta = value.sequence - state.last_sequence
+        sequence_gap = not 1 <= sequence_delta <= policy.max_sequence_gap
+    if sequence_gap:
         _reject("history_sequence_gap")
     signer_ids, roles = _verify_signatures(
         value,

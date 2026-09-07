@@ -51,8 +51,8 @@ ceremony per publication without changing what an attacker can achieve.
 Onboarding and catch-up
 -----------------------
 A validator's chain state starts at genesis and otherwise only ever advances
-by consecutive accepted sequences, so two situations need a defined,
-authenticated path:
+through accepted digest-linked publications (whose sequence values may make
+bounded positive jumps), so two situations need a defined, authenticated path:
 
 - **Onboarding.** A validator with no history has nothing to compare against;
   :func:`anchor_manifest_chain_state` accepts the current head at any
@@ -65,10 +65,10 @@ authenticated path:
   links back from the head, fetching each historical manifest, its immutable
   pointer copy, and the signature objects the copy names, until it reaches
   its last accepted digest. :func:`replay_manifest_history` then verifies the
-  span in ascending order under historical semantics and yields the state
-  from which the head verifies live. The span is bounded by the pinned
-  policy's ``max_sequence_gap``; a deeper gap is an operator re-anchoring
-  event, never a silent reset.
+  actual span in ascending order under historical semantics and yields the
+  state from which the head verifies live. The span is bounded by the pinned
+  policy's ``max_sequence_gap`` actual history entries; a deeper history is
+  an operator re-anchoring event, never a silent reset.
 
 Key rotation
 ------------
@@ -267,10 +267,13 @@ class AssignmentManifestLatestPointer(StrictFrozenModel):
 class LatestPointerVerdict:
     """Pre-fetch outcome: which immutable objects to fetch and how the chain state relates.
 
-    ``history_depth`` is the number of publications strictly between the last
-    accepted sequence and the pointer's sequence; when it is positive the
-    fetcher must walk ``previous`` links and :func:`replay_manifest_history`
-    before the named manifest can extend the chain state.
+    Sequence numbers may make bounded jumps, so a head pointer alone cannot
+    reveal the exact number of publications between it and the last accepted
+    digest. ``history_depth`` is therefore the maximum number of historical
+    entries the fetcher may walk: zero when the head directly names the local
+    digest, otherwise the tighter of the remaining sequence slots and the
+    policy's history-entry bound. The walk stops when it reaches the local
+    digest and :func:`replay_manifest_history` validates its actual length.
     """
 
     manifest_object_key: str
@@ -364,9 +367,10 @@ def _verify_pointer_chain_position(
 ) -> tuple[bool, int]:
     """Mirror the append-only chain rules on the pointer's copied chain fields.
 
-    Returns ``(reprobe, history_depth)``. A gap of up to ``max_sequence_gap``
-    publications is not a rejection: it is the span the fetcher must replay
-    through :func:`replay_manifest_history` before the head can be accepted.
+    Returns ``(reprobe, history_depth)``. A sequence delta is bounded only for
+    a direct digest-linked transition. When history is required, its actual
+    entries (and the final head transition) enforce that bound per hop; the
+    pointer can expose only a safe traversal budget, not an exact depth.
     """
 
     if state.accepted_manifest_count == 0:
@@ -379,20 +383,34 @@ def _verify_pointer_chain_position(
         return True, 0
     if pointer.sequence < state.last_sequence:
         _reject("pointer_rollback")
-    if pointer.sequence - state.last_sequence > policy.max_sequence_gap:
-        _reject("pointer_sequence_gap")
-    history_depth = pointer.sequence - state.last_sequence - 1
-    if history_depth == 0 and (
-        pointer.previous_manifest_digest_sha256 != state.last_manifest_digest_sha256
-    ):
-        _reject("pointer_equivocation")
+    sequence_delta = pointer.sequence - state.last_sequence
+    direct_extension = pointer.previous_manifest_digest_sha256 == state.last_manifest_digest_sha256
+    if direct_extension:
+        if sequence_delta > policy.max_sequence_gap:
+            _reject("pointer_sequence_gap")
+        history_depth = 0
+    else:
+        # At least one intermediate publication is required. With strictly
+        # increasing sequence numbers, a delta of one leaves no slot for it.
+        if sequence_delta == 1:
+            _reject("pointer_equivocation")
+        # Each digest-linked hop may advance by at most max_sequence_gap and
+        # at most that many actual historical entries may be replayed. Reject
+        # only when even the shortest possible bounded-jump path cannot fit;
+        # a large cumulative delta is otherwise not itself a per-hop failure.
+        minimum_history_entries = (sequence_delta - 1) // policy.max_sequence_gap
+        if minimum_history_entries > policy.max_sequence_gap:
+            _reject("pointer_sequence_gap")
+        history_depth = min(sequence_delta - 1, policy.max_sequence_gap)
     last_height = state.last_finalized_height
     last_epoch = state.last_finalized_epoch
     if last_height is None or last_epoch is None:
         _reject("pointer_rollback")
     if pointer.finalized_height < last_height or pointer.finalized_epoch < last_epoch:
         _reject("pointer_rollback")
-    if pointer.finalized_height - last_height > policy.max_finalized_height_gap:
+    if direct_extension and (
+        pointer.finalized_height - last_height > policy.max_finalized_height_gap
+    ):
         _reject("pointer_sequence_gap")
     if pointer.finalized_height == last_height and (
         pointer.finalized_block_hash != state.last_finalized_block_hash
@@ -595,26 +613,31 @@ def replay_manifest_history(
     *,
     evaluation_epoch: int,
 ) -> AssignmentManifestChainState:
-    """Advance a chain state across the consecutive historical publications it missed.
+    """Advance a chain state across the digest-linked historical publications it missed.
 
     ``history`` is the span strictly between the validator's last accepted
     manifest and the live head, in ascending sequence order, each entry
     carrying the immutable pointer copy, the manifest, and exactly the
     envelopes that copy names. Every entry is bound pointer-to-objects, then
     verified under historical semantics, and must be exactly the next
-    sequence; the returned state is the one the live head must extend. The
-    head itself is not part of the history and is verified live afterwards,
-    which is what authenticates the replayed span end to end. The span may
-    not exceed the policy's ``max_sequence_gap``; a validator further behind
-    than that is re-anchored by its operator, never silently resynchronised.
+    digest-linked transition; its positive sequence delta is independently
+    bounded by ``max_sequence_gap``. The returned state is the one the live
+    head must extend. The head itself is not part of the history and is
+    verified live afterwards, which is what authenticates the replayed span
+    end to end. The span may not exceed the policy's ``max_sequence_gap``; a
+    validator further behind than that is re-anchored by its operator, never
+    silently resynchronised.
     """
 
     _validate_evaluation_epoch(evaluation_epoch)
     state = revalidate(prior_chain_state, AssignmentManifestChainState)
     policy = revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
-    if len(history) > policy.max_sequence_gap:
+    # Snapshot the caller-owned sequence before measuring it so the actual
+    # entries checked against the bound are exactly the entries replayed.
+    entries = tuple(history)
+    if len(entries) > policy.max_sequence_gap:
         _reject("history_depth_exceeded")
-    for entry in history:
+    for entry in entries:
         pointer = revalidate(entry.pointer, AssignmentManifestLatestPointer)
         manifest = revalidate(entry.manifest, ActiveAssignmentManifest)
         if (
@@ -632,7 +655,12 @@ def replay_manifest_history(
             bind_latest_pointer_to_manifest(pointer, manifest, entry.signatures)
         except ManifestPublicationError:
             _reject("history_pointer_mismatch")
-        if manifest.sequence != state.last_sequence + 1 or (
+        if state.accepted_manifest_count == 0:
+            sequence_gap = manifest.sequence != 1
+        else:
+            sequence_delta = manifest.sequence - state.last_sequence
+            sequence_gap = not 1 <= sequence_delta <= policy.max_sequence_gap
+        if sequence_gap or (
             state.accepted_manifest_count > 0
             and manifest.previous_manifest_digest_sha256 != state.last_manifest_digest_sha256
         ):
