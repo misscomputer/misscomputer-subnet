@@ -391,10 +391,15 @@ Frozen invariants:
   earlier). Sightings are scoped to the exact `(uid, hotkey)` identity, never
   to the last manifest that published an endpoint: an endpoint republished
   under a new UID adds a sighting for the new identity and cannot erase the
-  one recorded for the identity that earned weight in earlier rounds, and a
-  supplied archived sighting applies to every identity the chain published on
-  that endpoint. On parse, every non-`unassigned` row must carry a sighting no
-  later than the minimum `issued_at_epoch` of the sealed evidence manifests
+  one recorded for the identity that earned weight in earlier rounds. An
+  archived sighting is supplied per exact identity
+  (`identity_first_seen_epoch`, keyed by `(uid, hotkey)`), moves only that
+  identity, must not post-date that identity's earliest in-chain publication
+  (`decision_first_seen_after_sighting`), and is ignored for an identity the
+  chain never publishes; an archived sighting of the old UID therefore never
+  pulls a republished new UID out of grace. On parse, every non-`unassigned`
+  row must carry a sighting no later than the minimum `issued_at_epoch` of
+  the sealed evidence manifests
   that publish its identity (`row_first_seen_not_derived`); an earlier archived
   sighting remains valid. Grace creates no weight; a miner earns weight from
   the first window in which it is attributed. `activation_grace_seconds` may
@@ -450,6 +455,7 @@ defaults, not consensus.
 | Validator sampling too sparse | `rounds_insufficient`/`coverage_insufficient`; abstain | the validator's gap never becomes a miner's zero |
 | Digest-valid rewrite shifts a miner's first sighting later to manufacture activation grace | `row_first_seen_not_derived` on parse; never reaches a plan | every non-unassigned row is bounded by the earliest sealed manifest publication of its identity, while a genuinely earlier archived sighting remains legal |
 | Endpoint republished under a new UID while the earlier registered identity earned weight in the window | producer seals the earning identity's original sighting; the record round-trips and its rewrite is still `row_first_seen_not_derived` | sightings are keyed by exact identity, so a later UID owner never erases an earlier `(uid, hotkey)` sighting |
+| Old UID's archived sighting supplied for an endpoint republished under a new UID | the new UID keeps its own republication sighting (`assigned_in_grace` if unverified); only the archived identity moves earlier; the record round-trips, and rewriting the new UID's sighting later, erasing it, or back-dating it to the old UID's epoch is refused on parse (`row_first_seen_not_derived`, `row_assigned_first_seen_missing`, `row_classification_not_derived`) | archived sightings are keyed by exact `(uid, hotkey)`, never by endpoint, so archive data cannot cross-credit identities |
 | Miner newly activated late in a window | `assigned_in_grace`; window still submits | new miners cannot stall the network |
 | Miner registered but never assigned | `unassigned`, zero under safe preconditions | assignment is the central authority's prerogative; weight follows serving |
 | Registered set from a different chain segment (behind, too far ahead, same height with another hash or epoch, lower epoch) | `registered_set_unbound`; abstain | plan and manifest views must agree |
@@ -499,7 +505,9 @@ contract shape.
    decision policy defaults assume roughly one probe per minute over a
    one-hour window, and the policy enforces only `grace <= window`.
 4. **Archive-derived first-seen sightings.** A coordinator may or may not
-   supply earlier endpoint sightings from its archive; both are conforming.
+   supply earlier identity sightings from its archive; both are conforming.
+   What is not open is their scope: a supplied sighting names the exact
+   `(uid, hotkey)` it was archived for and never applies to another identity.
    Cross-window mass-unassignment protection is not an open choice: the
    sealed baseline is part of the v1 record and a coordinator that holds one
    must supply it. Neither is chain completeness: a coordinator that did not

@@ -36,11 +36,12 @@ Frozen rules
    accepted manifests, the terminal manifest, and any earlier sighting the
    coordinator supplies from its archive) is less than
    ``activation_grace_seconds`` before window close is never the reason to
-   abstain and is reported as ``assigned_in_grace`` if unverified. Sightings
-   are scoped to the exact ``(uid, hotkey)`` identity, so an endpoint
-   republished under another UID never erases an earlier identity's sighting.
-   Grace creates no weight: the miner earns weight from the first window in
-   which it is attributed.
+   abstain and is reported as ``assigned_in_grace`` if unverified. Sightings,
+   including archived ones, are scoped to the exact ``(uid, hotkey)``
+   identity, so an endpoint republished under another UID never erases an
+   earlier identity's sighting and an archived sighting of the earlier
+   identity never pulls the new UID out of grace. Grace creates no weight:
+   the miner earns weight from the first window in which it is attributed.
 7. **Finalized window closure.** Reports are admitted only with
    ``window_start_epoch <= evaluation_epoch < window_end_epoch`` and before
    their manifest's effective horizon; the terminal manifest observation is
@@ -1117,7 +1118,7 @@ def _assigned_identities(
 
 def _identity_first_seen(
     chain: Sequence[ActiveAssignmentManifest],
-    supplied_endpoint_sightings: Mapping[str, int],
+    supplied_identity_sightings: Mapping[tuple[int, str], int],
 ) -> dict[tuple[int, str], int]:
     """Earliest sighting of every exact ``(uid, hotkey)`` identity the chain publishes.
 
@@ -1128,14 +1129,16 @@ def _identity_first_seen(
     parser's ``row_first_seen_not_derived`` bound: an identity's sighting is
     never later than the earliest sealed manifest that publishes it.
 
-    A coordinator-supplied earlier endpoint sighting may not post-date that
-    endpoint's earliest in-chain publication and is applied to every identity
-    the chain published on the endpoint; it can only move a sighting earlier.
+    Archived sightings are identity-scoped too. A coordinator supplies each
+    earlier sighting keyed by the exact ``(uid, hotkey)`` it was archived for;
+    it is applied to that identity alone, never to another UID that later
+    inherited the same endpoint, and it may not post-date the identity's
+    earliest in-chain publication. Every supplied epoch must be valid, and a
+    sighting for an identity the chain never publishes is ignored: without a
+    chain publication there is no row for it to anchor.
     """
 
     identity_first_seen: dict[tuple[int, str], int] = {}
-    endpoint_first_seen: dict[str, int] = {}
-    endpoint_identities: dict[str, set[tuple[int, str]]] = {}
     for manifest in chain:
         issued_at = manifest.issued_at_epoch
         for item in manifest.deployments:
@@ -1144,19 +1147,15 @@ def _identity_first_seen(
                 seen = identity_first_seen.get(identity)
                 if seen is None or issued_at < seen:
                     identity_first_seen[identity] = issued_at
-                endpoint_seen = endpoint_first_seen.get(replica.endpoint_id)
-                if endpoint_seen is None or issued_at < endpoint_seen:
-                    endpoint_first_seen[replica.endpoint_id] = issued_at
-                endpoint_identities.setdefault(replica.endpoint_id, set()).add(identity)
-    for endpoint_id, supplied in supplied_endpoint_sightings.items():
-        derived = endpoint_first_seen.get(endpoint_id)
+    for identity, supplied in supplied_identity_sightings.items():
+        supplied = _validate_epoch(supplied)
+        derived = identity_first_seen.get(identity)
         if derived is None:
             continue
-        if _validate_epoch(supplied) > derived:
+        if supplied > derived:
             _reject("decision_first_seen_after_sighting")
-        for identity in endpoint_identities[endpoint_id]:
-            if supplied < identity_first_seen[identity]:
-                identity_first_seen[identity] = supplied
+        if supplied < derived:
+            identity_first_seen[identity] = supplied
     return identity_first_seen
 
 
@@ -1283,7 +1282,7 @@ def decide_weight_submission(
     window_end_epoch: int,
     decision_policy: WeightDecisionPolicy | None = None,
     scoring_policy: ProbeScoringPolicy | None = None,
-    endpoint_first_seen_epoch: Mapping[str, int] | None = None,
+    identity_first_seen_epoch: Mapping[tuple[int, str], int] | None = None,
     prior_assigned_baseline: AssignedBaseline | None = None,
     archived_manifests: Sequence[ActiveAssignmentManifest] = (),
 ) -> ValidatorWeightDecision:
@@ -1296,12 +1295,14 @@ def decide_weight_submission(
     terminal but did not probe; the whole span must be one unbroken digest
     chain, so every intermediate publication has to be supplied. They
     contribute sightings and assigned-set sizes but no evidence.
-    ``endpoint_first_seen_epoch`` lets the coordinator supply earlier sightings
-    of an endpoint incarnation from its own accepted-manifest archive; a
-    supplied value may only be earlier than the in-window sighting and applies
-    to every identity the chain published on that endpoint. Sightings are kept
-    per exact ``(uid, hotkey)`` identity, so an endpoint republished under a
-    new UID never erases the sighting of the identity that earned weight.
+    ``identity_first_seen_epoch`` lets the coordinator supply earlier sightings
+    from its own accepted-manifest archive, keyed by the exact ``(uid, hotkey)``
+    identity each sighting was archived for. A supplied value may only be
+    earlier than that identity's in-chain sighting, moves only that identity,
+    and is ignored for an identity the chain never publishes. Sightings are
+    kept per exact identity, so an endpoint republished under a new UID never
+    erases the sighting of the identity that earned weight, and an archived
+    sighting of the old UID never pulls the new UID out of activation grace.
     ``prior_assigned_baseline`` is the
     ``assigned_baseline`` sealed by the coordinator's previous decision; a
     coordinator that holds one must supply it, and the record seals both what
@@ -1390,7 +1391,7 @@ def decide_weight_submission(
     if len(rounds) < policy.min_verified_rounds:
         reasons.add("rounds_insufficient")
 
-    miner_first_seen = _identity_first_seen(chain, endpoint_first_seen_epoch or {})
+    miner_first_seen = _identity_first_seen(chain, identity_first_seen_epoch or {})
 
     registered_keys = frozenset((miner.uid, miner.hotkey) for miner in registered.miners)
     chain_by_sequence: dict[int, ActiveAssignmentManifest] = {}

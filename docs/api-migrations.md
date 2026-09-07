@@ -101,8 +101,13 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   coordinator's archive remains valid. The producer records sightings per
   exact `(uid, hotkey)` identity rather than per endpoint owner, so an
   endpoint republished under a new UID never leaves the identity that earned
-  weight without a sighting; a supplied `endpoint_first_seen_epoch` entry
-  applies to every identity the chain published on that endpoint.
+  weight without a sighting. Archived sightings are supplied through
+  `identity_first_seen_epoch`, keyed by exact `(uid, hotkey)`; each entry
+  moves only that identity (it must not post-date the identity's earliest
+  in-chain publication, `decision_first_seen_after_sighting`, and is ignored
+  for an identity the chain never publishes), so the old UID's archive never
+  pulls a republished new UID out of activation grace. The former
+  endpoint-keyed `endpoint_first_seen_epoch` input is removed.
 - Assigned sets are counted in registered identities only:
   `terminal_assigned_miner_count` must equal the rows sealed
   `assigned_at_close` (`assigned_counts_invalid`), and the successor

@@ -515,15 +515,11 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
     )
     assert few_rounds.abstain_reasons == ["rounds_insufficient"]
 
-    # Pull MinerF out of grace with an archived earlier sighting: nine
-    # opportunities are then below a ten-attribution coverage requirement, so
-    # F's silence is the validator's sampling gap, never a zero.
-    delta_endpoint = next(
-        replica.endpoint_id
-        for item in context.manifests[2].deployments
-        for replica in item.replicas
-        if replica.miner_hotkey == "MinerF"
-    )
+    # Pull MinerF out of grace with an archived earlier sighting of its exact
+    # identity: nine opportunities are then below a ten-attribution coverage
+    # requirement, so F's silence is the validator's sampling gap, never a
+    # zero. A sighting for an identity the chain never published is ignored.
+    miner_f = (15, "MinerF")
     undersampled = decide_weight_submission(
         context.rounds,
         terminal=context.terminal,
@@ -531,7 +527,7 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=WeightDecisionPolicy(min_expected_attributions=10),
-        endpoint_first_seen_epoch={delta_endpoint: BASE_EPOCH, "unknown-endpoint": BASE_EPOCH},
+        identity_first_seen_epoch={miner_f: BASE_EPOCH, (99, "MinerZ"): BASE_EPOCH},
     )
     assert undersampled.abstain_reasons == ["coverage_insufficient"]
     assert classes(undersampled)["MinerF"] == "assigned_undersampled"
@@ -544,7 +540,7 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
         registered=context.registered,
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
-        endpoint_first_seen_epoch={delta_endpoint: BASE_EPOCH},
+        identity_first_seen_epoch={miner_f: BASE_EPOCH},
     )
     assert sampled.decision == "submit"
     assert classes(sampled)["MinerF"] == "assigned_unverified"
@@ -556,9 +552,22 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
             registered=context.registered,
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
-            endpoint_first_seen_epoch={delta_endpoint: BASE_EPOCH + 3_001},
+            identity_first_seen_epoch={miner_f: BASE_EPOCH + 3_001},
         )
     assert failure.value.code == "decision_first_seen_after_sighting"
+    # Every supplied epoch is validated, even for an identity that is ignored.
+    invalid_epochs: tuple[Any, ...] = (-1, True, "1800000000")
+    for invalid in invalid_epochs:
+        with pytest.raises(WeightDecisionError) as failure:
+            decide_weight_submission(
+                context.rounds,
+                terminal=context.terminal,
+                registered=context.registered,
+                window_start_epoch=WINDOW_START,
+                window_end_epoch=WINDOW_END,
+                identity_first_seen_epoch={(99, "MinerZ"): invalid},
+            )
+        assert failure.value.code == "decision_epoch_invalid"
 
 
 def test_positive_evidence_does_not_bypass_minimum_coverage() -> None:
@@ -724,21 +733,15 @@ def test_uid_republication_never_erases_the_earning_identity_sighting() -> None:
         WINDOW_START - 1
     )
 
-    # An archived endpoint sighting applies to every identity published on the
-    # endpoint and may still not post-date the endpoint's earliest publication.
-    alpha_a_endpoint = next(
-        replica.endpoint_id
-        for item in republished.deployments
-        for replica in item.replicas
-        if replica.miner_hotkey == "MinerA"
-    )
-    archived = decide(endpoint_first_seen_epoch={alpha_a_endpoint: BASE_EPOCH - 100})
+    # An archived sighting names the exact identity it was archived for and
+    # may still not post-date that identity's earliest publication.
+    archived = decide(identity_first_seen_epoch={(10, "MinerA"): BASE_EPOCH - 100})
     assert next(row for row in archived.rows if row.hotkey == "MinerA").first_seen_epoch == (
         BASE_EPOCH - 100
     )
     assert parse_validator_weight_decision(validator_weight_decision_bytes(archived)) == archived
     with pytest.raises(WeightDecisionError) as failure:
-        decide(endpoint_first_seen_epoch={alpha_a_endpoint: BASE_EPOCH + 1})
+        decide(identity_first_seen_epoch={(10, "MinerA"): BASE_EPOCH + 1})
     assert failure.value.code == "decision_first_seen_after_sighting"
 
     # Seen from a registered view that already holds the new UID, the new
@@ -756,6 +759,115 @@ def test_uid_republication_never_erases_the_earning_identity_sighting() -> None:
         True,
     )
     assert new_a.weight == 0.0
+
+
+def test_archived_sighting_of_old_uid_never_leaves_republished_uid_grace() -> None:
+    """The old UID's archive cannot cross-credit a new UID that inherited its endpoint.
+
+    UID 10 earned its sighting on the alpha endpoint at window start; the
+    endpoint is republished as UID 99 sixty seconds before close. The
+    registered view now holds UID 99 alone. With or without the coordinator's
+    archived sighting for UID 10, UID 99's sighting is its own republication
+    and it stays ``assigned_in_grace``: an archived sighting moves only the
+    exact identity it names.
+    """
+
+    context = make_window_context()
+    republished_at = WINDOW_END - 60
+    republished = build_probe_manifest(
+        context.policy,
+        [
+            window_deployment("fixture-alpha", [(99, "MinerA"), *MINERS[1:3]], campaign_sequence=1),
+            window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2),
+        ],
+        sequence=2,
+        previous=context.manifests[0].manifest_digest_sha256,
+        issued_at=republished_at,
+        expires_at=republished_at + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 20,
+        finalized_block_hash=label_digest("republished-alpha-late"),
+    )
+    verify_active_assignment_manifest(
+        republished,
+        sign_manifest(republished, context.keys),
+        context.policy,
+        context.states[1],
+        evaluation_epoch=republished_at,
+        current_finalized_height=FINALIZED_HEIGHT,
+    )
+    terminal = TerminalManifestObservation(
+        status="verified", evaluated_at_epoch=WINDOW_END, manifest=republished
+    )
+    reregistered = registered_set(miners=tuple(sorted([*REGISTERED_MINERS[1:], (99, "MinerA")])))
+    old_archive = {(10, "MinerA"): BASE_EPOCH - 100}
+
+    def decide(**changes: Any) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            context.rounds[:24],
+            terminal=terminal,
+            registered=reregistered,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+            **changes,
+        )
+
+    def miner_a(decision: ValidatorWeightDecision) -> tuple[int, int | None, str]:
+        row = next(row for row in decision.rows if row.hotkey == "MinerA")
+        return (row.uid, row.first_seen_epoch, row.classification)
+
+    without_archive = decide()
+    with_old_archive = decide(identity_first_seen_epoch=old_archive)
+    for decision in (without_archive, with_old_archive):
+        assert decision.decision == "submit"
+        assert decision.abstain_reasons == []
+        assert miner_a(decision) == (99, republished_at, "assigned_in_grace")
+        rendered = validator_weight_decision_bytes(decision)
+        parsed = parse_validator_weight_decision(rendered)
+        assert parsed == decision
+        assert validator_weight_decision_bytes(parsed) == rendered
+        assert weight_plan_rows_for_submission(parsed)
+    # The old UID's archive changed nothing observable: the sealed records are
+    # byte-identical because UID 10 is not a registered identity here.
+    assert validator_weight_decision_bytes(with_old_archive) == validator_weight_decision_bytes(
+        without_archive
+    )
+
+    # Only a sighting archived for UID 99 itself moves UID 99, bounded by its
+    # own republication rather than by the endpoint's earlier history.
+    own_archive = decide(identity_first_seen_epoch={(99, "MinerA"): BASE_EPOCH + 1})
+    assert own_archive.abstain_reasons == ["coverage_insufficient"]
+    assert miner_a(own_archive) == (99, BASE_EPOCH + 1, "assigned_undersampled")
+    assert parse_validator_weight_decision(validator_weight_decision_bytes(own_archive)) == (
+        own_archive
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(identity_first_seen_epoch={(99, "MinerA"): republished_at + 1})
+    assert failure.value.code == "decision_first_seen_after_sighting"
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(identity_first_seen_epoch={**old_archive, (99, "MinerA"): republished_at + 1})
+    assert failure.value.code == "decision_first_seen_after_sighting"
+
+    # A digest-valid rewrite of the sealed record can neither erase UID 99's
+    # sighting, move it later, nor back-date it to the old UID's epoch while
+    # keeping the grace classification the producer derived.
+    rendered = validator_weight_decision_bytes(with_old_archive)
+    document = json.loads(rendered)
+
+    def with_uid_99_first_seen(value: int | None) -> dict[str, Any]:
+        return forged_decision(
+            rendered,
+            rows=[
+                {**row, "first_seen_epoch": value} if row["hotkey"] == "MinerA" else row
+                for row in document["rows"]
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="row_assigned_first_seen_missing"):
+        ValidatorWeightDecision.model_validate(with_uid_99_first_seen(None))
+    with pytest.raises(ValidationError, match="row_first_seen_not_derived"):
+        ValidatorWeightDecision.model_validate(with_uid_99_first_seen(republished_at + 1))
+    with pytest.raises(ValidationError, match="row_classification_not_derived"):
+        ValidatorWeightDecision.model_validate(with_uid_99_first_seen(BASE_EPOCH - 100))
 
 
 def test_no_positive_evidence_means_no_transaction() -> None:
