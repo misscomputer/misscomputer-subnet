@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -26,6 +26,7 @@ from contract_checkpoint_context import build_pointer
 from misscomputer_subnet.assignment_probe import (
     ActiveAssignmentManifest,
     AssignmentManifestChainState,
+    AssignmentManifestSignatureEnvelope,
     AssignmentProbeError,
     build_initial_manifest_chain_state,
     verify_active_assignment_manifest,
@@ -393,6 +394,53 @@ def _entry(manifest: ActiveAssignmentManifest, keys: dict) -> ManifestHistoryEnt
         manifest=manifest,
         signatures=signatures,
     )
+
+
+def test_history_replay_snapshots_each_entry_signature_sequence_once() -> None:
+    context = make_context(max_age=600)
+    manifest = _chain(context, 2)[1]
+    valid_signatures = tuple(sign_manifest(manifest, signer_keys()))
+    pointer_bound_but_invalid_signatures = (
+        valid_signatures[0].model_copy(
+            update={"signature_base64": valid_signatures[1].signature_base64}
+        ),
+        valid_signatures[1],
+    )
+
+    class FlippingSignatures(Sequence[AssignmentManifestSignatureEnvelope]):
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __len__(self) -> int:
+            return len(pointer_bound_but_invalid_signatures)
+
+        def __getitem__(self, index: int) -> AssignmentManifestSignatureEnvelope:
+            return pointer_bound_but_invalid_signatures[index]
+
+        def __iter__(self) -> Iterator[AssignmentManifestSignatureEnvelope]:
+            self.iterations += 1
+            if self.iterations == 1:
+                return iter(pointer_bound_but_invalid_signatures)
+            return iter(valid_signatures)
+
+    signatures = FlippingSignatures()
+    entry = ManifestHistoryEntry(
+        pointer=build_manifest_latest_pointer(manifest, pointer_bound_but_invalid_signatures),
+        manifest=manifest,
+        signatures=signatures,
+    )
+
+    # The pointer-bound signature snapshot is cryptographically invalid. A
+    # second read would flip to the valid envelopes and incorrectly accept it.
+    with pytest.raises(AssignmentProbeError) as failure:
+        replay_manifest_history(
+            context.verification.next_chain_state,
+            [entry],
+            context.policy,
+            evaluation_epoch=manifest.issued_at_epoch + 500,
+        )
+    assert failure.value.code == "signature_invalid"
+    assert signatures.iterations == 1
 
 
 def test_catch_up_replays_missed_publications_under_historical_semantics() -> None:

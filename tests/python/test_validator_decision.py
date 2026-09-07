@@ -39,6 +39,7 @@ from contract_checkpoint_context import (
     make_window_context,
     metagraph_view,
     registered_set,
+    reseal_decision,
     window_deployment,
 )
 from pydantic import ValidationError
@@ -270,7 +271,9 @@ def test_abstain_record_can_never_become_a_plan() -> None:
     assert abstained.weight_plan_rows_digest_sha256 is None
     assert abstained.terminal_manifest_rejection_code == "timeout"
     assert abstained.terminal_manifest_digest_sha256 is None
-    assert abstained.assigned_baseline is None
+    assert abstained.assigned_baseline == assigned_baseline(
+        context.manifests[2], established_at_epoch=WINDOW_END
+    )
     # Evidence is retained for audit, but it cannot be turned into rows.
     assert classes(abstained)["MinerA"] == "verified_serving"
     with pytest.raises(WeightDecisionError) as failure:
@@ -294,7 +297,6 @@ def test_sealed_record_re_derives_every_submit_precondition() -> None:
         terminal_finalized_height=None,
         terminal_finalized_block_hash=None,
         terminal_finalized_epoch=None,
-        assigned_baseline=None,
     )
     assert outage["decision"] == "submit"
     with pytest.raises(ValidationError, match="abstain_reasons_not_derived"):
@@ -309,7 +311,6 @@ def test_sealed_record_re_derives_every_submit_precondition() -> None:
         decision="abstain",
         abstain_reasons=["manifest_unavailable"],
         **{key: value for key, value in outage.items() if key.startswith("terminal_")},
-        assigned_baseline=None,
     )
     parsed = ValidatorWeightDecision.model_validate(honest)
     with pytest.raises(WeightDecisionError):
@@ -854,8 +855,8 @@ def test_mass_unassignment_baseline_survives_the_window_boundary() -> None:
             _reduced_window(context, prior=bad)
         assert failure.value.code == "decision_baseline_invalid"
 
-    # An outage carries the applied baseline forward untouched; an expired
-    # one is dropped so the successor starts clean.
+    # An outage carries the largest verified in-window set. On a tie it uses
+    # the fresh in-window evidence rather than preserving an older baseline.
     outage = decide_weight_submission(
         context.rounds,
         terminal=TerminalManifestObservation(
@@ -868,7 +869,9 @@ def test_mass_unassignment_baseline_survives_the_window_boundary() -> None:
             context.manifests[0], established_at_epoch=WINDOW_START
         ),
     )
-    assert outage.assigned_baseline == outage.prior_assigned_baseline
+    assert outage.assigned_baseline == assigned_baseline(
+        context.manifests[2], established_at_epoch=WINDOW_END
+    )
     assert outage.prior_assigned_baseline_status == "applied"
     assert outage.max_assigned_miner_count == 6
     dropped = decide_weight_submission(
@@ -884,7 +887,51 @@ def test_mass_unassignment_baseline_survives_the_window_boundary() -> None:
         ),
     )
     assert dropped.prior_assigned_baseline_status == "expired"
-    assert dropped.assigned_baseline is None
+    assert dropped.assigned_baseline == assigned_baseline(
+        context.manifests[2], established_at_epoch=WINDOW_END
+    )
+
+
+@pytest.mark.parametrize("expired_prior", [False, True])
+@pytest.mark.parametrize(
+    ("terminal_status", "terminal_reason"),
+    [("unavailable", "manifest_unavailable"), ("rejected", "manifest_invalid")],
+)
+def test_outage_window_carries_verified_max_into_next_reduction(
+    *, expired_prior: bool, terminal_status: Any, terminal_reason: str
+) -> None:
+    """A close-time outage cannot erase a first-window or expired-prior guard horizon."""
+
+    context = make_window_context()
+    prior = (
+        assigned_baseline(context.manifests[0], established_at_epoch=WINDOW_START - 90_000)
+        if expired_prior
+        else None
+    )
+    outage = decide_weight_submission(
+        context.rounds,
+        terminal=TerminalManifestObservation(
+            status=terminal_status,
+            evaluated_at_epoch=WINDOW_END,
+            rejection_code="timeout" if terminal_status == "unavailable" else "manifest_stale",
+        ),
+        registered=context.registered,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+        prior_assigned_baseline=prior,
+    )
+    assert outage.abstain_reasons == [terminal_reason]
+    assert outage.prior_assigned_baseline_status == ("expired" if expired_prior else "absent")
+    assert outage.assigned_baseline == assigned_baseline(
+        context.manifests[2], established_at_epoch=WINDOW_END
+    )
+
+    reduced = _reduced_window(context, prior=outage.assigned_baseline)
+    assert reduced.decision == "abstain"
+    assert reduced.abstain_reasons == ["mass_unassignment_guard"]
+    assert reduced.max_assigned_miner_count == 6
+    assert reduced.terminal_assigned_miner_count == 1
+    assert reduced.assigned_baseline == outage.assigned_baseline
 
 
 def test_window_manifests_must_form_one_coherent_chain() -> None:
@@ -1208,56 +1255,33 @@ def test_guarded_drop_cannot_redirect_the_next_window() -> None:
     # The sealed record enforces the same rule: a guarded record whose
     # successor baseline is the reduced terminal set is refused, while the
     # honest carried form is accepted and unsubmittable.
-    rendered = (FIXTURES / "validator-weight-decision.v1.json").read_bytes()
+    rendered = validator_weight_decision_bytes(guarded)
     document = json.loads(rendered)
-    dropped_rows = [
-        {
-            **row,
-            "assigned_at_close": row["hotkey"] == "MinerA",
-            "first_seen_epoch": row["first_seen_epoch"] if row["hotkey"] == "MinerA" else None,
-            "classification": (
-                "verified_serving"
-                if row["weight"] > 0.0
-                else ("assigned_in_grace" if row["hotkey"] == "MinerA" else "unassigned")
-            ),
-        }
-        for row in document["rows"]
-    ]
     refreshed = forged_decision(
         rendered,
-        decision="abstain",
-        abstain_reasons=["mass_unassignment_guard"],
-        rows=dropped_rows,
-        terminal_assigned_miner_count=1,
-        assigned_baseline={
-            **document["assigned_baseline"],
-            "assigned_miner_count": 1,
-            "assigned_identity_digest_sha256": canonical_digest([[10, "MinerA"]]),
-        },
+        assigned_baseline=assigned_baseline(
+            reduced_four, established_at_epoch=guarded.window_end_epoch
+        ).model_dump(mode="json"),
     )
     with pytest.raises(ValidationError, match="assigned_baseline_not_derived"):
         ValidatorWeightDecision.model_validate(refreshed)
-    honest = forged_decision(
-        rendered,
-        decision="abstain",
-        abstain_reasons=["mass_unassignment_guard"],
-        rows=dropped_rows,
-        terminal_assigned_miner_count=1,
-        assigned_baseline={
-            **document["assigned_baseline"],
-            "manifest_sequence": 2,
-            "manifest_digest_sha256": context.manifests[1].manifest_digest_sha256,
-        },
-    )
-    parsed = ValidatorWeightDecision.model_validate(honest)
+    parsed = ValidatorWeightDecision.model_validate(document)
     assert parsed.assigned_baseline is not None
     assert parsed.assigned_baseline.assigned_miner_count == 6
     with pytest.raises(WeightDecisionError):
         weight_plan_rows_for_submission(parsed)
     # A carried baseline that is not the largest set, or that names the
     # terminal sequence, is equally refused.
+    five_identities = document["assigned_baseline"]["assigned_identities"][:5]
     for successor in (
-        {**document["assigned_baseline"], "manifest_sequence": 2, "assigned_miner_count": 5},
+        {
+            **document["assigned_baseline"],
+            "assigned_miner_count": 5,
+            "assigned_identities": five_identities,
+            "assigned_identity_digest_sha256": canonical_digest(
+                [[item["uid"], item["hotkey"]] for item in five_identities]
+            ),
+        },
         {**document["assigned_baseline"], "established_at_epoch": WINDOW_START},
         {**document["assigned_baseline"], "manifest_sequence": 4},
     ):
@@ -1265,10 +1289,6 @@ def test_guarded_drop_cannot_redirect_the_next_window() -> None:
             ValidatorWeightDecision.model_validate(
                 forged_decision(
                     rendered,
-                    decision="abstain",
-                    abstain_reasons=["mass_unassignment_guard"],
-                    rows=dropped_rows,
-                    terminal_assigned_miner_count=1,
                     assigned_baseline=successor,
                 )
             )
@@ -1338,14 +1358,10 @@ def test_mass_guard_counts_registered_identities_only() -> None:
                     rendered,
                     terminal_assigned_miner_count=terminal_count,
                     max_assigned_miner_count=max(terminal_count, 6),
-                    assigned_baseline={
-                        **document["assigned_baseline"],
-                        "assigned_miner_count": terminal_count,
-                    },
                 )
             )
     # And the successor baseline's identity digest is always checked.
-    with pytest.raises(ValidationError, match="assigned_baseline_not_derived"):
+    with pytest.raises(ValidationError, match="baseline_assignment_not_derived"):
         ValidatorWeightDecision.model_validate(
             forged_decision(
                 rendered,
@@ -1355,6 +1371,114 @@ def test_mass_guard_counts_registered_identities_only() -> None:
                 },
             )
         )
+
+
+def test_digest_valid_six_to_one_rewrite_cannot_reseal_assignment_evidence() -> None:
+    """Manifest evidence and scoring opportunities expose a coherent 6-to-1 rewrite."""
+
+    rendered = validator_weight_decision_bytes(make_window_context().decision)
+    document = json.loads(rendered)
+    evidence = document["assignment_manifest_evidence"]
+
+    def reseal_manifest(manifest: dict[str, Any]) -> None:
+        manifest["deployments"] = sorted(
+            manifest["deployments"], key=lambda item: item["deployment_id"]
+        )
+        manifest["assignment_vector_digest_sha256"] = canonical_digest(manifest["deployments"])
+        unsigned = {
+            key: value for key, value in manifest.items() if key != "manifest_digest_sha256"
+        }
+        manifest["manifest_digest_sha256"] = canonical_digest(unsigned)
+
+    # Move the terminal-only MinerF deployment into sequence 2, making that
+    # manifest's registered assignment set six, then reduce sequence 3 to F.
+    # Every nested and outer digest is resealed and the chain link is repaired.
+    delta = next(
+        item
+        for item in evidence[2]["manifest"]["deployments"]
+        if item["deployment_id"] == "fixture-delta"
+    )
+    evidence[1]["manifest"]["deployments"].append(delta)
+    reseal_manifest(evidence[1]["manifest"])
+    evidence[2]["manifest"]["deployments"] = [delta]
+    evidence[2]["manifest"]["previous_manifest_digest_sha256"] = evidence[1]["manifest"][
+        "manifest_digest_sha256"
+    ]
+    reseal_manifest(evidence[2]["manifest"])
+
+    document["terminal_manifest_digest_sha256"] = evidence[2]["manifest"]["manifest_digest_sha256"]
+    document["terminal_assigned_miner_count"] = 1
+    document["max_assigned_miner_count"] = 6
+    document["decision"] = "abstain"
+    document["abstain_reasons"] = ["mass_unassignment_guard"]
+    for row in document["rows"]:
+        row["assigned_at_close"] = row["hotkey"] == "MinerF"
+
+    identities = [
+        {"uid": row["uid"], "hotkey": row["hotkey"]}
+        for row in document["rows"]
+        if row["hotkey"] != "MinerG"
+    ]
+    document["assigned_baseline"] = {
+        "established_at_epoch": document["window_end_epoch"],
+        "manifest_sequence": 2,
+        "manifest_digest_sha256": evidence[1]["manifest"]["manifest_digest_sha256"],
+        "assigned_miner_count": 6,
+        "assigned_identity_digest_sha256": canonical_digest(
+            [[item["uid"], item["hotkey"]] for item in identities]
+        ),
+        "assigned_identities": identities,
+    }
+    forged = reseal_decision(document)
+
+    # Sequence 2 now claims F was present for its twelve linked reports, but
+    # the immutable scoring summary records only F's nine sequence-3
+    # opportunities. Exact per-manifest opportunity derivation refuses it.
+    with pytest.raises(ValidationError, match="scoring_window_evidence_inconsistent"):
+        ValidatorWeightDecision.model_validate(forged)
+
+
+def test_digest_valid_six_to_one_rewrite_cannot_drop_report_manifests() -> None:
+    """All sealed reports retain their exact manifest binding in a 6-to-1 rewrite."""
+
+    document = json.loads(validator_weight_decision_bytes(make_window_context().decision))
+    evidence = document["assignment_manifest_evidence"]
+    reports = [report for item in evidence for report in item["scoring_reports"]]
+    terminal = evidence[-1]
+    delta = next(
+        item
+        for item in terminal["manifest"]["deployments"]
+        if item["deployment_id"] == "fixture-delta"
+    )
+    terminal["manifest"]["deployments"] = [delta]
+    terminal["manifest"]["assignment_vector_digest_sha256"] = canonical_digest([delta])
+    unsigned_manifest = {
+        key: value for key, value in terminal["manifest"].items() if key != "manifest_digest_sha256"
+    }
+    terminal["manifest"]["manifest_digest_sha256"] = canonical_digest(unsigned_manifest)
+    terminal["scoring_reports"] = sorted(reports, key=lambda report: report["report_digest_sha256"])
+    document["assignment_manifest_evidence"] = [terminal]
+    document["terminal_manifest_digest_sha256"] = terminal["manifest"]["manifest_digest_sha256"]
+    document["terminal_assigned_miner_count"] = 1
+    document["max_assigned_miner_count"] = 1
+    for row in document["rows"]:
+        row["assigned_at_close"] = row["hotkey"] == "MinerF"
+        if row["hotkey"] == "MinerG":
+            row["first_seen_epoch"] = None
+    document["assigned_baseline"] = {
+        "established_at_epoch": document["window_end_epoch"],
+        "manifest_sequence": terminal["manifest"]["sequence"],
+        "manifest_digest_sha256": terminal["manifest"]["manifest_digest_sha256"],
+        "assigned_miner_count": 1,
+        "assigned_identity_digest_sha256": canonical_digest([[15, "MinerF"]]),
+        "assigned_identities": [{"uid": 15, "hotkey": "MinerF"}],
+    }
+
+    # This was accepted when the evidence contained only freely remappable
+    # report digests. Full reports still name sequences 1 and 2 (and the
+    # original sequence-3 digest), so exact round reconstruction refuses it.
+    with pytest.raises(ValidationError, match="scoring_window_evidence_inconsistent"):
+        ValidatorWeightDecision.model_validate(reseal_decision(document))
 
 
 def test_manifest_chain_must_be_unbroken_across_omitted_sequences() -> None:

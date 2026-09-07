@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -79,6 +80,140 @@ func TestSealReproducesGoldenDigestsFromFactsAlone(t *testing.T) {
 	}
 	if !bytes.Equal(encoded, payload) {
 		t.Fatalf("sealed snapshot drifted from the golden fixture\nencoded: %s", encoded)
+	}
+}
+
+func TestSealDoesNotMutateOrAliasInput(t *testing.T) {
+	input, err := Parse(fixtureBytes(t, "active-assignment-snapshot.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exercise every mutation Seal performs, including both canonical sorts.
+	for left, right := 0, len(input.Deployments)-1; left < right; left, right = left+1, right-1 {
+		input.Deployments[left], input.Deployments[right] = input.Deployments[right], input.Deployments[left]
+	}
+	for index := range input.Deployments {
+		deployment := &input.Deployments[index]
+		deployment.ExpectedStatus = 0
+		deployment.AttestationRequirement = "caller-attestation"
+		deployment.ChallengePath = "/caller-challenge"
+		for left, right := 0, len(deployment.Replicas)-1; left < right; left, right = left+1, right-1 {
+			deployment.Replicas[left], deployment.Replicas[right] = deployment.Replicas[right], deployment.Replicas[left]
+		}
+		for replicaIndex := range deployment.Replicas {
+			replica := &deployment.Replicas[replicaIndex]
+			replica.RouteState = "caller-route-state"
+			replica.ReplicaID = "caller-replica-id"
+			replica.EndpointID = "caller-endpoint-id"
+		}
+	}
+	before, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sealed, err := Seal(input)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	after, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("Seal mutated its input\nbefore: %s\nafter:  %s", before, after)
+	}
+
+	sealed.Deployments[0].BuildID = "sealed-build-id"
+	sealed.Deployments[0].Replicas[0].MinerHotkey = "sealed-hotkey"
+	afterSealedMutation, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterSealedMutation, before) {
+		t.Fatalf("mutating the sealed result changed the input\nbefore: %s\nafter:  %s", before, afterSealedMutation)
+	}
+
+	sealedBeforeInputMutation, err := json.Marshal(sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.Deployments[0].BuildID = "input-build-id"
+	input.Deployments[0].Replicas[0].MinerHotkey = "input-hotkey"
+	sealedAfterInputMutation, err := json.Marshal(sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sealedAfterInputMutation, sealedBeforeInputMutation) {
+		t.Fatalf("mutating the input changed the sealed result\nbefore: %s\nafter:  %s", sealedBeforeInputMutation, sealedAfterInputMutation)
+	}
+}
+
+func TestSealDoesNotMutateInputWhenValidationFails(t *testing.T) {
+	input, err := Parse(fixtureBytes(t, "active-assignment-snapshot.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	input.CentralAuthorityFingerprintSHA256 = "invalid"
+	for left, right := 0, len(input.Deployments)-1; left < right; left, right = left+1, right-1 {
+		input.Deployments[left], input.Deployments[right] = input.Deployments[right], input.Deployments[left]
+	}
+	for index := range input.Deployments {
+		replicas := input.Deployments[index].Replicas
+		for left, right := 0, len(replicas)-1; left < right; left, right = left+1, right-1 {
+			replicas[left], replicas[right] = replicas[right], replicas[left]
+		}
+	}
+	before, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Seal(input); err == nil {
+		t.Fatal("Seal must reject the invalid authority fingerprint")
+	}
+	after, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("failed Seal mutated its input\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+func TestSealResultAndInputCanBeMutatedConcurrently(t *testing.T) {
+	input, err := Parse(fixtureBytes(t, "active-assignment-snapshot.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := Seal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	workers.Add(2)
+	mutate := func(snapshot *Snapshot, deploymentID, hotkey string) {
+		defer workers.Done()
+		<-start
+		for iteration := 0; iteration < 1_000; iteration++ {
+			snapshot.Deployments[0].DeploymentID = deploymentID
+			snapshot.Deployments[0].Replicas[0].MinerHotkey = hotkey
+			runtime.Gosched()
+		}
+	}
+	go mutate(&input, "input-deployment", "input-hotkey")
+	go mutate(&sealed, "sealed-deployment", "sealed-hotkey")
+	close(start)
+	workers.Wait()
+
+	if input.Deployments[0].DeploymentID != "input-deployment" || input.Deployments[0].Replicas[0].MinerHotkey != "input-hotkey" {
+		t.Fatalf("input mutation crossed the Seal boundary: %+v", input.Deployments[0])
+	}
+	if sealed.Deployments[0].DeploymentID != "sealed-deployment" || sealed.Deployments[0].Replicas[0].MinerHotkey != "sealed-hotkey" {
+		t.Fatalf("sealed-result mutation crossed the Seal boundary: %+v", sealed.Deployments[0])
 	}
 }
 

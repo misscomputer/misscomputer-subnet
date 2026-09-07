@@ -59,7 +59,9 @@ Frozen rules
    terminal manifest that clears the guard; while the guard holds, the
    largest set (the applied prior baseline or the window's largest manifest)
    is carried instead, so a guarded drop can never become the next window's
-   baseline.
+   baseline. If the terminal fetch fails, the larger of the applied prior and
+   the window's largest verified manifest is carried (fresh in-window
+   evidence wins a tie), including on a first window or with an expired prior.
 10. **One coherent, unbroken manifest chain.** Every manifest in the window,
     every archived manifest the coordinator accepted between them, and the
     terminal manifest must form one chain: one central authority, one
@@ -71,19 +73,23 @@ Frozen rules
     missing actual predecessor is a gap; both refuse the inputs outright.
 11. **Deterministic, self-enforcing boundary.** The sealed
     ``validator-weight-decision`` v1 document is the only input to the
-    decision-aware weight-plan builder. Every abstain reason and every row
-    classification is re-derived from the sealed fields on parse, so a record
-    that says ``submit`` while its own fields describe an outage, a coverage
-    gap, a mass drop, or an unbound registered view is rejected; its
+    decision-aware weight-plan builder. It embeds the canonical scoring
+    summary and each unique canonical manifest with every full report that
+    probed it. Every abstain reason, row classification, assignment maximum,
+    and successor baseline is re-derived on parse, so a record that says
+    ``submit`` while its evidence describes an outage, a coverage gap, a mass
+    drop, or an unbound registered view is rejected; its
     ``weight_plan_rows_digest_sha256`` commits to the exact rows and is
     ``null`` on abstain, so an abstain record can never be turned into a plan.
 12. **Positive weight needs sealed serving evidence.** A positive row must
     carry at least ``scoring_policy.min_attributions`` attributions, bounded
     by its opportunities and by the record's serving observation count, and
-    its expected attributions are recomputed exactly from sealed
-    replica-cardinality opportunity buckets. The positive weights must be one
-    normalized distribution; a digest-valid record cannot assign weight to a
-    miner it never observed serving.
+    its opportunities, attributions, latency and expected attributions are
+    recomputed exactly from the embedded canonical reports paired with their
+    full manifests. The scoring-window digest, per-row replica-cardinality
+    buckets, counts, and positive normalized weights must all match that
+    reconstruction; a digest-valid record cannot assign weight to a miner it
+    never observed serving.
 
 This module is pure: no clock, network, file, process, environment, wallet,
 chain, randomness, or signing capability.
@@ -123,6 +129,7 @@ from .contract_codec import (
 from .probe_scoring import (
     MAX_REGISTERED_MINERS,
     MAX_ROUNDS,
+    MinerProbeTally,
     ProbeRound,
     ProbeScoringPolicy,
     ProbeScoringWindow,
@@ -139,6 +146,8 @@ DECISION_PURPOSE: Final = "public_validator_weight_decision_v1"
 MAX_DECISION_BYTES: Final = 64 * 1_024 * 1_024
 PERMILLE: Final = 1_000
 MAX_BASELINE_AGE_SECONDS: Final = 30 * 86_400
+MAX_MANIFEST_EVIDENCE: Final = 2 * MAX_ROUNDS + 1
+MAX_SCORING_IDENTITIES: Final = 1 << 16
 
 ManifestFetchStatus = Literal["rejected", "unavailable", "verified"]
 Decision = Literal["abstain", "submit"]
@@ -265,6 +274,85 @@ class AssignedBaseline(StrictFrozenModel):
     manifest_digest_sha256: Digest
     assigned_miner_count: int = Field(ge=0, le=MAX_REGISTERED_MINERS)
     assigned_identity_digest_sha256: Digest
+    assigned_identities: list[RegisteredMiner] = Field(max_length=MAX_REGISTERED_MINERS)
+
+    @model_validator(mode="after")
+    def canonical_baseline(self) -> Self:
+        identities = [(item.uid, item.hotkey) for item in self.assigned_identities]
+        if identities != sorted(set(identities)):
+            raise ValueError("baseline_identities_not_canonical")
+        if len({uid for uid, _ in identities}) != len(identities) or len(
+            {hotkey for _, hotkey in identities}
+        ) != len(identities):
+            raise ValueError("baseline_identity_duplicate")
+        identity_set = set(identities)
+        if self.assigned_miner_count != len(identity_set) or (
+            self.assigned_identity_digest_sha256 != _identity_digest(identity_set)
+        ):
+            raise ValueError("baseline_assignment_not_derived")
+        return self
+
+
+class SealedScoringWindow(StrictFrozenModel):
+    """JSON-native canonical scoring summary embedded in a decision record."""
+
+    purpose: Literal["public_validator_probe_scoring_v1"]
+    schema_version: Literal[1]
+    validator_uid: UID
+    validator_hotkey: Hotkey
+    window_start_epoch: Epoch
+    window_end_epoch: Epoch
+    round_count: int = Field(ge=1, le=MAX_ROUNDS)
+    observation_count: int = Field(ge=0)
+    serving_observation_count: int = Field(ge=0)
+    report_digests: list[Digest] = Field(min_length=1, max_length=MAX_ROUNDS)
+    tallies: list[MinerProbeTally] = Field(max_length=MAX_SCORING_IDENTITIES)
+
+    @model_validator(mode="after")
+    def canonical_scoring_window(self) -> Self:
+        if self.report_digests != sorted(set(self.report_digests)):
+            raise ValueError("scoring_window_reports_not_canonical")
+        self.as_probe_scoring_window()
+        return self
+
+    def as_probe_scoring_window(self) -> ProbeScoringWindow:
+        return ProbeScoringWindow(
+            purpose=self.purpose,
+            schema_version=self.schema_version,
+            validator_uid=self.validator_uid,
+            validator_hotkey=self.validator_hotkey,
+            window_start_epoch=self.window_start_epoch,
+            window_end_epoch=self.window_end_epoch,
+            round_count=self.round_count,
+            observation_count=self.observation_count,
+            serving_observation_count=self.serving_observation_count,
+            report_digests=tuple(self.report_digests),
+            tallies=tuple(self.tallies),
+        )
+
+
+class ManifestAssignmentEvidence(StrictFrozenModel):
+    """One full verified manifest and its immutable scoring linkage.
+
+    ``scoring_reports`` contains every canonical report in the sealed scoring
+    window that probed this exact manifest. Keeping the reports themselves,
+    rather than a freely remappable list of their digests, lets a parser
+    reconstruct the exact :class:`~misscomputer_subnet.probe_scoring.ProbeRound`
+    sequence and recompute the scoring-window digest. Together the ordered
+    records make the registered-only maximum assignment set, terminal set,
+    guard, opportunity buckets and successor baseline independently derivable
+    instead of trusting scalar summaries.
+    """
+
+    manifest: ActiveAssignmentManifest
+    scoring_reports: list[ValidatorProbeReport] = Field(max_length=MAX_ROUNDS)
+
+    @model_validator(mode="after")
+    def canonical_evidence(self) -> Self:
+        report_digests = [item.report_digest_sha256 for item in self.scoring_reports]
+        if report_digests != sorted(set(report_digests)):
+            raise ValueError("assignment_evidence_reports_not_canonical")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +507,32 @@ def _identity_digest(identities: set[tuple[int, str]]) -> str:
     return digest([[uid, hotkey] for uid, hotkey in sorted(identities)])
 
 
+def _evidence_identities(
+    evidence: ManifestAssignmentEvidence,
+    registered_keys: frozenset[tuple[int, str]] | set[tuple[int, str]],
+) -> set[tuple[int, str]]:
+    return _assigned_identities(evidence.manifest, frozenset(registered_keys))
+
+
+def _baseline_from_evidence(
+    evidence: ManifestAssignmentEvidence,
+    *,
+    established_at_epoch: int,
+    registered_keys: frozenset[tuple[int, str]] | set[tuple[int, str]],
+) -> dict[str, object]:
+    identities = _evidence_identities(evidence, registered_keys)
+    return {
+        "established_at_epoch": established_at_epoch,
+        "manifest_sequence": evidence.manifest.sequence,
+        "manifest_digest_sha256": evidence.manifest.manifest_digest_sha256,
+        "assigned_miner_count": len(identities),
+        "assigned_identity_digest_sha256": _identity_digest(identities),
+        "assigned_identities": [
+            {"uid": uid, "hotkey": hotkey} for uid, hotkey in sorted(identities)
+        ],
+    }
+
+
 #: Positive weights are exact rational shares rendered as floats; their sum
 #: may differ from one only by float rounding, never by a forged row.
 _NORMALIZATION_TOLERANCE: Final = Fraction(1, 10**9)
@@ -471,7 +585,11 @@ class ValidatorWeightDecision(StrictFrozenModel):
     round_count: int = Field(ge=0, le=MAX_ROUNDS)
     observation_count: int = Field(ge=0)
     serving_observation_count: int = Field(ge=0)
+    scoring_window: SealedScoringWindow | None
     scoring_window_digest_sha256: Digest | None
+    assignment_manifest_evidence: list[ManifestAssignmentEvidence] = Field(
+        max_length=MAX_MANIFEST_EVIDENCE
+    )
     prior_assigned_baseline: AssignedBaseline | None
     prior_assigned_baseline_status: BaselineStatus
     max_assigned_miner_count: int = Field(ge=0, le=MAX_REGISTERED_MINERS)
@@ -591,54 +709,261 @@ class ValidatorWeightDecision(StrictFrozenModel):
         reasons = self._derived_reasons()
         if sorted(reasons) != self.abstain_reasons:
             raise ValueError("abstain_reasons_not_derived")
-        successor = self.assigned_baseline
-        if verified and "mass_unassignment_guard" in reasons:
-            # A guarded drop never anchors the baseline: the largest set is
-            # carried instead, either the applied prior baseline or a manifest
-            # observed in this window, never the reduced terminal set.
-            if successor is None or successor.assigned_miner_count != (
-                self.max_assigned_miner_count
-            ):
-                raise ValueError("assigned_baseline_not_derived")
-            if (
-                prior is not None
-                and status == "applied"
-                and (prior.assigned_miner_count == self.max_assigned_miner_count)
-            ):
-                if successor != prior:
-                    raise ValueError("assigned_baseline_not_derived")
-            elif (
-                terminal_sequence is None
-                or successor.established_at_epoch != self.window_end_epoch
-                or successor.manifest_sequence >= terminal_sequence
-                or successor.manifest_digest_sha256 == self.terminal_manifest_digest_sha256
-            ):
-                raise ValueError("assigned_baseline_not_derived")
-        elif verified:
-            if (
-                successor is None
-                or successor.established_at_epoch != self.window_end_epoch
-                or successor.manifest_sequence != terminal_sequence
-                or successor.manifest_digest_sha256 != self.terminal_manifest_digest_sha256
-                or successor.assigned_miner_count != self.terminal_assigned_miner_count
-                or successor.assigned_identity_digest_sha256 != _identity_digest(assigned_rows)
-            ):
-                raise ValueError("assigned_baseline_not_derived")
-        elif status == "applied":
-            if self.assigned_baseline != prior:
-                raise ValueError("assigned_baseline_not_derived")
-        elif self.assigned_baseline is not None:
-            raise ValueError("assigned_baseline_not_derived")
         if self.decision == "submit":
             if self.weight_plan_rows_digest_sha256 != digest(_plan_rows(self.rows)):
                 raise ValueError("weight_plan_rows_digest_mismatch")
         elif self.weight_plan_rows_digest_sha256 is not None:
             raise ValueError("abstain_with_plan_rows_digest")
         verify_model_digest(self, "decision_digest_sha256")
+        self._validate_sealed_evidence(
+            assigned_rows=assigned_rows,
+            baseline_status=status,
+            prior=prior,
+            reasons=reasons,
+        )
         return self
+
+    def _validate_sealed_evidence(
+        self,
+        *,
+        assigned_rows: set[tuple[int, str]],
+        baseline_status: BaselineStatus,
+        prior: AssignedBaseline | None,
+        reasons: set[AbstainReason],
+    ) -> None:
+        """Recompute assignment/scoring claims from the canonical sealed evidence."""
+
+        evidence = self.assignment_manifest_evidence
+        evidence_keys = [
+            (item.manifest.sequence, item.manifest.manifest_digest_sha256) for item in evidence
+        ]
+        if evidence_keys != sorted(evidence_keys) or len(
+            {sequence for sequence, _ in evidence_keys}
+        ) != len(evidence_keys):
+            raise ValueError("assignment_evidence_not_canonical")
+        manifests = [item.manifest for item in evidence]
+        if (
+            any(
+                manifest.network != self.network or manifest.netuid != self.netuid
+                for manifest in manifests
+            )
+            or len({manifest.central_authority_fingerprint_sha256 for manifest in manifests}) > 1
+        ):
+            raise ValueError("assignment_evidence_chain_incoherent")
+        for previous, current in zip(manifests, manifests[1:], strict=False):
+            if (
+                current.previous_manifest_digest_sha256 != previous.manifest_digest_sha256
+                or current.finalized_height < previous.finalized_height
+                or current.finalized_epoch < previous.finalized_epoch
+                or current.issued_at_epoch < previous.issued_at_epoch
+                or (
+                    current.finalized_height == previous.finalized_height
+                    and (
+                        current.finalized_block_hash != previous.finalized_block_hash
+                        or current.finalized_epoch != previous.finalized_epoch
+                    )
+                )
+            ):
+                raise ValueError("assignment_evidence_chain_incoherent")
+
+        registered_keys = {(row.uid, row.hotkey) for row in self.rows}
+
+        terminal_evidence: ManifestAssignmentEvidence | None = None
+        if self.terminal_manifest_status == "verified":
+            terminal_matches = [
+                item
+                for item in evidence
+                if item.manifest.sequence == self.terminal_manifest_sequence
+                and item.manifest.manifest_digest_sha256 == self.terminal_manifest_digest_sha256
+            ]
+            if len(terminal_matches) != 1 or terminal_matches[0] is not evidence[-1]:
+                raise ValueError("assignment_evidence_terminal_mismatch")
+            terminal_evidence = terminal_matches[0]
+            terminal_manifest = terminal_evidence.manifest
+            if (
+                self.terminal_manifest_expires_at_epoch != terminal_manifest.expires_at_epoch
+                or self.terminal_manifest_effective_expires_at_epoch
+                != manifest_effective_expires_at_epoch(terminal_manifest)
+                or self.terminal_earliest_lease_expires_at_block
+                != manifest_earliest_lease_expires_at_block(terminal_manifest)
+                or self.terminal_finalized_height != terminal_manifest.finalized_height
+                or self.terminal_finalized_block_hash != terminal_manifest.finalized_block_hash
+                or self.terminal_finalized_epoch != terminal_manifest.finalized_epoch
+            ):
+                raise ValueError("assignment_evidence_terminal_mismatch")
+            derived_close = _evidence_identities(terminal_evidence, registered_keys)
+        elif evidence:
+            derived_close = _evidence_identities(evidence[-1], registered_keys)
+        else:
+            derived_close = set()
+        if derived_close != assigned_rows or self.terminal_assigned_miner_count != len(
+            derived_close
+        ):
+            raise ValueError("assigned_counts_invalid")
+
+        evidence_counts = [len(_evidence_identities(item, registered_keys)) for item in evidence]
+        prior_counts = (
+            [prior.assigned_miner_count]
+            if prior is not None and baseline_status == "applied"
+            else []
+        )
+        derived_max = max([*evidence_counts, *prior_counts, 0])
+        if self.max_assigned_miner_count != derived_max:
+            raise ValueError("assigned_counts_invalid")
+
+        sealed_rounds: list[ProbeRound] = []
+        linked_report_digests: list[str] = []
+        for item in evidence:
+            manifest = item.manifest
+            for report in item.scoring_reports:
+                if not _report_matches_manifest(
+                    report, manifest
+                ) or report.evaluation_epoch >= manifest_effective_expires_at_epoch(manifest):
+                    raise ValueError("scoring_window_evidence_inconsistent")
+                sealed_rounds.append(ProbeRound(manifest=manifest, report=report))
+                linked_report_digests.append(report.report_digest_sha256)
+        if len(linked_report_digests) > MAX_ROUNDS:
+            raise ValueError("scoring_window_evidence_inconsistent")
+        if len(linked_report_digests) != len(set(linked_report_digests)):
+            raise ValueError("assignment_evidence_report_duplicate")
+        linked_report_digests.sort()
+        scoring_window = self.scoring_window
+        if self.round_count == 0:
+            if (
+                scoring_window is not None
+                or self.scoring_window_digest_sha256 is not None
+                or linked_report_digests
+            ):
+                raise ValueError("scoring_window_digest_inconsistent")
+        else:
+            if scoring_window is None or self.scoring_window_digest_sha256 is None:
+                raise ValueError("scoring_window_digest_inconsistent")
+            if (
+                scoring_window.validator_uid != self.validator_uid
+                or scoring_window.validator_hotkey != self.validator_hotkey
+                or scoring_window.window_start_epoch != self.window_start_epoch
+                or scoring_window.window_end_epoch != self.window_end_epoch
+                or scoring_window.round_count != self.round_count
+                or scoring_window.observation_count != self.observation_count
+                or scoring_window.serving_observation_count != self.serving_observation_count
+                or tuple(scoring_window.report_digests)
+                != tuple(sorted(scoring_window.report_digests))
+                or linked_report_digests != list(scoring_window.report_digests)
+                or self.scoring_window_digest_sha256 != digest(model_document(scoring_window))
+            ):
+                raise ValueError("scoring_window_evidence_inconsistent")
+
+            try:
+                recomputed_window = accumulate_scoring_window(
+                    sealed_rounds,
+                    validator_uid=self.validator_uid,
+                    validator_hotkey=self.validator_hotkey,
+                    window_start_epoch=self.window_start_epoch,
+                    window_end_epoch=self.window_end_epoch,
+                )
+            except (ValidationError, ValueError, TypeError, AttributeError):
+                raise ValueError("scoring_window_evidence_inconsistent") from None
+            probe_scoring_window = scoring_window.as_probe_scoring_window()
+            if model_document(recomputed_window) != model_document(probe_scoring_window):
+                raise ValueError("scoring_window_evidence_inconsistent")
+            tallies_by_identity = {
+                (item.uid, item.hotkey): item for item in recomputed_window.tallies
+            }
+            vector = build_probe_weight_vector(
+                recomputed_window,
+                registered=[RegisteredMiner(uid=row.uid, hotkey=row.hotkey) for row in self.rows],
+                policy=self.scoring_policy,
+            )
+            weights = {(row.uid, row.hotkey): row.weight for row in vector.rows}
+            for row in self.rows:
+                identity = (row.uid, row.hotkey)
+                row_tally = tallies_by_identity.get(identity)
+                if row_tally is None:
+                    tally_values: tuple[object, ...] = (0, 0, 0, 1, [])
+                else:
+                    tally_values = (
+                        row_tally.attributions,
+                        row_tally.opportunities,
+                        row_tally.expected_attributions_numerator,
+                        row_tally.expected_attributions_denominator,
+                        list(row_tally.replica_share_counts),
+                    )
+                row_values: tuple[object, ...] = (
+                    row.attributions,
+                    row.opportunities,
+                    row.expected_attributions_numerator,
+                    row.expected_attributions_denominator,
+                    list(row.replica_share_counts),
+                )
+                if row_values != tally_values or row.weight != weights[identity]:
+                    raise ValueError("scoring_window_evidence_inconsistent")
+
+        nonterminal_evidence = [item for item in evidence if item is not terminal_evidence]
+        largest_window = (
+            max(
+                nonterminal_evidence,
+                key=lambda item: (
+                    len(_evidence_identities(item, registered_keys)),
+                    item.manifest.sequence,
+                ),
+            )
+            if nonterminal_evidence
+            else None
+        )
+        expected_successor: dict[str, object] | None
+        if terminal_evidence is not None and "mass_unassignment_guard" in reasons:
+            if (
+                prior is not None
+                and baseline_status == "applied"
+                and prior.assigned_miner_count == derived_max
+            ):
+                expected_successor = model_document(prior)
+            elif (
+                largest_window is not None
+                and len(_evidence_identities(largest_window, registered_keys)) == derived_max
+            ):
+                expected_successor = _baseline_from_evidence(
+                    largest_window,
+                    established_at_epoch=self.window_end_epoch,
+                    registered_keys=registered_keys,
+                )
+            else:
+                raise ValueError("assigned_baseline_not_derived")
+        elif terminal_evidence is not None:
+            expected_successor = _baseline_from_evidence(
+                terminal_evidence,
+                established_at_epoch=self.window_end_epoch,
+                registered_keys=registered_keys,
+            )
+        elif (
+            prior is not None
+            and baseline_status == "applied"
+            and (
+                largest_window is None
+                or prior.assigned_miner_count
+                > len(_evidence_identities(largest_window, registered_keys))
+            )
+        ):
+            expected_successor = model_document(prior)
+        elif largest_window is not None:
+            expected_successor = _baseline_from_evidence(
+                largest_window,
+                established_at_epoch=self.window_end_epoch,
+                registered_keys=registered_keys,
+            )
+        elif prior is not None and baseline_status == "applied":
+            expected_successor = model_document(prior)
+        else:
+            expected_successor = None
+        actual_successor = (
+            None if self.assigned_baseline is None else model_document(self.assigned_baseline)
+        )
+        if actual_successor != expected_successor:
+            raise ValueError("assigned_baseline_not_derived")
 
     def _derived_reasons(self) -> set[AbstainReason]:
         policy = self.decision_policy
+        terminal_assigned_count, max_assigned_count = self._sealed_assignment_counts()
         reasons: set[AbstainReason] = set()
         if self.terminal_manifest_status == "unavailable":
             reasons.add("manifest_unavailable")
@@ -672,9 +997,7 @@ class ValidatorWeightDecision(StrictFrozenModel):
                 policy=policy,
             ):
                 reasons.add("registered_set_unbound")
-            if _mass_drop(
-                self.terminal_assigned_miner_count, self.max_assigned_miner_count, policy
-            ):
+            if _mass_drop(terminal_assigned_count, max_assigned_count, policy):
                 reasons.add("mass_unassignment_guard")
         if self.round_count < policy.min_verified_rounds:
             reasons.add("rounds_insufficient")
@@ -683,6 +1006,35 @@ class ValidatorWeightDecision(StrictFrozenModel):
         if not any(row.weight > 0.0 for row in self.rows):
             reasons.add("no_positive_evidence")
         return reasons
+
+    def _sealed_assignment_counts(self) -> tuple[int, int]:
+        """Derive the close and maximum counts without trusting their scalar fields."""
+
+        evidence = self.assignment_manifest_evidence
+        registered_keys = {(row.uid, row.hotkey) for row in self.rows}
+        if self.terminal_manifest_status == "verified":
+            terminal_matches = [
+                item
+                for item in evidence
+                if item.manifest.sequence == self.terminal_manifest_sequence
+                and item.manifest.manifest_digest_sha256 == self.terminal_manifest_digest_sha256
+            ]
+            if len(terminal_matches) != 1:
+                raise ValueError("assignment_evidence_terminal_mismatch")
+            close_count = len(_evidence_identities(terminal_matches[0], registered_keys))
+        elif evidence:
+            close_count = len(_evidence_identities(evidence[-1], registered_keys))
+        else:
+            close_count = 0
+        status = _baseline_status(
+            self.prior_assigned_baseline,
+            window_end_epoch=self.window_end_epoch,
+            policy=self.decision_policy,
+        )
+        evidence_counts = [len(_evidence_identities(item, registered_keys)) for item in evidence]
+        if self.prior_assigned_baseline is not None and status == "applied":
+            evidence_counts.append(self.prior_assigned_baseline.assigned_miner_count)
+        return close_count, max([*evidence_counts, 0])
 
 
 def _plan_rows(rows: Sequence[WeightDecisionRow]) -> list[dict[str, object]]:
@@ -774,7 +1126,36 @@ def _revalidate_rounds(rounds: Sequence[ProbeRound]) -> list[ProbeRound]:
             )
         except (ValidationError, ValueError, TypeError, AttributeError):
             _reject("decision_round_invalid")
+    for entry in fresh:
+        if not _report_matches_manifest(entry.report, entry.manifest):
+            _reject("decision_round_invalid")
     return fresh
+
+
+def _report_matches_manifest(
+    report: ValidatorProbeReport, manifest: ActiveAssignmentManifest
+) -> bool:
+    """Bind every report claim used by a decision to its full manifest."""
+
+    return (
+        report.network == manifest.network
+        and report.netuid == manifest.netuid
+        and report.central_authority_fingerprint_sha256
+        == manifest.central_authority_fingerprint_sha256
+        and report.trust_policy_digest_sha256 == manifest.trust_policy_digest_sha256
+        and report.manifest_digest_sha256 == manifest.manifest_digest_sha256
+        and report.manifest_sequence == manifest.sequence
+        and report.manifest_issued_at_epoch == manifest.issued_at_epoch
+        and report.manifest_expires_at_epoch == manifest.expires_at_epoch
+        and report.finalized_height == manifest.finalized_height
+        and report.finalized_block_hash == manifest.finalized_block_hash
+        and report.finalized_epoch == manifest.finalized_epoch
+        and report.probe_scheme == manifest.probe_scheme
+        and report.probe_port == manifest.probe_port
+        and manifest.issued_at_epoch <= report.evaluation_epoch
+        and {item.deployment_id for item in report.observations}
+        == {item.deployment_id for item in manifest.deployments}
+    )
 
 
 def _revalidate_archived_manifests(
@@ -902,6 +1283,10 @@ def decide_weight_submission(
     if prior is not None and prior.established_at_epoch > window_start_epoch:
         _reject("decision_baseline_invalid")
 
+    if len(rounds) > MAX_ROUNDS:
+        _reject("decision_round_invalid")
+    if len(archived_manifests) > MAX_ROUNDS:
+        _reject("decision_archived_manifest_invalid")
     rounds = _revalidate_rounds(rounds)
     manifests = [entry.manifest for entry in rounds]
     for entry in rounds:
@@ -966,6 +1351,24 @@ def decide_weight_submission(
             miner_first_seen[owner] = seen
 
     registered_keys = frozenset((miner.uid, miner.hotkey) for miner in registered.miners)
+    chain_by_sequence: dict[int, ActiveAssignmentManifest] = {}
+    for manifest in chain:
+        chain_by_sequence.setdefault(manifest.sequence, manifest)
+    reports_by_manifest: dict[str, list[ValidatorProbeReport]] = {}
+    for entry in rounds:
+        reports_by_manifest.setdefault(entry.manifest.manifest_digest_sha256, []).append(
+            entry.report
+        )
+    assignment_evidence = [
+        ManifestAssignmentEvidence(
+            manifest=manifest,
+            scoring_reports=sorted(
+                reports_by_manifest.get(manifest.manifest_digest_sha256, []),
+                key=lambda report: report.report_digest_sha256,
+            ),
+        )
+        for manifest in (chain_by_sequence[sequence] for sequence in sorted(chain_by_sequence))
+    ]
     # Window manifests: everything in the chain except the terminal, one per
     # sequence, so the largest assigned set of the window can be named.
     window_manifests: dict[int, ActiveAssignmentManifest] = {}
@@ -1066,6 +1469,18 @@ def decide_weight_submission(
     if not positive:
         reasons.add("no_positive_evidence")
 
+    evidence_by_sequence = {item.manifest.sequence: item for item in assignment_evidence}
+    largest_window_evidence = (
+        max(
+            (evidence_by_sequence[sequence] for sequence in window_sets),
+            key=lambda item: (
+                len(_evidence_identities(item, registered_keys)),
+                item.manifest.sequence,
+            ),
+        )
+        if window_sets
+        else None
+    )
     successor_baseline: dict[str, object] | None
     if terminal_manifest is not None and guarded:
         # The guard fired: the reduced terminal set must not become the next
@@ -1079,25 +1494,36 @@ def decide_weight_submission(
         ):
             successor_baseline = model_document(prior)
         else:
-            largest_sequence = max(
-                window_sets, key=lambda sequence: (len(window_sets[sequence]), sequence)
+            if largest_window_evidence is None:
+                raise AssertionError("guarded terminal without larger assignment evidence")
+            successor_baseline = _baseline_from_evidence(
+                largest_window_evidence,
+                established_at_epoch=window_end_epoch,
+                registered_keys=registered_keys,
             )
-            largest = window_manifests[largest_sequence]
-            successor_baseline = {
-                "established_at_epoch": window_end_epoch,
-                "manifest_sequence": largest.sequence,
-                "manifest_digest_sha256": largest.manifest_digest_sha256,
-                "assigned_miner_count": len(window_sets[largest_sequence]),
-                "assigned_identity_digest_sha256": _identity_digest(window_sets[largest_sequence]),
-            }
     elif terminal_manifest is not None:
-        successor_baseline = {
-            "established_at_epoch": window_end_epoch,
-            "manifest_sequence": terminal_manifest.sequence,
-            "manifest_digest_sha256": terminal_manifest.manifest_digest_sha256,
-            "assigned_miner_count": terminal_count,
-            "assigned_identity_digest_sha256": _identity_digest(assigned),
-        }
+        terminal_evidence = evidence_by_sequence[terminal_manifest.sequence]
+        successor_baseline = _baseline_from_evidence(
+            terminal_evidence,
+            established_at_epoch=window_end_epoch,
+            registered_keys=registered_keys,
+        )
+    elif (
+        prior is not None
+        and baseline_status == "applied"
+        and (
+            largest_window_evidence is None
+            or prior.assigned_miner_count
+            > len(_evidence_identities(largest_window_evidence, registered_keys))
+        )
+    ):
+        successor_baseline = model_document(prior)
+    elif largest_window_evidence is not None:
+        successor_baseline = _baseline_from_evidence(
+            largest_window_evidence,
+            established_at_epoch=window_end_epoch,
+            registered_keys=registered_keys,
+        )
     elif prior is not None and baseline_status == "applied":
         successor_baseline = model_document(prior)
     else:
@@ -1146,7 +1572,15 @@ def decide_weight_submission(
         "round_count": len(rounds),
         "observation_count": 0 if window is None else window.observation_count,
         "serving_observation_count": 0 if window is None else window.serving_observation_count,
-        "scoring_window_digest_sha256": None if window is None else digest(model_document(window)),
+        "scoring_window": (
+            None
+            if window is None
+            else model_document(SealedScoringWindow.model_validate(model_document(window)))
+        ),
+        "scoring_window_digest_sha256": (
+            None if window is None else digest(model_document(window))
+        ),
+        "assignment_manifest_evidence": [model_document(item) for item in assignment_evidence],
         "prior_assigned_baseline": None if prior is None else model_document(prior),
         "prior_assigned_baseline_status": baseline_status,
         "max_assigned_miner_count": max_count,

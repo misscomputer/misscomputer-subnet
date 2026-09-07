@@ -292,7 +292,10 @@ Frozen invariants:
   the chain keeps its previous weights.
 - **The sealed record is self-enforcing.** Parsing a
   `validator-weight-decision` re-derives every abstain reason and every row
-  classification from the sealed fields and accepts the record only if the
+  classification from the sealed fields. It also revalidates every unique
+  full manifest in `assignment_manifest_evidence`, derives each registered
+  assignment set and the maximum from those manifests plus the canonical
+  prior-baseline identity list, and accepts the record only if the
   `decision` and `abstain_reasons` it states are exactly the ones its own
   fields imply (`abstain_reasons_not_derived`,
   `row_classification_not_derived`, `assigned_baseline_not_derived`,
@@ -301,7 +304,14 @@ Frozen invariants:
   under-sampled assigned miner, a mass drop, or an unbound registered view
   is rejected before it can reach a plan; the `contracts/negative/`
   `submit-with-*` fixtures are exactly such records.
-- **Positive weight needs sealed serving evidence.** A `verified_serving`
+- **Positive weight needs sealed serving evidence.** The record embeds its
+  canonical `scoring_window`; its digest must equal
+  `scoring_window_digest_sha256`, and every sorted full report must be
+  partitioned exactly under the full manifest that it names. Parsing rebuilds
+  those canonical probe rounds and recomputes the observation and serving
+  totals, attributions, latency, every identity's opportunity total and exact
+  replica-cardinality buckets, then rebuilds the registered weight vector.
+  A `verified_serving`
   row must carry at least `scoring_policy.min_attributions` attributions,
   never more attributions than opportunities nor more opportunities than the
   record's `observation_count`; `round_count` never exceeds
@@ -339,8 +349,8 @@ Frozen invariants:
   complete fingerprint is refused rather than submitted.
 - **Mass-unassignment baseline outlives the window.** Every decision seals an
   `assigned_baseline`: the largest verified assigned set of *registered*
-  miners (count, identity digest, sequence, digest, and the window close that
-  established it; carried forward unchanged through an outage). When the
+  miners (canonical identity list, derived count and identity digest,
+  sequence, manifest digest, and the window close that established it). When the
   terminal manifest clears the guard it becomes the baseline; when the guard
   fires, the reduced terminal set never does: the applied prior baseline, or
   else the window's largest manifest, is carried instead, and the record
@@ -348,9 +358,13 @@ Frozen invariants:
   that holds a baseline supplies it as `prior_assigned_baseline` to the next
   window, and the record seals both the supplied value and its status:
   `applied` (widens the guard's largest-set baseline), `expired` (established
-  more than `assigned_baseline_max_age_seconds` before window close; ignored
-  and dropped so the successor starts clean), or `absent` (a coordinator's
-  first window). Assigned sets are counted in registered identities only, so
+  more than `assigned_baseline_max_age_seconds` before window close and
+  ignored for this comparison), or `absent` (a coordinator's first window).
+  If the terminal fetch is unavailable or rejected, the successor is the
+  larger of the applied prior and the largest verified in-window manifest;
+  fresh in-window evidence wins a tie and is established at the current
+  close. Thus a first-window outage or expired prior cannot erase an observed
+  guard horizon. Assigned sets are counted in registered identities only, so
   `terminal_assigned_miner_count` is exactly the rows sealed
   `assigned_at_close` (`assigned_counts_invalid`) and a manifest padded with
   identities outside the metagraph is still a drop. A central mass-eviction
@@ -415,14 +429,14 @@ defaults, not consensus.
 | Manifest claims validity beyond its tickets or block leases | `manifest_expired`/`manifest_replica_lease_expired` at the verifier; `manifest_expired_at_close`/`assignment_lease_expired_at_close` at the decision | assignment authority, not the manifest's own claim, bounds what is scoreable |
 | Validator missed publications | `history_depth > 0`; catch-up walks at most that many actual entries, replays them under per-transition historical semantics, then verifies the head live | the head's link chain authenticates the span; cumulative sequence/height movement is never mistaken for one hop |
 | New validator, no history | operator anchors on the live head from genesis only | complete live verification; history starts at the anchor and cannot be reset later |
-| Sealed decision rewritten or produced by a defective coordinator | `abstain_reasons_not_derived` and companions on parse; never reaches a plan | every precondition is re-derived from the record itself |
+| Sealed decision rewritten or produced by a defective coordinator | `abstain_reasons_not_derived`, `assigned_counts_invalid`, `scoring_window_evidence_inconsistent`, and companions on parse; never reaches a plan | full canonical manifests and reports reconstruct the probe rounds, assignment sets, scoring-window digest, and opportunities instead of trusting resealable summaries or scalar maxima |
 | Digest-valid decision assigns positive weight with impossible counts, forged expected attribution, no serving evidence, or an unnormalized vector | `row_positive_weight_without_evidence`/`row_expected_attributions_inconsistent`/`observation_counts_invalid`/`weights_not_normalized` on parse | positive weight must be backed by exactly recomputable sealed evidence consistent with the scoring policy |
 | Decision applied to a different metagraph view | `build_weight_plan_from_decision` refuses | height, hash, epoch, fingerprint, and every UID/hotkey are checked |
 | Decision omits an eligible miner while naming the complete snapshot fingerprint, including through concurrent nested-row mutation | `build_weight_plan_from_decision` refuses (`complete eligible miner set`) | one deep-validated private decision and row snapshot is used throughout; rows must equal `eligible_weight_targets` |
 | Verified report mutated in memory after validation | `decision_round_invalid`/`scoring_round_invalid` | evidence is rebuilt from canonical form before use |
 | Runtime snapshot torn or inconsistent | `snapshot_revision_content_divergence` or manifest derivation mismatch; publisher refuses to sign | one-revision read is a contract, and the projection digest binds manifest to snapshot |
 | Snapshot leaks material | structurally impossible: digests only; fixture scanned for forbidden terms | private retained bytes never enter the public contract |
-| Central mass-eviction or empty snapshot, including exactly at a window boundary | `mass_unassignment_guard` (within the window or against the carried baseline) or manifest expiry; abstain | central failure is not miner evidence |
+| Central mass-eviction or empty snapshot, including exactly at a window boundary or after a close-time outage | `mass_unassignment_guard` (within the window or against the carried baseline) or manifest expiry; abstain | central failure or terminal availability is not miner evidence; verified in-window maxima survive the outage |
 | Reduced assignment repeated in the next window to make the drop the new normal | still `mass_unassignment_guard`: the guarded window carried the pre-drop baseline, not the reduced set | a guarded drop never anchors the baseline; only policy age releases it |
 | Manifest drops registered miners and pads itself with unregistered identities | `mass_unassignment_guard`; the padding is not counted and never enters a baseline | assigned sets are measured in registered identities |
 | Validator sampling too sparse | `rounds_insufficient`/`coverage_insufficient`; abstain | the validator's gap never becomes a miner's zero |

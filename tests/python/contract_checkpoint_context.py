@@ -363,6 +363,7 @@ def assigned_baseline(
         assigned_identity_digest_sha256=canonical_digest(
             [[uid, hotkey] for uid, hotkey in identities]
         ),
+        assigned_identities=[RegisteredMiner(uid=uid, hotkey=hotkey) for uid, hotkey in identities],
     )
 
 
@@ -835,7 +836,7 @@ def negative_documents() -> dict[str, bytes]:
         "validator-weight-decision",
         "submit-with-mass-drop",
         "model",
-        "abstain_reasons_not_derived",
+        "assigned_counts_invalid",
         forged_decision(
             decision,
             max_assigned_miner_count=decision_doc["terminal_assigned_miner_count"] * 3,
@@ -896,8 +897,10 @@ def negative_documents() -> dict[str, bytes]:
             decision,
             assigned_baseline={
                 **decision_doc["assigned_baseline"],
-                "assigned_miner_count": decision_doc["assigned_baseline"]["assigned_miner_count"]
-                - 1,
+                "manifest_sequence": 2,
+                "manifest_digest_sha256": decision_doc["assignment_manifest_evidence"][1][
+                    "manifest"
+                ]["manifest_digest_sha256"],
             },
         ),
     )
@@ -1034,11 +1037,6 @@ def negative_documents() -> dict[str, bytes]:
             decision,
             terminal_assigned_miner_count=decision_doc["terminal_assigned_miner_count"] + 1,
             max_assigned_miner_count=decision_doc["max_assigned_miner_count"] + 1,
-            assigned_baseline={
-                **decision_doc["assigned_baseline"],
-                "assigned_miner_count": decision_doc["assigned_baseline"]["assigned_miner_count"]
-                + 1,
-            },
         ),
     )
     # A guarded drop whose successor baseline is the reduced terminal set.
@@ -1055,7 +1053,7 @@ def negative_documents() -> dict[str, bytes]:
         "validator-weight-decision",
         "guarded-drop-refreshes-baseline",
         "model",
-        "assigned_baseline_not_derived",
+        "abstain_reasons_not_derived",
         forged_decision(
             decision,
             decision="abstain",
@@ -1066,6 +1064,7 @@ def negative_documents() -> dict[str, bytes]:
                 **decision_doc["assigned_baseline"],
                 "assigned_miner_count": 1,
                 "assigned_identity_digest_sha256": canonical_digest([[10, "MinerA"]]),
+                "assigned_identities": [{"uid": 10, "hotkey": "MinerA"}],
             },
         ),
     )

@@ -652,7 +652,13 @@ def replay_manifest_history(
             _verify_pointer_signer_provenance(
                 pointer, policy, evaluation_epoch=pointer.issued_at_epoch
             )
-            bind_latest_pointer_to_manifest(pointer, manifest, entry.signatures)
+            # Validate and snapshot the caller-owned sequence once. Pointer
+            # binding and signature verification must observe the same
+            # immutable envelopes even if a custom Sequence changes on read.
+            signatures = tuple(
+                revalidate(item, AssignmentManifestSignatureEnvelope) for item in entry.signatures
+            )
+            bind_latest_pointer_to_manifest(pointer, manifest, signatures)
         except ManifestPublicationError:
             _reject("history_pointer_mismatch")
         if state.accepted_manifest_count == 0:
@@ -667,7 +673,7 @@ def replay_manifest_history(
             _reject("history_link_mismatch")
         state = verify_historical_active_assignment_manifest(
             manifest,
-            entry.signatures,
+            signatures,
             policy,
             state,
             evaluation_epoch=evaluation_epoch,

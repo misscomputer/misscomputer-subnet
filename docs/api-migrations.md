@@ -75,6 +75,15 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   field `assigned_baseline_max_age_seconds`, and the abstain reason
   `assignment_lease_expired_at_close`. Parsing re-derives every abstain reason
   and row classification from the sealed fields.
+- The decision now embeds a canonical `scoring_window` and ordered
+  `assignment_manifest_evidence` entries containing each unique full manifest
+  and the exact sorted full reports that probed it. Parsing reconstructs the
+  probe rounds and recomputes the scoring-window digest, report partition,
+  observation count, serving attributions and latency, per-identity
+  opportunities and replica-share buckets, terminal registered identity set,
+  maximum assigned count, mass-drop guard, and successor baseline. Baselines
+  now carry their canonical assigned-identity list; count and identity digest
+  are derived from it.
 - Parsing also enforces sealed serving evidence: a positive row needs at least
   `scoring_policy.min_attributions` attributions, no more attributions than
   opportunities, no more opportunities than the record's `observation_count`,
@@ -93,6 +102,9 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
   `mass_unassignment_guard` fired must carry the largest set (the applied prior
   baseline, or a manifest of the window at a sequence below the terminal)
   rather than the reduced terminal set (`assigned_baseline_not_derived`).
+  On an unavailable or rejected terminal fetch, the largest verified
+  in-window set is carried unless an applied prior is strictly larger; this
+  also applies to first windows and expired priors.
 - `decide_weight_submission` accepts `prior_assigned_baseline` and
   `archived_manifests`. The window's manifests, the archived manifests, and
   the terminal must include every actual digest-linked transition; bounded

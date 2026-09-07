@@ -286,15 +286,15 @@ func Project(deployments []Deployment) ([]ManifestDeployment, error) {
 // deployments and replicas canonically, and validates the result. Callers
 // supply only facts; no digest is ever accepted from the caller.
 func Seal(snapshot Snapshot) (Snapshot, error) {
+	// A value copy of Snapshot still shares its slice backing arrays. Detach the
+	// full deployment tree before deriving fields or canonicalizing its order.
+	snapshot.Deployments = cloneDeployments(snapshot.Deployments)
 	snapshot.Schema = Schema
 	snapshot.SchemaVersion = SchemaVersion
 	snapshot.Purpose = Purpose
 	snapshot.Network = Network
 	snapshot.NetUID = NetUID
 	snapshot.ProbeScheme = ProbeScheme
-	if snapshot.Deployments == nil {
-		snapshot.Deployments = []Deployment{}
-	}
 	for index := range snapshot.Deployments {
 		deployment := &snapshot.Deployments[index]
 		deployment.ExpectedStatus = 200
@@ -336,6 +336,22 @@ func Seal(snapshot Snapshot) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func cloneDeployments(deployments []Deployment) []Deployment {
+	if deployments == nil {
+		return []Deployment{}
+	}
+	cloned := make([]Deployment, len(deployments))
+	copy(cloned, deployments)
+	for index := range deployments {
+		if deployments[index].Replicas == nil {
+			continue
+		}
+		cloned[index].Replicas = make([]Replica, len(deployments[index].Replicas))
+		copy(cloned[index].Replicas, deployments[index].Replicas)
+	}
+	return cloned
 }
 
 // Parse accepts exactly the canonical bytes of one valid snapshot. Unknown
