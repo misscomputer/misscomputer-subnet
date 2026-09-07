@@ -1,0 +1,1707 @@
+{
+  "$defs": {
+    "ActiveAssignmentManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "assignment_vector_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assignment Vector Digest Sha256",
+          "type": "string"
+        },
+        "central_authority_fingerprint_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Central Authority Fingerprint Sha256",
+          "type": "string"
+        },
+        "deployments": {
+          "items": {
+            "$ref": "#/$defs/ActiveDeploymentAssignment"
+          },
+          "maxItems": 4096,
+          "minItems": 1,
+          "title": "Deployments",
+          "type": "array"
+        },
+        "expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Expires At Epoch",
+          "type": "integer"
+        },
+        "finalized_block_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Finalized Block Hash",
+          "type": "string"
+        },
+        "finalized_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Finalized Epoch",
+          "type": "integer"
+        },
+        "finalized_height": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Finalized Height",
+          "type": "integer"
+        },
+        "issued_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Issued At Epoch",
+          "type": "integer"
+        },
+        "manifest_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Digest Sha256",
+          "type": "string"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "const": "finney",
+          "title": "Network",
+          "type": "string"
+        },
+        "previous_manifest_digest_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Previous Manifest Digest Sha256"
+        },
+        "probe_port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Probe Port",
+          "type": "integer"
+        },
+        "probe_scheme": {
+          "const": "https",
+          "title": "Probe Scheme",
+          "type": "string"
+        },
+        "purpose": {
+          "const": "active_assignment_manifest_publication_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "route_host_suffix": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host Suffix",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/active-assignment-manifest",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Trust Policy Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "purpose",
+        "network",
+        "netuid",
+        "central_authority_fingerprint_sha256",
+        "trust_policy_digest_sha256",
+        "finalized_height",
+        "finalized_block_hash",
+        "finalized_epoch",
+        "sequence",
+        "previous_manifest_digest_sha256",
+        "issued_at_epoch",
+        "expires_at_epoch",
+        "route_host_suffix",
+        "probe_scheme",
+        "probe_port",
+        "deployments",
+        "assignment_vector_digest_sha256",
+        "manifest_digest_sha256"
+      ],
+      "title": "ActiveAssignmentManifest",
+      "type": "object"
+    },
+    "ActiveDeploymentAssignment": {
+      "additionalProperties": false,
+      "description": "One public route with its centrally expected challenge response and replicas.",
+      "properties": {
+        "assignment_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assignment Digest Sha256",
+          "type": "string"
+        },
+        "attestation_requirement": {
+          "const": "miner_service_key_v1",
+          "title": "Attestation Requirement",
+          "type": "string"
+        },
+        "build_id": {
+          "pattern": "^[0-9a-f]{24}$",
+          "title": "Build Id",
+          "type": "string"
+        },
+        "campaign_sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Campaign Sequence",
+          "type": "integer"
+        },
+        "challenge_path": {
+          "pattern": "^/__challenge/[0-9a-f]{24}$",
+          "title": "Challenge Path",
+          "type": "string"
+        },
+        "challenge_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Challenge Sha256",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "expected_status": {
+          "const": 200,
+          "title": "Expected Status",
+          "type": "integer"
+        },
+        "image_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Image Digest",
+          "type": "string"
+        },
+        "replicas": {
+          "items": {
+            "$ref": "#/$defs/AssignedReplica"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Replicas",
+          "type": "array"
+        },
+        "route_host": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host",
+          "type": "string"
+        },
+        "workload_spec_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Workload Spec Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "deployment_id",
+        "campaign_sequence",
+        "route_host",
+        "challenge_path",
+        "build_id",
+        "challenge_sha256",
+        "expected_status",
+        "image_digest",
+        "workload_spec_digest_sha256",
+        "attestation_requirement",
+        "replicas",
+        "assignment_digest_sha256"
+      ],
+      "title": "ActiveDeploymentAssignment",
+      "type": "object"
+    },
+    "AssignedBaseline": {
+      "additionalProperties": false,
+      "description": "The largest verified assigned set a decision hands to its successor window.\n\n``established_at_epoch`` is the close of the window that established it;\n``assigned_identity_digest_sha256`` is the digest of the sorted\n``[uid, hotkey]`` pairs of *registered* miners assigned in that manifest,\nand ``assigned_miner_count`` counts exactly those pairs.",
+      "properties": {
+        "assigned_identities": {
+          "items": {
+            "$ref": "#/$defs/RegisteredMiner"
+          },
+          "maxItems": 4096,
+          "title": "Assigned Identities",
+          "type": "array"
+        },
+        "assigned_identity_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assigned Identity Digest Sha256",
+          "type": "string"
+        },
+        "assigned_miner_count": {
+          "maximum": 4096,
+          "minimum": 0,
+          "title": "Assigned Miner Count",
+          "type": "integer"
+        },
+        "established_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Established At Epoch",
+          "type": "integer"
+        },
+        "manifest_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Digest Sha256",
+          "type": "string"
+        },
+        "manifest_sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Manifest Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "established_at_epoch",
+        "manifest_sequence",
+        "manifest_digest_sha256",
+        "assigned_miner_count",
+        "assigned_identity_digest_sha256",
+        "assigned_identities"
+      ],
+      "title": "AssignedBaseline",
+      "type": "object"
+    },
+    "AssignedReplica": {
+      "additionalProperties": false,
+      "description": "Public-safe projection of one accepted, route-active deployment.v3 assignment.",
+      "properties": {
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "chain_block": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Chain Block",
+          "type": "integer"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "expires_at_block": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "receipt_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Receipt Digest Sha256",
+          "type": "string"
+        },
+        "replica_id": {
+          "maxLength": 256,
+          "minLength": 3,
+          "title": "Replica Id",
+          "type": "string"
+        },
+        "route_state": {
+          "const": "active",
+          "title": "Route State",
+          "type": "string"
+        },
+        "ticket_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Ticket Digest Sha256",
+          "type": "string"
+        },
+        "ticket_expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Ticket Expires At Epoch",
+          "type": "integer"
+        },
+        "ticket_issued_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Ticket Issued At Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "miner_service_public_key",
+        "generation",
+        "assignment_nonce",
+        "replica_id",
+        "endpoint_id",
+        "ticket_digest_sha256",
+        "receipt_digest_sha256",
+        "chain_block",
+        "expires_at_block",
+        "ticket_issued_at_epoch",
+        "ticket_expires_at_epoch",
+        "route_state"
+      ],
+      "title": "AssignedReplica",
+      "type": "object"
+    },
+    "ManifestAssignmentEvidence": {
+      "additionalProperties": false,
+      "description": "One full verified manifest and its immutable scoring linkage.\n\n``scoring_reports`` contains every canonical report in the sealed scoring\nwindow that probed this exact manifest. Keeping the reports themselves,\nrather than a freely remappable list of their digests, lets a parser\nreconstruct the exact :class:`~misscomputer_subnet.probe_scoring.ProbeRound`\nsequence and recompute the scoring-window digest. Together the ordered\nrecords make the registered-only maximum assignment set, terminal set,\nguard, opportunity buckets and successor baseline independently derivable\ninstead of trusting scalar summaries.",
+      "properties": {
+        "manifest": {
+          "$ref": "#/$defs/ActiveAssignmentManifest"
+        },
+        "scoring_reports": {
+          "items": {
+            "$ref": "#/$defs/ValidatorProbeReport"
+          },
+          "maxItems": 4096,
+          "title": "Scoring Reports",
+          "type": "array"
+        }
+      },
+      "required": [
+        "manifest",
+        "scoring_reports"
+      ],
+      "title": "ManifestAssignmentEvidence",
+      "type": "object"
+    },
+    "MinerProbeAttestation": {
+      "additionalProperties": false,
+      "description": "Miner service-key statement binding one probe nonce to one served payload.",
+      "properties": {
+        "algorithm": {
+          "const": "ed25519",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "probe_nonce": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Probe Nonce",
+          "type": "string"
+        },
+        "purpose": {
+          "const": "miner_probe_response_attestation_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "response_body_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Response Body Sha256",
+          "type": "string"
+        },
+        "response_status": {
+          "const": 200,
+          "title": "Response Status",
+          "type": "integer"
+        },
+        "route_host": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/miner-probe-attestation",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "signature_hex": {
+          "pattern": "^[0-9a-f]{128}$",
+          "title": "Signature Hex",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "purpose",
+        "algorithm",
+        "probe_nonce",
+        "route_host",
+        "deployment_id",
+        "generation",
+        "assignment_nonce",
+        "endpoint_id",
+        "miner_uid",
+        "miner_hotkey",
+        "miner_service_public_key",
+        "response_status",
+        "response_body_sha256",
+        "signature_hex"
+      ],
+      "title": "MinerProbeAttestation",
+      "type": "object"
+    },
+    "MinerProbeTally": {
+      "additionalProperties": false,
+      "description": "What one scoring window observed about one miner identity.",
+      "properties": {
+        "attributions": {
+          "minimum": 0,
+          "title": "Attributions",
+          "type": "integer"
+        },
+        "expected_attributions_denominator": {
+          "minimum": 1,
+          "title": "Expected Attributions Denominator",
+          "type": "integer"
+        },
+        "expected_attributions_numerator": {
+          "minimum": 0,
+          "title": "Expected Attributions Numerator",
+          "type": "integer"
+        },
+        "hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "opportunities": {
+          "minimum": 0,
+          "title": "Opportunities",
+          "type": "integer"
+        },
+        "replica_share_counts": {
+          "items": {
+            "$ref": "#/$defs/ReplicaShareCount"
+          },
+          "maxItems": 8,
+          "title": "Replica Share Counts",
+          "type": "array"
+        },
+        "total_latency_millis": {
+          "minimum": 0,
+          "title": "Total Latency Millis",
+          "type": "integer"
+        },
+        "uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Uid",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "uid",
+        "hotkey",
+        "opportunities",
+        "attributions",
+        "expected_attributions_numerator",
+        "expected_attributions_denominator",
+        "replica_share_counts",
+        "total_latency_millis"
+      ],
+      "title": "MinerProbeTally",
+      "type": "object"
+    },
+    "ProbeObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "assignment_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assignment Digest Sha256",
+          "type": "string"
+        },
+        "attestation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MinerProbeAttestation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attestation_status": {
+          "enum": [
+            "not_presented",
+            "rejected",
+            "verified"
+          ],
+          "title": "Attestation Status",
+          "type": "string"
+        },
+        "build_id_header_verified": {
+          "title": "Build Id Header Verified",
+          "type": "boolean"
+        },
+        "challenge_path": {
+          "pattern": "^/__challenge/[0-9a-f]{24}$",
+          "title": "Challenge Path",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "failure_code": {
+          "anyOf": [
+            {
+              "enum": [
+                "attestation_invalid",
+                "attestation_missing",
+                "body_digest_mismatch",
+                "build_id_header_mismatch",
+                "connection_failed",
+                "redirect_rejected",
+                "response_oversized",
+                "timeout",
+                "tls_certificate_invalid",
+                "tls_handshake_failed",
+                "tls_pin_mismatch",
+                "transport_error",
+                "unexpected_status"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Failure Code"
+        },
+        "latency_millis": {
+          "maximum": 3600000,
+          "minimum": 0,
+          "title": "Latency Millis",
+          "type": "integer"
+        },
+        "observation_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Digest Sha256",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "failed",
+            "serving"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "probe_nonce": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Probe Nonce",
+          "type": "string"
+        },
+        "response_body_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Body Sha256"
+        },
+        "response_bytes": {
+          "maximum": 1048577,
+          "minimum": 0,
+          "title": "Response Bytes",
+          "type": "integer"
+        },
+        "response_status": {
+          "anyOf": [
+            {
+              "maximum": 599,
+              "minimum": 100,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Status"
+        },
+        "route_host": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host",
+          "type": "string"
+        },
+        "tls_leaf_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tls Leaf Certificate Sha256"
+        }
+      },
+      "required": [
+        "deployment_id",
+        "route_host",
+        "challenge_path",
+        "assignment_digest_sha256",
+        "probe_nonce",
+        "latency_millis",
+        "outcome",
+        "failure_code",
+        "response_status",
+        "response_bytes",
+        "response_body_sha256",
+        "build_id_header_verified",
+        "tls_leaf_certificate_sha256",
+        "attestation_status",
+        "attestation",
+        "observation_digest_sha256"
+      ],
+      "title": "ProbeObservation",
+      "type": "object"
+    },
+    "ProbeScoringPolicy": {
+      "additionalProperties": false,
+      "description": "Validator-local scoring parameters.\n\nThese are policy, not consensus: a validator may tune them without breaking\nanything, because each validator scores independently.",
+      "properties": {
+        "apply_coverage_penalty": {
+          "default": true,
+          "title": "Apply Coverage Penalty",
+          "type": "boolean"
+        },
+        "latency_target_millis": {
+          "default": 1000,
+          "maximum": 3600000,
+          "minimum": 1,
+          "title": "Latency Target Millis",
+          "type": "integer"
+        },
+        "min_attributions": {
+          "default": 1,
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Min Attributions",
+          "type": "integer"
+        }
+      },
+      "title": "ProbeScoringPolicy",
+      "type": "object"
+    },
+    "RegisteredMiner": {
+      "additionalProperties": false,
+      "description": "One metagraph identity eligible to receive weight.\n\nCallers derive these from the finalized snapshot. The validator's own\nhotkey and inactive neurons must be excluded:\n:func:`~misscomputer_subnet.weight_plan.build_weight_plan` rejects a row\nnaming either, and it does so before it looks at the weight, so a zero row\nis not a safe way to mention them.",
+      "properties": {
+        "hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Uid",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "uid",
+        "hotkey"
+      ],
+      "title": "RegisteredMiner",
+      "type": "object"
+    },
+    "ReplicaShareCount": {
+      "additionalProperties": false,
+      "description": "Opportunity count accumulated at one exact published replica-set size.",
+      "properties": {
+        "opportunity_count": {
+          "minimum": 1,
+          "title": "Opportunity Count",
+          "type": "integer"
+        },
+        "replica_count": {
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Replica Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "replica_count",
+        "opportunity_count"
+      ],
+      "title": "ReplicaShareCount",
+      "type": "object"
+    },
+    "SealedScoringWindow": {
+      "additionalProperties": false,
+      "description": "JSON-native canonical scoring summary embedded in a decision record.",
+      "properties": {
+        "observation_count": {
+          "minimum": 0,
+          "title": "Observation Count",
+          "type": "integer"
+        },
+        "purpose": {
+          "const": "public_validator_probe_scoring_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "report_digests": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "minItems": 1,
+          "title": "Report Digests",
+          "type": "array"
+        },
+        "round_count": {
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Round Count",
+          "type": "integer"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "serving_observation_count": {
+          "minimum": 0,
+          "title": "Serving Observation Count",
+          "type": "integer"
+        },
+        "tallies": {
+          "items": {
+            "$ref": "#/$defs/MinerProbeTally"
+          },
+          "maxItems": 65536,
+          "title": "Tallies",
+          "type": "array"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        },
+        "validator_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Validator Uid",
+          "type": "integer"
+        },
+        "window_end_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window End Epoch",
+          "type": "integer"
+        },
+        "window_start_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window Start Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "purpose",
+        "schema_version",
+        "validator_uid",
+        "validator_hotkey",
+        "window_start_epoch",
+        "window_end_epoch",
+        "round_count",
+        "observation_count",
+        "serving_observation_count",
+        "report_digests",
+        "tallies"
+      ],
+      "title": "SealedScoringWindow",
+      "type": "object"
+    },
+    "ValidatorProbeReport": {
+      "additionalProperties": false,
+      "properties": {
+        "central_authority_fingerprint_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Central Authority Fingerprint Sha256",
+          "type": "string"
+        },
+        "deployment_count": {
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Deployment Count",
+          "type": "integer"
+        },
+        "edge_origin_override": {
+          "title": "Edge Origin Override",
+          "type": "boolean"
+        },
+        "evaluation_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Evaluation Epoch",
+          "type": "integer"
+        },
+        "failed_count": {
+          "maximum": 4096,
+          "minimum": 0,
+          "title": "Failed Count",
+          "type": "integer"
+        },
+        "finalized_block_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Finalized Block Hash",
+          "type": "string"
+        },
+        "finalized_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Finalized Epoch",
+          "type": "integer"
+        },
+        "finalized_height": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Finalized Height",
+          "type": "integer"
+        },
+        "manifest_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Digest Sha256",
+          "type": "string"
+        },
+        "manifest_expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Manifest Expires At Epoch",
+          "type": "integer"
+        },
+        "manifest_issued_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Manifest Issued At Epoch",
+          "type": "integer"
+        },
+        "manifest_reprobe": {
+          "title": "Manifest Reprobe",
+          "type": "boolean"
+        },
+        "manifest_sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Manifest Sequence",
+          "type": "integer"
+        },
+        "max_response_bytes": {
+          "maximum": 1048576,
+          "minimum": 64,
+          "title": "Max Response Bytes",
+          "type": "integer"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "const": "finney",
+          "title": "Network",
+          "type": "string"
+        },
+        "next_chain_state_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Next Chain State Digest Sha256",
+          "type": "string"
+        },
+        "observation_vector_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Vector Digest Sha256",
+          "type": "string"
+        },
+        "observations": {
+          "items": {
+            "$ref": "#/$defs/ProbeObservation"
+          },
+          "maxItems": 4096,
+          "minItems": 1,
+          "title": "Observations",
+          "type": "array"
+        },
+        "prior_chain_state_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Prior Chain State Digest Sha256",
+          "type": "string"
+        },
+        "probe_port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Probe Port",
+          "type": "integer"
+        },
+        "probe_scheme": {
+          "const": "https",
+          "title": "Probe Scheme",
+          "type": "string"
+        },
+        "probe_timeout_millis": {
+          "maximum": 60000,
+          "minimum": 100,
+          "title": "Probe Timeout Millis",
+          "type": "integer"
+        },
+        "purpose": {
+          "const": "public_validator_assignment_probe_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "report_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Report Digest Sha256",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/validator-probe-report",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "serving_count": {
+          "maximum": 4096,
+          "minimum": 0,
+          "title": "Serving Count",
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "degraded",
+            "serving"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Trust Policy Digest Sha256",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        },
+        "validator_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Validator Uid",
+          "type": "integer"
+        },
+        "verified_roles": {
+          "items": {
+            "enum": [
+              "assignment_auditor",
+              "assignment_issuer",
+              "assignment_security"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Verified Roles",
+          "type": "array"
+        },
+        "verified_signer_key_ids": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Verified Signer Key Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "purpose",
+        "status",
+        "network",
+        "netuid",
+        "validator_uid",
+        "validator_hotkey",
+        "evaluation_epoch",
+        "central_authority_fingerprint_sha256",
+        "trust_policy_digest_sha256",
+        "manifest_digest_sha256",
+        "manifest_sequence",
+        "manifest_issued_at_epoch",
+        "manifest_expires_at_epoch",
+        "finalized_height",
+        "finalized_block_hash",
+        "finalized_epoch",
+        "verified_signer_key_ids",
+        "verified_roles",
+        "prior_chain_state_digest_sha256",
+        "next_chain_state_digest_sha256",
+        "manifest_reprobe",
+        "edge_origin_override",
+        "probe_scheme",
+        "probe_port",
+        "probe_timeout_millis",
+        "max_response_bytes",
+        "deployment_count",
+        "serving_count",
+        "failed_count",
+        "observations",
+        "observation_vector_digest_sha256",
+        "report_digest_sha256"
+      ],
+      "title": "ValidatorProbeReport",
+      "type": "object"
+    },
+    "WeightDecisionPolicy": {
+      "additionalProperties": false,
+      "description": "Validator-local decision thresholds. Each validator decides independently.",
+      "properties": {
+        "activation_grace_seconds": {
+          "default": 1800,
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Activation Grace Seconds",
+          "type": "integer"
+        },
+        "assigned_baseline_max_age_seconds": {
+          "default": 86400,
+          "maximum": 2592000,
+          "minimum": 0,
+          "title": "Assigned Baseline Max Age Seconds",
+          "type": "integer"
+        },
+        "max_assigned_drop_permille": {
+          "default": 500,
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Max Assigned Drop Permille",
+          "type": "integer"
+        },
+        "max_registered_height_gap": {
+          "default": 600,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Registered Height Gap",
+          "type": "integer"
+        },
+        "min_expected_attributions": {
+          "default": 3,
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Min Expected Attributions",
+          "type": "integer"
+        },
+        "min_verified_rounds": {
+          "default": 24,
+          "maximum": 4096,
+          "minimum": 1,
+          "title": "Min Verified Rounds",
+          "type": "integer"
+        }
+      },
+      "title": "WeightDecisionPolicy",
+      "type": "object"
+    },
+    "WeightDecisionRow": {
+      "additionalProperties": false,
+      "description": "One registered miner: its class, weight, and the evidence counts behind it.",
+      "properties": {
+        "assigned_at_close": {
+          "title": "Assigned At Close",
+          "type": "boolean"
+        },
+        "attributions": {
+          "minimum": 0,
+          "title": "Attributions",
+          "type": "integer"
+        },
+        "classification": {
+          "enum": [
+            "assigned_in_grace",
+            "assigned_undersampled",
+            "assigned_unverified",
+            "unassigned",
+            "verified_serving"
+          ],
+          "title": "Classification",
+          "type": "string"
+        },
+        "expected_attributions_denominator": {
+          "minimum": 1,
+          "title": "Expected Attributions Denominator",
+          "type": "integer"
+        },
+        "expected_attributions_numerator": {
+          "minimum": 0,
+          "title": "Expected Attributions Numerator",
+          "type": "integer"
+        },
+        "first_seen_epoch": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "First Seen Epoch"
+        },
+        "hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "opportunities": {
+          "minimum": 0,
+          "title": "Opportunities",
+          "type": "integer"
+        },
+        "replica_share_counts": {
+          "items": {
+            "$ref": "#/$defs/ReplicaShareCount"
+          },
+          "maxItems": 8,
+          "title": "Replica Share Counts",
+          "type": "array"
+        },
+        "uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Uid",
+          "type": "integer"
+        },
+        "weight": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Weight",
+          "type": "number"
+        }
+      },
+      "required": [
+        "uid",
+        "hotkey",
+        "classification",
+        "weight",
+        "attributions",
+        "opportunities",
+        "expected_attributions_numerator",
+        "expected_attributions_denominator",
+        "replica_share_counts",
+        "first_seen_epoch",
+        "assigned_at_close"
+      ],
+      "title": "WeightDecisionRow",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Sealed, archivable outcome of one scoring window: abstain or submit.\n\nParsing re-derives every abstain reason and every row classification from\nthe sealed fields; a record is accepted only when the ``decision`` it\nstates is the one its own fields imply.",
+  "properties": {
+    "abstain_reasons": {
+      "items": {
+        "enum": [
+          "assignment_lease_expired_at_close",
+          "coverage_insufficient",
+          "manifest_expired_at_close",
+          "manifest_invalid",
+          "manifest_unavailable",
+          "mass_unassignment_guard",
+          "no_positive_evidence",
+          "registered_set_unbound",
+          "rounds_insufficient"
+        ],
+        "type": "string"
+      },
+      "maxItems": 9,
+      "title": "Abstain Reasons",
+      "type": "array"
+    },
+    "assigned_baseline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AssignedBaseline"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "assignment_manifest_evidence": {
+      "items": {
+        "$ref": "#/$defs/ManifestAssignmentEvidence"
+      },
+      "maxItems": 8193,
+      "title": "Assignment Manifest Evidence",
+      "type": "array"
+    },
+    "decision": {
+      "enum": [
+        "abstain",
+        "submit"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "decision_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Decision Digest Sha256",
+      "type": "string"
+    },
+    "decision_policy": {
+      "$ref": "#/$defs/WeightDecisionPolicy"
+    },
+    "max_assigned_miner_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Max Assigned Miner Count",
+      "type": "integer"
+    },
+    "metagraph_identity_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Metagraph Identity Fingerprint Sha256",
+      "type": "string"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "observation_count": {
+      "minimum": 0,
+      "title": "Observation Count",
+      "type": "integer"
+    },
+    "prior_assigned_baseline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AssignedBaseline"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "prior_assigned_baseline_status": {
+      "enum": [
+        "absent",
+        "applied",
+        "expired"
+      ],
+      "title": "Prior Assigned Baseline Status",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "public_validator_weight_decision_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "registered_finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Registered Finalized Block Hash",
+      "type": "string"
+    },
+    "registered_finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Registered Finalized Epoch",
+      "type": "integer"
+    },
+    "registered_finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Registered Finalized Height",
+      "type": "integer"
+    },
+    "registered_miner_count": {
+      "maximum": 4096,
+      "minimum": 1,
+      "title": "Registered Miner Count",
+      "type": "integer"
+    },
+    "round_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Round Count",
+      "type": "integer"
+    },
+    "rows": {
+      "items": {
+        "$ref": "#/$defs/WeightDecisionRow"
+      },
+      "maxItems": 4096,
+      "minItems": 1,
+      "title": "Rows",
+      "type": "array"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/validator-weight-decision",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "scoring_policy": {
+      "$ref": "#/$defs/ProbeScoringPolicy"
+    },
+    "scoring_window": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SealedScoringWindow"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "scoring_window_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Scoring Window Digest Sha256"
+    },
+    "serving_observation_count": {
+      "minimum": 0,
+      "title": "Serving Observation Count",
+      "type": "integer"
+    },
+    "terminal_assigned_miner_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Terminal Assigned Miner Count",
+      "type": "integer"
+    },
+    "terminal_earliest_lease_expires_at_block": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Earliest Lease Expires At Block"
+    },
+    "terminal_evaluated_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Terminal Evaluated At Epoch",
+      "type": "integer"
+    },
+    "terminal_finalized_block_hash": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Block Hash"
+    },
+    "terminal_finalized_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Epoch"
+    },
+    "terminal_finalized_height": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Height"
+    },
+    "terminal_manifest_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Digest Sha256"
+    },
+    "terminal_manifest_effective_expires_at_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Effective Expires At Epoch"
+    },
+    "terminal_manifest_expires_at_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Expires At Epoch"
+    },
+    "terminal_manifest_rejection_code": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z0-9_]{1,64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Rejection Code"
+    },
+    "terminal_manifest_sequence": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Sequence"
+    },
+    "terminal_manifest_status": {
+      "enum": [
+        "rejected",
+        "unavailable",
+        "verified"
+      ],
+      "title": "Terminal Manifest Status",
+      "type": "string"
+    },
+    "validator_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Validator Hotkey",
+      "type": "string"
+    },
+    "validator_uid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Validator Uid",
+      "type": "integer"
+    },
+    "weight_plan_rows_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Weight Plan Rows Digest Sha256"
+    },
+    "window_end_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Window End Epoch",
+      "type": "integer"
+    },
+    "window_start_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Window Start Epoch",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "validator_uid",
+    "validator_hotkey",
+    "window_start_epoch",
+    "window_end_epoch",
+    "decision",
+    "abstain_reasons",
+    "decision_policy",
+    "scoring_policy",
+    "terminal_manifest_status",
+    "terminal_manifest_rejection_code",
+    "terminal_evaluated_at_epoch",
+    "terminal_manifest_digest_sha256",
+    "terminal_manifest_sequence",
+    "terminal_manifest_expires_at_epoch",
+    "terminal_manifest_effective_expires_at_epoch",
+    "terminal_earliest_lease_expires_at_block",
+    "terminal_finalized_height",
+    "terminal_finalized_block_hash",
+    "terminal_finalized_epoch",
+    "round_count",
+    "observation_count",
+    "serving_observation_count",
+    "scoring_window",
+    "scoring_window_digest_sha256",
+    "assignment_manifest_evidence",
+    "prior_assigned_baseline",
+    "prior_assigned_baseline_status",
+    "max_assigned_miner_count",
+    "terminal_assigned_miner_count",
+    "assigned_baseline",
+    "registered_finalized_height",
+    "registered_finalized_block_hash",
+    "registered_finalized_epoch",
+    "registered_miner_count",
+    "metagraph_identity_fingerprint_sha256",
+    "rows",
+    "weight_plan_rows_digest_sha256",
+    "decision_digest_sha256"
+  ],
+  "title": "ValidatorWeightDecision",
+  "type": "object"
+}

@@ -65,6 +65,7 @@ from misscomputer_subnet.assignment_probe import (
     assignment_manifest_chain_state_bytes,
     assignment_manifest_signature_envelope_bytes,
     assignment_manifest_trust_policy_bytes,
+    build_active_assignment_manifest,
     build_initial_manifest_chain_state,
     build_manifest_signature_envelope,
     build_validator_probe_report,
@@ -130,6 +131,7 @@ def verify(
         policy or context.policy,
         state or context.state,
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
 
 
@@ -157,7 +159,12 @@ def verify_publication(
     state: AssignmentManifestChainState,
 ) -> Any:
     return verify_active_assignment_manifest(
-        manifest, signatures, policy, state, evaluation_epoch=EVALUATION_EPOCH
+        manifest,
+        signatures,
+        policy,
+        state,
+        evaluation_epoch=EVALUATION_EPOCH,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
 
 
@@ -516,6 +523,39 @@ def test_append_only_rollback_gap_link_fork_and_divergence() -> None:
         third(issued_at=BASE_EPOCH + 299),
         policy,
     )
+    # The finalized epoch is carried in the state and bound like the height:
+    # it never goes backwards, and one height has exactly one epoch.
+    assert state_two.last_finalized_epoch == second.finalized_epoch
+    rolled_epoch = build_active_assignment_manifest(
+        policy,
+        finalized_height=FINALIZED_HEIGHT + 20,
+        finalized_block_hash=label_digest("block-three"),
+        finalized_epoch=second.finalized_epoch - 1,
+        sequence=3,
+        previous_manifest_digest_sha256=second.manifest_digest_sha256,
+        issued_at_epoch=BASE_EPOCH + 600,
+        expires_at_epoch=BASE_EPOCH + 4_200,
+        route_host_suffix=second.route_host_suffix,
+        probe_port=second.probe_port,
+        deployments=second.deployments,
+    )
+    assert_rejected(
+        "finalized_epoch_rollback", advance_manifest_chain_state, state_two, rolled_epoch, policy
+    )
+    epoch_fork = build_active_assignment_manifest(
+        policy,
+        finalized_height=second.finalized_height,
+        finalized_block_hash=second.finalized_block_hash,
+        finalized_epoch=second.finalized_epoch + 1,
+        sequence=3,
+        previous_manifest_digest_sha256=second.manifest_digest_sha256,
+        issued_at_epoch=BASE_EPOCH + 600,
+        expires_at_epoch=BASE_EPOCH + 4_200,
+        route_host_suffix=second.route_host_suffix,
+        probe_port=second.probe_port,
+        deployments=second.deployments,
+    )
+    assert_rejected("same_height_fork", advance_manifest_chain_state, state_two, epoch_fork, policy)
     assert_rejected("sequence_gap", advance_manifest_chain_state, context.state, second, policy)
     foreign_state = AssignmentManifestChainState.model_validate(
         {
@@ -938,6 +978,7 @@ def test_golden_fixtures_are_reproducible_and_verify_with_external_signatures() 
         policy,
         genesis,
         evaluation_epoch=EVALUATION_EPOCH,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     assert assignment_manifest_chain_state_bytes(result.next_chain_state) == (
         (FIXTURES / "assignment-manifest-chain-state.v1.json").read_bytes()

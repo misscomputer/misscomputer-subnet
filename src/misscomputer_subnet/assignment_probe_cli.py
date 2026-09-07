@@ -141,6 +141,9 @@ class AssignmentProbeCLIConfig:
     manifest: ManifestSource
     signatures: tuple[SignatureSource, ...]
     evaluation_epoch: int
+    #: The validator's own finalized chain height at ``evaluation_epoch``;
+    #: every published block lease is enforced against it before any probe.
+    current_finalized_height: int
     validator_uid: int
     validator_hotkey: str
     state_root: str
@@ -848,6 +851,9 @@ def execute_assignment_probe(
         isinstance(config.evaluation_epoch, bool)
         or not isinstance(config.evaluation_epoch, int)
         or not 0 <= config.evaluation_epoch <= MAX_EPOCH
+        or isinstance(config.current_finalized_height, bool)
+        or not isinstance(config.current_finalized_height, int)
+        or not 0 <= config.current_finalized_height <= MAX_EPOCH
         or isinstance(config.validator_uid, bool)
         or not isinstance(config.validator_uid, int)
         or not 0 <= config.validator_uid <= (1 << 16) - 1
@@ -882,6 +888,7 @@ def execute_assignment_probe(
             policy,
             prior_state,
             evaluation_epoch=config.evaluation_epoch,
+            current_finalized_height=config.current_finalized_height,
         )
         state_advanced = not verification.reprobe
         if state_advanced:
@@ -951,6 +958,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--signature-sha256", action="append", default=[])
     parser.add_argument("--signature-url", action="append", default=[])
     parser.add_argument("--evaluation-epoch", required=True, type=_unsigned_decimal)
+    parser.add_argument("--finalized-height", required=True, type=_unsigned_decimal)
     parser.add_argument("--validator-uid", required=True, type=_unsigned_decimal)
     parser.add_argument("--validator-hotkey", required=True)
     parser.add_argument("--state-root", required=True)
@@ -992,6 +1000,7 @@ def _config_from_arguments(arguments: argparse.Namespace) -> AssignmentProbeCLIC
         manifest=manifest,
         signatures=signatures,
         evaluation_epoch=cast(int, arguments.evaluation_epoch),
+        current_finalized_height=cast(int, arguments.finalized_height),
         validator_uid=cast(int, arguments.validator_uid),
         validator_hotkey=cast(str, arguments.validator_hotkey),
         state_root=cast(str, arguments.state_root),

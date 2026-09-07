@@ -30,7 +30,25 @@ from .assignment_probe import (
     manifest_signature_message,
     verify_active_assignment_manifest,
 )
+from .assignment_snapshot import (
+    ActiveAssignmentSnapshot,
+    SnapshotDeployment,
+    SnapshotReplica,
+    build_active_assignment_snapshot,
+    build_snapshot_deployment,
+    build_snapshot_replica,
+    project_manifest_deployments,
+    verify_manifest_derived_from_snapshot,
+    verify_snapshot_succession,
+)
 from .checkpoint_score_contracts import CanonicalScoreReport
+from .manifest_publication import (
+    AssignmentManifestLatestPointer,
+    bind_latest_pointer_to_manifest,
+    build_manifest_latest_pointer,
+    rebind_manifest_chain_state_trust_policy,
+    verify_manifest_latest_pointer,
+)
 from .score_checkpoint_relay import (
     CentralScoreCheckpoint,
     CheckpointChainState,
@@ -213,12 +231,17 @@ def execute(request: dict[str, object]) -> dict[str, object]:
         )
         return {"reprobe": reprobe, "value": _document(next_manifest_state)}
     if operation == "verify_manifest":
+        # Live verification always enforces block leases; a caller that does
+        # not state its finalized height is refused rather than waved through.
+        if "current_finalized_height" not in arguments:
+            raise ValueError("current_finalized_height_required")
         verification = verify_active_assignment_manifest(
             _model(ActiveAssignmentManifest, arguments["manifest"]),
             [_model(AssignmentManifestSignatureEnvelope, item) for item in arguments["signatures"]],
             _model(AssignmentManifestTrustPolicy, arguments["trust_policy"]),
             _model(AssignmentManifestChainState, arguments["prior_chain_state"]),
             evaluation_epoch=arguments["evaluation_epoch"],
+            current_finalized_height=arguments["current_finalized_height"],
         )
         return {
             "next_chain_state": _document(verification.next_chain_state),
@@ -226,10 +249,75 @@ def execute(request: dict[str, object]) -> dict[str, object]:
             "verified_roles": list(verification.verified_roles),
             "verified_signer_key_ids": list(verification.verified_signer_key_ids),
         }
+    if operation == "build_snapshot_replica":
+        return {"value": _document(build_snapshot_replica(**arguments))}
+    if operation == "build_snapshot_deployment":
+        arguments = dict(arguments)
+        arguments["replicas"] = [_model(SnapshotReplica, item) for item in arguments["replicas"]]
+        return {"value": _document(build_snapshot_deployment(**arguments))}
+    if operation == "build_assignment_snapshot":
+        arguments = dict(arguments)
+        arguments["deployments"] = [
+            _model(SnapshotDeployment, item) for item in arguments["deployments"]
+        ]
+        return {"value": _document(build_active_assignment_snapshot(**arguments))}
+    if operation == "project_snapshot_deployments":
+        projected = project_manifest_deployments(
+            _model(ActiveAssignmentSnapshot, arguments["snapshot"])
+        )
+        return {"value": [_document(item) for item in projected]}
+    if operation == "verify_snapshot_succession":
+        verify_snapshot_succession(
+            _model(ActiveAssignmentSnapshot, arguments["previous"]),
+            _model(ActiveAssignmentSnapshot, arguments["current"]),
+        )
+        return {"value": True}
+    if operation == "verify_manifest_derived_from_snapshot":
+        verify_manifest_derived_from_snapshot(
+            _model(ActiveAssignmentManifest, arguments["manifest"]),
+            _model(ActiveAssignmentSnapshot, arguments["snapshot"]),
+        )
+        return {"value": True}
+    if operation == "build_manifest_latest_pointer":
+        pointer = build_manifest_latest_pointer(
+            _model(ActiveAssignmentManifest, arguments["manifest"]),
+            [_model(AssignmentManifestSignatureEnvelope, item) for item in arguments["signatures"]],
+        )
+        return {"value": _document(pointer)}
+    if operation == "verify_manifest_latest_pointer":
+        verdict = verify_manifest_latest_pointer(
+            _model(AssignmentManifestLatestPointer, arguments["pointer"]),
+            _model(AssignmentManifestTrustPolicy, arguments["trust_policy"]),
+            _model(AssignmentManifestChainState, arguments["prior_chain_state"]),
+            evaluation_epoch=arguments["evaluation_epoch"],
+        )
+        return {
+            "history_depth": verdict.history_depth,
+            "manifest_object_key": verdict.manifest_object_key,
+            "reprobe": verdict.reprobe,
+            "signature_object_keys": list(verdict.signature_object_keys),
+        }
+    if operation == "bind_latest_pointer_to_manifest":
+        bind_latest_pointer_to_manifest(
+            _model(AssignmentManifestLatestPointer, arguments["pointer"]),
+            _model(ActiveAssignmentManifest, arguments["manifest"]),
+            [_model(AssignmentManifestSignatureEnvelope, item) for item in arguments["signatures"]],
+        )
+        return {"value": True}
+    if operation == "rebind_manifest_state_trust_policy":
+        rebound = rebind_manifest_chain_state_trust_policy(
+            _model(AssignmentManifestChainState, arguments["state"]),
+            _model(AssignmentManifestTrustPolicy, arguments["current_trust_policy"]),
+            _model(AssignmentManifestTrustPolicy, arguments["next_trust_policy"]),
+            evaluation_epoch=arguments["evaluation_epoch"],
+        )
+        return {"value": _document(rebound)}
     if operation == "validate":
         models: dict[str, type[BaseModel]] = {
             "active_assignment_manifest": ActiveAssignmentManifest,
+            "active_assignment_snapshot": ActiveAssignmentSnapshot,
             "assignment_manifest_chain_state": AssignmentManifestChainState,
+            "assignment_manifest_latest_pointer": AssignmentManifestLatestPointer,
             "assignment_manifest_signature_envelope": AssignmentManifestSignatureEnvelope,
             "assignment_manifest_trust_policy": AssignmentManifestTrustPolicy,
             "central_score_checkpoint": CentralScoreCheckpoint,

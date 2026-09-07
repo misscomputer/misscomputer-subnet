@@ -42,13 +42,21 @@ depend on the order in which reports were accumulated.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Annotated, Final, Literal, NoReturn, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 from .assignment_probe import (
+    MAX_REPLICAS,
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
     ValidatorProbeReport,
@@ -72,6 +80,7 @@ ScoringRejectionCode = Literal[
     "scoring_report_duplicate",
     "scoring_report_identity_mismatch",
     "scoring_report_outside_window",
+    "scoring_round_invalid",
     "scoring_rounds_empty",
     "scoring_rounds_overflow",
     "scoring_unpublished_attribution",
@@ -134,6 +143,13 @@ class ProbeRound:
     report: ValidatorProbeReport
 
 
+class ReplicaShareCount(_StrictFrozenModel):
+    """Opportunity count accumulated at one exact published replica-set size."""
+
+    replica_count: int = Field(ge=1, le=MAX_REPLICAS)
+    opportunity_count: int = Field(ge=1)
+
+
 class MinerProbeTally(_StrictFrozenModel):
     """What one scoring window observed about one miner identity."""
 
@@ -149,7 +165,36 @@ class MinerProbeTally(_StrictFrozenModel):
     #: miner appeared in, as an exact rational ``numerator/denominator``.
     expected_attributions_numerator: int = Field(ge=0)
     expected_attributions_denominator: int = Field(ge=1)
+    #: Canonical denominator buckets from which ``expected_attributions`` is
+    #: recomputed. One observation of an N-replica deployment contributes one
+    #: opportunity and a fair share of ``1 / N`` to each published replica.
+    replica_share_counts: list[ReplicaShareCount] = Field(max_length=MAX_REPLICAS)
     total_latency_millis: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def canonical_tally(self) -> Self:
+        replica_counts = [item.replica_count for item in self.replica_share_counts]
+        if replica_counts != sorted(set(replica_counts)):
+            _reject("scoring_window_invalid")
+        if self.attributions > self.opportunities:
+            _reject("scoring_window_invalid")
+        if sum(item.opportunity_count for item in self.replica_share_counts) != (
+            self.opportunities
+        ):
+            _reject("scoring_window_invalid")
+        expected = sum(
+            (
+                Fraction(item.opportunity_count, item.replica_count)
+                for item in self.replica_share_counts
+            ),
+            Fraction(0),
+        )
+        if (
+            self.expected_attributions_numerator,
+            self.expected_attributions_denominator,
+        ) != (expected.numerator, expected.denominator):
+            _reject("scoring_window_invalid")
+        return self
 
     @property
     def expected_attributions(self) -> Fraction:
@@ -223,6 +268,10 @@ class ProbeScoringWindow(_StrictFrozenModel):
         if self.window_end_epoch <= self.window_start_epoch:
             _reject("scoring_window_invalid")
         if self.serving_observation_count > self.observation_count:
+            _reject("scoring_window_invalid")
+        if self.round_count > self.observation_count:
+            _reject("scoring_window_invalid")
+        if len(self.report_digests) != self.round_count:
             _reject("scoring_window_invalid")
         keys = [(item.uid, item.hotkey) for item in self.tallies]
         if keys != sorted(keys):
@@ -309,7 +358,24 @@ class _MutableTally:
     opportunities: int = 0
     attributions: int = 0
     expected: Fraction = Fraction(0)
+    replica_share_counts: dict[int, int] = field(default_factory=dict)
     total_latency_millis: int = 0
+
+
+def _revalidated_rounds(rounds: Sequence[ProbeRound]) -> list[ProbeRound]:
+    fresh: list[ProbeRound] = []
+    for entry in rounds:
+        try:
+            manifest = ActiveAssignmentManifest.model_validate(
+                entry.manifest.model_dump(mode="json", by_alias=True)
+            )
+            report = ValidatorProbeReport.model_validate(
+                entry.report.model_dump(mode="json", by_alias=True)
+            )
+        except (ValidationError, ValueError, TypeError, AttributeError):
+            _reject("scoring_round_invalid")
+        fresh.append(ProbeRound(manifest=manifest, report=report))
+    return fresh
 
 
 def accumulate_scoring_window(
@@ -326,7 +392,10 @@ def accumulate_scoring_window(
     that manifest. Callers are expected to have verified both already, through
     ``verify_active_assignment_manifest`` and the report's own canonical
     validators; this function re-derives every binding it depends on rather
-    than trusting that it was done.
+    than trusting that it was done, and it re-validates both documents from
+    their canonical form first, so a report whose nested observation list was
+    mutated after validation is refused rather than counted against its
+    stale digest and declared counts.
     """
 
     if not rounds:
@@ -335,6 +404,7 @@ def accumulate_scoring_window(
         _reject("scoring_rounds_overflow")
     if window_end_epoch <= window_start_epoch:
         _reject("scoring_window_invalid")
+    rounds = _revalidated_rounds(rounds)
 
     tallies: dict[tuple[int, str], _MutableTally] = {}
     uid_to_hotkey: dict[int, str] = {}
@@ -387,6 +457,9 @@ def accumulate_scoring_window(
                 tally = identify(replica.miner_uid, replica.miner_hotkey)
                 tally.opportunities += 1
                 tally.expected += share
+                tally.replica_share_counts[len(deployment.replicas)] = (
+                    tally.replica_share_counts.get(len(deployment.replicas), 0) + 1
+                )
 
             if observation.outcome != "serving":
                 continue
@@ -428,6 +501,15 @@ def accumulate_scoring_window(
                 attributions=item.attributions,
                 expected_attributions_numerator=item.expected.numerator,
                 expected_attributions_denominator=item.expected.denominator,
+                replica_share_counts=[
+                    ReplicaShareCount(
+                        replica_count=replica_count,
+                        opportunity_count=opportunity_count,
+                    )
+                    for replica_count, opportunity_count in sorted(
+                        item.replica_share_counts.items()
+                    )
+                ],
                 total_latency_millis=item.total_latency_millis,
             )
             for item in ordered

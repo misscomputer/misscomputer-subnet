@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urlsplit
 
+from .validator_decision import (
+    ValidatorWeightDecision,
+    _validated_weight_submission,
+)
+
 if TYPE_CHECKING:
     from .chain import MetagraphSnapshot, NeuronRecord
 
@@ -434,6 +439,101 @@ def build_weight_plan(
         version_key=version_key,
         created_block=snapshot.block,
         expires_at_block=conservative_expiry_block(snapshot),
+    )
+
+
+def eligible_weight_targets(
+    snapshot: MetagraphSnapshot, *, validator_hotkey: str
+) -> frozenset[tuple[int, str]]:
+    """Every ``(uid, hotkey)`` a decision must judge: active neurons other than the validator.
+
+    This is exactly the set :func:`build_weight_plan` would accept a row for,
+    so a decision whose rows cover it has classified every miner the plan
+    could weight; a decision that omits one has silently left a miner out of
+    the judgement while still naming the complete snapshot fingerprint.
+    """
+
+    validator_hotkey = _validate_text(validator_hotkey, field_name="validator hotkey")
+    targets: set[tuple[int, str]] = set()
+    for neuron in snapshot.neurons:
+        uid, hotkey, _ = _validate_snapshot_neuron(neuron)
+        if hotkey != validator_hotkey and neuron.active:
+            targets.add((uid, hotkey))
+    return frozenset(targets)
+
+
+def build_weight_plan_from_decision(
+    decision: ValidatorWeightDecision,
+    *,
+    snapshot: MetagraphSnapshot,
+    finalized_block_hash: str,
+    version_key: int,
+) -> WeightPlan:
+    """The only path from a sealed ``validator-weight-decision`` to a weight plan.
+
+    The decision names the finalized metagraph view it was judged against:
+    network, netuid, validator identity, finalized height, block hash, epoch,
+    the complete identity fingerprint, and every registered UID/hotkey pair.
+    All of it is checked against the snapshot the plan will be built from
+    before the unchanged :func:`build_weight_plan` sees a single row, so a
+    decision can never be replayed against a different chain segment, a
+    reorganised metagraph, or a remapped UID. The decision's rows must also be
+    exactly the snapshot's eligible weight targets
+    (:func:`eligible_weight_targets`): a decision that omits an eligible miner
+    is refused, so no miner can be left out of the judgement while the
+    fingerprint still names the complete set.
+    """
+
+    # ``frozen=True`` prevents attribute assignment but does not make a
+    # Pydantic model's nested lists immutable. Snapshot the complete sealed
+    # decision once, then consult only that private copy: a caller mutating
+    # ``decision.rows`` concurrently cannot make the identity checks observe
+    # different rows from the ones committed to ``rows``.
+    decision, row_values = _validated_weight_submission(decision)
+    rows = tuple({"miner_hotkey": hotkey, "weight": weight} for hotkey, weight in row_values)
+    if snapshot.finalized is not True:
+        raise WeightPlanError("weight plans require a finalized metagraph snapshot")
+    if (
+        _validate_network_identity(snapshot.network, field_name="snapshot network")
+        != decision.network
+        or snapshot.netuid != decision.netuid
+    ):
+        raise WeightPlanError("decision network identity does not match the snapshot")
+    block = _validate_integer(
+        snapshot.block, field_name="snapshot block", minimum=0, maximum=MAX_BLOCK
+    )
+    tempo = _validate_integer(
+        snapshot.tempo, field_name="snapshot tempo", minimum=1, maximum=MAX_BLOCK
+    )
+    if block != decision.registered_finalized_height:
+        raise WeightPlanError("decision finalized height does not match the snapshot block")
+    if block // tempo != decision.registered_finalized_epoch:
+        raise WeightPlanError("decision finalized epoch does not match the snapshot epoch")
+    if (
+        not isinstance(finalized_block_hash, str)
+        or finalized_block_hash != decision.registered_finalized_block_hash
+    ):
+        raise WeightPlanError("decision finalized block hash does not match the snapshot")
+    by_hotkey = {neuron.hotkey: neuron for neuron in snapshot.neurons}
+    validator = by_hotkey.get(decision.validator_hotkey)
+    if validator is None or validator.uid != decision.validator_uid:
+        raise WeightPlanError("decision validator identity is absent from the snapshot")
+    for row in decision.rows:
+        neuron = by_hotkey.get(row.hotkey)
+        if neuron is None or neuron.uid != row.uid:
+            raise WeightPlanError("decision row identity is absent from or remapped in snapshot")
+    if snapshot_identity_fingerprint(snapshot) != decision.metagraph_identity_fingerprint_sha256:
+        raise WeightPlanError("decision metagraph fingerprint does not match the snapshot")
+    row_identities = frozenset((row.uid, row.hotkey) for row in decision.rows)
+    if row_identities != eligible_weight_targets(
+        snapshot, validator_hotkey=decision.validator_hotkey
+    ):
+        raise WeightPlanError("decision rows do not cover the complete eligible miner set")
+    return build_weight_plan(
+        snapshot=snapshot,
+        validator_hotkey=decision.validator_hotkey,
+        rows=rows,
+        version_key=version_key,
     )
 
 

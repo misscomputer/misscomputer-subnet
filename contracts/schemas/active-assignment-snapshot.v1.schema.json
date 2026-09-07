@@ -1,0 +1,322 @@
+{
+  "$defs": {
+    "SnapshotDeployment": {
+      "additionalProperties": false,
+      "description": "One route-active deployment and its replicas, challenge digest only.",
+      "properties": {
+        "attestation_requirement": {
+          "const": "miner_service_key_v1",
+          "title": "Attestation Requirement",
+          "type": "string"
+        },
+        "build_id": {
+          "pattern": "^[0-9a-f]{24}$",
+          "title": "Build Id",
+          "type": "string"
+        },
+        "campaign_sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Campaign Sequence",
+          "type": "integer"
+        },
+        "challenge_path": {
+          "pattern": "^/__challenge/[0-9a-f]{24}$",
+          "title": "Challenge Path",
+          "type": "string"
+        },
+        "challenge_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Challenge Sha256",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "expected_status": {
+          "const": 200,
+          "title": "Expected Status",
+          "type": "integer"
+        },
+        "image_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Image Digest",
+          "type": "string"
+        },
+        "replicas": {
+          "items": {
+            "$ref": "#/$defs/SnapshotReplica"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Replicas",
+          "type": "array"
+        },
+        "route_host": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host",
+          "type": "string"
+        },
+        "workload_spec_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Workload Spec Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "deployment_id",
+        "campaign_sequence",
+        "route_host",
+        "challenge_path",
+        "build_id",
+        "challenge_sha256",
+        "expected_status",
+        "image_digest",
+        "workload_spec_digest_sha256",
+        "attestation_requirement",
+        "replicas"
+      ],
+      "title": "SnapshotDeployment",
+      "type": "object"
+    },
+    "SnapshotReplica": {
+      "additionalProperties": false,
+      "description": "One route-active replica: exact incarnation, identity, digests, and timing.",
+      "properties": {
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "chain_block": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Chain Block",
+          "type": "integer"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "expires_at_block": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "receipt_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Receipt Digest Sha256",
+          "type": "string"
+        },
+        "replica_id": {
+          "maxLength": 256,
+          "minLength": 3,
+          "title": "Replica Id",
+          "type": "string"
+        },
+        "route_activated_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Route Activated At Epoch",
+          "type": "integer"
+        },
+        "route_state": {
+          "const": "active",
+          "title": "Route State",
+          "type": "string"
+        },
+        "ticket_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Ticket Digest Sha256",
+          "type": "string"
+        },
+        "ticket_expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Ticket Expires At Epoch",
+          "type": "integer"
+        },
+        "ticket_issued_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Ticket Issued At Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "miner_service_public_key",
+        "generation",
+        "assignment_nonce",
+        "replica_id",
+        "endpoint_id",
+        "ticket_digest_sha256",
+        "receipt_digest_sha256",
+        "chain_block",
+        "expires_at_block",
+        "ticket_issued_at_epoch",
+        "ticket_expires_at_epoch",
+        "route_state",
+        "route_activated_at_epoch"
+      ],
+      "title": "SnapshotReplica",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One consistent, credential-safe capture of every route-active assignment.",
+  "properties": {
+    "captured_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Captured At Epoch",
+      "type": "integer"
+    },
+    "central_authority_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Central Authority Fingerprint Sha256",
+      "type": "string"
+    },
+    "deployments": {
+      "items": {
+        "$ref": "#/$defs/SnapshotDeployment"
+      },
+      "maxItems": 4096,
+      "title": "Deployments",
+      "type": "array"
+    },
+    "finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Finalized Block Hash",
+      "type": "string"
+    },
+    "finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Epoch",
+      "type": "integer"
+    },
+    "finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Height",
+      "type": "integer"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "probe_port": {
+      "maximum": 65535,
+      "minimum": 1,
+      "title": "Probe Port",
+      "type": "integer"
+    },
+    "probe_scheme": {
+      "const": "https",
+      "title": "Probe Scheme",
+      "type": "string"
+    },
+    "projected_assignment_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Projected Assignment Vector Digest Sha256",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "active_assignment_snapshot_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "route_host_suffix": {
+      "maxLength": 253,
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+      "title": "Route Host Suffix",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/active-assignment-snapshot",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "snapshot_sequence": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Snapshot Sequence",
+      "type": "integer"
+    },
+    "state_revision": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "State Revision",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "central_authority_fingerprint_sha256",
+    "snapshot_sequence",
+    "state_revision",
+    "captured_at_epoch",
+    "finalized_height",
+    "finalized_block_hash",
+    "finalized_epoch",
+    "route_host_suffix",
+    "probe_scheme",
+    "probe_port",
+    "deployments",
+    "projected_assignment_vector_digest_sha256",
+    "snapshot_digest_sha256"
+  ],
+  "title": "ActiveAssignmentSnapshot",
+  "type": "object"
+}

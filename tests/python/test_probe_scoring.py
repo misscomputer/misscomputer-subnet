@@ -7,11 +7,13 @@ from __future__ import annotations
 import ast
 import hashlib
 from collections.abc import Sequence
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
 from assignment_probe_context import (
     BASE_EPOCH,
+    FINALIZED_HEIGHT,
     MINERS,
     ROOT,
     build_deployment,
@@ -28,6 +30,7 @@ from misscomputer_subnet.assignment_probe import (
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
     AssignmentManifestTrustPolicy,
+    ProbeObservation,
     ProbeTransportFailure,
     ValidatorProbeReport,
     build_initial_manifest_chain_state,
@@ -82,6 +85,7 @@ def build_round(
         policy,
         state,
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
     )
     observations = []
     for deployment in manifest.deployments:
@@ -240,6 +244,10 @@ def test_miner_dark_for_the_whole_window_scores_zero() -> None:
     # It had every opportunity and took none of them.
     assert dark.opportunities == 10
     assert dark.attributions == 0
+    assert dark.expected_attributions == Fraction(10, 3)
+    assert [(item.replica_count, item.opportunity_count) for item in dark.replica_share_counts] == [
+        (3, 10)
+    ]
     assert dark.coverage() == 0
 
 
@@ -571,3 +579,42 @@ def test_unpublished_attribution_is_refused() -> None:
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
+
+
+def test_mutated_report_is_refused_rather_than_counted() -> None:
+    """A frozen report's nested observation list is still a Python list; scoring re-validates."""
+
+    policy, manifest = single_deployment_context()
+    round_one = rotate(policy, manifest, ["MinerA"], rounds=1)[0]
+    baseline = accumulate_scoring_window(
+        [round_one],
+        validator_uid=VALIDATOR_UID,
+        validator_hotkey=VALIDATOR_HOTKEY,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+    )
+    extra = ProbeObservation.model_validate(
+        round_one.report.observations[0].model_dump(mode="json", by_alias=True)
+    )
+    round_one.report.observations.append(extra)
+    try:
+        with pytest.raises(ProbeScoringError, match="scoring_round_invalid"):
+            accumulate_scoring_window(
+                [round_one],
+                validator_uid=VALIDATOR_UID,
+                validator_hotkey=VALIDATOR_HOTKEY,
+                window_start_epoch=WINDOW_START,
+                window_end_epoch=WINDOW_END,
+            )
+    finally:
+        round_one.report.observations.pop()
+    assert (
+        accumulate_scoring_window(
+            [round_one],
+            validator_uid=VALIDATOR_UID,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+        == baseline
+    )
