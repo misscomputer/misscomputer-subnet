@@ -152,6 +152,7 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "row-classification-not-derived",
         "self-digest-mismatch",
         "submit-with-epoch-behind-terminal",
+        "submit-with-erased-first-seen",
         "submit-with-expired-block-lease",
         "submit-with-expired-terminal",
         "submit-with-expected-attributions-exceeding-opportunities",

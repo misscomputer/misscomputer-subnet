@@ -856,6 +856,21 @@ def negative_documents() -> dict[str, bytes]:
             ],
         ),
     )
+    # An earning identity whose first sighting was erased, as a producer that
+    # tracked sightings per endpoint rather than per identity once could.
+    add(
+        "validator-weight-decision",
+        "submit-with-erased-first-seen",
+        "model",
+        "row_assigned_first_seen_missing",
+        forged_decision(
+            decision,
+            rows=[
+                {**row, "first_seen_epoch": None} if row["hotkey"] == "MinerA" else row
+                for row in decision_doc["rows"]
+            ],
+        ),
+    )
     add(
         "validator-weight-decision",
         "submit-with-mass-drop",

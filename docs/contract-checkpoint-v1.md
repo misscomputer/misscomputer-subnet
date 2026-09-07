@@ -388,9 +388,14 @@ Frozen invariants:
 - **Activation grace** anchors on the miner's earliest sighting across the
   window's accepted manifests, the terminal manifest, and any earlier
   archived sighting the coordinator supplies (a supplied sighting may only be
-  earlier). On parse, every non-`unassigned` row must carry a sighting no later
-  than the minimum `issued_at_epoch` of the sealed evidence manifests that
-  publish its identity (`row_first_seen_not_derived`); an earlier archived
+  earlier). Sightings are scoped to the exact `(uid, hotkey)` identity, never
+  to the last manifest that published an endpoint: an endpoint republished
+  under a new UID adds a sighting for the new identity and cannot erase the
+  one recorded for the identity that earned weight in earlier rounds, and a
+  supplied archived sighting applies to every identity the chain published on
+  that endpoint. On parse, every non-`unassigned` row must carry a sighting no
+  later than the minimum `issued_at_epoch` of the sealed evidence manifests
+  that publish its identity (`row_first_seen_not_derived`); an earlier archived
   sighting remains valid. Grace creates no weight; a miner earns weight from
   the first window in which it is attributed. `activation_grace_seconds` may
   not exceed the window length.
@@ -444,6 +449,7 @@ defaults, not consensus.
 | Manifest drops registered miners and pads itself with unregistered identities | `mass_unassignment_guard`; the padding is not counted and never enters a baseline | assigned sets are measured in registered identities |
 | Validator sampling too sparse | `rounds_insufficient`/`coverage_insufficient`; abstain | the validator's gap never becomes a miner's zero |
 | Digest-valid rewrite shifts a miner's first sighting later to manufacture activation grace | `row_first_seen_not_derived` on parse; never reaches a plan | every non-unassigned row is bounded by the earliest sealed manifest publication of its identity, while a genuinely earlier archived sighting remains legal |
+| Endpoint republished under a new UID while the earlier registered identity earned weight in the window | producer seals the earning identity's original sighting; the record round-trips and its rewrite is still `row_first_seen_not_derived` | sightings are keyed by exact identity, so a later UID owner never erases an earlier `(uid, hotkey)` sighting |
 | Miner newly activated late in a window | `assigned_in_grace`; window still submits | new miners cannot stall the network |
 | Miner registered but never assigned | `unassigned`, zero under safe preconditions | assignment is the central authority's prerogative; weight follows serving |
 | Registered set from a different chain segment (behind, too far ahead, same height with another hash or epoch, lower epoch) | `registered_set_unbound`; abstain | plan and manifest views must agree |

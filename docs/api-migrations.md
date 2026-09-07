@@ -98,7 +98,11 @@ re-pinned at their new bytes; the probe-report *schema* is unchanged.
 - Parsing derives each registered identity's earliest sealed manifest sighting
   and rejects a non-`unassigned` row whose `first_seen_epoch` is absent or later
   (`row_first_seen_not_derived`). An earlier sighting supplied from the
-  coordinator's archive remains valid.
+  coordinator's archive remains valid. The producer records sightings per
+  exact `(uid, hotkey)` identity rather than per endpoint owner, so an
+  endpoint republished under a new UID never leaves the identity that earned
+  weight without a sighting; a supplied `endpoint_first_seen_epoch` entry
+  applies to every identity the chain published on that endpoint.
 - Assigned sets are counted in registered identities only:
   `terminal_assigned_miner_count` must equal the rows sealed
   `assigned_at_close` (`assigned_counts_invalid`), and the successor

@@ -634,6 +634,130 @@ def test_sealed_first_seen_rejects_later_rewrite_and_accepts_earlier_archive() -
     )
 
 
+def test_uid_republication_never_erases_the_earning_identity_sighting() -> None:
+    """An endpoint republished under a new UID keeps the earlier identity's first sighting.
+
+    Sightings are scoped to the exact ``(uid, hotkey)`` identity, never to the
+    last manifest that published an endpoint, so the producer's record always
+    round-trips through its own parser instead of raising a raw
+    ``row_first_seen_not_derived`` validation error.
+    """
+
+    context = make_window_context()
+    republished = build_probe_manifest(
+        context.policy,
+        [
+            window_deployment("fixture-alpha", [(99, "MinerA"), *MINERS[1:3]], campaign_sequence=1),
+            window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2),
+        ],
+        sequence=2,
+        previous=context.manifests[0].manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 1_500,
+        expires_at=BASE_EPOCH + 1_500 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 20,
+        finalized_block_hash=label_digest("republished-alpha-two"),
+    )
+
+    def endpoint_ids(manifest: Any) -> set[str]:
+        return {replica.endpoint_id for item in manifest.deployments for replica in item.replicas}
+
+    # The same endpoint lineage, now owned by UID 99, on a successor the
+    # coordinator's chain state accepts.
+    assert endpoint_ids(republished) == endpoint_ids(context.manifests[0])
+    verify_active_assignment_manifest(
+        republished,
+        sign_manifest(republished, context.keys),
+        context.policy,
+        context.states[1],
+        evaluation_epoch=BASE_EPOCH + 1_500,
+        current_finalized_height=FINALIZED_HEIGHT,
+    )
+    terminal = TerminalManifestObservation(
+        status="verified", evaluated_at_epoch=WINDOW_END, manifest=republished
+    )
+
+    def decide(**changes: Any) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            context.rounds[:24],
+            terminal=terminal,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+            **{"registered": context.registered, **changes},
+        )
+
+    decision = decide()
+    rendered = validator_weight_decision_bytes(decision)
+    parsed = parse_validator_weight_decision(rendered)
+    assert validator_weight_decision_bytes(parsed) == rendered
+    assert parsed.decision == "submit"
+    miner_a = next(row for row in parsed.rows if row.hotkey == "MinerA")
+    assert (miner_a.uid, miner_a.classification, miner_a.assigned_at_close) == (
+        10,
+        "verified_serving",
+        False,
+    )
+    assert miner_a.first_seen_epoch == BASE_EPOCH
+    assert miner_a.weight > 0.0
+    # The unregistered UID 99 incarnation is not an assigned registered identity.
+    assert parsed.terminal_assigned_miner_count == 3
+    assert weight_plan_rows_for_submission(parsed)
+
+    # Rewrite resistance is unchanged for the republished record: the earning
+    # identity's sighting can be neither erased nor moved later, while a
+    # genuinely earlier archived sighting remains legal.
+    document = json.loads(rendered)
+
+    def with_miner_a_first_seen(value: int | None) -> dict[str, Any]:
+        return forged_decision(
+            rendered,
+            rows=[
+                {**row, "first_seen_epoch": value} if row["hotkey"] == "MinerA" else row
+                for row in document["rows"]
+            ],
+        )
+
+    for rewritten in (None, BASE_EPOCH + 1):
+        with pytest.raises(ValidationError, match="row_first_seen_not_derived"):
+            ValidatorWeightDecision.model_validate(with_miner_a_first_seen(rewritten))
+    earlier = ValidatorWeightDecision.model_validate(with_miner_a_first_seen(WINDOW_START - 1))
+    assert next(row for row in earlier.rows if row.hotkey == "MinerA").first_seen_epoch == (
+        WINDOW_START - 1
+    )
+
+    # An archived endpoint sighting applies to every identity published on the
+    # endpoint and may still not post-date the endpoint's earliest publication.
+    alpha_a_endpoint = next(
+        replica.endpoint_id
+        for item in republished.deployments
+        for replica in item.replicas
+        if replica.miner_hotkey == "MinerA"
+    )
+    archived = decide(endpoint_first_seen_epoch={alpha_a_endpoint: BASE_EPOCH - 100})
+    assert next(row for row in archived.rows if row.hotkey == "MinerA").first_seen_epoch == (
+        BASE_EPOCH - 100
+    )
+    assert parse_validator_weight_decision(validator_weight_decision_bytes(archived)) == archived
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(endpoint_first_seen_epoch={alpha_a_endpoint: BASE_EPOCH + 1})
+    assert failure.value.code == "decision_first_seen_after_sighting"
+
+    # Seen from a registered view that already holds the new UID, the new
+    # identity's sighting is its own first publication, not the old UID's.
+    reregistered = decide(
+        registered=registered_set(miners=tuple(sorted([*REGISTERED_MINERS[1:], (99, "MinerA")])))
+    )
+    parsed_reregistered = parse_validator_weight_decision(
+        validator_weight_decision_bytes(reregistered)
+    )
+    new_a = next(row for row in parsed_reregistered.rows if row.hotkey == "MinerA")
+    assert (new_a.uid, new_a.first_seen_epoch, new_a.assigned_at_close) == (
+        99,
+        BASE_EPOCH + 1_500,
+        True,
+    )
+    assert new_a.weight == 0.0
+
+
 def test_no_positive_evidence_means_no_transaction() -> None:
     context = make_window_context()
     empty = decide_weight_submission(
