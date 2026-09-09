@@ -121,8 +121,9 @@ MAX_LINEAGE_REPLICAS: Final = MAX_DEPLOYMENTS * MAX_REPLICAS
 #: exported, kept so no later incarnation can recycle any of them; a lineage
 #: past this must be re-anchored by its operator.
 MAX_LINEAGE_FACTS: Final = 1 << 17
-#: Security eras a lineage may record; each era boundary is an explicit,
-#: operator-initiated loss of retired-fact memory.
+#: Security eras a lineage may pass through (``era`` is at most this value, so
+#: at most ``MAX_LINEAGE_ERAS - 1`` boundaries); each boundary is an explicit,
+#: operator-initiated loss of retired-fact and inactive-lineage memory.
 MAX_LINEAGE_ERAS: Final = 64
 MAX_LINEAGE_BYTES: Final = 64 * 1_024 * 1_024
 
@@ -494,6 +495,10 @@ class ReplicaLineage(StrictFrozenModel):
     receipt_digest_sha256: Digest
     replica_digest_sha256: Digest
     deployment_facts_digest_sha256: Digest
+    #: The last accepted capture that exported this incarnation. An entry whose
+    #: value is below the lineage's ``last_snapshot_sequence`` is inactive and
+    #: is the only kind an era boundary may prune.
+    last_seen_snapshot_sequence: PositiveEpoch
 
     @model_validator(mode="after")
     def canonical_lineage(self) -> Self:
@@ -518,6 +523,7 @@ class LineageEraBoundary(StrictFrozenModel):
 
     era: PositiveEpoch
     opened_after_snapshot_sequence: PositiveEpoch
+    dropped_replica_lineages: int = Field(ge=0)
     dropped_assignment_nonces: int = Field(ge=0)
     dropped_ticket_digests: int = Field(ge=0)
     dropped_receipt_digests: int = Field(ge=0)
@@ -566,7 +572,7 @@ class SnapshotLineage(StrictFrozenModel):
     history_start_snapshot_sequence: PositiveEpoch
     #: Current security era; ``1`` until an operator begins a new one.
     era: PositiveEpoch
-    era_boundaries: list[LineageEraBoundary] = Field(max_length=MAX_LINEAGE_ERAS)
+    era_boundaries: list[LineageEraBoundary] = Field(max_length=MAX_LINEAGE_ERAS - 1)
     #: Digest of the lineage this one was advanced from; ``null`` at genesis.
     previous_lineage_digest_sha256: Digest | None
     accepted_snapshot_count: int = Field(ge=0)
@@ -630,26 +636,41 @@ class SnapshotLineage(StrictFrozenModel):
             for item in self.replicas
         ):
             raise ValueError("lineage_used_facts_not_derived")
+        if tickets & receipts:
+            raise ValueError("lineage_used_facts_overlap")
         if genesis and (nonces or tickets or receipts):
             raise ValueError("lineage_genesis_invalid")
         if genesis and self.previous_lineage_digest_sha256 is not None:
             raise ValueError("lineage_genesis_invalid")
         if not genesis and self.previous_lineage_digest_sha256 is None:
             raise ValueError("lineage_chain_link_missing")
-        if (
-            not genesis
-            and cast(int, self.last_snapshot_sequence)
-            < self.history_start_snapshot_sequence + self.accepted_snapshot_count - 1
-        ):
-            raise ValueError("lineage_history_not_contiguous")
+        if not genesis:
+            last_sequence = cast(int, self.last_snapshot_sequence)
+            if last_sequence != (
+                self.history_start_snapshot_sequence + self.accepted_snapshot_count - 1
+            ):
+                raise ValueError("lineage_history_not_contiguous")
+            if any(
+                not self.history_start_snapshot_sequence
+                <= item.last_seen_snapshot_sequence
+                <= last_sequence
+                for item in self.replicas
+            ):
+                raise ValueError("lineage_replica_seen_out_of_range")
         eras = [item.era for item in self.era_boundaries]
         if eras != list(range(2, 2 + len(eras))) or self.era != 1 + len(eras):
             raise ValueError("lineage_era_invalid")
-        if any(
-            genesis or item.opened_after_snapshot_sequence > cast(int, self.last_snapshot_sequence)
-            for item in self.era_boundaries
-        ):
-            raise ValueError("lineage_era_invalid")
+        if self.era_boundaries:
+            if genesis:
+                raise ValueError("lineage_era_invalid")
+            opened = [item.opened_after_snapshot_sequence for item in self.era_boundaries]
+            if opened != sorted(opened) or any(
+                not self.history_start_snapshot_sequence
+                <= value
+                <= cast(int, self.last_snapshot_sequence)
+                for value in opened
+            ):
+                raise ValueError("lineage_era_invalid")
         verify_model_digest(self, "lineage_digest_sha256")
         return self
 
@@ -662,7 +683,17 @@ def _deployment_facts_digest(deployment: SnapshotDeployment) -> str:
     )
 
 
-def _replica_lineage(deployment: SnapshotDeployment, replica: SnapshotReplica) -> ReplicaLineage:
+def _same_incarnation(known: ReplicaLineage, current: ReplicaLineage) -> bool:
+    """Identical incarnation facts; the capture that last exported them may differ."""
+
+    return model_document(known) | {"last_seen_snapshot_sequence": 0} == model_document(current) | {
+        "last_seen_snapshot_sequence": 0
+    }
+
+
+def _replica_lineage(
+    deployment: SnapshotDeployment, replica: SnapshotReplica, *, seen_at: int
+) -> ReplicaLineage:
     return ReplicaLineage(
         replica_id=replica.replica_id,
         deployment_id=deployment.deployment_id,
@@ -674,6 +705,7 @@ def _replica_lineage(deployment: SnapshotDeployment, replica: SnapshotReplica) -
         receipt_digest_sha256=replica.receipt_digest_sha256,
         replica_digest_sha256=digest(model_document(replica)),
         deployment_facts_digest_sha256=_deployment_facts_digest(deployment),
+        last_seen_snapshot_sequence=seen_at,
     )
 
 
@@ -758,9 +790,10 @@ def advance_snapshot_lineage(
       must advance the generation (``snapshot_generation_not_increasing``);
     - every new incarnation, replacement or first appearance, must carry a
       nonce, ticket digest, and receipt digest that no incarnation of any
-      replica ever carried before, however many captures or replacements ago
-      (``snapshot_incarnation_facts_reused``); the lineage keeps every fact it
-      has accepted for exactly this purpose.
+      replica ever carried before in any role (a retired ticket digest may not
+      return as a receipt digest, nor the reverse), however many captures or
+      replacements ago (``snapshot_incarnation_facts_reused``); the lineage
+      keeps every fact it has accepted in the era for exactly this purpose.
     """
 
     lineage = revalidate(lineage, SnapshotLineage)
@@ -808,18 +841,20 @@ def advance_snapshot_lineage(
     used_receipts = set(lineage.used_receipt_digests)
     for deployment in snapshot.deployments:
         for replica in deployment.replicas:
-            current = _replica_lineage(deployment, replica)
+            current = _replica_lineage(deployment, replica, seen_at=snapshot.snapshot_sequence)
             known = retained.get(current.replica_id)
             if known is not None and known.endpoint_id == current.endpoint_id:
-                if known != current:
+                if not _same_incarnation(known, current):
                     _reject("snapshot_incarnation_rewritten")
+                retained[current.replica_id] = current
                 continue
             if known is not None and current.generation <= known.generation:
                 _reject("snapshot_generation_not_increasing")
+            used_any = used_nonces | used_tickets | used_receipts
             if (
-                current.assignment_nonce in used_nonces
-                or current.ticket_digest_sha256 in used_tickets
-                or current.receipt_digest_sha256 in used_receipts
+                current.assignment_nonce in used_any
+                or current.ticket_digest_sha256 in used_any
+                or current.receipt_digest_sha256 in used_any
             ):
                 _reject("snapshot_incarnation_facts_reused")
             used_nonces.add(current.assignment_nonce)
@@ -859,30 +894,41 @@ def advance_snapshot_lineage(
 
 
 def begin_snapshot_lineage_era(lineage: SnapshotLineage) -> SnapshotLineage:
-    """Open a new security era: keep every current incarnation, drop retired facts.
+    """Open a new security era: keep the active incarnations, drop everything retired.
 
     This is the only operation that forgets. It is for a lineage that has hit
     ``snapshot_lineage_overflow`` (or that an operator must otherwise re-scope)
     and it never happens implicitly: the result carries ``era + 1``, a
     :class:`LineageEraBoundary` naming the last accepted capture, the counts
-    of retired facts dropped, and the digest of the lineage it was taken from,
-    so downstream readers can see that facts retired before the boundary are
-    no longer guarded against reuse. The current incarnations and their facts
-    are kept, so retained endpoints are still held to their documents and a
-    replacement still needs a higher generation and facts unseen in this era.
+    of inactive replica lineages and retired facts dropped, and the digest of
+    the lineage it was taken from, so downstream readers can see that facts and
+    generations retired before the boundary are no longer guarded. Only the
+    incarnations exported by the last accepted capture are kept, with their
+    facts, so retained endpoints are still held to their documents and a
+    replacement still needs a higher generation and facts unseen in this era;
+    a lineage over ``MAX_LINEAGE_REPLICAS`` therefore recovers here exactly
+    when it holds inactive lineages, which it always does past that bound
+    because one capture cannot hold more. ``era`` may not exceed
+    ``MAX_LINEAGE_ERAS`` (``snapshot_lineage_overflow``).
     """
 
     lineage = revalidate(lineage, SnapshotLineage)
     if lineage.accepted_snapshot_count == 0:
         _reject("snapshot_lineage_gap")
-    if len(lineage.era_boundaries) + 1 > MAX_LINEAGE_ERAS:
+    if lineage.era >= MAX_LINEAGE_ERAS:
         _reject("snapshot_lineage_overflow")
-    kept_nonces = sorted({item.assignment_nonce for item in lineage.replicas})
-    kept_tickets = sorted({item.ticket_digest_sha256 for item in lineage.replicas})
-    kept_receipts = sorted({item.receipt_digest_sha256 for item in lineage.replicas})
+    active = [
+        item
+        for item in lineage.replicas
+        if item.last_seen_snapshot_sequence == lineage.last_snapshot_sequence
+    ]
+    kept_nonces = sorted({item.assignment_nonce for item in active})
+    kept_tickets = sorted({item.ticket_digest_sha256 for item in active})
+    kept_receipts = sorted({item.receipt_digest_sha256 for item in active})
     boundary = {
         "era": lineage.era + 1,
         "opened_after_snapshot_sequence": lineage.last_snapshot_sequence,
+        "dropped_replica_lineages": len(lineage.replicas) - len(active),
         "dropped_assignment_nonces": len(lineage.used_assignment_nonces) - len(kept_nonces),
         "dropped_ticket_digests": len(lineage.used_ticket_digests) - len(kept_tickets),
         "dropped_receipt_digests": len(lineage.used_receipt_digests) - len(kept_receipts),
@@ -894,11 +940,33 @@ def begin_snapshot_lineage_era(lineage: SnapshotLineage) -> SnapshotLineage:
         "era": lineage.era + 1,
         "era_boundaries": [*(model_document(item) for item in lineage.era_boundaries), boundary],
         "previous_lineage_digest_sha256": lineage.lineage_digest_sha256,
+        "replicas": [model_document(item) for item in active],
         "used_assignment_nonces": kept_nonces,
         "used_ticket_digests": kept_tickets,
         "used_receipt_digests": kept_receipts,
     }
     return SnapshotLineage.model_validate({**unsigned, "lineage_digest_sha256": digest(unsigned)})
+
+
+def snapshot_history_gaps(
+    snapshots: Sequence[ActiveAssignmentSnapshot],
+) -> list[tuple[int, int]]:
+    """Preflight a retained capture history: every ``(before, after)`` sequence jump.
+
+    A lineage accepts captures only in exact order, so a publisher adopting it
+    over a history written under the base contract (which allowed any strictly
+    increasing ``snapshot_sequence``) checks for jumps first. An empty result
+    means the history replays without ``snapshot_lineage_gap``; otherwise the
+    lineage must start after the last jump (``first_snapshot_sequence``), and
+    the document then states that facts before it are outside the guarantee.
+    """
+
+    sequences = [revalidate(item, ActiveAssignmentSnapshot).snapshot_sequence for item in snapshots]
+    return [
+        (previous, current)
+        for previous, current in zip(sequences, sequences[1:], strict=False)
+        if current != previous + 1
+    ]
 
 
 def verify_snapshot_lineage_anchor(

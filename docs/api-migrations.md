@@ -57,8 +57,11 @@ policy document:
   `assignment_probe.verify_observation_policy_binding(observation, policy)`
   (every response-derived outcome inside the policy's whole-request budget,
   `latency_millis <= probe_timeout_millis`; a pinned certificate when the
-  policy pins; `response_bytes` within `max_response_bytes`; each judged on the
-  outcomes and failure codes that could only follow that check). Producer codes:
+  policy pins; `response_bytes` within `max_response_bytes`; a
+  `tls_pin_mismatch` only under a policy that pins and against a recorded leaf
+  outside its pins, so a mismatch judged under a stricter policy cannot be
+  carried into a report naming a looser one; each judged on the outcomes and
+  failure codes that could only follow that check, in both directions). Producer codes:
   `decision_round_policy_rejected`, `decision_terminal_policy_rejected`; parser
   codes: `report_policy_rejected`, `terminal_policy_rejected`. Signatures,
   block leases, and the effective horizon are not re-derived: the first two
@@ -113,13 +116,26 @@ and policy to every call and is unaffected.
 ### `misscomputer-assignment-probe` transport: one whole-request budget (behavioural)
 
 `HttpsProbeTransport` now enforces the policy's `probe_timeout_millis` as one
-absolute whole-request budget on one monotonic clock (`RequestBudget`). httpx's
-per-phase timeouts only cap each phase; the transport itself measures the
-elapsed time immediately before it inspects the response headers, before every
+absolute whole-request budget on one monotonic clock (`RequestBudget`), in two
+layers. httpx's per-operation timeouts only cap each read or write, so a peer
+trickling header or body bytes just inside them could hold a request open
+indefinitely; the connection therefore runs on `DeadlineNetworkBackend`, an
+httpcore network backend that clamps every connect, TLS handshake, write, and
+read to the time remaining in the budget on the same monotonic clock and
+raises the matching timeout when nothing remains, so a slow trickle across
+connect, TLS, headers, or body ends within a small margin of the budget as
+`ProbeTransportFailure("timeout")` (name resolution inside
+`socket.create_connection` is the one step the operating system bounds, not
+the budget). No socket is ever closed from another thread, so a stale read can
+never consume a reused file descriptor. The transport also measures the elapsed time
+immediately before it inspects the response headers, before every
 response-derived return (`Content-Length` rejection, body rejection, and the
 response itself), and at every body chunk, and anything that would complete
-after the budget is reported as `ProbeTransportFailure("timeout")` with the
-measured latency. Exact boundary: latency is whole-request elapsed time in
+after the budget is reported as a timeout too. A wire status outside the
+contract's `100..599` (httpx accepts up to 999) is reported as
+`ProbeTransportFailure("transport_error")` with no recorded status, and
+`evaluate_probe_response` maps such a `ProbeResponse` the same way instead of
+raising a `ValidationError`. Exact boundary: latency is whole-request elapsed time in
 floor milliseconds; a response-derived outcome with `latency_millis` equal to
 the budget is a response, one millisecond more is a timeout, mirroring
 `verify_observation_policy_binding`. Previously a response whose headers
@@ -160,28 +176,56 @@ on parse). History is anchored, contiguous, and era-scoped:
 - captures are accepted only in exact order: the first must be
   `history_start_snapshot_sequence` and every later one exactly
   `last_snapshot_sequence + 1` (`snapshot_lineage_gap`; a lower or equal
-  sequence stays `snapshot_sequence_not_increasing`).
-  `replay_snapshot_lineage(lineage, snapshots)` seeds or catches up a lineage
-  over retained captures in order and refuses a gap; a missed capture is never
-  skipped;
+  sequence stays `snapshot_sequence_not_increasing`), and the parser requires
+  `last_snapshot_sequence == history_start_snapshot_sequence +
+  accepted_snapshot_count - 1` exactly (`lineage_history_not_contiguous`) with
+  every `last_seen_snapshot_sequence` inside that range
+  (`lineage_replica_seen_out_of_range`). `replay_snapshot_lineage(lineage,
+  snapshots)` seeds or catches up a lineage over retained captures in order
+  and refuses a gap; a missed capture is never skipped. **This tightens the
+  base contract**, which allowed any strictly increasing `snapshot_sequence`:
+  a legacy history with skipped values cannot be replayed across the skip.
+  `snapshot_history_gaps(snapshots)` preflights a retained history and names
+  every jump; the lineage is then started with `first_snapshot_sequence` set
+  to the capture after the last jump, records it as
+  `history_start_snapshot_sequence`, and states that facts before it are
+  outside the guarantee. Runtimes must increment `snapshot_sequence` by
+  exactly one per capture from now on;
+- freshness is judged across every fact role: a new incarnation's nonce,
+  ticket digest, and receipt digest must each be absent from the union of
+  every nonce, ticket digest, and receipt digest the lineage has accepted in
+  the era, so a retired ticket digest cannot return as a receipt digest nor
+  the reverse, and the parser refuses a lineage whose ticket and receipt
+  histories overlap (`lineage_used_facts_overlap`);
 - `snapshot_lineage_overflow` (more than `MAX_LINEAGE_REPLICAS` distinct
-  `replica_id`s, or more than `MAX_LINEAGE_FACTS` retained facts of one kind,
-  or more than `MAX_LINEAGE_ERAS` eras) **refuses the capture and forgets
-  nothing**. The only operation that sheds retired facts is
-  `begin_snapshot_lineage_era(lineage)`: it opens `era + 1`, keeps every
-  current incarnation and its facts, drops the retired ones, and records a
-  `LineageEraBoundary` (era, last accepted sequence, dropped counts, digest of
+  `replica_id`s, more than `MAX_LINEAGE_FACTS` retained facts of one kind, or
+  an `era` that would exceed `MAX_LINEAGE_ERAS`, i.e. more than
+  `MAX_LINEAGE_ERAS - 1` boundaries) **refuses the capture and forgets
+  nothing**. The only operation that sheds anything is
+  `begin_snapshot_lineage_era(lineage)`: it opens `era + 1`, keeps exactly the
+  incarnations exported by the last accepted capture (each `ReplicaLineage`
+  records `last_seen_snapshot_sequence`; inactive entries are pruned) with
+  their facts, drops every retired fact, and records a `LineageEraBoundary`
+  (era, last accepted sequence, dropped replica lineages and facts, digest of
   the lineage it was taken from) that stays in the document forever
-  (`lineage_era_invalid` if eras and boundaries disagree). The never-reuse
-  guarantee is therefore exactly: no nonce, ticket digest, or receipt digest
-  accepted since `history_start_snapshot_sequence` within the current `era` is
-  ever accepted again. After an era boundary, facts retired before it are no
-  longer guarded, and the document says so; a consumer must treat `era > 1`
-  as a re-scoped guarantee and may reject or flag it by policy.
+  (`lineage_era_invalid` if eras and boundaries disagree or a boundary names a
+  sequence outside the lineage's history or out of order). A lineage over
+  `MAX_LINEAGE_REPLICAS` always holds inactive entries (one capture cannot
+  exceed that bound), so pruning at a boundary is its recovery. The
+  never-reuse guarantee is therefore exactly: no nonce, ticket digest, or
+  receipt digest accepted since `history_start_snapshot_sequence` within the
+  current `era` is ever accepted again in any role, and no incarnation kept
+  across the boundary is replaced without a higher generation. After an era
+  boundary, facts and generations retired before it are no longer guarded,
+  and the document says so; a consumer must treat `era > 1` as a re-scoped
+  guarantee and may reject or flag it by policy.
 
 New codes: `snapshot_generation_not_increasing`,
 `snapshot_incarnation_facts_reused`, `snapshot_lineage_gap`,
-`snapshot_lineage_overflow`, `snapshot_lineage_anchor_mismatch`. A publisher
+`snapshot_lineage_overflow`, `snapshot_lineage_anchor_mismatch`; parser codes
+`lineage_chain_link_missing`, `lineage_history_not_contiguous`,
+`lineage_replica_seen_out_of_range`, `lineage_used_facts_overlap`,
+`lineage_era_invalid`. A publisher
 persists the lineage beside its manifest chain state, retains the head digest
 out of band, and advances it with every accepted capture before it derives or
 publishes anything from that capture. There is no Go counterpart.
@@ -248,7 +292,8 @@ procedure that follows keeps every pairing inside the supported set.
 | `validator-weight-decision` v1 | **unsupported**: an old coordinator seals records without `trust_policies`; the new parser refuses them (digest mismatch) | **unsupported**: the new coordinator seals `trust_policies`; the old parser refuses them (`additionalProperties: false`) | no weight plan can be built from the refused record; the validator keeps its previous weights (abstain-equivalent) until the pairing is corrected |
 | `active-assignment-snapshot` v1 | **conditionally supported**: every capture an old runtime could emit that satisfied the old rules is accepted by the new publisher *except* captures that rewrite a retained incarnation or recycle retired facts (`snapshot_incarnation_rewritten`, `snapshot_generation_not_increasing`, `snapshot_incarnation_facts_reused`), which the old rules never tested; the new publisher refuses those and stops publishing | **unsupported once the new runtime uses the tolerance**: a capture whose ticket is stamped after activation within the 30s tolerance is refused by an old publisher (`replica_activation_order_invalid`); the old publisher stops publishing | the publisher fails closed; the last manifest reaches its effective horizon and every validator abstains (`manifest_expired_at_close`); no miner is zeroed, no weight moves |
 | `active-assignment-snapshot-lineage` v1 | n/a (new; publisher-local) | n/a | none |
-| `validator-probe-report` v1 | **conditionally supported**: an old CLI's transport can report a response-derived observation whose whole-request latency exceeds the policy budget (headers late but inside every per-phase timeout); the new coordinator refuses the round (`decision_round_policy_rejected`) and the new parser the record (`report_policy_rejected`); every other old report is accepted unchanged | supported: report bytes are unchanged and the new CLI emits only observations the old coordinator also accepted | a refused round is dropped from the window by the coordinator's own input handling before sealing; if the coordinator does not drop it, the window is refused and the validator abstains; no wrong weight is produced |
+| `validator-probe-report` v1 | **conditionally supported**: an old CLI's transport can report a response-derived observation whose whole-request latency exceeds the policy budget (headers late or trickled inside every per-operation timeout), and an old CLI crashes on a wire status outside `100..599` instead of reporting a transport fault; the new coordinator refuses the over-budget round (`decision_round_policy_rejected`) and the new parser the record (`report_policy_rejected`); every other old report is accepted unchanged | supported: report bytes are unchanged and the new CLI emits only observations the old coordinator also accepted | a refused round is dropped from the window by the coordinator's own input handling before sealing; if the coordinator does not drop it, the window is refused and the validator abstains; no wrong weight is produced |
+| `active-assignment-snapshot` sequence numbering | **conditionally supported**: a legacy runtime that skipped sequence values (allowed by the base contract) produces `snapshot_lineage_gap` at the skip; preflight with `snapshot_history_gaps` and start the lineage after the last skip | supported: contiguous sequences are strictly increasing | the publisher refuses the capture after the skip until the lineage is restarted at the documented late start; validators abstain after the horizon meanwhile |
 | manifests, envelopes, trust policy, pointer, weight plan | supported (bytes unchanged) | supported (bytes unchanged) | none |
 
 There is no compatibility reader: neither parser accepts the other form, by
@@ -268,19 +313,21 @@ by tolerance:
    than the window is not an outage of the network, only of this validator's
    weight updates.
 2. **Snapshot pair (runtime and publisher).** Upgrade the publisher first (it
-   accepts everything a correct old runtime emits), seed its lineage by
-   replaying the runtime's retained captures in order from sequence 1
-   (`replay_snapshot_lineage`; record `history_start_snapshot_sequence` and
-   the head digest if the retained history starts later), then upgrade the
+   accepts everything a correct old runtime emits), preflight the runtime's
+   retained captures with `snapshot_history_gaps`, seed its lineage by
+   replaying them in order from sequence 1 (`replay_snapshot_lineage`) or,
+   if the history has a skip, from the capture after the last skip (record
+   `history_start_snapshot_sequence` and the head digest), then upgrade the
    runtime, within one manifest lifetime so the publisher never sits idle
    past the effective horizon. If the new publisher refuses an old runtime's
    capture with a lineage code, the runtime state is genuinely inconsistent
    (a rewritten incarnation or a recycled fact): keep the refusal and expect
    validators to abstain until publication resumes; the only sanctioned way
    past it is to repair the runtime's assignments (new generations with fresh
-   tickets) or, if retired facts must be forgotten, an explicit
-   `begin_snapshot_lineage_era` recorded in the operator log and visible to
-   every reader. Never downgrade the publisher to make a lineage refusal
+   tickets) or, if retired facts or inactive lineage must be forgotten, an
+   explicit `begin_snapshot_lineage_era` recorded in the operator log and
+   visible to every reader (it keeps only the incarnations of the last
+   accepted capture). Never downgrade the publisher to make a lineage refusal
    disappear. Do not upgrade the runtime before the publisher.
 3. **Validators (probe CLI) and coordinator.** Upgrade every probe CLI before
    the coordinator that consumes their reports: an old CLI can still report a
@@ -344,12 +391,16 @@ Retention and reprocessing:
   (`verify_snapshot_lineage_anchor`); a mismatch is a stale or altered
   lineage and publication must stop until the true head is restored or the
   captures are replayed from a known-good head.
-- A lineage past `MAX_LINEAGE_REPLICAS`, `MAX_LINEAGE_FACTS`, or
-  `MAX_LINEAGE_ERAS` refuses every capture (`snapshot_lineage_overflow`) and
-  forgets nothing. The operator may open a new era
-  (`begin_snapshot_lineage_era`), which keeps the current incarnations and
-  records the boundary in the document; there is no silent re-anchor from
-  genesis.
+- A lineage past `MAX_LINEAGE_REPLICAS` or `MAX_LINEAGE_FACTS` refuses every
+  capture (`snapshot_lineage_overflow`) and forgets nothing. The operator may
+  open a new era (`begin_snapshot_lineage_era`), which keeps only the
+  incarnations of the last accepted capture with their facts, prunes inactive
+  lineage, and records the boundary in the document; this is the recovery for
+  both bounds. A lineage already at `era == MAX_LINEAGE_ERAS` (64 eras, 63
+  boundaries) cannot open another and is terminal: the operator starts a new
+  lineage from genesis over the runtime's retained captures, which is a new
+  document with its own history start, and records the cut-over; there is no
+  silent re-anchor and no continuation that pretends to remember.
 
 Outage prevention checklist: pause the coordinator only at a window boundary;
 finish each writer/reader pair within one manifest lifetime; verify the

@@ -60,7 +60,7 @@ valid manifest source.
 
 | Field | Meaning |
 | --- | --- |
-| `snapshot_sequence` | increases by exactly one per capture from one runtime; a publisher's lineage treats a jump as a missed capture to replay |
+| `snapshot_sequence` | increases by exactly one per capture from one runtime (tightened from "strictly increasing"); a publisher's lineage treats a jump as a missed capture to replay, and a legacy history with skips is preflighted with `snapshot_history_gaps` and restarted after the last skip |
 | `state_revision` | scheduler durable revision the capture was read at; two captures at one revision carry byte-identical `deployments` |
 | `captured_at_epoch` | capture instant; becomes the manifest's `issued_at_epoch` |
 | `finalized_height`, `finalized_block_hash`, `finalized_epoch` | finalized chain view the scheduler held at capture; copied into the manifest |
@@ -173,18 +173,25 @@ of band and `verify_snapshot_lineage_anchor` refuses a restored lineage that is
 not that head (`snapshot_lineage_anchor_mismatch`), because a stale backup or
 a resealed copy with retired facts removed is digest-valid but false. Captures
 are accepted only in exact sequence order from
-`history_start_snapshot_sequence` (`snapshot_lineage_gap`): a missed capture is
-replayed, never skipped. `snapshot_lineage_overflow` (more than
+`history_start_snapshot_sequence` (`snapshot_lineage_gap`; the parser requires
+`last == start + count - 1`, `lineage_history_not_contiguous`): a missed
+capture is replayed, never skipped, and a legacy history with skipped values
+is preflighted with `snapshot_history_gaps` and started after the last skip.
+Freshness is judged across every fact role: a new incarnation's nonce, ticket
+digest, and receipt digest must be absent from the union of everything the
+era has accepted (`lineage_used_facts_overlap` on parse if ticket and receipt
+histories overlap). `snapshot_lineage_overflow` (more than
 `MAX_LINEAGE_REPLICAS` replica lineages, `MAX_LINEAGE_FACTS` retained facts of
-one kind, or `MAX_LINEAGE_ERAS` eras) refuses the capture and forgets nothing;
-the only operation that sheds retired facts is `begin_snapshot_lineage_era`,
-which opens `era + 1`, keeps every current incarnation and its facts, and
-records a `LineageEraBoundary` (era, last accepted sequence, dropped counts,
-predecessor digest) in the document permanently. The never-reuse guarantee is
+one kind, or an era beyond `MAX_LINEAGE_ERAS`) refuses the capture and forgets
+nothing; the only operation that sheds anything is `begin_snapshot_lineage_era`,
+which opens `era + 1`, keeps exactly the incarnations of the last accepted
+capture (every `ReplicaLineage` records `last_seen_snapshot_sequence`) with
+their facts, prunes inactive lineage, and records a `LineageEraBoundary` (era,
+last accepted sequence, dropped lineages and facts, predecessor digest) in
+the document permanently, in range and in order. The never-reuse guarantee is
 therefore exactly "no fact accepted since `history_start_snapshot_sequence`
-within the current `era` is ever accepted again", readable from the document.
-Nonce and digest freshness is judged across every incarnation of every
-`replica_id` the lineage has accepted in the era. The lineage is a Python
+within the current `era` is ever accepted again in any role", readable from
+the document. The lineage is a Python
 publisher-side rule with no Go counterpart: `pkg/assignment` produces captures
 and has no succession API.
 
@@ -636,7 +643,9 @@ come from the sealed trust policies.
 | Responses judged under a looser same-authority policy (longer request budget, no certificate pins, larger body ceiling) relabelled under the stricter policy that verified the manifest | `observation_policy_violation` at report construction; `decision_round_policy_rejected` at the decision; `report_policy_rejected` on parse | every observation records the certificate and body size the policy-dependent checks judged, so the named policy's constraints are re-derived from the observation itself |
 | Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation; recycles a nonce, ticket, or receipt retired by any earlier replacement (A → B → A); or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_incarnation_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id` and every signed fact it ever accepted in the era; a replacement is a new generation with never-seen facts |
 | Lineage restored from a stale backup, resealed with retired facts removed, fed a capture out of order, or grown past its bounds | `snapshot_lineage_anchor_mismatch`/`snapshot_lineage_gap`/`snapshot_lineage_overflow`; publisher refuses and forgets nothing | the lineage is a hash chain whose head the operator anchors out of band; sequences are contiguous; only an explicit, recorded era boundary sheds retired facts |
-| Probe response whose headers or body arrive after the policy's whole-request budget but inside every per-phase timeout | `ProbeTransportFailure("timeout")` at the transport; `observation_policy_violation` if an older transport reports it as a response | one absolute budget on one monotonic clock is judged before every response-derived return; the binding re-derives the same bound from the recorded latency |
+| Probe response whose headers or body arrive after the policy's whole-request budget but inside every per-operation timeout, including a byte-by-byte trickle | `ProbeTransportFailure("timeout")` at the transport within a small margin of the budget; `observation_policy_violation` if an older transport reports it as a response | every connect, TLS, write, and read on the connection is clamped to the time remaining in one budget on one monotonic clock (`DeadlineNetworkBackend`), and the same budget is judged before every response-derived return; the binding re-derives the same bound from the recorded latency |
+| Peer answers with a wire status outside `100..599` | `ProbeTransportFailure("transport_error")` with no status at the transport; the same at `evaluate_probe_response` for a leaked `ProbeResponse` | the contract's status range is enforced before an observation exists; no raw validation error reaches the CLI |
+| `tls_pin_mismatch` judged under a pinning policy carried into a report naming a policy without pins, or whose pins include the leaf | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | every policy-dependent failure branch is bound in both directions |
 
 ## Compatibility matrix
 

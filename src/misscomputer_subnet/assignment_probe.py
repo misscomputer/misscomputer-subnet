@@ -1121,8 +1121,12 @@ def verify_observation_policy_binding(
     outcome, or any failure code reached only after the pin check, requires a
     pinned certificate when the policy pins any; a ``serving`` outcome, or any
     failure code reached only after the size check, requires a body within
-    ``max_response_bytes``. An observation evaluated under a looser policy and
-    relabelled with this one is therefore refused (``observation_policy_violation``).
+    ``max_response_bytes``; a ``tls_pin_mismatch`` requires a policy that pins
+    and a recorded leaf outside its pins. Every policy-dependent branch is
+    bound in both directions, so an observation evaluated under a looser
+    policy and relabelled with a stricter one, or judged under a stricter
+    policy and relabelled with a looser one, is refused
+    (``observation_policy_violation``).
     """
 
     pins = policy.pinned_edge_leaf_certificate_sha256
@@ -1130,6 +1134,13 @@ def verify_observation_policy_binding(
     if (
         serving or observation.failure_code not in _TRANSPORT_FAILURE_CODES
     ) and observation.latency_millis > policy.probe_timeout_millis:
+        _reject("observation_policy_violation")
+    if observation.failure_code == "tls_pin_mismatch" and (
+        not pins or observation.tls_leaf_certificate_sha256 in pins
+    ):
+        # The pin check only fails under a policy that pins, against a leaf
+        # outside its pins; a mismatch judged under a stricter policy cannot
+        # be carried into a report naming a looser one.
         _reject("observation_policy_violation")
     if (
         pins
@@ -1614,6 +1625,11 @@ def evaluate_probe_response(
     if isinstance(result, ProbeTransportFailure):
         document["failure_code"] = result.code
         document["response_status"] = result.response_status
+        return _seal_observation(document)
+    if not 100 <= result.status <= 599:
+        # A wire status outside the contract is a peer fault, not an
+        # observation with a status; the transport reports it the same way.
+        document["failure_code"] = "transport_error"
         return _seal_observation(document)
 
     document["response_status"] = result.status

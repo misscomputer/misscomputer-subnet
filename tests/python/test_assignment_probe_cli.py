@@ -931,8 +931,8 @@ class _FixedClock:
 
 def _mock_transport(
     responder: Callable[[httpx.Request], httpx.Response],
-) -> Callable[[ssl.SSLContext], httpx.BaseTransport]:
-    return lambda _context: httpx.MockTransport(responder)
+) -> probe_cli.TransportBuilder:
+    return lambda _context, _remaining: httpx.MockTransport(responder)
 
 
 def _fetch(
@@ -1094,6 +1094,127 @@ def test_transport_enforces_one_whole_request_budget_at_the_exact_boundary() -> 
     assert budget.budget_millis == 100
     assert not budget.exhausted(100) and budget.exhausted(101)
     assert probe_cli.RequestBudget(5.0, clock=_FixedClock(0.0)).budget_millis == 5_000
+
+
+class TrickleHandler(BaseHTTPRequestHandler):
+    """Origin that stays inside every per-operation timeout while exceeding the budget."""
+
+    def log_message(self, *_: object) -> None:
+        return
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server API
+        try:
+            if self.path.startswith("/trickle-headers"):
+                for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n":
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.03)
+                self.wfile.write(b"ok")
+            elif self.path.startswith("/trickle-body"):
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 60\r\n\r\n")
+                self.wfile.flush()
+                for _ in range(60):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.03)
+            else:
+                self.wfile.write(b"HTTP/1.1 999 Odd\r\nContent-Length: 0\r\n\r\n")
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def trickle_server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
+    root = tmp_path / "trickle"
+    root.mkdir(mode=0o700)
+    ca_path, leaf_path, key_path, _ = write_certificate_chain(root)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), TrickleHandler)
+    server.daemon_threads = True
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(leaf_path), str(key_path))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"https://127.0.0.1:{server.server_address[1]}", ca_path
+    server.shutdown()
+
+
+def test_slow_trickle_origins_are_cut_off_at_the_whole_request_deadline(
+    trickle_server: tuple[str, Path],
+) -> None:
+    """Header and body trickles inside every per-read timeout still end near the budget.
+
+    A peer emitting one byte every 30ms never trips a 200ms per-read timeout,
+    so only the cancellable wall-clock deadline bounds the request: both
+    trickles must be reported as ``timeout`` within a small margin of 200ms
+    instead of running for the seconds the trickle would take.
+    """
+
+    origin, ca_path = trickle_server
+    transport = probe_cli.HttpsProbeTransport(ssl.create_default_context(cafile=str(ca_path)))
+    for path in ("/trickle-headers", "/trickle-body"):
+        started = time.monotonic()
+        result = transport.fetch(
+            url=f"{origin}{path}",
+            server_name="fixture-alpha.mock.local",
+            headers={"host": "fixture-alpha.mock.local"},
+            timeout_seconds=0.2,
+            max_bytes=4_096,
+        )
+        wall = time.monotonic() - started
+        assert isinstance(result, probe_cli.ProbeTransportFailure), path
+        assert result.code == "timeout", path
+        assert 200 <= result.latency_millis, path
+        assert wall < 0.75, (path, wall)  # trickles alone would take > 1.2s
+    # A live origin answering with a wire status outside the contract is a
+    # transport fault with no recorded status, not a crash and not a response.
+    result = transport.fetch(
+        url=f"{origin}/status-999",
+        server_name="fixture-alpha.mock.local",
+        headers={"host": "fixture-alpha.mock.local"},
+        timeout_seconds=5.0,
+        max_bytes=4_096,
+    )
+    assert isinstance(result, probe_cli.ProbeTransportFailure)
+    assert (result.code, result.response_status) == ("transport_error", None)
+
+
+def test_out_of_contract_wire_status_is_a_transport_fault_under_and_over_budget() -> None:
+    """httpx accepts 600..999 on the wire; the contract does not, so it is never an observation."""
+
+    context = make_context()
+    deployment = context.deployments[0]
+    policy = build_policy(context.keys, probe_timeout_millis=100)
+
+    def odd(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(999, stream=httpx.ByteStream(b""), headers=[("Content-Length", "0")])
+
+    within = _fetch(odd, elapsed_seconds=0.1)
+    assert isinstance(within, probe_cli.ProbeTransportFailure)
+    assert (within.code, within.response_status, within.latency_millis) == (
+        "transport_error",
+        None,
+        100,
+    )
+    observation = evaluate_probe_response(
+        deployment, policy, probe_nonce=label_digest("odd"), result=within
+    )
+    assert (observation.failure_code, observation.response_status) == ("transport_error", None)
+    verify_observation_policy_binding(observation, policy)
+    over = _fetch(odd, elapsed_seconds=0.101)
+    assert isinstance(over, probe_cli.ProbeTransportFailure)
+    assert (over.code, over.latency_millis) == ("timeout", 101)
+    # The contract layer defends itself too, for transports that let it through.
+    leaked = probe_cli.ProbeResponse(
+        status=600, headers=(), body=b"", latency_millis=5, tls_leaf_certificate_sha256=None
+    )
+    observation = evaluate_probe_response(
+        deployment, policy, probe_nonce=label_digest("odd"), result=leaked
+    )
+    assert (observation.outcome, observation.failure_code, observation.response_status) == (
+        "failed",
+        "transport_error",
+        None,
+    )
 
 
 def test_probe_requires_the_finalized_height_and_refuses_expired_leases(

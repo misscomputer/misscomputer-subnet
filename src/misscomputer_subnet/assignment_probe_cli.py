@@ -24,11 +24,12 @@ import ssl
 import stat
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, NoReturn, Protocol, cast
 from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 from pydantic import ValidationError
 
@@ -242,19 +243,140 @@ class RequestBudget:
     def exhausted(self, latency_millis: int) -> bool:
         return latency_millis > self.budget_millis
 
+    def remaining_seconds(self) -> float:
+        """Seconds left before the budget is exhausted; never negative."""
+
+        return max(0.0, self.budget_millis / 1000 - (self._clock() - self._started))
+
+
+#: httpcore's socket option shape, restated so no private module is imported.
+SOCKET_OPTION = (
+    tuple[int, int, int] | tuple[int, int, bytes | bytearray] | tuple[int, int, None, int]
+)
+
+
+class DeadlineNetworkStream(httpcore.NetworkStream):
+    """A socket stream whose every operation is bounded by the remaining request budget.
+
+    httpcore applies one timeout per read or write, so a peer that trickles
+    bytes just inside it can hold a request open indefinitely. This wrapper
+    clamps every operation's timeout to ``min(per-operation, remaining)`` and
+    raises the matching httpcore timeout when nothing remains, so the whole
+    request, across TLS, headers, and body, ends at the budget. It never
+    closes a socket from another thread, so no file descriptor can be reused
+    under a still-blocked read.
+    """
+
+    def __init__(self, inner: httpcore.NetworkStream, remaining: Callable[[], float]) -> None:
+        self._inner = inner
+        self._remaining = remaining
+
+    def _bounded(self, timeout: float | None, expired: type[Exception]) -> float:
+        remaining = self._remaining()
+        if remaining <= 0.0:
+            raise expired("whole-request budget exhausted")
+        return remaining if timeout is None else min(timeout, remaining)
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._inner.read(max_bytes, timeout=self._bounded(timeout, httpcore.ReadTimeout))
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self._inner.write(buffer, timeout=self._bounded(timeout, httpcore.WriteTimeout))
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        upgraded = self._inner.start_tls(
+            ssl_context,
+            server_hostname=server_hostname,
+            timeout=self._bounded(timeout, httpcore.ConnectTimeout),
+        )
+        return DeadlineNetworkStream(upgraded, self._remaining)
+
+    def get_extra_info(self, info: str) -> object:
+        return self._inner.get_extra_info(info)
+
+
+class DeadlineNetworkBackend(httpcore.NetworkBackend):
+    """The synchronous httpcore backend with every connection bounded by one budget."""
+
+    def __init__(self, remaining: Callable[[], float]) -> None:
+        self._inner = httpcore.SyncBackend()
+        self._remaining = remaining
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        remaining = self._remaining()
+        if remaining <= 0.0:
+            raise httpcore.ConnectTimeout("whole-request budget exhausted")
+        stream = self._inner.connect_tcp(
+            host,
+            port,
+            timeout=remaining if timeout is None else min(timeout, remaining),
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+        return DeadlineNetworkStream(stream, self._remaining)
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:  # pragma: no cover - probes never use unix sockets
+        raise httpcore.ConnectError("unix sockets are not probe targets")
+
+    def sleep(self, seconds: float) -> None:  # pragma: no cover - retries are disabled
+        self._inner.sleep(seconds)
+
+
+class _DeadlineHTTPTransport(httpx.HTTPTransport):
+    """``httpx.HTTPTransport`` whose connection pool uses :class:`DeadlineNetworkBackend`."""
+
+    def __init__(self, context: ssl.SSLContext, remaining: Callable[[], float]) -> None:
+        super().__init__(verify=context, retries=0, http2=False, trust_env=False)
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=context,
+            max_connections=1,
+            max_keepalive_connections=0,
+            http1=True,
+            http2=False,
+            retries=0,
+            network_backend=DeadlineNetworkBackend(remaining),
+        )
+
+
+TransportBuilder = Callable[[ssl.SSLContext, Callable[[], float]], httpx.BaseTransport]
+
 
 class HttpsProbeTransport:
     """httpx-based transport: no redirects, no environment proxies, exact byte bounds.
 
-    One absolute deadline governs the whole request. httpx's per-phase
-    timeouts only cap each phase at the total budget; the transport itself
-    measures the elapsed time on one monotonic clock immediately before it
+    One absolute deadline governs the whole request. httpx's per-operation
+    timeouts only cap each read or write, so a peer that trickles header or
+    body bytes just inside them could hold a request open indefinitely; the
+    connection therefore runs on :class:`DeadlineNetworkBackend`, which clamps
+    every connect, TLS, write, and read to the time remaining in the budget on
+    one monotonic clock and raises the matching timeout when nothing remains.
+    The transport also measures the elapsed time immediately before it
     inspects the response headers, before every response-derived return
     (``Content-Length`` rejection, body rejection, and the response itself),
-    and at every body chunk. Anything that would complete after the budget is
-    reported as ``ProbeTransportFailure("timeout")`` with the measured
-    latency, so no response-derived outcome ever carries a latency above the
-    budget (see :class:`RequestBudget` for the exact boundary). ``clock`` and
+    and at every body chunk, so a request that finishes just after the budget
+    is a timeout too, never a response (see :class:`RequestBudget` for the
+    exact boundary). A wire status outside the contract's ``100..599`` is a
+    ``transport_error`` with no recorded status. ``clock`` and
     ``transport_factory`` exist so the boundary can be tested deterministically.
     """
 
@@ -263,7 +385,7 @@ class HttpsProbeTransport:
         ssl_context: ssl.SSLContext,
         *,
         clock: Callable[[], float] = time.monotonic,
-        transport_factory: Callable[[ssl.SSLContext], httpx.BaseTransport] | None = None,
+        transport_factory: TransportBuilder | None = None,
     ) -> None:
         self._context = ssl_context
         self._clock = clock
@@ -300,7 +422,7 @@ class HttpsProbeTransport:
 
         try:
             with httpx.Client(
-                transport=self._transport_factory(self._context),
+                transport=self._transport_factory(self._context, budget.remaining_seconds),
                 timeout=httpx.Timeout(timeout_seconds),
                 follow_redirects=False,
                 max_redirects=0,
@@ -313,12 +435,19 @@ class HttpsProbeTransport:
                     extensions={"sni_hostname": server_name},
                 ) as response:
                     leaf = _peer_leaf_sha256(response)
-                    status = response.status_code
+                    in_contract = 100 <= response.status_code <= 599
+                    status = response.status_code if in_contract else None
                     # The headers are a response: judge the budget before
                     # anything derived from them can be reported.
                     arrival = budget.latency_millis()
                     if budget.exhausted(arrival):
                         return timed_out(arrival)
+                    if not in_contract:
+                        # Outside the contract's status range: a fault of the
+                        # peer's wire format, never an observation with a status.
+                        return ProbeTransportFailure(
+                            "transport_error", arrival, tls_leaf_certificate_sha256=leaf
+                        )
                     declared = response.headers.get("content-length")
                     if declared is not None and (
                         not declared.isascii()
@@ -382,8 +511,10 @@ class HttpsProbeTransport:
             )
 
 
-def _default_httpx_transport(context: ssl.SSLContext) -> httpx.BaseTransport:
-    return httpx.HTTPTransport(verify=context, retries=0, http2=False)
+def _default_httpx_transport(
+    context: ssl.SSLContext, remaining: Callable[[], float]
+) -> httpx.BaseTransport:
+    return _DeadlineHTTPTransport(context, remaining)
 
 
 def _default_transport_factory(context: ssl.SSLContext) -> ProbeTransport:

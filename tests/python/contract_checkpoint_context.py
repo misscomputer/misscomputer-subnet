@@ -787,11 +787,15 @@ def reseal_report_observations(
     """Replace a report's observations (resealing each) and re-derive its digests."""
 
     resealed = [reseal_observation(item) for item in observations]
+    serving = sum(item["outcome"] == "serving" for item in resealed)
     return reseal_report(
         {
             **report,
             "observations": resealed,
             "observation_vector_digest_sha256": canonical_digest(resealed),
+            "serving_count": serving,
+            "failed_count": len(resealed) - serving,
+            "status": "serving" if serving == len(resealed) else "degraded",
         }
     )
 
@@ -1185,6 +1189,25 @@ def negative_documents() -> dict[str, bytes]:
             observation_changes={"latency_millis": first_report["probe_timeout_millis"] + 1},
         ),
     )
+    # A pin mismatch can only be judged by a policy that pins, against a leaf
+    # outside its pins; the golden policy pins nothing.
+    add(
+        "validator-weight-decision",
+        "submit-with-pin-mismatch-under-unpinned-policy",
+        "model",
+        "report_policy_rejected",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={
+                "outcome": "failed",
+                "failure_code": "tls_pin_mismatch",
+                "build_id_header_verified": False,
+                "attestation_status": "not_presented",
+                "attestation": None,
+            },
+        ),
+    )
     lineage = documents["active-assignment-snapshot-lineage"]
     lineage_doc = json.loads(lineage)
     add(
@@ -1251,6 +1274,25 @@ def negative_documents() -> dict[str, bytes]:
         "model",
         "lineage_history_not_contiguous",
         _mutate(lineage, history_start_snapshot_sequence=2),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "history-overclaimed",
+        "model",
+        "lineage_history_not_contiguous",
+        _mutate(lineage, last_snapshot_sequence=lineage_doc["last_snapshot_sequence"] + 5),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "used-facts-overlap",
+        "model",
+        "lineage_used_facts_overlap",
+        _mutate(
+            lineage,
+            used_receipt_digests=sorted(
+                {*lineage_doc["used_receipt_digests"], lineage_doc["used_ticket_digests"][0]}
+            ),
+        ),
     )
     add(
         "validator-weight-decision",

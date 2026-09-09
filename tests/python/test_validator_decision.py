@@ -1501,6 +1501,118 @@ def test_timeout_policy_cannot_be_relabelled() -> None:
         )
 
 
+def test_pin_mismatch_cannot_be_relabelled_under_a_looser_policy() -> None:
+    """A ``tls_pin_mismatch`` needs a pinning policy and a leaf outside its pins.
+
+    Judged under pinned policy A (leaf B outside), the failure is genuine; the
+    same observation sealed under a policy without pins, or one whose pins
+    include leaf B, claims a failure that policy could never have produced
+    (strict-to-loose relabelling). Report construction, the decision producer,
+    and the parser refuse it; the loose-to-strict direction stays refused too.
+    """
+
+    context = make_window_context()
+    leaf_a, leaf_b = label_digest("edge-leaf-a"), label_digest("edge-leaf-b")
+    pinned_a = build_policy(
+        context.keys, max_age=3_600, pinned_edge_leaf_certificate_sha256=(leaf_a,)
+    )
+    pinned_b = build_policy(
+        context.keys, max_age=3_600, pinned_edge_leaf_certificate_sha256=(leaf_b,)
+    )
+    unpinned = build_policy(context.keys, max_age=3_600)
+    alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
+    beta = window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
+
+    def observations(policy: Any) -> list[ProbeObservation]:
+        items = []
+        for deployment in (alpha, beta):
+            nonce = label_digest(f"pin-{deployment.deployment_id}")
+            response = serving_response(
+                deployment,
+                attestation=sign_attestation(deployment, deployment.replicas[0], probe_nonce=nonce),
+                tls_leaf_certificate_sha256=leaf_b,
+            )
+            items.append(
+                evaluate_probe_response(deployment, policy, probe_nonce=nonce, result=response)
+            )
+        return items
+
+    mismatches = observations(pinned_a)
+    assert {item.failure_code for item in mismatches} == {"tls_pin_mismatch"}
+    verify_observation_policy_binding(mismatches[0], pinned_a)
+    for looser in (unpinned, pinned_b):
+        with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+            verify_observation_policy_binding(mismatches[0], looser)
+
+    for policy in (unpinned, pinned_b):
+        manifest = build_probe_manifest(policy, [alpha, beta])
+        genesis = build_initial_manifest_chain_state(policy)
+        verification = verify_active_assignment_manifest(
+            manifest,
+            sign_manifest(manifest, context.keys),
+            policy,
+            genesis,
+            evaluation_epoch=BASE_EPOCH + 60,
+            current_finalized_height=FINALIZED_HEIGHT,
+        )
+
+        def report(items: list[ProbeObservation], policy: Any = policy) -> ValidatorProbeReport:
+            return build_validator_probe_report(
+                verification,  # noqa: B023 - bound per loop iteration below
+                policy,
+                genesis,  # noqa: B023
+                items,
+                validator_uid=VALIDATOR_UID,
+                validator_hotkey=VALIDATOR_HOTKEY,
+                evaluation_epoch=BASE_EPOCH + 60,
+                edge_origin_override=False,
+            )
+
+        with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+            report(mismatches)
+        genuine = report(observations(policy))
+        assert genuine.serving_count == 2
+        relabelled = ValidatorProbeReport.model_validate(
+            reseal_report_observations(
+                genuine.model_dump(mode="json", by_alias=True),
+                [item.model_dump(mode="json", by_alias=True) for item in mismatches],
+            )
+        )
+
+        def decide(round_report: ValidatorProbeReport) -> ValidatorWeightDecision:
+            return decide_weight_submission(
+                [ProbeRound(manifest=manifest, report=round_report)],  # noqa: B023
+                terminal=TerminalManifestObservation(
+                    status="verified",
+                    evaluated_at_epoch=WINDOW_END,
+                    manifest=manifest,  # noqa: B023
+                ),
+                registered=context.registered,
+                trust_policies=[policy],  # noqa: B023
+                window_start_epoch=WINDOW_START,
+                window_end_epoch=WINDOW_END,
+            )
+
+        accepted = decide(genuine)
+        with pytest.raises(WeightDecisionError) as failure:
+            decide(relabelled)
+        assert failure.value.code == "decision_round_policy_rejected"
+        with pytest.raises(ValidationError, match="report_policy_rejected"):
+            ValidatorWeightDecision.model_validate(
+                forged_decision_with_report(
+                    validator_weight_decision_bytes(accepted),
+                    report_digest_sha256=genuine.report_digest_sha256,
+                    observation_changes={
+                        "outcome": "failed",
+                        "failure_code": "tls_pin_mismatch",
+                        "build_id_header_verified": False,
+                        "attestation_status": "not_presented",
+                        "attestation": None,
+                    },
+                )
+            )
+
+
 def test_observation_policy_binding_is_branch_complete() -> None:
     pin = label_digest("edge-leaf-a")
     pinned = build_policy(signer_keys(), pinned_edge_leaf_certificate_sha256=(pin,))
@@ -1574,6 +1686,22 @@ def test_observation_policy_binding_is_branch_complete() -> None:
     verify_observation_policy_binding(
         variant(failed, failure_code="tls_pin_mismatch", response_status=200), pinned
     )
+    # A pin mismatch is bound in both directions: it needs a pinning policy
+    # and a recorded leaf outside the pins.
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        verify_observation_policy_binding(
+            variant(failed, failure_code="tls_pin_mismatch", response_status=200), unpinned
+        )
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        verify_observation_policy_binding(
+            variant(
+                failed,
+                failure_code="tls_pin_mismatch",
+                response_status=200,
+                tls_leaf_certificate_sha256=pin,
+            ),
+            pinned,
+        )
     with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
         verify_observation_policy_binding(
             variant(failed, failure_code="unexpected_status", response_status=503), pinned
