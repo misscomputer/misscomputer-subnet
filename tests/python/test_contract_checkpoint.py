@@ -22,9 +22,14 @@ from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from misscomputer_subnet.assignment_snapshot import (
+    LINEAGE_SCHEMA,
     SNAPSHOT_SCHEMA,
     ActiveAssignmentSnapshot,
+    SnapshotLineage,
+    advance_snapshot_lineage,
+    build_initial_snapshot_lineage,
     parse_active_assignment_snapshot,
+    parse_snapshot_lineage,
 )
 from misscomputer_subnet.manifest_publication import (
     LATEST_POINTER_SCHEMA,
@@ -45,6 +50,7 @@ SOURCE = ROOT / "src" / "misscomputer_subnet"
 
 PARSERS: dict[str, Any] = {
     "active-assignment-snapshot": parse_active_assignment_snapshot,
+    "active-assignment-snapshot-lineage": parse_snapshot_lineage,
     "assignment-manifest-latest-pointer": parse_assignment_manifest_latest_pointer,
     "validator-weight-decision": parse_validator_weight_decision,
 }
@@ -140,6 +146,32 @@ def test_supplementary_fixtures_are_pinned_and_schema_valid(stem: str, contract:
     assert fixture_bytes.endswith(b"\n") and fixture_bytes.count(b"\n") == 1
 
 
+def test_lineage_fixture_is_the_two_capture_history_of_the_snapshot_goldens() -> None:
+    """The lineage golden is exactly genesis advanced over the golden and signer-skew captures."""
+
+    golden = parse_active_assignment_snapshot(
+        (FIXTURES / "active-assignment-snapshot.v1.json").read_bytes()
+    )
+    successor = parse_active_assignment_snapshot(
+        (FIXTURES / "active-assignment-snapshot-signer-skew.v1.json").read_bytes()
+    )
+    lineage = parse_snapshot_lineage(
+        (FIXTURES / "active-assignment-snapshot-lineage.v1.json").read_bytes()
+    )
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    assert genesis.accepted_snapshot_count == 0 and genesis.replicas == []
+    assert advance_snapshot_lineage(advance_snapshot_lineage(genesis, golden), successor) == lineage
+    assert lineage.accepted_snapshot_count == 2
+    assert lineage.last_snapshot_digest_sha256 == successor.snapshot_digest_sha256
+    assert lineage.last_snapshot_sequence == successor.snapshot_sequence
+    assert {item.generation for item in lineage.replicas} == {2}
+    assert [item.replica_id for item in lineage.replicas] == sorted(
+        replica.replica_id for item in golden.deployments for replica in item.replicas
+    )
+
+
 def test_every_checkpoint_fixture_on_disk_is_generated() -> None:
     """No stray golden document may sit beside a checkpoint contract's fixtures."""
 
@@ -170,6 +202,12 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "unknown-field",
         "wrong-network",
     },
+    "active-assignment-snapshot-lineage": {
+        "genesis-with-history",
+        "replicas-not-canonical",
+        "self-digest-mismatch",
+        "unknown-field",
+    },
     "assignment-manifest-latest-pointer": {
         "genesis-with-previous-link",
         "missing-signers",
@@ -194,6 +232,7 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "submit-with-late-first-seen",
         "submit-with-mass-drop",
         "submit-with-noncanonical-expected-attribution",
+        "submit-with-observation-oversized-for-policy",
         "submit-with-padded-terminal-count",
         "submit-with-positive-weight-below-min-attributions",
         "submit-with-positive-weight-without-attributions",
@@ -202,8 +241,10 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "submit-with-rejected-terminal",
         "submit-with-replica-share-aggregation-mismatch",
         "submit-with-report-preceding-manifest-beyond-skew",
+        "submit-with-report-probe-bounds-not-policy",
         "submit-with-rounds-exceeding-observations",
         "submit-with-same-height-fork",
+        "submit-with-terminal-before-policy-validity",
         "submit-with-terminal-issued-beyond-skew",
         "submit-with-unavailable-terminal",
         "submit-with-undersampled-positive-row",
@@ -288,6 +329,7 @@ def test_negative_fixtures_are_rejected_for_the_pinned_reason(path: Path) -> Non
     ("model", "expected_schema"),
     [
         (ActiveAssignmentSnapshot, SNAPSHOT_SCHEMA),
+        (SnapshotLineage, LINEAGE_SCHEMA),
         (AssignmentManifestLatestPointer, LATEST_POINTER_SCHEMA),
         (ValidatorWeightDecision, DECISION_SCHEMA),
     ],

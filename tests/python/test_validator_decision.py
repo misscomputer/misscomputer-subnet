@@ -21,7 +21,10 @@ from assignment_probe_context import (
     build_deployment,
     build_policy,
     label_digest,
+    serving_response,
+    sign_attestation,
     sign_manifest,
+    signer_keys,
 )
 from assignment_probe_context import build_manifest as build_probe_manifest
 from contract_checkpoint_context import (
@@ -44,7 +47,10 @@ from contract_checkpoint_context import (
     metagraph_view,
     registered_set,
     reseal_decision,
+    reseal_observation,
     reseal_report,
+    reseal_report_observations,
+    successor_policy_valid_from,
     window_deployment,
 )
 from pydantic import ValidationError
@@ -56,8 +62,10 @@ from misscomputer_subnet.assignment_probe import (
     ValidatorProbeReport,
     build_initial_manifest_chain_state,
     build_validator_probe_report,
+    evaluate_probe_response,
     manifest_effective_expires_at_epoch,
     verify_active_assignment_manifest,
+    verify_observation_policy_binding,
 )
 from misscomputer_subnet.contract_codec import digest as canonical_digest
 from misscomputer_subnet.manifest_publication import rebind_manifest_chain_state_trust_policy
@@ -1063,6 +1071,364 @@ def test_terminal_manifest_issued_beyond_its_policy_skew_is_refused() -> None:
         )
 
 
+def test_terminal_is_readmitted_under_its_policy_at_the_evaluation_instant() -> None:
+    """A terminal only its successor policy names is admissible only once that policy is valid.
+
+    The successor policy becomes valid at close+5 and the terminal is issued
+    then; at the close instant live verification refuses it
+    (``trust_policy_not_yet_valid``) even though it is within the skew bound,
+    and producer and parser refuse the same pairing.
+    """
+
+    context = make_window_context()
+    successor = successor_policy_valid_from(WINDOW_END + 5)
+    assert successor.max_future_skew_seconds == 5
+    terminal, state_three = build_future_terminal(context, lead_seconds=5, policy=successor)
+    assert terminal.issued_at_epoch == successor.valid_from_epoch == WINDOW_END + 5
+    rebound = rebind_manifest_chain_state_trust_policy(
+        state_three, context.policy, successor, evaluation_epoch=WINDOW_END + 5
+    )
+    with pytest.raises(AssignmentProbeError, match="trust_policy_not_yet_valid"):
+        verify_active_assignment_manifest(
+            terminal,
+            sign_manifest(terminal, context.keys),
+            successor,
+            rebound,
+            evaluation_epoch=WINDOW_END,
+            current_finalized_height=FINALIZED_HEIGHT,
+        )
+    verify_active_assignment_manifest(
+        terminal,
+        sign_manifest(terminal, context.keys),
+        successor,
+        rebound,
+        evaluation_epoch=WINDOW_END + 5,
+        current_finalized_height=FINALIZED_HEIGHT,
+    )
+
+    def decide(evaluated_at_epoch: int) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            context.rounds,
+            terminal=TerminalManifestObservation(
+                status="verified", evaluated_at_epoch=evaluated_at_epoch, manifest=terminal
+            ),
+            registered=context.registered,
+            trust_policies=[context.policy, successor],
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(WINDOW_END)
+    assert failure.value.code == "decision_terminal_policy_rejected"
+    valid = decide(WINDOW_END + 5)
+    assert valid.decision == "submit"
+    assert [item.trust_policy_digest_sha256 for item in valid.trust_policies] == sorted(
+        [context.policy.trust_policy_digest_sha256, successor.trust_policy_digest_sha256]
+    )
+    rendered = validator_weight_decision_bytes(valid)
+    assert parse_validator_weight_decision(rendered) == valid
+    assert valid == future_terminal_decision(
+        5, evaluated_at_epoch=WINDOW_END + 5, successor_policy=successor
+    )
+    with pytest.raises(ValidationError, match="terminal_policy_rejected"):
+        ValidatorWeightDecision.model_validate(
+            forged_decision(rendered, terminal_evaluated_at_epoch=WINDOW_END)
+        )
+    # A terminal that outlives its policy's lifetime bound is refused the same way.
+    overlong = build_probe_manifest(
+        context.policy,
+        list(context.manifests[2].deployments),
+        sequence=4,
+        previous=context.manifests[2].manifest_digest_sha256,
+        issued_at=WINDOW_END,
+        expires_at=WINDOW_END + context.policy.max_manifest_lifetime_seconds + 1,
+        finalized_height=context.manifests[2].finalized_height,
+        finalized_block_hash=context.manifests[2].finalized_block_hash,
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide_weight_submission(
+            context.rounds,
+            terminal=TerminalManifestObservation(
+                status="verified", evaluated_at_epoch=WINDOW_END, manifest=overlong
+            ),
+            registered=context.registered,
+            trust_policies=[context.policy],
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+    assert failure.value.code == "decision_terminal_policy_rejected"
+
+
+def test_reports_are_readmitted_under_their_policy_validity_window() -> None:
+    """A report evaluated before its manifest's policy became valid is impossible.
+
+    Manifest 3 is republished under a successor policy valid from its own
+    issuance; its genuine rounds are admitted, while a report forged one second
+    before that validity start (still inside the window and the skew bound)
+    is refused by producer and parser.
+    """
+
+    context = make_window_context()
+    successor = build_policy(
+        context.keys, max_age=3_600, valid_from=BASE_EPOCH + 3_000, max_future_skew=5
+    )
+    manifest_two = context.manifests[1]
+    rotated_three = build_probe_manifest(
+        successor,
+        list(context.manifests[2].deployments),
+        sequence=3,
+        previous=manifest_two.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 3_000,
+        expires_at=BASE_EPOCH + 3_000 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 40,
+        finalized_block_hash=label_digest("contract-checkpoint-block-three"),
+    )
+    state_two = rebind_manifest_chain_state_trust_policy(
+        context.states[2], context.policy, successor, evaluation_epoch=BASE_EPOCH + 3_000
+    )
+    rounds = list(context.rounds[:36])
+    for index in range(9):
+        rounds.append(
+            build_round(
+                successor,
+                rotated_three,
+                state_two,
+                context.keys,
+                responders={
+                    "fixture-alpha": "MinerA",
+                    "fixture-beta": "MinerB",
+                    "fixture-gamma": "MinerE",
+                    "fixture-delta": None,
+                },
+                label=f"validity-three-{index}",
+                evaluation_epoch=BASE_EPOCH + 3_060 + 60 * index,
+            )
+        )
+    terminal = TerminalManifestObservation(
+        status="verified", evaluated_at_epoch=WINDOW_END, manifest=rotated_three
+    )
+
+    def decide(window_rounds: list[ProbeRound]) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            window_rounds,
+            terminal=terminal,
+            registered=context.registered,
+            trust_policies=[context.policy, successor],
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+
+    decision = decide(rounds)
+    assert decision.decision == "submit" and decision.round_count == 45
+    rendered = validator_weight_decision_bytes(decision)
+    assert parse_validator_weight_decision(rendered) == decision
+    too_early = ProbeRound(
+        manifest=rotated_three,
+        report=_forged_report(rounds[36].report, evaluation_epoch=BASE_EPOCH + 2_999),
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide([*rounds[:36], too_early, *rounds[37:]])
+    assert failure.value.code == "decision_round_policy_rejected"
+    with pytest.raises(ValidationError, match="report_policy_rejected"):
+        ValidatorWeightDecision.model_validate(
+            forged_decision_with_report(
+                rendered,
+                report_digest_sha256=rounds[36].report.report_digest_sha256,
+                evaluation_epoch=BASE_EPOCH + 2_999,
+            )
+        )
+
+
+def test_observations_judged_under_a_looser_policy_cannot_be_relabelled() -> None:
+    """Every observation must be one the report's policy could have produced.
+
+    Responses presenting certificate B are ``tls_pin_mismatch`` under the
+    pinned policy A that verified the manifest; evaluated under a same-authority
+    policy without pins they become ``serving``. Sealing them under A is
+    refused at report construction, and a report that nevertheless claims them
+    is refused by the decision and the parser; the report's probe bounds must
+    also be exactly the policy's.
+    """
+
+    context = make_window_context()
+    pin = label_digest("edge-leaf-a")
+    pinned = build_policy(context.keys, max_age=3_600, pinned_edge_leaf_certificate_sha256=(pin,))
+    loose = build_policy(context.keys, max_age=3_600)
+    alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
+    beta = window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
+    manifest = build_probe_manifest(pinned, [alpha, beta])
+    genesis = build_initial_manifest_chain_state(pinned)
+    verification = verify_active_assignment_manifest(
+        manifest,
+        sign_manifest(manifest, context.keys),
+        pinned,
+        genesis,
+        evaluation_epoch=BASE_EPOCH + 60,
+        current_finalized_height=FINALIZED_HEIGHT,
+    )
+
+    def observations(leaf: str, policy: Any) -> list[ProbeObservation]:
+        items = []
+        for deployment in manifest.deployments:
+            nonce = label_digest(f"relabel-{deployment.deployment_id}")
+            replica = deployment.replicas[0]
+            response = serving_response(
+                deployment,
+                attestation=sign_attestation(deployment, replica, probe_nonce=nonce),
+                tls_leaf_certificate_sha256=leaf,
+            )
+            items.append(
+                evaluate_probe_response(deployment, policy, probe_nonce=nonce, result=response)
+            )
+        return items
+
+    def report(items: list[ProbeObservation]) -> ValidatorProbeReport:
+        return build_validator_probe_report(
+            verification,
+            pinned,
+            genesis,
+            items,
+            validator_uid=VALIDATOR_UID,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            evaluation_epoch=BASE_EPOCH + 60,
+            edge_origin_override=False,
+        )
+
+    strict = observations(label_digest("edge-leaf-b"), pinned)
+    assert {item.failure_code for item in strict} == {"tls_pin_mismatch"}
+    relabelled = observations(label_digest("edge-leaf-b"), loose)
+    assert {item.outcome for item in relabelled} == {"serving"}
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        report(relabelled)
+    genuine = report(observations(pin, pinned))
+    assert genuine.serving_count == 2
+    # Failures reached only after the pin check also need a pinned certificate.
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        report(
+            [
+                ProbeObservation.model_validate(
+                    reseal_observation(
+                        {
+                            **item.model_dump(mode="json", by_alias=True),
+                            "tls_leaf_certificate_sha256": label_digest("edge-leaf-b"),
+                        }
+                    )
+                )
+                for item in genuine.observations
+            ]
+        )
+
+    def decide(round_report: ValidatorProbeReport, *policies: Any) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            [ProbeRound(manifest=manifest, report=round_report)],
+            terminal=TerminalManifestObservation(
+                status="verified", evaluated_at_epoch=WINDOW_END, manifest=manifest
+            ),
+            registered=context.registered,
+            trust_policies=list(policies),
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+
+    accepted = decide(genuine, pinned)
+    assert accepted.round_count == 1 and accepted.trust_policies == [pinned]
+    genuine_document = genuine.model_dump(mode="json", by_alias=True)
+    # The genuine report with its observations swapped for the relabelled ones
+    # (report resealed) is refused under the policy it names...
+    forged = ValidatorProbeReport.model_validate(
+        reseal_report_observations(
+            genuine_document, [item.model_dump(mode="json", by_alias=True) for item in relabelled]
+        )
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(forged, pinned)
+    assert failure.value.code == "decision_round_policy_rejected"
+    # ...and a serving body over the policy's response ceiling is refused too.
+    oversized = ValidatorProbeReport.model_validate(
+        reseal_report_observations(
+            genuine_document,
+            [
+                {
+                    **item.model_dump(mode="json", by_alias=True),
+                    "response_bytes": pinned.max_response_bytes + 1,
+                }
+                for item in genuine.observations
+            ],
+        )
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(oversized, pinned)
+    assert failure.value.code == "decision_round_policy_rejected"
+    # Probe bounds are the policy's scalars, not free report fields.
+    loosened = _forged_report(genuine, max_response_bytes=pinned.max_response_bytes + 1)
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(loosened, pinned)
+    assert failure.value.code == "decision_round_invalid"
+    # Supplying the loose policy instead does not help: the manifest names A.
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(forged, loose)
+    assert failure.value.code == "decision_trust_policy_missing"
+
+
+def test_observation_policy_binding_is_branch_complete() -> None:
+    pin = label_digest("edge-leaf-a")
+    pinned = build_policy(signer_keys(), pinned_edge_leaf_certificate_sha256=(pin,))
+    unpinned = build_policy(signer_keys())
+    context = make_window_context()
+    serving = next(
+        item for item in context.rounds[0].report.observations if item.outcome == "serving"
+    )
+    failed = next(
+        item for item in context.rounds[36].report.observations if item.outcome == "failed"
+    )
+    assert failed.failure_code == "timeout"
+
+    def variant(base: ProbeObservation, **changes: Any) -> ProbeObservation:
+        return ProbeObservation.model_validate(
+            reseal_observation({**base.model_dump(mode="json", by_alias=True), **changes})
+        )
+
+    # Serving: pinned certificate and body within the ceiling are required.
+    verify_observation_policy_binding(variant(serving, tls_leaf_certificate_sha256=pin), pinned)
+    verify_observation_policy_binding(
+        variant(serving, tls_leaf_certificate_sha256=pin, response_bytes=pinned.max_response_bytes),
+        pinned,
+    )
+    for bad in (
+        variant(serving),  # no certificate recorded under a pinning policy
+        variant(serving, tls_leaf_certificate_sha256=label_digest("edge-leaf-b")),
+        variant(serving, response_bytes=pinned.max_response_bytes + 1),
+    ):
+        with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+            verify_observation_policy_binding(bad, pinned)
+    # Without pins the certificate is free; the size ceiling still binds.
+    verify_observation_policy_binding(variant(serving), unpinned)
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        verify_observation_policy_binding(
+            variant(serving, response_bytes=unpinned.max_response_bytes + 1), unpinned
+        )
+    # Transport failures precede the pin check and carry no policy claim; a
+    # pin mismatch is the pin check; post-pin failures need a pinned certificate.
+    verify_observation_policy_binding(failed, pinned)
+    verify_observation_policy_binding(
+        variant(failed, failure_code="tls_pin_mismatch", response_status=200), pinned
+    )
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        verify_observation_policy_binding(
+            variant(failed, failure_code="unexpected_status", response_status=503), pinned
+        )
+    verify_observation_policy_binding(
+        variant(
+            failed,
+            failure_code="unexpected_status",
+            response_status=503,
+            tls_leaf_certificate_sha256=pin,
+        ),
+        pinned,
+    )
+
+
 def test_uid_republication_never_erases_the_earning_identity_sighting() -> None:
     """An endpoint republished under a new UID keeps the earlier identity's first sighting.
 
@@ -1719,6 +2085,7 @@ def test_window_manifests_must_form_one_coherent_chain() -> None:
                 finalized_height=FINALIZED_HEIGHT + 40,
                 finalized_block_hash=context.manifests[2].finalized_block_hash,
                 issued_at=BASE_EPOCH + 2_999,
+                expires_at=BASE_EPOCH + 2_999 + 3_600,
             ),
         )
     assert failure.value.code == "decision_manifest_chain_incoherent"

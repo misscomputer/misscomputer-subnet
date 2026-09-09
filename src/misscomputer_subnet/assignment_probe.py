@@ -158,6 +158,7 @@ ProbeRejectionCode = Literal[
     "manifest_stale",
     "network_mismatch",
     "observation_coverage_mismatch",
+    "observation_policy_violation",
     "previous_link_mismatch",
     "probe_scheme_mismatch",
     "report_evaluation_epoch_mismatch",
@@ -1042,6 +1043,86 @@ def _verify_policy_binding(
         _reject("manifest_future")
 
 
+def verify_manifest_policy_admission(
+    manifest: ActiveAssignmentManifest,
+    policy: AssignmentManifestTrustPolicy,
+    *,
+    evaluation_epoch: int,
+) -> None:
+    """Re-derive what live verification demands of a manifest under a policy at an instant.
+
+    Everything :func:`verify_active_assignment_manifest` requires that depends
+    only on the manifest, the policy, and the evaluation instant: the
+    policy-digest, network, authority, scheme and route-suffix binding; the
+    policy's own validity window at ``evaluation_epoch``; the manifest's
+    issue and expiry inside that window; the manifest lifetime; the future
+    skew; and staleness. Signatures, block leases, and the effective horizon
+    are the caller's own rules and are not repeated here. A decision uses this
+    to refuse a report or terminal observation that its named policy could not
+    have admitted at the instant it claims.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
+    _verify_policy_binding(manifest, policy, evaluation_epoch=evaluation_epoch)
+    if (
+        evaluation_epoch > manifest.issued_at_epoch
+        and evaluation_epoch - manifest.issued_at_epoch > policy.max_manifest_age_seconds
+    ):
+        _reject("manifest_stale")
+
+
+#: Failure codes an observation can only carry after the policy's certificate
+#: pin check passed inside :func:`evaluate_probe_response`.
+_POST_PIN_FAILURE_CODES: Final = frozenset(
+    {
+        "redirect_rejected",
+        "unexpected_status",
+        "body_digest_mismatch",
+        "build_id_header_mismatch",
+        "attestation_missing",
+        "attestation_invalid",
+    }
+)
+#: Failure codes an observation can only carry after the policy's response-size
+#: check passed.
+_POST_SIZE_FAILURE_CODES: Final = frozenset(
+    {
+        "body_digest_mismatch",
+        "build_id_header_mismatch",
+        "attestation_missing",
+        "attestation_invalid",
+    }
+)
+
+
+def verify_observation_policy_binding(
+    observation: ProbeObservation, policy: AssignmentManifestTrustPolicy
+) -> None:
+    """Refuse an observation ``evaluate_probe_response`` could not have produced under ``policy``.
+
+    An observation records the facts the policy-dependent checks judged: the
+    edge leaf certificate and the response size. A ``serving`` outcome, or any
+    failure code reached only after the pin check, requires a pinned
+    certificate when the policy pins any; a ``serving`` outcome, or any failure
+    code reached only after the size check, requires a body within
+    ``max_response_bytes``. An observation evaluated under a looser policy and
+    relabelled with this one is therefore refused (``observation_policy_violation``).
+    """
+
+    pins = policy.pinned_edge_leaf_certificate_sha256
+    serving = observation.outcome == "serving"
+    if (
+        pins
+        and (serving or observation.failure_code in _POST_PIN_FAILURE_CODES)
+        and observation.tls_leaf_certificate_sha256 not in pins
+    ):
+        _reject("observation_policy_violation")
+    if (
+        serving or observation.failure_code in _POST_SIZE_FAILURE_CODES
+    ) and observation.response_bytes > policy.max_response_bytes:
+        _reject("observation_policy_violation")
+
+
 def manifest_effective_expires_at_epoch(manifest: ActiveAssignmentManifest) -> int:
     """The instant a manifest stops being valid: its own expiry or the earliest ticket expiry.
 
@@ -1583,8 +1664,11 @@ def build_validator_probe_report(
     must be the instant the manifest was verified at
     (``report_evaluation_epoch_mismatch``) and ``trust_policy`` the policy it
     was verified under, which is also the policy the manifest names
-    (``trust_policy_mismatch``). A report therefore never claims an evaluation
-    instant, and so a clock skew, that its verification did not admit.
+    (``trust_policy_mismatch``), and every observation must be one that
+    :func:`evaluate_probe_response` could have produced under that policy
+    (``observation_policy_violation``). A report therefore never claims an
+    evaluation instant, a clock skew, or a serving verdict that its
+    verification's policy did not admit.
     """
 
     _validate_evaluation_epoch(evaluation_epoch)
@@ -1614,6 +1698,7 @@ def build_validator_probe_report(
             or observation.challenge_path != deployment.challenge_path
         ):
             _reject("observation_coverage_mismatch")
+        verify_observation_policy_binding(observation, policy)
     vector = [_model_document(item) for item in ordered]
     serving = sum(item.outcome == "serving" for item in ordered)
     unsigned: dict[str, object] = {

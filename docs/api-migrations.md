@@ -3,14 +3,18 @@
 ## Contract checkpoint v1: clock-skew coherence
 
 This release makes the checkpoint's clock-skew tolerances coherent across the
-stages that apply them, and binds every tolerance to the policy document that
-admitted the evidence. It contains one declared contract compatibility event
-(`validator-weight-decision` v1 gains `trust_policies`), two breaking pure-API
-changes (`decide_weight_submission` requires `trust_policies`;
-`build_validator_probe_report` refuses an epoch or policy other than its
-verification's), one semantic relaxation and one semantic tightening of
-`active-assignment-snapshot` v1 invariants that change no schema or golden
-bytes. No other contract, fixture, Go API, or CLI changes.
+stages that apply them, and binds every evaluation-time rule to the policy
+document that admitted the evidence. It contains one declared contract
+compatibility event (`validator-weight-decision` v1 gains `trust_policies`;
+together with the earlier `assignment-manifest-chain-state` event the
+checkpoint now carries two), one new publisher-local contract
+(`active-assignment-snapshot-lineage` v1), two breaking pure-API changes
+(`decide_weight_submission` requires `trust_policies`;
+`build_validator_probe_report` refuses an epoch, policy, or observation other
+than its verification's), and one semantic relaxation plus one semantic
+tightening of `active-assignment-snapshot` v1 invariants that change no schema
+or golden bytes. No other contract, fixture, Go API, or CLI changes. The
+upgrade order and rollback rules are at the end of this section.
 
 ### `validator-weight-decision` v1 gains `trust_policies` (compatibility event; breaking `decide_weight_submission`)
 
@@ -35,10 +39,28 @@ policy document:
   `trust_policy_digest_sha256` (`decision_trust_policy_missing`).
 - A round is admitted only if `manifest.issued_at_epoch <=
   report.evaluation_epoch + policy.max_future_skew_seconds` for that
-  manifest's policy (`decision_round_invalid`). A verified terminal manifest
-  must satisfy `issued_at_epoch <= terminal_evaluated_at_epoch +
-  policy.max_future_skew_seconds` for its policy (`decision_terminal_future`),
-  exactly as live verification at that instant requires.
+  manifest's policy and the report's `probe_timeout_millis` and
+  `max_response_bytes` are that policy's scalars (`decision_round_invalid`).
+  A verified terminal manifest must satisfy `issued_at_epoch <=
+  terminal_evaluated_at_epoch + policy.max_future_skew_seconds` for its policy
+  (`decision_terminal_future`), exactly as live verification at that instant
+  requires.
+- Beyond the skew, every report and the terminal are re-admitted under their
+  manifest's policy with the new pure helper
+  `assignment_probe.verify_manifest_policy_admission(manifest, policy,
+  evaluation_epoch=...)`: everything `verify_active_assignment_manifest`
+  requires that depends only on the manifest, the policy, and the instant
+  (policy-digest, network, authority, scheme, and route-suffix binding; the
+  policy valid at the instant; the manifest inside the policy interval and
+  lifetime; future skew; staleness), and every observation must satisfy
+  `assignment_probe.verify_observation_policy_binding(observation, policy)`
+  (a pinned certificate when the policy pins, `response_bytes` within
+  `max_response_bytes`, judged on the outcomes and failure codes that could
+  only follow those checks). Producer codes:
+  `decision_round_policy_rejected`, `decision_terminal_policy_rejected`; parser
+  codes: `report_policy_rejected`, `terminal_policy_rejected`. Signatures,
+  block leases, and the effective horizon are not re-derived: the first two
+  are live-only, the horizon is the decision's own rule.
 - The record gains `trust_policies`: exactly the policy documents its sealed
   manifests name, sorted by digest. Parsing re-validates each document
   (digests and key material), requires the canonical order and the exact set
@@ -57,11 +79,15 @@ policy document:
   (that report resealed one second earlier, with the scoring window and record
   resealed), `submit-with-terminal-issued-beyond-skew` (a terminal issued 6s
   after the close, legitimately produced at close+1, evaluation instant
-  rewritten to the close), `submit-without-verifying-trust-policy`. A record
-  sealed before this release lacks `trust_policies`: its canonical document,
-  and therefore `decision_digest_sha256`, no longer matches, so it does not
-  parse and must be re-sealed from its rounds. No coordinator is live on the
-  previous form.
+  rewritten to the close), `submit-with-terminal-before-policy-validity` (a
+  terminal under a successor policy valid from close+5, produced at close+5,
+  evaluation instant rewritten to the close),
+  `submit-with-report-probe-bounds-not-policy`,
+  `submit-with-observation-oversized-for-policy`,
+  `submit-without-verifying-trust-policy`. A record sealed before this release
+  lacks `trust_policies`: its canonical document, and therefore
+  `decision_digest_sha256`, no longer matches, so it does not parse and must be
+  re-sealed from its rounds. No coordinator is live on the previous form.
 
 ### Report construction is bound to its verification (breaking)
 
@@ -70,23 +96,51 @@ policy document:
 signer-validity, and chain rules were applied at and under (live, historical,
 and anchor verification all record them). `build_validator_probe_report`
 refuses an `evaluation_epoch` other than the verification's
-(`report_evaluation_epoch_mismatch`, new `ProbeRejectionCode`) and a
+(`report_evaluation_epoch_mismatch`, new `ProbeRejectionCode`), a
 `trust_policy` whose digest differs from the verification's or from the
-manifest's `trust_policy_digest_sha256` (`trust_policy_mismatch`). A report can
-therefore never claim an evaluation instant, and so a clock skew, that its
-verification did not admit. The `misscomputer-assignment-probe` CLI already
-passes the same epoch and policy to both calls and is unaffected.
+manifest's `trust_policy_digest_sha256` (`trust_policy_mismatch`), and any
+observation that `evaluate_probe_response` could not have produced under that
+policy (`observation_policy_violation`, new `ProbeRejectionCode`): responses
+judged under a same-authority policy without certificate pins or with a larger
+body ceiling cannot be relabelled as serving under the pinned policy that
+verified the manifest. A report can therefore never claim an evaluation
+instant, a clock skew, or a serving verdict that its verification did not
+admit. The `misscomputer-assignment-probe` CLI already passes the same epoch
+and policy to every call and is unaffected.
+
+### `active-assignment-snapshot-lineage` v1 (new, publisher-local)
+
+`assignment_snapshot` gains `SnapshotLineage`, `ReplicaLineage`,
+`build_initial_snapshot_lineage`, `advance_snapshot_lineage`,
+`snapshot_lineage_bytes`, and `parse_snapshot_lineage`, with schema, golden
+fixture (genesis advanced over the golden capture and its signer-skew
+successor), and negative fixtures under `contracts/negative/`. The lineage is
+the durable form of snapshot succession: it carries the last accepted
+capture's transactional position and the latest accepted incarnation of every
+`replica_id` ever exported (generation, nonce, endpoint, ticket and receipt
+digests, replica-document digest, ticket-bound deployment-facts digest). New
+codes: `snapshot_generation_not_increasing` (a replacement must advance the
+generation), `snapshot_replacement_facts_reused` (a replacement must carry a
+fresh nonce, ticket digest, and receipt digest), `snapshot_lineage_overflow`
+(more than `MAX_LINEAGE_REPLICAS` distinct `replica_id`s; re-anchor). A
+publisher persists the lineage beside its manifest chain state and advances it
+with every accepted capture. There is no Go counterpart.
 
 ### `active-assignment-snapshot` v1: incarnation immutability across captures (semantics only)
 
-`verify_snapshot_succession` adds `snapshot_incarnation_rewritten`: an
-`endpoint_id` (deployment, hotkey, generation, nonce) exported by both the
-previous and the current capture must carry the identical replica document in
-both. A signed ticket binds its own issuance, so a retained ticket digest,
-nonce, and receipt digest with a restamped `ticket_issued_at_epoch`, a moved
-`route_activated_at_epoch`, or any other changed fact is an impossible rewrite,
-not a re-assignment; a re-issued ticket is a new generation and nonce. Schema
-and golden bytes are unchanged. There is no Go counterpart: succession is a
+`verify_snapshot_succession` is now exactly `advance_snapshot_lineage` applied
+from genesis over the two captures, and therefore adds
+`snapshot_incarnation_rewritten` (a retained `endpoint_id` must carry the
+identical replica document and identical ticket-bound deployment facts:
+image digest, challenge digest, workload spec, campaign, build, route),
+`snapshot_generation_not_increasing`, and `snapshot_replacement_facts_reused`.
+A signed ticket binds its own issuance and its assignment, so a retained ticket
+digest with a restamped `ticket_issued_at_epoch`, a moved
+`route_activated_at_epoch`, a changed parent fact, or a replacement that keeps
+the generation, nonce, ticket, or receipt is an impossible rewrite, not a
+re-assignment. The two-capture form cannot see an incarnation dropped by one
+capture and rewritten by a later one; the persisted lineage can. Schema and
+golden bytes are unchanged. There is no Go counterpart: succession is a
 publisher-side rule and `pkg/assignment` has no succession API.
 
 ### `active-assignment-snapshot` v1: one clock-domain rule (semantics only)
@@ -119,6 +173,44 @@ digests, so it is a valid successor of the golden capture) and the negatives
 beside the other rollback and fork codes in both the pre-request rejection
 list and the fork/rollback/equivocation response procedure; the retention and
 escalation steps are unchanged and apply to it.
+
+### Upgrade order, rollback, and retention
+
+New-form documents are not downgrade compatible in place: an old
+`validator-weight-decision` parser refuses a record carrying `trust_policies`
+(`additionalProperties: false`), an old snapshot consumer refuses a capture
+whose ticket is stamped after activation within the new tolerance
+(`replica_activation_order_invalid`), and no old consumer knows the lineage
+document. Conversely the new decision parser refuses every old-form record
+(digest mismatch) and the new snapshot rules refuse captures an old publisher
+would have accepted (rewritten incarnations). Roll out accordingly:
+
+1. **Consumers first, writers last.** Upgrade every reader of a contract
+   before any writer of it: decision parsers and the weight-plan builder
+   before the coordinator that seals decisions; snapshot consumers (the
+   publisher's derivation and succession checks, and every validator that
+   cross-references captures) before the runtime that exports captures. The
+   new consumers accept everything the old writers produce that was valid
+   under the old rules, except old-form decision records, which are re-sealed
+   (below).
+2. **Rollback writers first.** To roll back, stop or downgrade the writer
+   before any consumer, so that no new-form document reaches a downgraded
+   reader. Documents already produced in the new form stay in the archive and
+   are not rewritten.
+3. **Retention and reprocessing.** Retain every sealed decision, capture,
+   report, and lineage as produced; never rewrite an archived document. A
+   decision sealed before this release does not parse under the new rules and
+   is reprocessed by re-running `decide_weight_submission` over its retained
+   rounds, terminal observation, registered set, and the approved trust-policy
+   documents; the re-sealed record carries a new digest and is archived beside
+   the original. A publisher adopting the lineage starts it from genesis at
+   the first capture it accepts after the upgrade (or replays its retained
+   captures in order); captures accepted before that are outside the lineage's
+   memory and are documented as such.
+4. **No mixed windows.** A coordinator seals a scoring window entirely under
+   one code version; a window whose rounds were verified by old and new
+   probe-report builders is still valid input, because report bytes are
+   unchanged, but the decision is sealed only by the new coordinator.
 
 ## Contract checkpoint v1
 

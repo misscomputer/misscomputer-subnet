@@ -39,9 +39,13 @@ from misscomputer_subnet.assignment_snapshot import (
     SnapshotDeployment,
     SnapshotReplica,
     active_assignment_snapshot_bytes,
+    advance_snapshot_lineage,
+    build_initial_snapshot_lineage,
     build_snapshot_replica,
     parse_active_assignment_snapshot,
+    parse_snapshot_lineage,
     project_manifest_deployments,
+    snapshot_lineage_bytes,
     verify_manifest_derived_from_snapshot,
     verify_snapshot_succession,
 )
@@ -475,6 +479,183 @@ def test_succession_refuses_rewritten_incarnation_facts() -> None:
             ],
         ),
     )
+
+
+def _alpha_with(
+    replica_changes: dict[str, object], *, deployment_changes: dict[str, object] | None = None
+) -> SnapshotDeployment:
+    """The golden alpha deployment with its first replica (and optionally its facts) rewritten."""
+
+    alpha, _ = fixture_deployments()
+    lifted = snapshot_deployment_from(alpha)
+    replica = SnapshotReplica.model_validate(
+        {**lifted.replicas[0].model_dump(mode="json"), **replica_changes}
+    )
+    document = {**lifted.model_dump(mode="json"), **(deployment_changes or {})}
+    document["replicas"] = [
+        replica.model_dump(mode="json"),
+        *[item.model_dump(mode="json") for item in lifted.replicas[1:]],
+    ]
+    return SnapshotDeployment.model_validate(document)
+
+
+def _capture(sequence: int, alpha: SnapshotDeployment | None) -> ActiveAssignmentSnapshot:
+    _, beta = fixture_deployments()
+    return build_snapshot(
+        snapshot_sequence=sequence,
+        state_revision=6 + sequence,
+        snapshot_deployments=[snapshot_deployment_from(beta)]
+        if alpha is None
+        else [alpha, snapshot_deployment_from(beta)],
+    )
+
+
+def test_incarnation_lineage_refuses_every_rewrite_and_reuse() -> None:
+    """Replacement needs a higher generation and fresh signed facts; retention needs identity.
+
+    ``replica_id`` (deployment and hotkey) is the stable lineage; a new
+    ``endpoint_id`` for it is a replacement and must advance the generation and
+    carry a fresh nonce, ticket digest, and receipt digest; the same
+    ``endpoint_id`` must carry the identical replica document and identical
+    ticket-bound deployment facts. The lineage remembers every incarnation it
+    accepted, so a capture that drops an incarnation and a later one that
+    re-exports it rewritten is still refused.
+    """
+
+    golden = build_snapshot()
+    alpha, _ = fixture_deployments()
+    first = snapshot_deployment_from(alpha).replicas[0]
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    after_golden = advance_snapshot_lineage(genesis, golden)
+    assert after_golden.accepted_snapshot_count == 1 and len(after_golden.replicas) == 6
+    fresh_nonce = label_digest("fresh-nonce")[:32]
+
+    def rejects(code: str, alpha_variant: SnapshotDeployment) -> None:
+        capture = _capture(2, alpha_variant)
+        with pytest.raises(AssignmentSnapshotError) as durable:
+            advance_snapshot_lineage(after_golden, capture)
+        assert durable.value.code == code
+        with pytest.raises(AssignmentSnapshotError) as adjacent:
+            verify_snapshot_succession(golden, capture)
+        assert adjacent.value.code == code
+
+    # g1 -> g2 keeping nonce, ticket, and receipt: a replacement without fresh facts.
+    rejects(
+        "snapshot_replacement_facts_reused",
+        _alpha_with(
+            {
+                "generation": 2,
+                "endpoint_id": f"{first.replica_id}-g2-{first.assignment_nonce}",
+                "ticket_issued_at_epoch": BASE_EPOCH + 1,
+                "route_activated_at_epoch": BASE_EPOCH,
+            }
+        ),
+    )
+    # Same generation with a fresh nonce and endpoint, retaining ticket and receipt.
+    rejects(
+        "snapshot_generation_not_increasing",
+        _alpha_with(
+            {
+                "assignment_nonce": fresh_nonce,
+                "endpoint_id": f"{first.replica_id}-g1-{fresh_nonce}",
+                "ticket_issued_at_epoch": BASE_EPOCH + 1,
+                "route_activated_at_epoch": BASE_EPOCH,
+            }
+        ),
+    )
+    # Higher generation and fresh nonce, but a retained ticket or receipt digest.
+    for retained in (
+        {"receipt_digest_sha256": label_digest("fresh-receipt")},
+        {"ticket_digest_sha256": label_digest("fresh-ticket")},
+    ):
+        rejects(
+            "snapshot_replacement_facts_reused",
+            _alpha_with(
+                {
+                    "generation": 2,
+                    "assignment_nonce": fresh_nonce,
+                    "endpoint_id": f"{first.replica_id}-g2-{fresh_nonce}",
+                    **retained,
+                }
+            ),
+        )
+    # Same endpoint and ticket, parent deployment facts changed.
+    for facts in (
+        {"image_digest": "sha256:" + label_digest("other-image")},
+        {"challenge_sha256": label_digest("other-challenge")},
+        {"workload_spec_digest_sha256": label_digest("other-workload")},
+        {"campaign_sequence": 9},
+    ):
+        rejects("snapshot_incarnation_rewritten", _alpha_with({}, deployment_changes=facts))
+    # Same endpoint, replica facts rewritten (every fact, not only the ticket instant).
+    for changes in (
+        {"ticket_issued_at_epoch": BASE_EPOCH + 1, "route_activated_at_epoch": BASE_EPOCH},
+        {"receipt_digest_sha256": label_digest("rewritten-receipt")},
+        {"route_activated_at_epoch": ROUTE_ACTIVATED_AT + 1},
+        {"expires_at_block": FINALIZED_HEIGHT + 61},
+    ):
+        rejects("snapshot_incarnation_rewritten", _alpha_with(changes))
+
+    # Empty intermediate capture, then the old endpoint re-exported rewritten:
+    # invisible to adjacent succession, refused by the durable lineage.
+    empty = build_snapshot([], snapshot_sequence=2, state_revision=8)
+    after_empty = advance_snapshot_lineage(after_golden, empty)
+    assert after_empty.replicas == after_golden.replicas
+    rewritten = _capture(
+        3,
+        _alpha_with(
+            {"ticket_issued_at_epoch": BASE_EPOCH + 1, "route_activated_at_epoch": BASE_EPOCH}
+        ),
+    )
+    verify_snapshot_succession(golden, empty)
+    verify_snapshot_succession(empty, rewritten)
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(after_empty, rewritten)
+    assert failure.value.code == "snapshot_incarnation_rewritten"
+    # ...while the identical incarnation re-exported after the gap is accepted.
+    restored = advance_snapshot_lineage(after_empty, _capture(3, snapshot_deployment_from(alpha)))
+    assert restored.replicas == after_golden.replicas
+
+    # A genuine replacement: higher generation, fresh nonce, ticket, and receipt.
+    genuine = _capture(
+        2,
+        snapshot_deployment_from(
+            alpha, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 1
+        ),
+    )
+    verify_snapshot_succession(golden, genuine)
+    advanced = advance_snapshot_lineage(after_golden, genuine)
+    replaced = {item.replica_id: item for item in advanced.replicas}
+    for replica in genuine.deployments[0].replicas:
+        entry = replaced[replica.replica_id]
+        assert entry.generation == 2 and entry.endpoint_id == replica.endpoint_id
+    # Replacing again must advance past generation 2, not merely differ from 1.
+    stale_generation = _capture(
+        3,
+        snapshot_deployment_from(
+            alpha, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 2
+        ),
+    )
+    assert stale_generation.deployments[0].replicas[0].generation == 2
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(advanced, stale_generation)
+    assert failure.value.code == "snapshot_generation_not_increasing"
+
+    # The lineage is a durable canonical document.
+    rendered = snapshot_lineage_bytes(advanced)
+    assert parse_snapshot_lineage(rendered) == advanced
+    assert advanced.last_snapshot_sequence == 2 and advanced.accepted_snapshot_count == 2
+    # Transactional rules hold against the lineage exactly as between captures.
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(advanced, golden)
+    assert failure.value.code == "snapshot_sequence_not_increasing"
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(
+            genesis, build_snapshot(central_authority=label_digest("other-authority"))
+        )
+    assert failure.value.code == "snapshot_authority_mismatch"
 
 
 def test_builder_never_trusts_a_supplied_projection_digest_or_order() -> None:

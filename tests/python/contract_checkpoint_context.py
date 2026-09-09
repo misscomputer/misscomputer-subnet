@@ -57,10 +57,14 @@ from misscomputer_subnet.assignment_snapshot import (
     TICKET_MAX_FUTURE_SKEW_SECONDS,
     ActiveAssignmentSnapshot,
     SnapshotDeployment,
+    SnapshotLineage,
     active_assignment_snapshot_bytes,
+    advance_snapshot_lineage,
     build_active_assignment_snapshot,
+    build_initial_snapshot_lineage,
     build_snapshot_deployment,
     build_snapshot_replica,
+    snapshot_lineage_bytes,
 )
 from misscomputer_subnet.contract_codec import canonical_json
 from misscomputer_subnet.contract_codec import digest as canonical_digest
@@ -293,6 +297,18 @@ def build_signer_skew_snapshot() -> ActiveAssignmentSnapshot:
                 beta, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 1
             ),
         ],
+    )
+
+
+def build_snapshot_lineage() -> SnapshotLineage:
+    """The publisher's lineage after accepting the golden capture and its signer-skew successor."""
+
+    golden = build_snapshot()
+    lineage = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    return advance_snapshot_lineage(
+        advance_snapshot_lineage(lineage, golden), build_signer_skew_snapshot()
     )
 
 
@@ -583,7 +599,10 @@ def make_window_context(
 
 
 def build_future_terminal(
-    context: WindowContext, *, lead_seconds: int
+    context: WindowContext,
+    *,
+    lead_seconds: int,
+    policy: AssignmentManifestTrustPolicy | None = None,
 ) -> tuple[ActiveAssignmentManifest, AssignmentManifestChainState]:
     """Manifest 4: manifest 3's assignments republished ``lead_seconds`` after window close.
 
@@ -603,7 +622,7 @@ def build_future_terminal(
         current_finalized_height=FINALIZED_HEIGHT,
     ).next_chain_state
     manifest_four = build_manifest(
-        context.policy,
+        context.policy if policy is None else policy,
         [
             ActiveDeploymentAssignment.model_validate(item.model_dump(mode="json", by_alias=True))
             for item in manifest_three.deployments
@@ -619,22 +638,37 @@ def build_future_terminal(
 
 
 def future_terminal_decision(
-    lead_seconds: int, *, evaluated_at_epoch: int
+    lead_seconds: int,
+    *,
+    evaluated_at_epoch: int,
+    successor_policy: AssignmentManifestTrustPolicy | None = None,
 ) -> ValidatorWeightDecision:
-    """The golden window closed by a terminal manifest issued after the close instant."""
+    """The golden window closed by a terminal manifest issued after the close instant.
+
+    With ``successor_policy`` the terminal is published under that policy (a
+    rotation at the close) and both policies are supplied to the decision.
+    """
 
     context = make_window_context()
-    manifest_four, _ = build_future_terminal(context, lead_seconds=lead_seconds)
+    manifest_four, _ = build_future_terminal(
+        context, lead_seconds=lead_seconds, policy=successor_policy
+    )
     return decide_weight_submission(
         context.rounds,
         terminal=TerminalManifestObservation(
             status="verified", evaluated_at_epoch=evaluated_at_epoch, manifest=manifest_four
         ),
         registered=context.registered,
-        trust_policies=[context.policy],
+        trust_policies=[context.policy] + ([] if successor_policy is None else [successor_policy]),
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
     )
+
+
+def successor_policy_valid_from(valid_from_epoch: int) -> AssignmentManifestTrustPolicy:
+    """The golden trust policy re-issued with a later validity start (a rotation)."""
+
+    return build_policy(signer_keys(), max_age=3_600, valid_from=valid_from_epoch)
 
 
 def build_pointer() -> AssignmentManifestLatestPointer:
@@ -644,6 +678,7 @@ def build_pointer() -> AssignmentManifestLatestPointer:
 
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "active-assignment-snapshot": ActiveAssignmentSnapshot,
+    "active-assignment-snapshot-lineage": SnapshotLineage,
     "assignment-manifest-latest-pointer": AssignmentManifestLatestPointer,
     "validator-weight-decision": ValidatorWeightDecision,
 }
@@ -655,6 +690,7 @@ def fixture_documents() -> dict[str, bytes]:
         "active-assignment-snapshot-signer-skew": active_assignment_snapshot_bytes(
             build_signer_skew_snapshot()
         ),
+        "active-assignment-snapshot-lineage": snapshot_lineage_bytes(build_snapshot_lineage()),
         "assignment-manifest-latest-pointer": assignment_manifest_latest_pointer_bytes(
             build_pointer()
         ),
@@ -736,8 +772,36 @@ def reseal_report(document: dict[str, Any]) -> dict[str, Any]:
     return resealed
 
 
+def reseal_observation(document: dict[str, Any]) -> dict[str, Any]:
+    """Recompute a mutated observation's self digest."""
+
+    resealed = dict(document)
+    unsigned = {k: v for k, v in resealed.items() if k != "observation_digest_sha256"}
+    resealed["observation_digest_sha256"] = canonical_digest(unsigned)
+    return resealed
+
+
+def reseal_report_observations(
+    report: dict[str, Any], observations: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Replace a report's observations (resealing each) and re-derive its digests."""
+
+    resealed = [reseal_observation(item) for item in observations]
+    return reseal_report(
+        {
+            **report,
+            "observations": resealed,
+            "observation_vector_digest_sha256": canonical_digest(resealed),
+        }
+    )
+
+
 def forged_decision_with_report(
-    rendered: bytes, *, report_digest_sha256: str, **report_changes: Any
+    rendered: bytes,
+    *,
+    report_digest_sha256: str,
+    observation_changes: dict[str, Any] | None = None,
+    **report_changes: Any,
 ) -> dict[str, Any]:
     """Rewrite one sealed report in place and re-derive every digest that depends on it.
 
@@ -752,7 +816,13 @@ def forged_decision_with_report(
         reports = evidence["scoring_reports"]
         for index, report in enumerate(reports):
             if report["report_digest_sha256"] == report_digest_sha256:
-                reports[index] = reseal_report({**report, **report_changes})
+                rewritten = {**report, **report_changes}
+                if observation_changes:
+                    rewritten = reseal_report_observations(
+                        rewritten,
+                        [{**item, **observation_changes} for item in report["observations"]],
+                    )
+                reports[index] = reseal_report(rewritten)
                 replaced = True
         reports.sort(key=lambda item: item["report_digest_sha256"])
     if not replaced:
@@ -1059,6 +1129,77 @@ def negative_documents() -> dict[str, bytes]:
         "model",
         "trust_policies_not_derived",
         forged_decision(decision, trust_policies=[]),
+    )
+    # A terminal published under a successor policy that only becomes valid at
+    # the close+5 instant it was issued: legitimately produced at close+5, its
+    # evaluation instant rewritten to the close, where that policy could not
+    # yet have admitted anything.
+    successor = successor_policy_valid_from(WINDOW_END + 5)
+    rotated_terminal = validator_weight_decision_bytes(
+        future_terminal_decision(5, evaluated_at_epoch=WINDOW_END + 5, successor_policy=successor)
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-terminal-before-policy-validity",
+        "model",
+        "terminal_policy_rejected",
+        forged_decision(rotated_terminal, terminal_evaluated_at_epoch=WINDOW_END),
+    )
+    # A report's probe bounds are its policy's own scalars.
+    first_report = decision_doc["assignment_manifest_evidence"][0]["scoring_reports"][0]
+    add(
+        "validator-weight-decision",
+        "submit-with-report-probe-bounds-not-policy",
+        "model",
+        "scoring_window_evidence_inconsistent",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            max_response_bytes=first_report["max_response_bytes"] + 1,
+        ),
+    )
+    # A serving observation larger than the policy's response ceiling could
+    # only have been judged under a looser policy.
+    add(
+        "validator-weight-decision",
+        "submit-with-observation-oversized-for-policy",
+        "model",
+        "report_policy_rejected",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={"response_bytes": first_report["max_response_bytes"] + 1},
+        ),
+    )
+    lineage = documents["active-assignment-snapshot-lineage"]
+    lineage_doc = json.loads(lineage)
+    add(
+        "active-assignment-snapshot-lineage",
+        "unknown-field",
+        "schema",
+        "extra_forbidden",
+        _mutate(lineage, ticket_json="not-allowed"),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "self-digest-mismatch",
+        "model",
+        "lineage_digest_sha256_mismatch",
+        _mutate(lineage, lineage_digest_sha256="0" * 64),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "replicas-not-canonical",
+        "model",
+        "lineage_replicas_not_canonical",
+        _mutate(lineage, replicas=list(reversed(lineage_doc["replicas"]))),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "genesis-with-history",
+        "model",
+        "lineage_genesis_invalid",
+        _mutate(lineage, accepted_snapshot_count=0),
     )
     add(
         "validator-weight-decision",

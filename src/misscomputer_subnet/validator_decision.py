@@ -47,15 +47,19 @@ Frozen rules
    their manifest's effective horizon; the terminal manifest observation is
    taken at or after ``window_end_epoch``; the registered set is a finalized
    view. Every manifest names the trust policy it was verified under, and the
-   record seals exactly those policy documents (``trust_policies``); a
-   report's ``evaluation_epoch`` may precede its manifest's ``issued_at_epoch``
-   by at most *that* policy's ``max_future_skew_seconds``, and the terminal
-   manifest's ``issued_at_epoch`` may lead ``terminal_evaluated_at_epoch`` by
-   at most its policy's bound: exactly what live verification admitted, no
-   decision-local bound. A round the validator verified is never refused here
-   for skew its policy allowed, a report or terminal that no verification
-   under its policy could have produced is refused, and a policy rotation
-   inside the window binds each manifest to its own policy.
+   record seals exactly those policy documents (``trust_policies``). Each
+   report and the terminal observation are re-admitted under their manifest's
+   own policy exactly as live verification admits a manifest at an instant:
+   the policy must be valid at the evaluation epoch, the manifest must lie
+   inside the policy's interval, lifetime, route, scheme, authority and
+   network constraints, may lead the evaluation epoch by at most the policy's
+   ``max_future_skew_seconds`` and trail it by at most
+   ``max_manifest_age_seconds``; a report's probe bounds are the policy's, and
+   every observation must be one the policy could have produced. No
+   decision-local bound exists. A round the validator verified is never
+   refused here for what its policy allowed, a report or terminal that no
+   verification under its policy could have produced is refused, and a policy
+   rotation inside the window binds each manifest to its own policy.
 8. **Replicas need repeated probing.** Coverage is measured in expected
    attributions, ``opportunities / replica_count`` summed over the rounds a
    miner was published in, so a three-replica deployment needs at least
@@ -122,6 +126,7 @@ from .assignment_probe import (
     UID,
     ActiveAssignmentManifest,
     AssignmentManifestTrustPolicy,
+    AssignmentProbeError,
     Digest,
     Epoch,
     Hotkey,
@@ -129,6 +134,8 @@ from .assignment_probe import (
     ValidatorProbeReport,
     manifest_earliest_lease_expires_at_block,
     manifest_effective_expires_at_epoch,
+    verify_manifest_policy_admission,
+    verify_observation_policy_binding,
 )
 from .contract_codec import (
     StrictFrozenModel,
@@ -199,8 +206,10 @@ DecisionRejectionCode = Literal[
     "decision_round_after_horizon",
     "decision_round_after_terminal",
     "decision_round_invalid",
+    "decision_round_policy_rejected",
     "decision_terminal_before_close",
     "decision_terminal_future",
+    "decision_terminal_policy_rejected",
     "decision_terminal_status_invalid",
     "decision_trust_policy_invalid",
     "decision_trust_policy_missing",
@@ -836,6 +845,14 @@ class ValidatorWeightDecision(StrictFrozenModel):
                 self.terminal_evaluated_at_epoch + terminal_policy.max_future_skew_seconds
             ):
                 raise ValueError("terminal_manifest_future")
+            try:
+                verify_manifest_policy_admission(
+                    terminal_manifest,
+                    terminal_policy,
+                    evaluation_epoch=self.terminal_evaluated_at_epoch,
+                )
+            except AssignmentProbeError:
+                raise ValueError("terminal_policy_rejected") from None
             derived_close = _evidence_identities(terminal_evidence, registered_keys)
         elif evidence:
             derived_close = _evidence_identities(evidence[-1], registered_keys)
@@ -860,14 +877,16 @@ class ValidatorWeightDecision(StrictFrozenModel):
         linked_report_digests: list[str] = []
         for item in evidence:
             manifest = item.manifest
-            max_future_skew_seconds = policy_by_digest[
-                manifest.trust_policy_digest_sha256
-            ].max_future_skew_seconds
+            manifest_policy = policy_by_digest[manifest.trust_policy_digest_sha256]
             for report in item.scoring_reports:
                 if not _report_matches_manifest(
-                    report, manifest, max_future_skew_seconds=max_future_skew_seconds
+                    report, manifest, policy=manifest_policy
                 ) or report.evaluation_epoch >= manifest_effective_expires_at_epoch(manifest):
                     raise ValueError("scoring_window_evidence_inconsistent")
+                try:
+                    _verify_report_policy_admission(report, manifest, manifest_policy)
+                except AssignmentProbeError:
+                    raise ValueError("report_policy_rejected") from None
                 sealed_rounds.append(ProbeRound(manifest=manifest, report=report))
                 linked_report_digests.append(report.report_digest_sha256)
         if len(linked_report_digests) > MAX_ROUNDS:
@@ -1278,28 +1297,50 @@ def _revalidate_rounds(
             _reject("decision_round_invalid")
     for entry in fresh:
         policy = _verifying_policy(entry.manifest, trust_policies)
-        if not _report_matches_manifest(
-            entry.report,
-            entry.manifest,
-            max_future_skew_seconds=policy.max_future_skew_seconds,
-        ):
+        if not _report_matches_manifest(entry.report, entry.manifest, policy=policy):
             _reject("decision_round_invalid")
+        try:
+            _verify_report_policy_admission(entry.report, entry.manifest, policy)
+        except AssignmentProbeError:
+            _reject("decision_round_policy_rejected")
     return fresh
+
+
+def _verify_report_policy_admission(
+    report: ValidatorProbeReport,
+    manifest: ActiveAssignmentManifest,
+    policy: AssignmentManifestTrustPolicy,
+) -> None:
+    """Re-admit a report's manifest and observations under the policy the report names.
+
+    The manifest must satisfy everything live verification demands under
+    ``policy`` at ``report.evaluation_epoch`` (policy validity window,
+    manifest interval, lifetime, route, scheme, skew, staleness), and every
+    observation must be one ``evaluate_probe_response`` could have produced
+    under that policy (certificate pins, response size). Raises
+    :class:`AssignmentProbeError` with the live verifier's own code.
+    """
+
+    verify_manifest_policy_admission(manifest, policy, evaluation_epoch=report.evaluation_epoch)
+    for observation in report.observations:
+        verify_observation_policy_binding(observation, policy)
 
 
 def _report_matches_manifest(
     report: ValidatorProbeReport,
     manifest: ActiveAssignmentManifest,
     *,
-    max_future_skew_seconds: int,
+    policy: AssignmentManifestTrustPolicy,
 ) -> bool:
-    """Bind every report claim used by a decision to its full manifest.
+    """Bind every report claim used by a decision to its full manifest and policy.
 
-    The report may have been evaluated up to ``max_future_skew_seconds`` before
-    the manifest's ``issued_at_epoch``: live verification admits a manifest
-    whose issuer clock leads the validator's by at most the trust policy's
-    ``max_future_skew_seconds``, and the caller passes exactly that policy's
-    value, never a decision-local one.
+    The report may have been evaluated up to the policy's
+    ``max_future_skew_seconds`` before the manifest's ``issued_at_epoch``:
+    live verification admits a manifest whose issuer clock leads the
+    validator's by at most that much, and ``policy`` is the very policy the
+    manifest names, never a decision-local bound. The report's probe bounds
+    (``probe_timeout_millis``, ``max_response_bytes``) are the policy's own
+    scalars, so a report cannot claim looser probing than its policy allowed.
     """
 
     return (
@@ -1317,7 +1358,9 @@ def _report_matches_manifest(
         and report.finalized_epoch == manifest.finalized_epoch
         and report.probe_scheme == manifest.probe_scheme
         and report.probe_port == manifest.probe_port
-        and manifest.issued_at_epoch <= report.evaluation_epoch + max_future_skew_seconds
+        and report.probe_timeout_millis == policy.probe_timeout_millis
+        and report.max_response_bytes == policy.max_response_bytes
+        and manifest.issued_at_epoch <= report.evaluation_epoch + policy.max_future_skew_seconds
         and {item.deployment_id for item in report.observations}
         == {item.deployment_id for item in manifest.deployments}
     )
@@ -1408,10 +1451,14 @@ def decide_weight_submission(
     or successor across a rotation inside the window); every manifest in the
     window, archived or terminal, must name one of them
     (``decision_trust_policy_missing``), each report is bound to its
-    manifest under that policy's ``max_future_skew_seconds``, the terminal
-    manifest may lead its evaluation instant by at most its policy's bound
-    (``decision_terminal_future``), and exactly the policies the sealed
-    manifests name are sealed in the record.
+    manifest under that policy's ``max_future_skew_seconds``
+    (``decision_round_invalid``) and re-admitted under the policy's full
+    evaluation-time rules and observation constraints
+    (``decision_round_policy_rejected``), the terminal manifest may lead its
+    evaluation instant by at most its policy's bound
+    (``decision_terminal_future``) and must likewise be admissible under its
+    policy at that instant (``decision_terminal_policy_rejected``), and
+    exactly the policies the sealed manifests name are sealed in the record.
     ``archived_manifests`` are the actual publications the coordinator accepted
     into its chain state between the window's first probed manifest and the
     terminal but did not probe; the whole span must be one unbroken digest
@@ -1459,6 +1506,12 @@ def decide_weight_submission(
             evaluated_at + terminal_policy.max_future_skew_seconds
         ):
             _reject("decision_terminal_future")
+        try:
+            verify_manifest_policy_admission(
+                terminal_manifest, terminal_policy, evaluation_epoch=evaluated_at
+            )
+        except AssignmentProbeError:
+            _reject("decision_terminal_policy_rejected")
     elif terminal.manifest is not None or not terminal.rejection_code:
         _reject("decision_terminal_status_invalid")
     prior = (
