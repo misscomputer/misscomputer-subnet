@@ -371,7 +371,9 @@ def build_round(
         probe_nonce = nonce_for(f"{label}-{deployment.deployment_id}")
         responder = responders.get(deployment.deployment_id)
         if responder is None:
-            result: object = ProbeTransportFailure(code="timeout", latency_millis=latency_millis)
+            result: object = ProbeTransportFailure(
+                code="timeout", latency_millis=policy.probe_timeout_millis + 1
+            )
         else:
             replica = next(item for item in deployment.replicas if item.miner_hotkey == responder)
             attestation = sign_attestation(deployment, replica, probe_nonce=probe_nonce)
@@ -1184,7 +1186,7 @@ def negative_documents() -> dict[str, bytes]:
         "validator-weight-decision",
         "submit-with-observation-oversized-for-policy",
         "model",
-        "report_policy_rejected",
+        "observation_policy_violation",
         forged_decision_with_report(
             decision,
             report_digest_sha256=first_report["report_digest_sha256"],
@@ -1198,7 +1200,7 @@ def negative_documents() -> dict[str, bytes]:
         "validator-weight-decision",
         "submit-with-observation-slower-than-policy-timeout",
         "model",
-        "report_policy_rejected",
+        "observation_policy_violation",
         forged_decision_with_report(
             decision,
             report_digest_sha256=first_report["report_digest_sha256"],
@@ -1242,7 +1244,7 @@ def negative_documents() -> dict[str, bytes]:
         "validator-weight-decision",
         "submit-with-oversized-below-policy-ceiling",
         "model",
-        "report_policy_rejected",
+        "observation_policy_violation",
         forged_decision_with_report(
             decision,
             report_digest_sha256=first_report["report_digest_sha256"],

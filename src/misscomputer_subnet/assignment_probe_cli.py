@@ -301,7 +301,7 @@ class HttpsProbeTransport:
         try:
             with httpx.Client(
                 transport=self._transport_factory(self._context, budget.remaining_seconds),
-                timeout=httpx.Timeout(timeout_seconds),
+                timeout=httpx.Timeout((budget.budget_millis + 1) / 1000),
                 follow_redirects=False,
                 max_redirects=0,
                 trust_env=False,
@@ -374,7 +374,14 @@ class HttpsProbeTransport:
                         )
                     )
         except Exception as exc:  # noqa: BLE001 - every transport fault is classified
+            latency_millis = budget.latency_millis()
+            if budget.exhausted(latency_millis):
+                return timed_out(latency_millis)
             code = _classify_transport_error(exc)
+            # A transport/OS timeout before our deadline is a transport fault,
+            # not evidence that this policy's whole-request budget expired.
+            if code == "timeout":
+                code = "transport_error"
             return ProbeTransportFailure(
                 cast(
                     Literal[
@@ -387,7 +394,7 @@ class HttpsProbeTransport:
                     ],
                     code,
                 ),
-                budget.latency_millis(),
+                latency_millis,
                 tls_leaf_certificate_sha256=leaf,
             )
 

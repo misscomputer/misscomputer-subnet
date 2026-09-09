@@ -1,4 +1,8 @@
-# Final checkpoint repair evidence
+# Prior checkpoint repair evidence
+
+Historical evidence for `00de93cd`; the subsequent atomic-cap and timeout
+repairs supersede its ceiling and timeout-policy claims. See
+[the next-round evidence](pr9-atomic-timeout-repair-evidence.md).
 
 ## Scope and immutable input
 

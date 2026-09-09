@@ -197,8 +197,10 @@ publisher-side rule with no Go counterpart: `pkg/assignment` produces captures
 and has no succession API. Candidate boundaries fully dry-run the candidate
 before returning a persistable pending head. Replay distinguishes full versus
 suffix boundary events and can reproduce pending heads with `pending_candidate`.
-Immutable replay has an explicit cumulative `MAX_REPLAY_WORK` limit, not a linear
-runtime guarantee; see `api-migrations.md` for batching and exact recovery.
+Immutable replay has an explicit cumulative `MAX_REPLAY_WORK = 1_814_787` limit,
+derived as initial validation plus the maximum producer-admitted atomic boundary
+(4 state charges + 3 candidate charges), not a linear runtime guarantee; see
+`api-migrations.md` for the proof, batching, and exact recovery.
 
 An empty snapshot is a valid state meaning "nothing is route-active". A
 manifest cannot be derived from it (manifest v1 requires at least one
@@ -560,15 +562,19 @@ Frozen invariants:
   own scalars; and every observation must be one `evaluate_probe_response`
   could have produced under that policy
   (`verify_observation_policy_binding`: the observation names that policy's
-  digest, `trust_policy_digest_sha256`; every response-derived outcome, that
-  is a serving outcome or any failure other than a transport failure, has
-  `latency_millis <= probe_timeout_millis`, because the transport applies the
-  policy's whole-request budget and a slower response is a `timeout`; a
+  digest, `trust_policy_digest_sha256`; `timeout` if and only if
+  `latency_millis > probe_timeout_millis`, with all other outcomes at or below
+  the budget. Early OS/per-operation timeouts are `transport_error`; the pure
+  evaluator and transport use identical precedence. The continuous deadline is
+  `(probe_timeout_millis + 1) / 1000` to match floor-millisecond admission; a
   serving outcome, or any failure code reached only after the pin check,
   carries a pinned edge certificate when the policy pins any; a serving
   outcome or any failure reached only after the size check has
   `response_bytes <= max_response_bytes`; and a `response_oversized` verdict
-  carries size evidence above it). Producer codes are
+  carries size evidence above it). Budget/size inconsistencies reject first in
+  the report model as `observation_policy_violation` (`decision_round_invalid`
+  at decision production); the standalone scorer enforces these same scalars.
+  Remaining full-policy producer codes are
   `decision_round_policy_rejected` and `decision_terminal_policy_rejected`;
   parser codes `report_policy_rejected` and `terminal_policy_rejected`
   (`scoring_window_evidence_inconsistent` for the probe-bound scalars).
@@ -651,7 +657,7 @@ come from the sealed trust policies.
 | Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation; recycles a nonce, ticket, or receipt retired by any earlier replacement (A → B → A); or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_incarnation_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id` and every signed fact it ever accepted in the era; a replacement is a new generation with never-seen facts |
 | Lineage restored from a stale backup, resealed with retired facts removed or with impossible boundary claims, fed a capture out of order or a duplicate/rolled-back history, spent on a capture other than the one its boundary was taken for, given a second boundary before any capture followed, or grown past its bounds | `snapshot_lineage_anchor_mismatch`/`lineage_era_invalid`/`lineage_replica_facts_duplicate`/`snapshot_lineage_gap`/`snapshot_sequence_not_increasing`/`snapshot_lineage_candidate_mismatch`/`snapshot_lineage_boundary_pending`/`snapshot_lineage_overflow`; publisher refuses and forgets nothing | the lineage is a hash chain whose head the operator anchors out of band; sequences are contiguous and a history preflight refuses rollbacks; boundary claims are bounded, unique per sequence, and tied to the document's predecessor; only an explicit, recorded era boundary sheds retired facts, at the replica cap it is taken for the capture it admits and admits only that capture, and every live history replays to itself |
 | Probe request stalled anywhere inside per-operation timeouts: slow name resolution, several unreachable addresses, a partial send drained just fast enough, or a byte-by-byte header or body trickle; or many lookups blocked at once | `ProbeTransportFailure("timeout")` at the transport within a small margin of the budget, `connection_failed` fast when the process-wide resolver slots are all held; `observation_policy_violation` if an older transport reports it as a response | name resolution is waited on for the remaining budget and abandoned, each address is dialled with the remaining budget, and every TLS step, `send`, and read on the connection is clamped to the time remaining in one budget on one monotonic clock (`DeadlineNetworkBackend`); the same budget is judged before every response-derived return; the binding re-derives the same bound from the recorded latency |
-| The same wire outcome sealed under a policy other than the one that judged it (a 100ms `timeout` carried into a 5000ms report, a 64-byte `response_oversized` carried into a 4096-byte report, or the reverse) | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | every observation seals the digest of the policy that judged it and its size evidence, and every consumer requires equality with the report's policy |
+| The same wire outcome sealed under a policy other than the one that judged it (a 100ms `timeout` carried into a 5000ms report, a 64-byte `response_oversized` carried into a 4096-byte report, or the reverse) | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | self digests do not authenticate telemetry; consumers re-derive timeout iff latency exceeds budget and size failure iff evidence exceeds ceiling, as well as requiring policy-label equality; fully resealed unchanged facts cannot bypass these rules |
 | Peer answers with a wire status outside `100..599` | `ProbeTransportFailure("transport_error")` with no status at the transport; the same at `evaluate_probe_response` for a leaked `ProbeResponse` | the contract's status range is enforced before an observation exists; no raw validation error reaches the CLI |
 | `tls_pin_mismatch` judged under a pinning policy carried into a report naming a policy without pins, or whose pins include the leaf | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | every policy-dependent failure branch is bound in both directions |
 

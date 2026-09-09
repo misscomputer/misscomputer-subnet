@@ -1357,21 +1357,22 @@ def test_observations_judged_under_a_looser_policy_cannot_be_relabelled() -> Non
         decide(forged, pinned)
     assert failure.value.code == "decision_round_invalid"
     # ...and a serving body over the policy's response ceiling is refused too.
-    oversized = ValidatorProbeReport.model_validate(
-        reseal_report_observations(
-            genuine_document,
-            [
-                {
-                    **item.model_dump(mode="json", by_alias=True),
-                    "response_bytes": pinned.max_response_bytes + 1,
-                }
-                for item in genuine.observations
-            ],
-        )
+    oversized_document = reseal_report_observations(
+        genuine_document,
+        [
+            {
+                **item.model_dump(mode="json", by_alias=True),
+                "response_bytes": pinned.max_response_bytes + 1,
+            }
+            for item in genuine.observations
+        ],
     )
+    with pytest.raises(ValidationError, match="observation_policy_violation"):
+        ValidatorProbeReport.model_validate(oversized_document)
+    oversized = _foreign_policy_report(oversized_document)
     with pytest.raises(WeightDecisionError) as failure:
         decide(oversized, pinned)
-    assert failure.value.code == "decision_round_policy_rejected"
+    assert failure.value.code == "decision_round_invalid"
     # Probe bounds are the policy's scalars, not free report fields.
     loosened = _forged_report(genuine, max_response_bytes=pinned.max_response_bytes + 1)
     with pytest.raises(WeightDecisionError) as failure:
@@ -1390,7 +1391,7 @@ def test_timeout_policy_cannot_be_relabelled() -> None:
     whole request, so under the strict policy a 1000ms response is a
     ``timeout``, never a response. Report construction, the decision producer,
     and the parser all refuse the relabelled observations; a genuine transport
-    timeout under the strict policy is admitted whatever its latency.
+    timeout under the strict policy is admitted only after whole-request expiry.
     """
 
     context = make_window_context()
@@ -1443,10 +1444,11 @@ def test_timeout_policy_cannot_be_relabelled() -> None:
     # At the budget exactly the response is admissible; one millisecond over is not.
     genuine = report(observations(100, strict))
     assert genuine.serving_count == 2 and genuine.probe_timeout_millis == 100
-    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-        report(observations(101, strict))
+    # The pure producer now applies the same deadline as the transport.
+    late = report(observations(101, strict))
+    assert {item.failure_code for item in late.observations} == {"timeout"}
     # A post-transport failure is response-derived too: it needs a response
-    # inside the budget. A transport timeout carries any latency.
+    # inside the budget. An early transport timeout is a transport fault.
     timed_out = [
         evaluate_probe_response(
             deployment,
@@ -1502,7 +1504,7 @@ def test_timeout_policy_cannot_be_relabelled() -> None:
     with pytest.raises(WeightDecisionError) as failure:
         decide(relabelled)
     assert failure.value.code == "decision_round_invalid"
-    with pytest.raises(ValidationError, match="report_policy_rejected"):
+    with pytest.raises(ValidationError, match="observation_policy_violation"):
         ValidatorWeightDecision.model_validate(
             forged_decision_with_report(
                 rendered,
@@ -1779,6 +1781,15 @@ def test_observation_policy_binding_is_branch_complete() -> None:
         item for item in context.rounds[36].report.observations if item.outcome == "failed"
     )
     assert failed.failure_code == "timeout"
+    failed = ProbeObservation.model_validate(
+        reseal_observation(
+            {
+                **failed.model_dump(mode="json", by_alias=True),
+                "failure_code": "transport_error",
+                "latency_millis": 42,
+            }
+        )
+    )
 
     def variant(base: ProbeObservation, policy: Any, **changes: Any) -> ProbeObservation:
         """``base`` re-sealed as if ``policy`` had judged it, with ``changes`` applied."""
@@ -1831,8 +1842,8 @@ def test_observation_policy_binding_is_branch_complete() -> None:
     # Without pins the certificate is free; the size ceiling still binds.
     accepts(variant(serving, unpinned), unpinned)
     refuses(variant(serving, unpinned, response_bytes=unpinned.max_response_bytes + 1), unpinned)
-    # Every response-derived outcome fits the whole-request budget; a transport
-    # failure, including a timeout, carries whatever latency it took.
+    # Every non-timeout outcome fits the budget; only whole-request expiry
+    # carries timeout, including after a transport fault.
     accepts(
         variant(
             serving,
@@ -1861,7 +1872,14 @@ def test_observation_policy_binding_is_branch_complete() -> None:
         ),
         pinned,
     )
-    accepts(variant(failed, pinned, latency_millis=pinned.probe_timeout_millis + 1), pinned)
+    refuses(variant(failed, pinned, latency_millis=pinned.probe_timeout_millis + 1), pinned)
+    accepts(
+        variant(
+            failed, pinned, failure_code="timeout", latency_millis=pinned.probe_timeout_millis + 1
+        ),
+        pinned,
+    )
+    refuses(variant(failed, pinned, failure_code="timeout"), pinned)
     # Transport failures precede the pin check and carry no policy claim; a
     # pin mismatch is the pin check; post-pin failures need a pinned certificate.
     accepts(variant(failed, pinned), pinned)

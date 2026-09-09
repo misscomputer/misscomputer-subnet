@@ -127,8 +127,15 @@ MAX_LINEAGE_FACTS: Final = 1 << 17
 #: operator-initiated loss of retired-fact and inactive-lineage memory.
 MAX_LINEAGE_ERAS: Final = 64
 MAX_LINEAGE_BYTES: Final = 64 * 1_024 * 1_024
-#: Cumulative immutable-state entries visited per replay call (including dry runs).
-MAX_REPLAY_WORK: Final = 1_000_000
+#: Largest charged state and candidate, derived from the producer's field caps.
+MAX_REPLAY_STATE_ENTRIES: Final = (
+    1 + MAX_LINEAGE_REPLICAS + 3 * MAX_LINEAGE_FACTS + MAX_LINEAGE_ERAS - 1
+)
+MAX_REPLAY_CANDIDATE_ENTRIES: Final = 1 + MAX_DEPLOYMENTS + MAX_LINEAGE_REPLICAS
+#: Initial validation plus the most expensive atomic event: a candidate boundary
+#: (three passes). Also covers an ordinary capture or pending-head verification.
+#: Keep cumulative accounting intact: larger archives still require batching.
+MAX_REPLAY_WORK: Final = 4 * MAX_REPLAY_STATE_ENTRIES + 3 * MAX_REPLAY_CANDIDATE_ENTRIES
 
 SnapshotRejectionCode = Literal[
     "snapshot_authority_mismatch",

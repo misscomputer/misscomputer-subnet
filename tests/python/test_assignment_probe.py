@@ -706,7 +706,10 @@ def test_probe_evaluation_fail_closed_matrix() -> None:
             probe_nonce=nonce,
             result=ProbeTransportFailure(code, 1_000),  # type: ignore[arg-type]
         )
-        assert (observation.outcome, observation.failure_code) == ("failed", code)
+        assert (observation.outcome, observation.failure_code) == (
+            "failed",
+            "transport_error" if code == "timeout" else code,
+        )
         assert observation.response_status is None
         assert observation.response_bytes == 0
 
@@ -822,7 +825,7 @@ def test_report_requires_exact_deployment_coverage_and_counts_failures() -> None
         beta,
         context.policy,
         probe_nonce=label_digest("failed-nonce"),
-        result=ProbeTransportFailure("timeout", 5_000),
+        result=ProbeTransportFailure("timeout", 5_001),
     )
     degraded = build_validator_probe_report(
         verification,

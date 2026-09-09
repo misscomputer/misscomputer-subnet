@@ -40,6 +40,8 @@ class RequestBudget:
     only while ``latency_millis <= budget_millis``. A latency of exactly the
     budget is a response; one millisecond more is a ``timeout``. Latency is
     measured once per decision, so the value recorded is the value judged.
+    The continuous I/O deadline is (budget_millis + 1) / 1000, matching that
+    floor-inclusive interval rather than expiring one millisecond too early.
     """
 
     __slots__ = ("_clock", "_started", "budget_millis")
@@ -56,9 +58,9 @@ class RequestBudget:
         return latency_millis > self.budget_millis
 
     def remaining_seconds(self) -> float:
-        """Seconds left before the budget is exhausted; never negative."""
+        """Seconds until floor(elapsed milliseconds) exceeds the budget; never negative."""
 
-        return max(0.0, self.budget_millis / 1000 - (self._clock() - self._started))
+        return max(0.0, (self.budget_millis + 1) / 1000 - (self._clock() - self._started))
 
 
 #: httpcore's socket option shape, restated so no private module is imported.

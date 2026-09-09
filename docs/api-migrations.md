@@ -14,7 +14,9 @@ checkpoint now carries three), one new publisher-local contract
 `build_validator_probe_report` refuses an epoch, policy, or observation other
 than its verification's), and one semantic relaxation plus one semantic
 tightening of `active-assignment-snapshot` v1 invariants that change no schema
-or golden bytes. No other contract, fixture, Go API, or CLI changes. The
+or golden bytes. The additional prelaunch timeout semantic tightening below
+also changes timeout observations and their dependent fixture digests, without
+adding JSON fields or changing Go APIs. The
 supported mixed-version pairings, the coordinated pause that keeps operation
 inside them, rollback order, and retention are at the end of this section.
 
@@ -96,21 +98,68 @@ policy document:
   archived with its original reader; old-report reprocessing is unsupported
   in this release (see Retention and reprocessing).
 
+### Whole-request timeout semantics (additional prelaunch compatibility event)
+
+`timeout` now means **if and only if** `latency_millis > probe_timeout_millis`.
+The pure evaluator and HTTPS boundary apply this rule before any other outcome.
+An OS/per-operation timeout before that boundary is `transport_error`, not a
+claim that the policy budget expired; other transport errors before expiry keep
+their codes. Report model/parser and standalone scorer enforce the same rule
+using the report budget; report construction and decision producer/parser also
+bind that budget to the approved policy. A fully resealed 101ms timeout labelled
+with a 5000ms policy fails `observation_policy_violation` (byte parser wrapper:
+`document_invalid`; scorer: `scoring_round_invalid`; decision producer:
+`decision_round_invalid`). This is a semantic tightening with no new JSON fields.
+
+The admission clock remains floor milliseconds and inclusive of the integer
+budget. Therefore the continuous I/O deadline is `(budget_millis + 1) / 1000`,
+including httpx's outer per-operation timeout. At 100.5ms under a 100ms budget,
+latency is 100 and 0.5ms remains; at 101ms it is 101 and no I/O time remains.
+No retry, extra deadline, or sleeping to fabricate elapsed evidence is added.
+
+Old timeout reports at or below their budget are not admissible and cannot be
+converted by relabelling a digest or changing latency/cause. Keep their original
+bytes with the old reader offline. Cut over CLI/coordinator together and collect
+new observations. The deterministic fixture's deliberately silent route now
+records actual expiry (5001ms under 5000ms), not an impossible 42ms expiry;
+weights are unchanged, while report/decision digests change. No schema or
+dependency update is needed for this semantic change.
+
+Policy-dimension review: request budget, response ceiling, and certificate pins
+are the only observation-dependent policy branches. Size evidence and pin
+membership are checked in both directions; standalone reports can enforce their
+embedded size/budget scalars, while pin lists require the policy-aware consumer.
+Scheme/network/netuid/purpose are fixed; route suffix, authority, validity,
+age/skew/lifetime, signer keys/threshold/roles/revocation, and sequence/height gaps
+are manifest/verification rules, not unrecorded timeout causes. Their existing
+signature/admission/chain checks remain required. Compatible policies may admit
+the same facts without changing an outcome; no digest can prove the identity of
+a malicious observer's actual policy. This release does not introduce or claim
+signed validator telemetry.
+
 ### `validator-probe-report` v1: observations seal their evaluation policy (compatibility event)
 
 Every `ProbeObservation` gains `trust_policy_digest_sha256`: the digest of the
 trust policy whose bounds (request budget, certificate pins, response ceiling)
 `evaluate_probe_response` judged it under. `build_validator_probe_report`,
 `verify_observation_policy_binding`, the standalone report parser, scorer,
-decision producer, and decision parser require it to equal the policy the report names, so an observation can
-never be relabelled under a looser or stricter policy than the one that made
-it: the same 101ms response is a `timeout` under a 100ms budget and `serving`
-under 5000ms, and neither observation is admissible under the other policy.
+decision producer, and decision parser require it to equal the policy the report
+names. This unsigned digest is not authenticated provenance. Consumers also
+re-derive policy-dependent outcomes from unchanged recorded facts: a 101ms
+`timeout` under a 100ms budget cannot be relabelled under 5000ms even after every
+self/vector/report digest is resealed. Changing the recorded latency or fabricating
+an observation is outside this local-observer trust boundary, not prevented by
+self digests.
 A foreign digest is `observation_policy_violation` during model validation
 (and the existing `document_invalid` wrapper during byte parsing),
 `scoring_round_invalid` at standalone scoring, and `decision_round_invalid`
 at the decision producer's report-validation boundary. Policy-bound semantic
-violations on otherwise well-formed reports keep their existing codes.
+violations requiring the full policy keep their existing codes. Budget and size
+violations now reject earlier at report validation: the decision producer reports
+`decision_round_invalid`, and nested report models report
+`observation_policy_violation` instead of the former later
+`decision_round_policy_rejected` / `report_policy_rejected`. The three affected
+negative fixtures pin this earlier deterministic outcome; no attack is admitted.
 An oversized verdict now also preserves the size evidence the transport judged
 (`ProbeTransportFailure.response_bytes`: the declared `Content-Length`, or the
 bytes received before the ceiling was crossed, capped at
@@ -307,7 +356,7 @@ the capture: the union of retained facts is built once and updated as facts
 are accepted (a scale guard in the suite fails on quadratic behaviour).
 
 Replay is **not linear in capture count**: immutable hash-chain links require
-hashing growing history at each step. `MAX_REPLAY_WORK = 1_000_000` enforces a
+hashing growing history at each step. `MAX_REPLAY_WORK = 1_814_787` enforces a
 cumulative-work ceiling per call before expensive transitions: each charge
 counts one state plus retained replicas, all three fact arrays, boundaries,
 and the candidate's deployment/replica entries. Candidate boundaries charge
@@ -318,6 +367,19 @@ by O(B log B) for the fixed entry cap B, rather than claiming O(captures).
 Use bounded batches starting at an independently anchored persisted head for
 long archives; keep all captures and boundaries, never restart genesis merely
 to evade the bound. Growing-history tests cover rejection and batch equivalence.
+
+The ceiling is derived, not a tunable guess: a valid state charges at most
+S = 1 + 32,768 replicas + 3 × 131,072 facts + 63 boundaries = 426,048 entries;
+a candidate charges at most C = 1 + 4,096 deployments + 32,768 replicas = 36,865.
+Initial validation plus an indivisible candidate boundary costs at most
+S + 3(S + C) = **1,814,787**. Plain boundaries, individual captures, and
+already-pending-head verification cost less. Thus any producer-admitted atomic
+transition fits the default cap; callers choosing a smaller `max_work` can still
+reject it intentionally. A boundary and its subsequent capture are two separately
+persistable transitions and may require separate replay calls. Accounting and
+all field/byte caps remain unchanged. Regressions replay both the 4,096-replica,
+86,016-fact review example and a producer-built 131,072-fact head to the exact
+pending digest, then consume the candidate in a separate call.
 
 Boundary input is explicit: `boundary_mode="full"` (default) requires the exact
 current boundary prefix followed by new events; `boundary_mode="suffix"`

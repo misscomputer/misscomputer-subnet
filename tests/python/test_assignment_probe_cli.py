@@ -1072,14 +1072,17 @@ def test_transport_enforces_one_whole_request_budget_at_the_exact_boundary() -> 
     assert isinstance(late_stream, probe_cli.ProbeTransportFailure)
     assert (late_stream.code, late_stream.latency_millis) == ("timeout", 101)
 
-    # Genuine transport timeouts and faults are transport codes at any latency.
+    # Only whole-request expiry is timeout; early operation timeouts are transport faults.
     def slow(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow origin", request=request)
 
     for elapsed, latency in ((0.05, 50), (0.1, 100), (0.25, 250)):
         result = _fetch(slow, elapsed_seconds=elapsed)
         assert isinstance(result, probe_cli.ProbeTransportFailure)
-        assert (result.code, result.latency_millis) == ("timeout", latency)
+        assert (result.code, result.latency_millis) == (
+            "timeout" if latency > 100 else "transport_error",
+            latency,
+        )
         verify_observation_policy_binding(
             evaluate_probe_response(deployment, unpinned, probe_nonce=probe_nonce, result=result),
             unpinned,
@@ -1090,7 +1093,7 @@ def test_transport_enforces_one_whole_request_budget_at_the_exact_boundary() -> 
 
     result = _fetch(refused, elapsed_seconds=0.25)
     assert isinstance(result, probe_cli.ProbeTransportFailure)
-    assert (result.code, result.latency_millis) == ("connection_failed", 250)
+    assert (result.code, result.latency_millis) == ("timeout", 250)
 
     # The budget is the policy's millisecond value, rounded once from seconds.
     budget = probe_cli.RequestBudget(0.1, clock=_FixedClock(0.0))

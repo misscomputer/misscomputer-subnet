@@ -584,8 +584,8 @@ class ProbeObservation(_StrictFrozenModel):
     assignment_digest_sha256: Digest
     #: The trust policy whose bounds (request budget, certificate pins,
     #: response ceiling) judged this observation. Every consumer requires it
-    #: to equal the policy the report names, so an observation can never be
-    #: relabelled under a looser or stricter policy than the one that made it.
+    #: to equal the policy the report names. This self-digest is NOT authenticated
+    #: provenance; consumers also re-derive policy-dependent outcomes from facts.
     trust_policy_digest_sha256: Digest
     probe_nonce: Hex64
     latency_millis: int = Field(ge=0, le=MAX_LATENCY_MILLIS)
@@ -676,6 +676,9 @@ class ValidatorProbeReport(_StrictFrozenModel):
             for item in self.observations
         ):
             raise ValueError("observation_policy_violation")
+        for item in self.observations:
+            _verify_observation_budget(item, self.probe_timeout_millis)
+            _verify_observation_size(item, self.max_response_bytes)
         serving = sum(item.outcome == "serving" for item in self.observations)
         if (
             self.deployment_count != len(self.observations)
@@ -1101,18 +1104,6 @@ _POST_PIN_FAILURE_CODES: Final = frozenset(
         "attestation_invalid",
     }
 )
-#: Failure codes the transport boundary reports before any response exists;
-#: every other outcome describes a response the transport delivered inside the
-#: policy's ``probe_timeout_millis`` budget.
-_TRANSPORT_FAILURE_CODES: Final = frozenset(
-    {
-        "connection_failed",
-        "timeout",
-        "tls_certificate_invalid",
-        "tls_handshake_failed",
-        "transport_error",
-    }
-)
 #: Failure codes an observation can only carry after the policy's response-size
 #: check passed.
 _POST_SIZE_FAILURE_CODES: Final = frozenset(
@@ -1125,64 +1116,53 @@ _POST_SIZE_FAILURE_CODES: Final = frozenset(
 )
 
 
+def _verify_observation_budget(observation: ProbeObservation, budget_millis: int) -> None:
+    """Timeout means whole-request expiry, never an early per-operation fault."""
+
+    expired = observation.latency_millis > budget_millis
+    if (observation.failure_code == "timeout") != expired:
+        _reject("observation_policy_violation")
+
+
+def _verify_observation_size(observation: ProbeObservation, max_bytes: int) -> None:
+    if (
+        observation.failure_code == "response_oversized" and observation.response_bytes <= max_bytes
+    ) or (
+        (observation.outcome == "serving" or observation.failure_code in _POST_SIZE_FAILURE_CODES)
+        and observation.response_bytes > max_bytes
+    ):
+        _reject("observation_policy_violation")
+
+
 def verify_observation_policy_binding(
     observation: ProbeObservation, policy: AssignmentManifestTrustPolicy
 ) -> None:
-    """Refuse an observation ``evaluate_probe_response`` could not have produced under ``policy``.
+    """Re-derive policy-dependent outcomes from the recorded observation facts.
 
-    An observation names the policy that judged it
-    (``trust_policy_digest_sha256``), which must be this one; the remaining
-    rules re-derive that policy's bounds from the recorded facts so a document
-    that names the right policy but describes facts it could not have produced
-    is refused as well. An observation records the facts the policy-dependent
-    checks judged: the request latency, the edge leaf certificate, and the
-    response size. Any
-    response-derived outcome (``serving`` or a failure other than a transport
-    failure) requires ``latency_millis <= probe_timeout_millis``: the transport
-    applies the policy's budget to the whole request, so a response that took
-    longer is a ``timeout`` under this policy, never a response. A ``serving``
-    outcome, or any failure code reached only after the pin check, requires a
-    pinned certificate when the policy pins any; a ``serving`` outcome, or any
-    failure code reached only after the size check, requires a body within
-    ``max_response_bytes``; a ``tls_pin_mismatch`` requires a policy that pins
-    and a recorded leaf outside its pins. Every policy-dependent branch is
-    bound in both directions, so an observation evaluated under a looser
-    policy and relabelled with a stricter one, or judged under a stricter
-    policy and relabelled with a looser one, is refused
-    (``observation_policy_violation``).
+    Self digests are integrity checks, not authenticated telemetry. With facts
+    unchanged, resealing a policy label cannot make a timeout fit a longer
+    budget: timeout iff floor(elapsed milliseconds) exceeds this budget.
+    Earlier OS/per-operation timeouts are transport_error, independent of the
+    policy. Response-size and certificate-pin failures bind in both directions.
+    Authenticity of the recorded facts remains the local observer's trust
+    boundary; these unsigned reports cannot prove what a malicious observer saw.
     """
 
     if observation.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256:
         _reject("observation_policy_violation")
+    _verify_observation_budget(observation, policy.probe_timeout_millis)
+    _verify_observation_size(observation, policy.max_response_bytes)
     pins = policy.pinned_edge_leaf_certificate_sha256
     serving = observation.outcome == "serving"
-    if (
-        serving or observation.failure_code not in _TRANSPORT_FAILURE_CODES
-    ) and observation.latency_millis > policy.probe_timeout_millis:
-        _reject("observation_policy_violation")
-    if (
-        observation.failure_code == "response_oversized"
-        and observation.response_bytes <= policy.max_response_bytes
-    ):
-        # The size check only fails above this policy's ceiling; the sealed
-        # size evidence (declared or observed lower bound) must show that.
-        _reject("observation_policy_violation")
     if observation.failure_code == "tls_pin_mismatch" and (
         not pins or observation.tls_leaf_certificate_sha256 in pins
     ):
-        # The pin check only fails under a policy that pins, against a leaf
-        # outside its pins; a mismatch judged under a stricter policy cannot
-        # be carried into a report naming a looser one.
         _reject("observation_policy_violation")
     if (
         pins
         and (serving or observation.failure_code in _POST_PIN_FAILURE_CODES)
         and observation.tls_leaf_certificate_sha256 not in pins
     ):
-        _reject("observation_policy_violation")
-    if (
-        serving or observation.failure_code in _POST_SIZE_FAILURE_CODES
-    ) and observation.response_bytes > policy.max_response_bytes:
         _reject("observation_policy_violation")
 
 
@@ -1656,8 +1636,11 @@ def evaluate_probe_response(
         "attestation_status": "not_presented",
         "attestation": None,
     }
+    if result.latency_millis > policy.probe_timeout_millis:
+        document["failure_code"] = "timeout"
+        return _seal_observation(document)
     if isinstance(result, ProbeTransportFailure):
-        document["failure_code"] = result.code
+        document["failure_code"] = "transport_error" if result.code == "timeout" else result.code
         document["response_status"] = result.response_status
         if result.code == "response_oversized":
             # Preserve the size evidence the transport judged, bounded to the
