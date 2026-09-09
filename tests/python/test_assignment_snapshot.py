@@ -41,13 +41,16 @@ from misscomputer_subnet.assignment_snapshot import (
     SnapshotReplica,
     active_assignment_snapshot_bytes,
     advance_snapshot_lineage,
+    begin_snapshot_lineage_era,
     build_initial_snapshot_lineage,
     build_snapshot_replica,
     parse_active_assignment_snapshot,
     parse_snapshot_lineage,
     project_manifest_deployments,
+    replay_snapshot_lineage,
     snapshot_lineage_bytes,
     verify_manifest_derived_from_snapshot,
+    verify_snapshot_lineage_anchor,
     verify_snapshot_succession,
 )
 from misscomputer_subnet.contract_codec import digest as canonical_digest
@@ -829,6 +832,180 @@ def test_retired_incarnation_facts_are_never_recycled() -> None:
     document["lineage_digest_sha256"] = canonical_digest(unsigned)
     with pytest.raises(ValidationError, match="lineage_used_facts_not_derived"):
         SnapshotLineage.model_validate(document)
+
+
+def test_lineage_recovery_never_silently_resets_retired_fact_memory() -> None:
+    """Overflow refuses, gaps refuse, stale restores refuse, and eras are explicit and visible.
+
+    The retired-fact guarantee survives every recovery path: a full lineage
+    refuses the next capture instead of forgetting; a capture out of sequence
+    is a gap that must be replayed; a restored lineage must match the anchored
+    head digest; and the only way to shed retired facts is an explicit era
+    boundary that the document records and that keeps every current
+    incarnation's facts, so A -> B -> A recycling is refused in the era that
+    saw A, and after an era boundary the document says exactly which era
+    forgot what.
+    """
+
+    golden = build_snapshot()
+    alpha, beta = fixture_deployments()
+    a1 = snapshot_deployment_from(alpha)
+    b2 = snapshot_deployment_from(
+        alpha, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 1
+    )
+    second = _capture(2, b2)
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    assert (genesis.era, genesis.history_start_snapshot_sequence) == (1, 1)
+    after_first = advance_snapshot_lineage(genesis, golden)
+    lineage = advance_snapshot_lineage(after_first, second)
+    # Hash chain: every advance names its predecessor.
+    assert after_first.previous_lineage_digest_sha256 == genesis.lineage_digest_sha256
+    assert lineage.previous_lineage_digest_sha256 == after_first.lineage_digest_sha256
+
+    # Gap: the next capture must be exactly sequence 3; genesis must start at
+    # its declared history start; replay supplies the missing captures.
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(lineage, _capture(4, b2))
+    assert failure.value.code == "snapshot_lineage_gap"
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(genesis, second)
+    assert failure.value.code == "snapshot_lineage_gap"
+    later_start = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256,
+        first_snapshot_sequence=2,
+    )
+    assert advance_snapshot_lineage(later_start, second).history_start_snapshot_sequence == 2
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(later_start, golden)
+    assert failure.value.code == "snapshot_lineage_gap"
+    assert replay_snapshot_lineage(genesis, [golden, second]) == lineage
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        replay_snapshot_lineage(genesis, [golden, _capture(3, b2)])
+    assert failure.value.code == "snapshot_lineage_gap"
+    for invalid in (0, -1, True):
+        with pytest.raises(ValueError, match="lineage_history_start_invalid"):
+            build_initial_snapshot_lineage(
+                central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256,
+                first_snapshot_sequence=invalid,  # type: ignore[arg-type]
+            )
+
+    # Stale restore: only the anchored head is accepted; the predecessor, a
+    # resealed copy with retired facts removed, and a foreign digest are not.
+    assert (
+        verify_snapshot_lineage_anchor(
+            lineage, expected_lineage_digest_sha256=lineage.lineage_digest_sha256
+        )
+        == lineage
+    )
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        verify_snapshot_lineage_anchor(
+            after_first, expected_lineage_digest_sha256=lineage.lineage_digest_sha256
+        )
+    assert failure.value.code == "snapshot_lineage_anchor_mismatch"
+    document = json.loads(snapshot_lineage_bytes(lineage))
+    retired_only = sorted(
+        set(document["used_ticket_digests"])
+        - {item["ticket_digest_sha256"] for item in document["replicas"]}
+    )
+    assert len(retired_only) == 3
+    document["used_ticket_digests"] = [
+        item for item in document["used_ticket_digests"] if item not in retired_only
+    ]
+    unsigned = {k: v for k, v in document.items() if k != "lineage_digest_sha256"}
+    document["lineage_digest_sha256"] = canonical_digest(unsigned)
+    resealed = SnapshotLineage.model_validate(document)  # digest-valid, history-false
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        verify_snapshot_lineage_anchor(
+            resealed, expected_lineage_digest_sha256=lineage.lineage_digest_sha256
+        )
+    assert failure.value.code == "snapshot_lineage_anchor_mismatch"
+
+    # Overflow: a capture that would exceed the fact budget is refused and
+    # nothing is forgotten; the same lineage still accepts a capture that fits.
+    recycled = _capture(3, _reincarnation(b2, a1, generation=3))
+    fresh_third = _capture(
+        3,
+        SnapshotDeployment.model_validate(
+            {
+                **b2.model_dump(mode="json"),
+                "replicas": [
+                    SnapshotReplica.model_validate(
+                        {
+                            **r.model_dump(mode="json"),
+                            "generation": 3,
+                            "assignment_nonce": label_digest(f"g3-nonce-{r.miner_hotkey}")[:32],
+                            "ticket_digest_sha256": label_digest(f"g3-ticket-{r.miner_hotkey}"),
+                            "receipt_digest_sha256": label_digest(f"g3-receipt-{r.miner_hotkey}"),
+                            "endpoint_id": (
+                                f"{r.replica_id}-g3-{label_digest(f'g3-nonce-{r.miner_hotkey}')[:32]}"
+                            ),
+                        }
+                    ).model_dump(mode="json")
+                    for r in b2.replicas
+                ],
+            }
+        ),
+    )
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(lineage, fresh_third, max_facts=9)
+    assert failure.value.code == "snapshot_lineage_overflow"
+    grown = advance_snapshot_lineage(lineage, fresh_third, max_facts=12)
+    assert len(grown.used_ticket_digests) == 12 and grown.era == 1
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(lineage, recycled)
+    assert failure.value.code == "snapshot_incarnation_facts_reused"
+
+    # Era boundary: explicit, recorded, keeps the current incarnations' facts.
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        begin_snapshot_lineage_era(genesis)
+    assert failure.value.code == "snapshot_lineage_gap"
+    era_two = begin_snapshot_lineage_era(lineage)
+    assert era_two.era == 2 and era_two.accepted_snapshot_count == 2
+    assert era_two.previous_lineage_digest_sha256 == lineage.lineage_digest_sha256
+    assert era_two.replicas == lineage.replicas
+    assert len(era_two.used_ticket_digests) == 6 and len(era_two.era_boundaries) == 1
+    boundary = era_two.era_boundaries[0]
+    assert (boundary.era, boundary.opened_after_snapshot_sequence) == (2, 2)
+    assert (
+        boundary.dropped_assignment_nonces,
+        boundary.dropped_ticket_digests,
+        boundary.dropped_receipt_digests,
+    ) == (3, 3, 3)
+    assert boundary.previous_lineage_digest_sha256 == lineage.lineage_digest_sha256
+    assert parse_snapshot_lineage(snapshot_lineage_bytes(era_two)) == era_two
+    # Within era 2 the guarantee is re-scoped: A's era-1 facts are no longer
+    # remembered, and the document says so; current facts are still guarded.
+    era_two_recycled = advance_snapshot_lineage(era_two, recycled)
+    assert era_two_recycled.era == 2 and era_two_recycled.era_boundaries == [boundary]
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(era_two, _capture(3, _reincarnation(b2, b2, generation=3)))
+    assert failure.value.code == "snapshot_incarnation_facts_reused"
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(
+            era_two,
+            _capture(
+                3,
+                SnapshotDeployment.model_validate(
+                    {
+                        **b2.model_dump(mode="json"),
+                        "image_digest": "sha256:" + label_digest("other-image"),
+                    }
+                ),
+            ),
+        )
+    assert failure.value.code == "snapshot_incarnation_rewritten"
+    # Eras chain and are bounded.
+    era_three = begin_snapshot_lineage_era(era_two)
+    assert [item.era for item in era_three.era_boundaries] == [2, 3]
+    assert era_three.previous_lineage_digest_sha256 == era_two.lineage_digest_sha256
+    forged = json.loads(snapshot_lineage_bytes(era_three))
+    forged["era_boundaries"] = forged["era_boundaries"][:1]
+    unsigned = {k: v for k, v in forged.items() if k != "lineage_digest_sha256"}
+    forged["lineage_digest_sha256"] = canonical_digest(unsigned)
+    with pytest.raises(ValidationError, match="lineage_era_invalid"):
+        SnapshotLineage.model_validate(forged)
 
 
 def test_builder_never_trusts_a_supplied_projection_digest_or_order() -> None:

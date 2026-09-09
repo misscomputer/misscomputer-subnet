@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from assignment_probe_context import (
     BASE_EPOCH,
@@ -45,8 +46,10 @@ from misscomputer_subnet.assignment_probe import (
     active_assignment_manifest_bytes,
     assignment_manifest_signature_envelope_bytes,
     assignment_manifest_trust_policy_bytes,
+    evaluate_probe_response,
     parse_assignment_manifest_chain_state,
     parse_validator_probe_report,
+    verify_observation_policy_binding,
 )
 from misscomputer_subnet.assignment_probe_cli import (
     EXIT_DEGRADED,
@@ -912,6 +915,185 @@ def test_probe_transport_classifies_failures_without_raising(tmp_path: Path) -> 
     assert result.code == "connection_failed"
     assert json.dumps(result.code)
     del tmp_path
+
+
+class _FixedClock:
+    """Monotonic clock that reads ``0`` at the request start and ``elapsed`` ever after."""
+
+    def __init__(self, elapsed_seconds: float) -> None:
+        self._elapsed = elapsed_seconds
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return 0.0 if self.calls == 1 else self._elapsed
+
+
+def _mock_transport(
+    responder: Callable[[httpx.Request], httpx.Response],
+) -> Callable[[ssl.SSLContext], httpx.BaseTransport]:
+    return lambda _context: httpx.MockTransport(responder)
+
+
+def _fetch(
+    responder: Callable[[httpx.Request], httpx.Response],
+    *,
+    elapsed_seconds: float,
+    budget_seconds: float = 0.1,
+    max_bytes: int = 4_096,
+) -> probe_cli.ProbeResponse | probe_cli.ProbeTransportFailure:
+    transport = probe_cli.HttpsProbeTransport(
+        ssl.create_default_context(),
+        clock=_FixedClock(elapsed_seconds),
+        transport_factory=_mock_transport(responder),
+    )
+    return transport.fetch(
+        url="https://fixture-alpha.mock.local/__challenge/000000000000000000000000",
+        server_name="fixture-alpha.mock.local",
+        headers={"host": "fixture-alpha.mock.local"},
+        timeout_seconds=budget_seconds,
+        max_bytes=max_bytes,
+    )
+
+
+def _response_scenarios(
+    deployment: ActiveDeploymentAssignment, probe_nonce: str
+) -> dict[str, Callable[[httpx.Request], httpx.Response]]:
+    """One responder per response-derived outcome ``evaluate_probe_response`` can reach."""
+
+    replica = deployment.replicas[0]
+    body = challenge_value(deployment.deployment_id).encode("ascii")
+    good = {"X-Build-ID": deployment.build_id}
+    attestation = attestation_header(sign_attestation(deployment, replica, probe_nonce=probe_nonce))
+
+    def respond(
+        status: int = 200,
+        *,
+        content: bytes = body,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> Callable[[httpx.Request], httpx.Response]:
+        # A streamed body keeps the response readable through ``iter_raw`` and
+        # lets the declared ``Content-Length`` be judged before the body.
+        return lambda _request: httpx.Response(
+            status,
+            stream=httpx.ByteStream(content),
+            headers=[("Content-Length", str(len(content))), *(headers or [])],
+        )
+
+    return {
+        "serving": respond(headers=[*good.items(), ("X-Miss-Probe-Attestation", attestation)]),
+        "tls_pin_mismatch": respond(
+            headers=[*good.items(), ("X-Miss-Probe-Attestation", attestation)]
+        ),
+        "redirect_rejected": respond(302, content=b"", headers=[("Location", "https://x/")]),
+        "unexpected_status": respond(500, content=b"no"),
+        "response_oversized": respond(content=b"x" * 6_000, headers=list(good.items())),
+        "body_digest_mismatch": respond(content=b"tampered", headers=list(good.items())),
+        "build_id_header_mismatch": respond(headers=[("X-Build-ID", "0" * 24)]),
+        "attestation_missing": respond(headers=list(good.items())),
+        "attestation_invalid": respond(
+            headers=[
+                *good.items(),
+                ("X-Miss-Probe-Attestation", attestation),
+                ("X-Miss-Probe-Attestation", attestation),
+            ]
+        ),
+    }
+
+
+def test_transport_enforces_one_whole_request_budget_at_the_exact_boundary() -> None:
+    """Every response-derived outcome fits the budget or becomes a timeout, at ms precision.
+
+    With a 100ms budget, a request completing at exactly 100ms yields the
+    response-derived outcome with ``latency_millis == 100``; at 101ms every
+    one of them (serving and all eight response-derived failure codes,
+    including a late oversized ``Content-Length``) is reported as
+    ``ProbeTransportFailure("timeout")`` with the measured latency. Both are
+    admissible under :func:`verify_observation_policy_binding` for the policy
+    that set the budget, so the transport never emits an observation the
+    report builder, the decision, or the parser would refuse.
+    """
+
+    context = make_context()
+    deployment = context.deployments[0]
+    probe_nonce = label_digest("budget-nonce")
+    unpinned = build_policy(context.keys, probe_timeout_millis=100, max_response_bytes=4_096)
+    pinned = build_policy(
+        context.keys,
+        probe_timeout_millis=100,
+        max_response_bytes=4_096,
+        pinned_edge_leaf_certificate_sha256=(label_digest("edge-leaf"),),
+    )
+    scenarios = _response_scenarios(deployment, probe_nonce)
+    for code, responder in scenarios.items():
+        policy = pinned if code == "tls_pin_mismatch" else unpinned
+        at_budget = _fetch(responder, elapsed_seconds=0.1)
+        assert at_budget.latency_millis == 100, code
+        if code == "response_oversized":
+            # Declared Content-Length above the ceiling is judged before the body.
+            assert isinstance(at_budget, probe_cli.ProbeTransportFailure)
+            assert at_budget.code == "response_oversized" and at_budget.response_status == 200
+        else:
+            assert isinstance(at_budget, probe_cli.ProbeResponse), code
+        observation = evaluate_probe_response(
+            deployment, policy, probe_nonce=probe_nonce, result=at_budget
+        )
+        assert (observation.outcome, observation.failure_code) == (
+            ("serving", None) if code == "serving" else ("failed", code)
+        )
+        assert observation.latency_millis == 100
+        verify_observation_policy_binding(observation, policy)
+
+        over_budget = _fetch(responder, elapsed_seconds=0.101)
+        assert isinstance(over_budget, probe_cli.ProbeTransportFailure), code
+        assert over_budget.code == "timeout" and over_budget.latency_millis == 101
+        assert over_budget.response_status == (
+            302 if code == "redirect_rejected" else (500 if code == "unexpected_status" else 200)
+        )
+        late = evaluate_probe_response(
+            deployment, policy, probe_nonce=probe_nonce, result=over_budget
+        )
+        assert (late.outcome, late.failure_code, late.latency_millis) == ("failed", "timeout", 101)
+        verify_observation_policy_binding(late, policy)
+
+    # A body that exceeds the ceiling only while streaming is response-derived too.
+    def chunked(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, stream=httpx.ByteStream(b"y" * 5_000), headers={"X-Build-ID": deployment.build_id}
+        )
+
+    streamed = _fetch(chunked, elapsed_seconds=0.1, max_bytes=64)
+    assert isinstance(streamed, probe_cli.ProbeTransportFailure)
+    assert (streamed.code, streamed.latency_millis) == ("response_oversized", 100)
+    late_stream = _fetch(chunked, elapsed_seconds=0.101, max_bytes=64)
+    assert isinstance(late_stream, probe_cli.ProbeTransportFailure)
+    assert (late_stream.code, late_stream.latency_millis) == ("timeout", 101)
+
+    # Genuine transport timeouts and faults are transport codes at any latency.
+    def slow(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow origin", request=request)
+
+    for elapsed, latency in ((0.05, 50), (0.1, 100), (0.25, 250)):
+        result = _fetch(slow, elapsed_seconds=elapsed)
+        assert isinstance(result, probe_cli.ProbeTransportFailure)
+        assert (result.code, result.latency_millis) == ("timeout", latency)
+        verify_observation_policy_binding(
+            evaluate_probe_response(deployment, unpinned, probe_nonce=probe_nonce, result=result),
+            unpinned,
+        )
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    result = _fetch(refused, elapsed_seconds=0.25)
+    assert isinstance(result, probe_cli.ProbeTransportFailure)
+    assert (result.code, result.latency_millis) == ("connection_failed", 250)
+
+    # The budget is the policy's millisecond value, rounded once from seconds.
+    budget = probe_cli.RequestBudget(0.1, clock=_FixedClock(0.0))
+    assert budget.budget_millis == 100
+    assert not budget.exhausted(100) and budget.exhausted(101)
+    assert probe_cli.RequestBudget(5.0, clock=_FixedClock(0.0)).budget_millis == 5_000
 
 
 def test_probe_requires_the_finalized_height_and_refuses_expired_leases(

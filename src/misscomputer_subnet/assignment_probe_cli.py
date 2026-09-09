@@ -216,11 +216,58 @@ def _peer_leaf_sha256(response: httpx.Response) -> str | None:
     return hashlib.sha256(der).hexdigest()
 
 
-class HttpsProbeTransport:
-    """httpx-based transport: no redirects, no environment proxies, exact byte bounds."""
+class RequestBudget:
+    """One absolute whole-request budget, measured on one monotonic clock.
 
-    def __init__(self, ssl_context: ssl.SSLContext) -> None:
+    Exact-boundary semantics, shared with
+    :func:`~misscomputer_subnet.assignment_probe.verify_observation_policy_binding`:
+    latency is the whole-request elapsed time in whole milliseconds (floor),
+    the budget is the policy's ``probe_timeout_millis`` (``timeout_seconds``
+    rounded to the millisecond), and a response-derived outcome is admissible
+    only while ``latency_millis <= budget_millis``. A latency of exactly the
+    budget is a response; one millisecond more is a ``timeout``. Latency is
+    measured once per decision, so the value recorded is the value judged.
+    """
+
+    __slots__ = ("_clock", "_started", "budget_millis")
+
+    def __init__(self, timeout_seconds: float, *, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._started = clock()
+        self.budget_millis = max(0, round(timeout_seconds * 1000))
+
+    def latency_millis(self) -> int:
+        return max(0, int((self._clock() - self._started) * 1000))
+
+    def exhausted(self, latency_millis: int) -> bool:
+        return latency_millis > self.budget_millis
+
+
+class HttpsProbeTransport:
+    """httpx-based transport: no redirects, no environment proxies, exact byte bounds.
+
+    One absolute deadline governs the whole request. httpx's per-phase
+    timeouts only cap each phase at the total budget; the transport itself
+    measures the elapsed time on one monotonic clock immediately before it
+    inspects the response headers, before every response-derived return
+    (``Content-Length`` rejection, body rejection, and the response itself),
+    and at every body chunk. Anything that would complete after the budget is
+    reported as ``ProbeTransportFailure("timeout")`` with the measured
+    latency, so no response-derived outcome ever carries a latency above the
+    budget (see :class:`RequestBudget` for the exact boundary). ``clock`` and
+    ``transport_factory`` exist so the boundary can be tested deterministically.
+    """
+
+    def __init__(
+        self,
+        ssl_context: ssl.SSLContext,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        transport_factory: Callable[[ssl.SSLContext], httpx.BaseTransport] | None = None,
+    ) -> None:
         self._context = ssl_context
+        self._clock = clock
+        self._transport_factory = transport_factory or _default_httpx_transport
 
     def fetch(
         self,
@@ -231,17 +278,29 @@ class HttpsProbeTransport:
         timeout_seconds: float,
         max_bytes: int,
     ) -> ProbeResponse | ProbeTransportFailure:
-        started = time.monotonic()
-        deadline = started + timeout_seconds
-
-        def elapsed_millis() -> int:
-            return int((time.monotonic() - started) * 1000)
-
+        budget = RequestBudget(timeout_seconds, clock=self._clock)
         leaf: str | None = None
+        status: int | None = None
+
+        def timed_out(latency_millis: int) -> ProbeTransportFailure:
+            return ProbeTransportFailure(
+                "timeout",
+                latency_millis,
+                response_status=status,
+                tls_leaf_certificate_sha256=leaf,
+            )
+
+        def response_derived(
+            build: Callable[[int], ProbeResponse | ProbeTransportFailure],
+        ) -> ProbeResponse | ProbeTransportFailure:
+            latency_millis = budget.latency_millis()
+            if budget.exhausted(latency_millis):
+                return timed_out(latency_millis)
+            return build(latency_millis)
+
         try:
-            transport = httpx.HTTPTransport(verify=self._context, retries=0, http2=False)
             with httpx.Client(
-                transport=transport,
+                transport=self._transport_factory(self._context),
                 timeout=httpx.Timeout(timeout_seconds),
                 follow_redirects=False,
                 max_redirects=0,
@@ -254,46 +313,55 @@ class HttpsProbeTransport:
                     extensions={"sni_hostname": server_name},
                 ) as response:
                     leaf = _peer_leaf_sha256(response)
+                    status = response.status_code
+                    # The headers are a response: judge the budget before
+                    # anything derived from them can be reported.
+                    arrival = budget.latency_millis()
+                    if budget.exhausted(arrival):
+                        return timed_out(arrival)
                     declared = response.headers.get("content-length")
                     if declared is not None and (
                         not declared.isascii()
                         or not declared.isdigit()
                         or int(declared) > max_bytes
                     ):
-                        return ProbeTransportFailure(
-                            "response_oversized",
-                            elapsed_millis(),
-                            response_status=response.status_code,
-                            tls_leaf_certificate_sha256=leaf,
+                        return response_derived(
+                            lambda latency_millis: ProbeTransportFailure(
+                                "response_oversized",
+                                latency_millis,
+                                response_status=status,
+                                tls_leaf_certificate_sha256=leaf,
+                            )
                         )
                     chunks: list[bytes] = []
                     total = 0
                     for chunk in response.iter_raw(chunk_size=16_384):
-                        if time.monotonic() > deadline:
-                            return ProbeTransportFailure(
-                                "timeout",
-                                elapsed_millis(),
-                                response_status=response.status_code,
-                                tls_leaf_certificate_sha256=leaf,
-                            )
+                        arrival = budget.latency_millis()
+                        if budget.exhausted(arrival):
+                            return timed_out(arrival)
                         total += len(chunk)
                         if total > max_bytes:
-                            return ProbeTransportFailure(
-                                "response_oversized",
-                                elapsed_millis(),
-                                response_status=response.status_code,
-                                tls_leaf_certificate_sha256=leaf,
+                            return response_derived(
+                                lambda latency_millis: ProbeTransportFailure(
+                                    "response_oversized",
+                                    latency_millis,
+                                    response_status=status,
+                                    tls_leaf_certificate_sha256=leaf,
+                                )
                             )
                         chunks.append(chunk)
                     observed_headers = tuple(
                         (str(key), str(value)) for key, value in response.headers.multi_items()
                     )
-                    return ProbeResponse(
-                        status=response.status_code,
-                        headers=observed_headers,
-                        body=b"".join(chunks),
-                        latency_millis=elapsed_millis(),
-                        tls_leaf_certificate_sha256=leaf,
+                    body = b"".join(chunks)
+                    return response_derived(
+                        lambda latency_millis: ProbeResponse(
+                            status=response.status_code,
+                            headers=observed_headers,
+                            body=body,
+                            latency_millis=latency_millis,
+                            tls_leaf_certificate_sha256=leaf,
+                        )
                     )
         except Exception as exc:  # noqa: BLE001 - every transport fault is classified
             code = _classify_transport_error(exc)
@@ -309,9 +377,13 @@ class HttpsProbeTransport:
                     ],
                     code,
                 ),
-                elapsed_millis(),
+                budget.latency_millis(),
                 tls_leaf_certificate_sha256=leaf,
             )
+
+
+def _default_httpx_transport(context: ssl.SSLContext) -> httpx.BaseTransport:
+    return httpx.HTTPTransport(verify=context, retries=0, http2=False)
 
 
 def _default_transport_factory(context: ssl.SSLContext) -> ProbeTransport:

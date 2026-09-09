@@ -1232,6 +1232,27 @@ def negative_documents() -> dict[str, bytes]:
         _mutate(lineage, used_receipt_digests=lineage_doc["used_receipt_digests"][:1]),
     )
     add(
+        "active-assignment-snapshot-lineage",
+        "era-without-boundary",
+        "model",
+        "lineage_era_invalid",
+        _mutate(lineage, era=2),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "chain-link-missing",
+        "model",
+        "lineage_chain_link_missing",
+        _mutate(lineage, previous_lineage_digest_sha256=None),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "history-not-contiguous",
+        "model",
+        "lineage_history_not_contiguous",
+        _mutate(lineage, history_start_snapshot_sequence=2),
+    )
+    add(
         "validator-weight-decision",
         "submit-with-undersampled-positive-row",
         "model",

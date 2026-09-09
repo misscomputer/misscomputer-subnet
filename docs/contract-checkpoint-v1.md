@@ -60,7 +60,7 @@ valid manifest source.
 
 | Field | Meaning |
 | --- | --- |
-| `snapshot_sequence` | strictly increasing per capture from one runtime |
+| `snapshot_sequence` | increases by exactly one per capture from one runtime; a publisher's lineage treats a jump as a missed capture to replay |
 | `state_revision` | scheduler durable revision the capture was read at; two captures at one revision carry byte-identical `deployments` |
 | `captured_at_epoch` | capture instant; becomes the manifest's `issued_at_epoch` |
 | `finalized_height`, `finalized_block_hash`, `finalized_epoch` | finalized chain view the scheduler held at capture; copied into the manifest |
@@ -159,17 +159,34 @@ accepts a capture or refuses it:
   the identical incarnation re-exported is accepted.
 
 `verify_snapshot_succession(previous, current)` is exactly the lineage
-advanced from genesis over the two captures, for a caller that holds only
-them; a publisher that persists its lineage (`snapshot_lineage_bytes`,
-`parse_snapshot_lineage`, `build_initial_snapshot_lineage`) gets the same
-rules across its whole history, which the two-capture form cannot: a
-rewrite after an intervening capture, or a fact retired two replacements ago.
-The lineage is bounded by `MAX_LINEAGE_REPLICAS` distinct `replica_id`s and
-`MAX_LINEAGE_FACTS` retained facts (`snapshot_lineage_overflow`); a runtime
-past that is re-anchored by its operator. Nonce and digest freshness is judged
-across every incarnation of every `replica_id` the lineage has accepted. The
-lineage is a Python publisher-side rule with no Go counterpart:
-`pkg/assignment` produces captures and has no succession API.
+advanced from genesis over the two captures (so `current` must be the very
+next sequence), for a caller that holds only them; a publisher that persists
+its lineage (`snapshot_lineage_bytes`, `parse_snapshot_lineage`,
+`build_initial_snapshot_lineage`, `replay_snapshot_lineage`) gets the same
+rules across its whole history, which the two-capture form cannot: a rewrite
+after an intervening capture, or a fact retired two replacements ago.
+
+The lineage's history is anchored, contiguous, and era-scoped. Each advanced
+lineage names its predecessor's digest (`previous_lineage_digest_sha256`), so
+persisted lineages form a hash chain; the operator retains the head digest out
+of band and `verify_snapshot_lineage_anchor` refuses a restored lineage that is
+not that head (`snapshot_lineage_anchor_mismatch`), because a stale backup or
+a resealed copy with retired facts removed is digest-valid but false. Captures
+are accepted only in exact sequence order from
+`history_start_snapshot_sequence` (`snapshot_lineage_gap`): a missed capture is
+replayed, never skipped. `snapshot_lineage_overflow` (more than
+`MAX_LINEAGE_REPLICAS` replica lineages, `MAX_LINEAGE_FACTS` retained facts of
+one kind, or `MAX_LINEAGE_ERAS` eras) refuses the capture and forgets nothing;
+the only operation that sheds retired facts is `begin_snapshot_lineage_era`,
+which opens `era + 1`, keeps every current incarnation and its facts, and
+records a `LineageEraBoundary` (era, last accepted sequence, dropped counts,
+predecessor digest) in the document permanently. The never-reuse guarantee is
+therefore exactly "no fact accepted since `history_start_snapshot_sequence`
+within the current `era` is ever accepted again", readable from the document.
+Nonce and digest freshness is judged across every incarnation of every
+`replica_id` the lineage has accepted in the era. The lineage is a Python
+publisher-side rule with no Go counterpart: `pkg/assignment` produces captures
+and has no succession API.
 
 An empty snapshot is a valid state meaning "nothing is route-active". A
 manifest cannot be derived from it (manifest v1 requires at least one
@@ -617,7 +634,9 @@ come from the sealed trust policies.
 | Clock skew | manifest issuance ahead of the validator bounded by the verifying trust policy's `max_future_skew_seconds` at verification and, per manifest, by the same sealed policy document at the decision (reports and terminal alike); signer-clock ticket issuance ahead of the runtime's activation and capture instants bounded at 30s by one rule in Python and Go | all time is explicit input to pure code; no stage applies a bound other than the one carried by the policy that admitted the evidence, and that policy is sealed with the evidence |
 | Report or terminal claims an evaluation instant its verification never admitted, or an instant at which its policy was not yet (or no longer) valid | `report_evaluation_epoch_mismatch`/`trust_policy_mismatch` at report construction; `decision_round_invalid`/`decision_round_policy_rejected`/`decision_terminal_future`/`decision_terminal_policy_rejected` at the decision; `scoring_window_evidence_inconsistent`/`report_policy_rejected`/`terminal_manifest_future`/`terminal_policy_rejected` on parse | the verification result carries its epoch and policy digest, and the sealed policy re-derives every evaluation-time admission rule |
 | Responses judged under a looser same-authority policy (longer request budget, no certificate pins, larger body ceiling) relabelled under the stricter policy that verified the manifest | `observation_policy_violation` at report construction; `decision_round_policy_rejected` at the decision; `report_policy_rejected` on parse | every observation records the certificate and body size the policy-dependent checks judged, so the named policy's constraints are re-derived from the observation itself |
-| Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation; recycles a nonce, ticket, or receipt retired by any earlier replacement (A → B → A); or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_incarnation_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id` and every signed fact it ever accepted; a replacement is a new generation with never-seen facts |
+| Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation; recycles a nonce, ticket, or receipt retired by any earlier replacement (A → B → A); or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_incarnation_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id` and every signed fact it ever accepted in the era; a replacement is a new generation with never-seen facts |
+| Lineage restored from a stale backup, resealed with retired facts removed, fed a capture out of order, or grown past its bounds | `snapshot_lineage_anchor_mismatch`/`snapshot_lineage_gap`/`snapshot_lineage_overflow`; publisher refuses and forgets nothing | the lineage is a hash chain whose head the operator anchors out of band; sequences are contiguous; only an explicit, recorded era boundary sheds retired facts |
+| Probe response whose headers or body arrive after the policy's whole-request budget but inside every per-phase timeout | `ProbeTransportFailure("timeout")` at the transport; `observation_policy_violation` if an older transport reports it as a response | one absolute budget on one monotonic clock is judged before every response-derived return; the binding re-derives the same bound from the recorded latency |
 
 ## Compatibility matrix
 
@@ -630,7 +649,7 @@ come from the sealed trust policies.
 | Manifest verification (`verify_active_assignment_manifest`, `anchor_manifest_chain_state`) | effective horizon replaces `expires_at_epoch` as the validity bound; **`current_finalized_height` is required** (breaking signature); historical variant added and lease-free | every live fetcher passes its finalized height |
 | `misscomputer-assignment-probe` CLI | **`--finalized-height` required** (breaking invocation) | operators add the flag from their finalized chain view |
 | `misscomputer-checkpoint-boundary` protocol `misscomputer.checkpoint-boundary.v1` | additive operations; `bind_latest_pointer_to_manifest` takes `signatures`; `verify_manifest_latest_pointer` response adds `history_depth`; **`verify_manifest` requires `current_finalized_height`** (`current_finalized_height_required`); other existing operations and response shapes unchanged | private producer passes the finalized height and may adopt the new operations |
-| `active-assignment-snapshot-lineage.v1` | new; publisher-local durable document; `advance_snapshot_lineage` is the durable form of `verify_snapshot_succession`; Python only (no Go succession API) | manifest publisher persists it beside its chain state |
+| `active-assignment-snapshot-lineage.v1` | new; publisher-local durable document; `advance_snapshot_lineage` is the durable form of `verify_snapshot_succession`; hash-chained (`previous_lineage_digest_sha256`), contiguous (`snapshot_lineage_gap`), era-scoped (`begin_snapshot_lineage_era`, `LineageEraBoundary`), anchored (`verify_snapshot_lineage_anchor`); Python only (no Go succession API) | manifest publisher persists it write-ahead beside its chain state, retains the head digest out of band, and seeds it by replaying retained captures |
 | `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity and incarnation lineage rules (`snapshot_incarnation_rewritten`, `snapshot_generation_not_increasing`, `snapshot_incarnation_facts_reused`). **Clock-domain rule**: the replica ordering check is `ticket_issued_at_epoch <= route_activated_at_epoch + 30` (was `<=` with no tolerance), so the documented capture+30 ticket tolerance is reachable; schema and golden fixture bytes unchanged, supplementary `active-assignment-snapshot-signer-skew.v1.json` added (fresh generation-2 incarnations, a valid successor of the golden) | runtime snapshot endpoint (Go), publisher; a producer that stamped activation from the signer's clock keeps validating; a publisher must never restamp a retained incarnation |
 | `assignment-manifest-latest-pointer.v1` | new; carries `finalized_epoch`; immutable `.pointer.json` copy per manifest | publisher, validator fetcher |
 | `validator-weight-decision.v1` | new; self-enforcing on parse, including sealed serving evidence, registered-only assigned counts, and the guarded-baseline rule; carries terminal hash/epoch/horizon/lease, `assigned_at_close`, baselines; `decide_weight_submission` takes `archived_manifests`. **Declared compatibility event**: the record gains `trust_policies` (the approved trust-policy documents its manifests name, sorted by digest) and `decide_weight_submission` requires `trust_policies`; the schema, golden fixture, and every decision negative fixture are re-pinned, and a record sealed without the field no longer digest-verifies (no coordinator is live on the old form) | validator coordinator supplies every accepted intermediate manifest it did not probe and the approved trust-policy documents it verified under |

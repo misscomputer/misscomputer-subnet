@@ -1,5 +1,53 @@
 {
   "$defs": {
+    "LineageEraBoundary": {
+      "additionalProperties": false,
+      "description": "One explicit reset of a lineage's retired-fact memory.\n\nA boundary is the only way retired facts leave a lineage. It records the\nera it opened, the last capture accepted before it, how many retired\nfacts of each kind were dropped, and the digest of the lineage it was\ntaken from, so a consumer can see exactly where the never-reuse guarantee\nwas re-scoped and can never mistake one era for another.",
+      "properties": {
+        "dropped_assignment_nonces": {
+          "minimum": 0,
+          "title": "Dropped Assignment Nonces",
+          "type": "integer"
+        },
+        "dropped_receipt_digests": {
+          "minimum": 0,
+          "title": "Dropped Receipt Digests",
+          "type": "integer"
+        },
+        "dropped_ticket_digests": {
+          "minimum": 0,
+          "title": "Dropped Ticket Digests",
+          "type": "integer"
+        },
+        "era": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Era",
+          "type": "integer"
+        },
+        "opened_after_snapshot_sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Opened After Snapshot Sequence",
+          "type": "integer"
+        },
+        "previous_lineage_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Previous Lineage Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "era",
+        "opened_after_snapshot_sequence",
+        "dropped_assignment_nonces",
+        "dropped_ticket_digests",
+        "dropped_receipt_digests",
+        "previous_lineage_digest_sha256"
+      ],
+      "title": "LineageEraBoundary",
+      "type": "object"
+    },
     "ReplicaLineage": {
       "additionalProperties": false,
       "description": "The latest incarnation a lineage has accepted for one stable ``replica_id``.\n\n``replica_id`` (deployment and hotkey) is stable across re-assignments;\n``generation`` and ``assignment_nonce`` name the incarnation, and the\nticket and receipt digests are the signed facts issued for it.\n``replica_digest_sha256`` seals the complete replica document and\n``deployment_facts_digest_sha256`` the enclosing deployment's ticket-bound\nfacts (everything but its replicas), so a later capture that re-exports\nthis incarnation can be held to exactly what was accepted.",
@@ -76,7 +124,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "Durable, append-only memory of every capture a publisher has accepted.\n\nThe lineage carries the transactional position of the last accepted\ncapture (so the succession rules hold across every capture, not only\nbetween two adjacent ones); for every ``replica_id`` ever exported, the\nlatest incarnation accepted for it, including incarnations that later\ncaptures dropped; and every assignment nonce, ticket digest, and receipt\ndigest ever accepted for any incarnation of any replica, so a fact retired\nby one replacement can never be recycled by a later one. A publisher\nadvances it with every capture it accepts and persists the result; an\nincarnation that disappears from a capture and reappears later is still\nheld to the facts first accepted for it.",
+  "description": "Durable, append-only memory of every capture a publisher has accepted.\n\nThe lineage carries the transactional position of the last accepted\ncapture (so the succession rules hold across every capture, not only\nbetween two adjacent ones); for every ``replica_id`` ever exported, the\nlatest incarnation accepted for it, including incarnations that later\ncaptures dropped; and every assignment nonce, ticket digest, and receipt\ndigest ever accepted for any incarnation of any replica, so a fact retired\nby one replacement can never be recycled by a later one. A publisher\nadvances it with every capture it accepts and persists the result; an\nincarnation that disappears from a capture and reappears later is still\nheld to the facts first accepted for it.\n\nHistory is anchored, contiguous, and era-scoped. Every advanced lineage\nnames the digest of the lineage it was derived from\n(``previous_lineage_digest_sha256``), so the sequence of persisted\nlineages is a hash chain whose head digest an operator retains out of\nband and re-checks with :func:`verify_snapshot_lineage_anchor` before\ntrusting a restored file. Captures are accepted only in exact sequence\norder from ``history_start_snapshot_sequence``: a missing capture is a\ngap that must be replayed, never skipped. Retired facts leave the lineage\nonly through an explicit :func:`begin_snapshot_lineage_era`, which\nrecords a :class:`LineageEraBoundary`; the never-reuse guarantee is\ntherefore exactly \"no fact accepted since ``history_start_snapshot_sequence``\nwithin the current ``era`` is ever accepted again\", and a consumer can read\nthat scope from the document.",
   "properties": {
     "accepted_snapshot_count": {
       "minimum": 0,
@@ -87,6 +135,26 @@
       "pattern": "^[0-9a-f]{64}$",
       "title": "Central Authority Fingerprint Sha256",
       "type": "string"
+    },
+    "era": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Era",
+      "type": "integer"
+    },
+    "era_boundaries": {
+      "items": {
+        "$ref": "#/$defs/LineageEraBoundary"
+      },
+      "maxItems": 64,
+      "title": "Era Boundaries",
+      "type": "array"
+    },
+    "history_start_snapshot_sequence": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "History Start Snapshot Sequence",
+      "type": "integer"
     },
     "last_captured_at_epoch": {
       "anyOf": [
@@ -204,6 +272,18 @@
       "title": "Network",
       "type": "string"
     },
+    "previous_lineage_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Previous Lineage Digest Sha256"
+    },
     "purpose": {
       "const": "active_assignment_snapshot_lineage_v1",
       "title": "Purpose",
@@ -262,6 +342,10 @@
     "network",
     "netuid",
     "central_authority_fingerprint_sha256",
+    "history_start_snapshot_sequence",
+    "era",
+    "era_boundaries",
+    "previous_lineage_digest_sha256",
     "accepted_snapshot_count",
     "last_snapshot_sequence",
     "last_state_revision",

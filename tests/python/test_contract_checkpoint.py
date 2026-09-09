@@ -164,6 +164,14 @@ def test_lineage_fixture_is_the_two_capture_history_of_the_snapshot_goldens() ->
     assert genesis.accepted_snapshot_count == 0 and genesis.replicas == []
     assert advance_snapshot_lineage(advance_snapshot_lineage(genesis, golden), successor) == lineage
     assert lineage.accepted_snapshot_count == 2
+    assert (lineage.era, lineage.era_boundaries, lineage.history_start_snapshot_sequence) == (
+        1,
+        [],
+        1,
+    )
+    first = advance_snapshot_lineage(genesis, golden)
+    assert first.previous_lineage_digest_sha256 == genesis.lineage_digest_sha256
+    assert lineage.previous_lineage_digest_sha256 == first.lineage_digest_sha256
     assert lineage.last_snapshot_digest_sha256 == successor.snapshot_digest_sha256
     assert lineage.last_snapshot_sequence == successor.snapshot_sequence
     assert {item.generation for item in lineage.replicas} == {2}
@@ -217,7 +225,10 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "wrong-network",
     },
     "active-assignment-snapshot-lineage": {
+        "chain-link-missing",
+        "era-without-boundary",
         "genesis-with-history",
+        "history-not-contiguous",
         "replicas-not-canonical",
         "retired-facts-forgotten",
         "self-digest-mismatch",
