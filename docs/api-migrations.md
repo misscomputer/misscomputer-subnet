@@ -93,18 +93,24 @@ policy document:
   `submit-without-verifying-trust-policy`. A record sealed before this release
   lacks `trust_policies`: its canonical document, and therefore
   `decision_digest_sha256`, no longer matches, so it does not parse and must be
-  re-sealed from its rounds. No coordinator is live on the previous form.
+  archived with its original reader; old-report reprocessing is unsupported
+  in this release (see Retention and reprocessing).
 
 ### `validator-probe-report` v1: observations seal their evaluation policy (compatibility event)
 
 Every `ProbeObservation` gains `trust_policy_digest_sha256`: the digest of the
 trust policy whose bounds (request budget, certificate pins, response ceiling)
 `evaluate_probe_response` judged it under. `build_validator_probe_report`,
-`verify_observation_policy_binding`, the decision producer, and the decision
-parser require it to equal the policy the report names, so an observation can
+`verify_observation_policy_binding`, the standalone report parser, scorer,
+decision producer, and decision parser require it to equal the policy the report names, so an observation can
 never be relabelled under a looser or stricter policy than the one that made
 it: the same 101ms response is a `timeout` under a 100ms budget and `serving`
 under 5000ms, and neither observation is admissible under the other policy.
+A foreign digest is `observation_policy_violation` during model validation
+(and the existing `document_invalid` wrapper during byte parsing),
+`scoring_round_invalid` at standalone scoring, and `decision_round_invalid`
+at the decision producer's report-validation boundary. Policy-bound semantic
+violations on otherwise well-formed reports keep their existing codes.
 An oversized verdict now also preserves the size evidence the transport judged
 (`ProbeTransportFailure.response_bytes`: the declared `Content-Length`, or the
 bytes received before the ceiling was crossed, capped at
@@ -120,7 +126,11 @@ validator is live on the previous form; the probe CLI emits the new form.
 `ManifestVerificationResult` gains `evaluation_epoch` and
 `trust_policy_digest_sha256`: the instant and policy the freshness, skew,
 signer-validity, and chain rules were applied at and under (live, historical,
-and anchor verification all record them). `build_validator_probe_report`
+and anchor verification all record them). Historical verification additionally
+sets `reportable=False`; the report builder refuses it with
+`historical_verification_not_reportable`, and anchor propagation preserves the
+mode. Even a caller-constructed live result is rechecked for freshness and
+effective expiry before report production. `build_validator_probe_report`
 refuses an `evaluation_epoch` other than the verification's
 (`report_evaluation_epoch_mismatch`, new `ProbeRejectionCode`), a
 `trust_policy` whose digest differs from the verification's or from the
@@ -150,7 +160,16 @@ descriptor); helper threads come from a process-wide pool of
 `MAX_OUTSTANDING_RESOLUTIONS` (16) slots with no queue, so however many
 lookups are blocked at once, at most that many threads exist and a request
 that finds no free slot fails fast with a connection error instead of waiting
-(the slot is released when the lookup itself returns); each resolved address
+(the slot is released when the lookup itself returns). Setup objects are
+allocated before admission; a locked lease transfers creator ownership to the
+worker, so cancellation before claim prevents lookup execution and cancellation
+after claim cannot release the worker's slot. SIGINT is deferred only across
+lease accounting, not DNS or waits, closing the acquire/record interruption
+window. Fork children reset the default process pool because parent workers
+no longer exist there. Signaling failure still releases
+the completed lookup's slot. Remaining time is recomputed after setup/start and
+immediately before waiting; unavoidable scheduler/startup delays are not
+followed by another stale-budget wait; each resolved address
 is dialled with the budget remaining at
 that instant so three unreachable addresses cost one budget rather than three,
 every `send` of a partial write re-derives the remaining budget, and every
@@ -259,8 +278,10 @@ on parse). History is anchored, contiguous, and era-scoped:
   **for that capture** (`retain_for=capture`): only the active lineages the
   capture continues are kept, the boundary records the capture's digest, and
   the capture is accepted next (it never exceeds the bound by itself). The
-  candidate is validated as the next capture in full before anything is
-  dropped, the commitment is enforced by the live lineage (only that exact
+  candidate is fully dry-run through `advance_snapshot_lineage` against
+  the proposed pruned state before any state is returned (including rewritten
+  incarnations, generation, reused facts, and resource limits; pass the same
+  `max_facts` and `max_replicas` to boundary and advance), the commitment is enforced by the live lineage (only that exact
   capture may follow; `snapshot_lineage_candidate_mismatch`), and one boundary
   per accepted capture is allowed (`snapshot_lineage_boundary_pending`), so a
   prepared boundary can never be spent on a different capture and a boundary
@@ -285,8 +306,31 @@ facts the live lineage legitimately accepted. Freshness checking is linear in
 the capture: the union of retained facts is built once and updated as facts
 are accepted (a scale guard in the suite fails on quadratic behaviour).
 
-Replay is linear in the history (one pass over deques with one-item
-lookahead; a scale guard in the suite covers it).
+Replay is **not linear in capture count**: immutable hash-chain links require
+hashing growing history at each step. `MAX_REPLAY_WORK = 1_000_000` enforces a
+cumulative-work ceiling per call before expensive transitions: each charge
+counts one state plus retained replicas, all three fact arrays, boundaries,
+and the candidate's deployment/replica entries. Candidate boundaries charge
+three passes for preparation and full dry-run. `max_work` may lower but never
+raise the ceiling; overflow returns `snapshot_lineage_replay_work_exceeded`
+without returning a partial state. This bounds cumulative sorting/hashing work
+by O(B log B) for the fixed entry cap B, rather than claiming O(captures).
+Use bounded batches starting at an independently anchored persisted head for
+long archives; keep all captures and boundaries, never restart genesis merely
+to evade the bound. Growing-history tests cover rejection and batch equivalence.
+
+Boundary input is explicit: `boundary_mode="full"` (default) requires the exact
+current boundary prefix followed by new events; `boundary_mode="suffix"`
+contains only new events, beginning with the next era. No sorting or silent
+prefix dropping occurs. To resume without new boundaries, use suffix mode.
+A crash head between boundary preparation and candidate acceptance is restored
+by supplying the candidate as `pending_candidate=...`, not in `snapshots`:
+it is fully validated but not consumed. This reproduces the pending digest
+exactly; replaying with the candidate in `snapshots` intentionally advances it.
+The parser requires pending heads to retain only active incarnations and exactly
+their facts; dropped plus retained counts obey all caps and the equal-count
+nonce/ticket/receipt invariant. As always, history claims additionally require
+the independently retained anchor; a self digest is not historical proof.
 
 New codes: `snapshot_generation_not_increasing`,
 `snapshot_incarnation_facts_reused`, `snapshot_lineage_gap`,
@@ -448,12 +492,14 @@ Retention and reprocessing:
   produced; never rewrite an archived document. Old-form and new-form
   decisions coexist in the archive and are told apart by the presence of
   `trust_policies`.
-- A decision sealed before this release does not parse under the new rules. If
-  a new consumer needs it, reprocess by re-running `decide_weight_submission`
-  over its retained rounds, terminal observation, registered set, and the
-  approved trust-policy documents in force at the time; archive the re-sealed
-  record beside the original with its new digest. Reprocessing is offline and
-  optional: live weight submission never depends on a past record.
+- A decision sealed before this release does not parse under the new rules.
+  **Reprocessing retained old-form reports with the new decision API is
+  unsupported.** No old/dual reader or validated converter ships here; adding
+  a policy digest and resealing cannot prove which policy judged an old probe.
+  Retain original bytes and their compatible archived reader in a segregated
+  offline archive. A future conversion requires a separately reviewed policy
+  and provenance validation; do not feed converted or historical evidence into
+  live report production. Live weight submission never depends on conversion.
 - A publisher adopting the lineage seeds it by replaying every retained
   capture in order from the runtime's first sequence
   (`replay_snapshot_lineage`); the lineage then remembers every fact those

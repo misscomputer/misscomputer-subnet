@@ -678,6 +678,16 @@ def _forged_report(report: ValidatorProbeReport, **changes: Any) -> ValidatorPro
     return ValidatorProbeReport.model_validate(reseal_report({**document, **changes}))
 
 
+def _foreign_policy_report(document: dict[str, Any]) -> ValidatorProbeReport:
+    with pytest.raises(ValidationError, match="observation_policy_violation"):
+        ValidatorProbeReport.model_validate(document)
+    return ValidatorProbeReport.model_construct(
+        **{key: value for key, value in document.items() if key not in ("schema", "observations")},
+        contract_schema=document["schema"],
+        observations=[ProbeObservation.model_validate(item) for item in document["observations"]],
+    )
+
+
 def test_golden_window_seals_its_skewed_round_under_the_verifying_policy() -> None:
     """The golden window probes manifest 2 once before its issuance, inside the trust bound.
 
@@ -1338,14 +1348,14 @@ def test_observations_judged_under_a_looser_policy_cannot_be_relabelled() -> Non
     genuine_document = genuine.model_dump(mode="json", by_alias=True)
     # The genuine report with its observations swapped for the relabelled ones
     # (report resealed) is refused under the policy it names...
-    forged = ValidatorProbeReport.model_validate(
+    forged = _foreign_policy_report(
         reseal_report_observations(
             genuine_document, [item.model_dump(mode="json", by_alias=True) for item in relabelled]
         )
     )
     with pytest.raises(WeightDecisionError) as failure:
         decide(forged, pinned)
-    assert failure.value.code == "decision_round_policy_rejected"
+    assert failure.value.code == "decision_round_invalid"
     # ...and a serving body over the policy's response ceiling is refused too.
     oversized = ValidatorProbeReport.model_validate(
         reseal_report_observations(
@@ -1483,7 +1493,7 @@ def test_timeout_policy_cannot_be_relabelled() -> None:
     assert accepted.round_count == 1
     rendered = validator_weight_decision_bytes(accepted)
     assert parse_validator_weight_decision(rendered) == accepted
-    relabelled = ValidatorProbeReport.model_validate(
+    relabelled = _foreign_policy_report(
         reseal_report_observations(
             genuine.model_dump(mode="json", by_alias=True),
             [item.model_dump(mode="json", by_alias=True) for item in slow],
@@ -1491,7 +1501,7 @@ def test_timeout_policy_cannot_be_relabelled() -> None:
     )
     with pytest.raises(WeightDecisionError) as failure:
         decide(relabelled)
-    assert failure.value.code == "decision_round_policy_rejected"
+    assert failure.value.code == "decision_round_invalid"
     with pytest.raises(ValidationError, match="report_policy_rejected"):
         ValidatorWeightDecision.model_validate(
             forged_decision_with_report(
@@ -1573,7 +1583,7 @@ def test_pin_mismatch_cannot_be_relabelled_under_a_looser_policy() -> None:
             report(mismatches)
         genuine = report(observations(policy))
         assert genuine.serving_count == 2
-        relabelled = ValidatorProbeReport.model_validate(
+        relabelled = _foreign_policy_report(
             reseal_report_observations(
                 genuine.model_dump(mode="json", by_alias=True),
                 [item.model_dump(mode="json", by_alias=True) for item in mismatches],
@@ -1597,7 +1607,7 @@ def test_pin_mismatch_cannot_be_relabelled_under_a_looser_policy() -> None:
         accepted = decide(genuine)
         with pytest.raises(WeightDecisionError) as failure:
             decide(relabelled)
-        assert failure.value.code == "decision_round_policy_rejected"
+        assert failure.value.code == "decision_round_invalid"
         with pytest.raises(ValidationError, match="report_policy_rejected"):
             ValidatorWeightDecision.model_validate(
                 forged_decision_with_report(
@@ -1700,7 +1710,7 @@ def test_observations_seal_their_evaluation_policy_and_size_evidence() -> None:
         with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
             report(foreign)
         genuine = report(judged(policy))
-        relabelled = ValidatorProbeReport.model_validate(
+        relabelled = _foreign_policy_report(
             reseal_report_observations(
                 genuine.model_dump(mode="json", by_alias=True),
                 [item.model_dump(mode="json", by_alias=True) for item in foreign],
@@ -1724,8 +1734,8 @@ def test_observations_seal_their_evaluation_policy_and_size_evidence() -> None:
         accepted = decide(genuine)
         with pytest.raises(WeightDecisionError) as failure:
             decide(relabelled)
-        assert failure.value.code == "decision_round_policy_rejected"
-        with pytest.raises(ValidationError, match="report_policy_rejected"):
+        assert failure.value.code == "decision_round_invalid"
+        with pytest.raises(ValidationError, match="observation_policy_violation"):
             ValidatorWeightDecision.model_validate(
                 forged_decision_with_report(
                     validator_weight_decision_bytes(accepted),

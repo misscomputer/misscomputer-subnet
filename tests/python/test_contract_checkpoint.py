@@ -21,6 +21,7 @@ from contract_checkpoint_context import (
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from misscomputer_subnet.assignment_probe import parse_validator_probe_report
 from misscomputer_subnet.assignment_snapshot import (
     LINEAGE_SCHEMA,
     SNAPSHOT_SCHEMA,
@@ -49,6 +50,7 @@ NEGATIVE = ROOT / "contracts" / "negative"
 SOURCE = ROOT / "src" / "misscomputer_subnet"
 
 PARSERS: dict[str, Any] = {
+    "validator-probe-report": parse_validator_probe_report,
     "active-assignment-snapshot": parse_active_assignment_snapshot,
     "active-assignment-snapshot-lineage": parse_snapshot_lineage,
     "assignment-manifest-latest-pointer": parse_assignment_manifest_latest_pointer,
@@ -212,6 +214,7 @@ def _negative_files() -> list[Path]:
 
 
 EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
+    "validator-probe-report": {"observation-under-foreign-policy"},
     "active-assignment-snapshot": {
         "endpoint-incarnation-mismatch",
         "projected-vector-digest-mismatch",

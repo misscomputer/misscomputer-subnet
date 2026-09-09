@@ -48,9 +48,11 @@ from misscomputer_subnet.assignment_probe import (
     AssignmentManifestChainState,
     AssignmentManifestTrustPolicy,
     ProbeTransportFailure,
+    ValidatorProbeReport,
     build_initial_manifest_chain_state,
     build_validator_probe_report,
     evaluate_probe_response,
+    validator_probe_report_bytes,
     verify_active_assignment_manifest,
 )
 from misscomputer_subnet.assignment_snapshot import (
@@ -677,6 +679,7 @@ def build_pointer() -> AssignmentManifestLatestPointer:
 
 
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
+    "validator-probe-report": ValidatorProbeReport,
     "active-assignment-snapshot": ActiveAssignmentSnapshot,
     "active-assignment-snapshot-lineage": SnapshotLineage,
     "assignment-manifest-latest-pointer": AssignmentManifestLatestPointer,
@@ -686,6 +689,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
 
 def fixture_documents() -> dict[str, bytes]:
     return {
+        "validator-probe-report": validator_probe_report_bytes(make_context().report),
         "active-assignment-snapshot": active_assignment_snapshot_bytes(build_snapshot()),
         "active-assignment-snapshot-signer-skew": active_assignment_snapshot_bytes(
             build_signer_skew_snapshot()
@@ -850,6 +854,18 @@ def negative_documents() -> dict[str, bytes]:
 
     def add(contract: str, case: str, expect: str, code: str, document: dict[str, Any]) -> None:
         cases[f"{contract}.v1/{case}"] = negative_document(contract, case, expect, code, document)
+
+    report_doc = json.loads(documents["validator-probe-report"])
+    observation = report_doc["observations"][0]
+    observation["trust_policy_digest_sha256"] = "0" * 64
+    report_doc = reseal_report_observations(report_doc, report_doc["observations"])
+    add(
+        "validator-probe-report",
+        "observation-under-foreign-policy",
+        "model",
+        "observation_policy_violation",
+        report_doc,
+    )
 
     snapshot_doc = json.loads(snapshot)
     add(
@@ -1214,7 +1230,7 @@ def negative_documents() -> dict[str, bytes]:
         "validator-weight-decision",
         "submit-with-observation-under-foreign-policy",
         "model",
-        "report_policy_rejected",
+        "observation_policy_violation",
         forged_decision_with_report(
             decision,
             report_digest_sha256=first_report["report_digest_sha256"],

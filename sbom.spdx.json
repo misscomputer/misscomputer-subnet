@@ -346,6 +346,25 @@
       "primaryPackagePurpose": "LIBRARY",
       "supplier": "NOASSERTION",
       "versionInfo": "0.52.4"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-pypi-httpcore-1.0.9",
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "https://pypi.org/project/httpcore/1.0.9/",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:pypi/httpcore@1.0.9",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "BSD-3-Clause",
+      "name": "httpcore",
+      "primaryPackagePurpose": "LIBRARY",
+      "supplier": "NOASSERTION",
+      "versionInfo": "1.0.9"
     }
   ],
   "relationships": [
@@ -436,6 +455,11 @@
     },
     {
       "relatedSpdxElement": "SPDXRef-Package-pkg-pypi-uvicorn-0.52.4-LIBRARY-64ffe251bd11",
+      "relationshipType": "DEPENDS_ON",
+      "spdxElementId": "SPDXRef-Package-misscomputer-subnet"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-pypi-httpcore-1.0.9",
       "relationshipType": "DEPENDS_ON",
       "spdxElementId": "SPDXRef-Package-misscomputer-subnet"
     }

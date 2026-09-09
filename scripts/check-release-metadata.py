@@ -40,6 +40,13 @@ def main() -> None:
     ):
         raise SystemExit("SBOM does not identify the licensed root package")
 
+    direct = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
+    versions = {item["name"].lower(): item.get("versionInfo") for item in packages}
+    for requirement in direct:
+        name, version = requirement.split("==")
+        if versions.get(name.lower()) != version:
+            raise SystemExit(f"direct dependency absent or version drift in SBOM: {name}")
+
 
 if __name__ == "__main__":
     main()

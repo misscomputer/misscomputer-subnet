@@ -194,7 +194,11 @@ therefore exactly "no fact accepted since `history_start_snapshot_sequence`
 within the current `era` is ever accepted again in any role", readable from
 the document. The lineage is a Python
 publisher-side rule with no Go counterpart: `pkg/assignment` produces captures
-and has no succession API.
+and has no succession API. Candidate boundaries fully dry-run the candidate
+before returning a persistable pending head. Replay distinguishes full versus
+suffix boundary events and can reproduce pending heads with `pending_candidate`.
+Immutable replay has an explicit cumulative `MAX_REPLAY_WORK` limit, not a linear
+runtime guarantee; see `api-migrations.md` for batching and exact recovery.
 
 An empty snapshot is a valid state meaning "nothing is route-active". A
 manifest cannot be derived from it (manifest v1 requires at least one

@@ -1352,9 +1352,12 @@ def test_probe_transport_module_is_bounded_network_plumbing_only() -> None:
     assert imported <= {
         "__future__",
         "collections",
+        "contextlib",
         "httpcore",
         "httpx",
+        "os",  # only register_at_fork: reset inherited resolver permits
         "select",
+        "signal",  # SIGINT masking only during lease accounting
         "socket",
         "ssl",
         "threading",
@@ -1373,6 +1376,13 @@ def test_probe_transport_module_is_bounded_network_plumbing_only() -> None:
         "urlopen",
         "wallet",
     }
+    assert {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    } == {"register_at_fork"}
     assert "https://" not in source
     # The CLI itself stays free of raw sockets; it only composes this module.
     cli_source = (ROOT / "src" / "misscomputer_subnet" / "assignment_probe_cli.py").read_text()

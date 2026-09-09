@@ -162,6 +162,7 @@ ProbeRejectionCode = Literal[
     "previous_link_mismatch",
     "probe_scheme_mismatch",
     "report_evaluation_epoch_mismatch",
+    "historical_verification_not_reportable",
     "required_role_missing",
     "route_host_policy_violation",
     "same_height_fork",
@@ -670,6 +671,11 @@ class ValidatorProbeReport(_StrictFrozenModel):
         deployment_ids = [item.deployment_id for item in self.observations]
         if deployment_ids != sorted(set(deployment_ids)):
             raise ValueError("report_observations_not_canonical")
+        if any(
+            item.trust_policy_digest_sha256 != self.trust_policy_digest_sha256
+            for item in self.observations
+        ):
+            raise ValueError("observation_policy_violation")
         serving = sum(item.outcome == "serving" for item in self.observations)
         if (
             self.deployment_count != len(self.observations)
@@ -704,6 +710,8 @@ class ManifestVerificationResult:
     reprobe: bool
     evaluation_epoch: int
     trust_policy_digest_sha256: str
+    # Historical chain walking never authorizes live report production.
+    reportable: bool = True
 
 
 @dataclass(frozen=True)
@@ -1522,6 +1530,7 @@ def verify_historical_active_assignment_manifest(
         verified_roles=roles,
         next_chain_state=next_state,
         reprobe=reprobe,
+        reportable=False,
         evaluation_epoch=evaluation_epoch,
         trust_policy_digest_sha256=policy.trust_policy_digest_sha256,
     )
@@ -1739,8 +1748,10 @@ def build_validator_probe_report(
     """
 
     _validate_evaluation_epoch(evaluation_epoch)
+    if verification.reportable is not True:
+        _reject("historical_verification_not_reportable")
     policy = _revalidate(trust_policy, AssignmentManifestTrustPolicy)
-    manifest = verification.manifest
+    manifest = _revalidate(verification.manifest, ActiveAssignmentManifest)
     if evaluation_epoch != verification.evaluation_epoch:
         _reject("report_evaluation_epoch_mismatch")
     if (
@@ -1748,6 +1759,7 @@ def build_validator_probe_report(
         or policy.trust_policy_digest_sha256 != manifest.trust_policy_digest_sha256
     ):
         _reject("trust_policy_mismatch")
+    _verify_trust_and_freshness(manifest, policy, evaluation_epoch=evaluation_epoch)
     prior = _revalidate(prior_chain_state, AssignmentManifestChainState)
     ordered = sorted(
         (_revalidate(item, ProbeObservation) for item in observations),

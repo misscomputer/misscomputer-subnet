@@ -127,6 +127,8 @@ MAX_LINEAGE_FACTS: Final = 1 << 17
 #: operator-initiated loss of retired-fact and inactive-lineage memory.
 MAX_LINEAGE_ERAS: Final = 64
 MAX_LINEAGE_BYTES: Final = 64 * 1_024 * 1_024
+#: Cumulative immutable-state entries visited per replay call (including dry runs).
+MAX_REPLAY_WORK: Final = 1_000_000
 
 SnapshotRejectionCode = Literal[
     "snapshot_authority_mismatch",
@@ -142,6 +144,7 @@ SnapshotRejectionCode = Literal[
     "snapshot_lineage_gap",
     "snapshot_lineage_overflow",
     "snapshot_lineage_replay_mismatch",
+    "snapshot_lineage_replay_work_exceeded",
     "snapshot_manifest_chain_mismatch",
     "snapshot_manifest_issued_at_mismatch",
     "snapshot_manifest_route_mismatch",
@@ -704,6 +707,25 @@ class SnapshotLineage(StrictFrozenModel):
                 if item.opened_after_snapshot_sequence == self.last_snapshot_sequence
             ):
                 raise ValueError("lineage_era_invalid")
+        if self.era_boundaries and _boundary_pending(self):
+            latest = self.era_boundaries[-1]
+            kept = len(self.replicas)
+            # A boundary retains exactly active incarnations, with exactly
+            # their facts: no retired facts can survive a boundary by themselves.
+            if any(
+                item.last_seen_snapshot_sequence != self.last_snapshot_sequence
+                for item in self.replicas
+            ) or any(len(facts) != kept for facts in (nonces, tickets, receipts)):
+                raise ValueError("lineage_era_invalid")
+            totals = (
+                latest.dropped_assignment_nonces + kept,
+                latest.dropped_ticket_digests + kept,
+                latest.dropped_receipt_digests + kept,
+            )
+            if max(totals) > MAX_LINEAGE_FACTS or len(set(totals)) != 1:
+                raise ValueError("lineage_era_invalid")
+            if latest.dropped_replica_lineages + kept > totals[0]:
+                raise ValueError("lineage_era_invalid")
         verify_model_digest(self, "lineage_digest_sha256")
         return self
 
@@ -979,20 +1001,25 @@ def begin_snapshot_lineage_era(
     lineage: SnapshotLineage,
     *,
     retain_for: ActiveAssignmentSnapshot | None = None,
+    max_facts: int = MAX_LINEAGE_FACTS,
+    max_replicas: int = MAX_LINEAGE_REPLICAS,
 ) -> SnapshotLineage:
     """Open a new security era: keep the active incarnations, drop everything retired.
 
     With ``retain_for``, the boundary is taken for a specific next capture and
     keeps only the active lineages that capture continues (``replica_id``s it
     exports), recording that capture's digest in the boundary. This is the
-    atomic boundary-plus-candidate transition for an exact-cap turnover: a
+    fully prevalidated boundary preparation for an exact-cap turnover: a
     capture that replaces every ``replica_id`` at ``MAX_LINEAGE_REPLICAS``
     cannot be accepted after a plain boundary (which keeps all active
     lineages), but is accepted after a boundary taken for it, because the
     retained set is then exactly what it continues and the capture itself never
-    exceeds the bound. The candidate is validated as the next capture in full
-    (sequence, authority, revision, instants, finalized view) before anything
-    is dropped, and the commitment is enforced: only that exact capture may be
+    exceeds the bound. Before returning any persistable state, fully dry-run
+    the candidate against the proposed pruned state (ordering, incarnation,
+    generation, reused facts, and the supplied resource limits). Pass the same
+    limits when advancing. The pending head can be restored exactly by replay
+    with ``pending_candidate``. No failing dry-run returns a boundary, and
+    the commitment is enforced: only that exact capture may be
     accepted next (``snapshot_lineage_candidate_mismatch``). One boundary per
     accepted capture: a second boundary before any capture follows the first
     is refused (``snapshot_lineage_boundary_pending``), so no boundary can hide
@@ -1060,7 +1087,17 @@ def begin_snapshot_lineage_era(
         "used_ticket_digests": kept_tickets,
         "used_receipt_digests": kept_receipts,
     }
-    return SnapshotLineage.model_validate({**unsigned, "lineage_digest_sha256": digest(unsigned)})
+    prepared = SnapshotLineage.model_validate(
+        {**unsigned, "lineage_digest_sha256": digest(unsigned)}
+    )
+    if retain_for is not None:
+        # Full dry run against the exact pruned state, including incarnation,
+        # lifetime fact reuse, generation and caller resource limits. Failure
+        # returns no state: the original lineage remains the only durable head.
+        advance_snapshot_lineage(
+            prepared, candidate, max_facts=max_facts, max_replicas=max_replicas
+        )
+    return prepared
 
 
 def snapshot_history_gaps(
@@ -1148,58 +1185,123 @@ def replay_snapshot_lineage(
     snapshots: Sequence[ActiveAssignmentSnapshot],
     *,
     era_boundaries: Sequence[LineageEraBoundary] = (),
+    boundary_mode: Literal["full", "suffix"] = "full",
+    pending_candidate: ActiveAssignmentSnapshot | None = None,
     max_facts: int = MAX_LINEAGE_FACTS,
     max_replicas: int = MAX_LINEAGE_REPLICAS,
+    max_work: int = MAX_REPLAY_WORK,
 ) -> SnapshotLineage:
-    """Replay retained captures and recorded era boundaries in order.
+    """Replay exact events, bounded by cumulative immutable-state work.
 
-    Used to seed a lineage from a runtime's retained captures at adoption, and
-    to catch up after a rollback or an outage: every capture from the
-    lineage's next expected sequence must be supplied, in order
-    (``snapshot_lineage_gap`` otherwise). Era boundaries are events too: each
-    recorded :class:`LineageEraBoundary` is replayed after the capture it names
-    (``opened_after_snapshot_sequence``), taken for the next capture when it
-    recorded one, and the replayed boundary must reproduce the recorded one
-    exactly (``snapshot_lineage_replay_mismatch``). A history that contains a
-    boundary therefore replays to the same lineage, boundary and all, instead
-    of refusing the era-2 facts the live lineage legitimately accepted.
+    ``full`` boundaries must start with the exact current prefix; ``suffix``
+    contains only new boundaries. No event is sorted, ignored, or deduplicated.
+    Captures always start at the next sequence. To restore a pending candidate
+    boundary, supply its candidate only as ``pending_candidate`` (validated but
+    not consumed), not in ``snapshots``. The result then equals the crash head.
+
+    Every transition hashes its entire predecessor state: this format is NOT
+    linear in capture count. Charge retained replicas, fact entries, boundaries,
+    and incoming replicas before each transition, with a hard cumulative cap.
+    A rejected call returns no partial state. Resume in explicitly bounded
+    batches from independently anchored persisted heads, never skip captures.
     """
 
+    if (
+        isinstance(max_work, bool)
+        or not isinstance(max_work, int)
+        or not 1 <= max_work <= MAX_REPLAY_WORK
+    ):
+        raise ValueError("snapshot_lineage_replay_work_invalid")
+    if boundary_mode not in ("full", "suffix"):
+        raise ValueError("snapshot_lineage_replay_mode_invalid")
+    # Bound event containers before copying or validating their contents.
+    if len(snapshots) + len(era_boundaries) > max_work:
+        _reject("snapshot_lineage_replay_work_exceeded")
+    work = 0
+
+    def charge(
+        state: SnapshotLineage,
+        candidate: ActiveAssignmentSnapshot | None = None,
+        *,
+        passes: int = 1,
+    ) -> None:
+        nonlocal work
+        size = (
+            1
+            + len(state.replicas)
+            + len(state.used_assignment_nonces)
+            + len(state.used_ticket_digests)
+            + len(state.used_receipt_digests)
+            + len(state.era_boundaries)
+        )
+        if candidate is not None:
+            size += (
+                1
+                + len(candidate.deployments)
+                + sum(len(item.replicas) for item in candidate.deployments)
+            )
+        work += passes * size
+        if work > max_work:
+            _reject("snapshot_lineage_replay_work_exceeded")
+
+    charge(lineage)
     current = revalidate(lineage, SnapshotLineage)
-    recorded_boundaries = sorted(
-        (revalidate(item, LineageEraBoundary) for item in era_boundaries),
-        key=lambda item: (item.opened_after_snapshot_sequence, item.era),
-    )
-    # Deques: replay is one pass with one-item lookahead, linear in the history.
-    pending = deque(recorded_boundaries[len(current.era_boundaries) :])
+    recorded = [revalidate(item, LineageEraBoundary) for item in era_boundaries]
+    if boundary_mode == "full":
+        prefix = len(current.era_boundaries)
+        if recorded[:prefix] != current.era_boundaries:
+            _reject("snapshot_lineage_replay_mismatch")
+        recorded = recorded[prefix:]
+    if [item.era for item in recorded] != list(
+        range(current.era + 1, current.era + 1 + len(recorded))
+    ):
+        _reject("snapshot_lineage_replay_mismatch")
+    pending = deque(recorded)
     upcoming = deque(snapshots)
+    used_pending_candidate = False
     while pending or upcoming:
         if (
             pending
             and current.accepted_snapshot_count > 0
             and pending[0].opened_after_snapshot_sequence == current.last_snapshot_sequence
         ):
-            recorded = pending.popleft()
-            candidate = upcoming[0] if upcoming else None
+            event = pending.popleft()
+            candidate = upcoming[0] if upcoming else pending_candidate
             retain: ActiveAssignmentSnapshot | None = None
-            if recorded.retained_for_snapshot_digest_sha256 is not None:
+            if event.retained_for_snapshot_digest_sha256 is not None:
                 if (
                     candidate is None
-                    or candidate.snapshot_digest_sha256
-                    != recorded.retained_for_snapshot_digest_sha256
+                    or candidate.snapshot_digest_sha256 != event.retained_for_snapshot_digest_sha256
                 ):
                     _reject("snapshot_lineage_replay_mismatch")
                 retain = candidate
-            current = begin_snapshot_lineage_era(current, retain_for=retain)
-            if current.era_boundaries[-1] != recorded:
+                used_pending_candidate = not upcoming
+            charge(current, retain, passes=3 if retain is not None else 1)
+            current = begin_snapshot_lineage_era(
+                current, retain_for=retain, max_facts=max_facts, max_replicas=max_replicas
+            )
+            if current.era_boundaries[-1] != event:
                 _reject("snapshot_lineage_replay_mismatch")
             continue
-        if not upcoming:
-            # Boundaries left that no retained capture reaches: the history
-            # cannot have produced them.
+        if pending and pending[0].opened_after_snapshot_sequence < (
+            current.last_snapshot_sequence or 0
+        ):
             _reject("snapshot_lineage_replay_mismatch")
+        if not upcoming:
+            _reject("snapshot_lineage_replay_mismatch")
+        candidate = upcoming.popleft()
+        charge(current, candidate)
         current = advance_snapshot_lineage(
-            current, upcoming.popleft(), max_facts=max_facts, max_replicas=max_replicas
+            current, candidate, max_facts=max_facts, max_replicas=max_replicas
+        )
+    if pending_candidate is not None and not used_pending_candidate:
+        # Also permit proving an already-persisted pending head, without
+        # consuming its candidate. Never silently ignore the supplied capture.
+        if _pending_candidate(current) != pending_candidate.snapshot_digest_sha256:
+            _reject("snapshot_lineage_replay_mismatch")
+        charge(current, pending_candidate)
+        advance_snapshot_lineage(
+            current, pending_candidate, max_facts=max_facts, max_replicas=max_replicas
         )
     return current
 

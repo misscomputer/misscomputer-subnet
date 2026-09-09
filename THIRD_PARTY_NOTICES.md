@@ -1,12 +1,12 @@
 # Third-party notices
 
-This project depends on separately licensed packages. The lock files and
+This project depends on separately licensed packages. The direct pins in `pyproject.toml`, Go module lock files, and
 `sbom.spdx.json` identify the reviewed versions. Principal direct dependencies:
 
 - Bittensor — MIT
 - cryptography — Apache-2.0 OR BSD-3-Clause
 - FastAPI, Pydantic, Hatchling, jsonschema, mypy and pytest — MIT
-- HTTPX — BSD-3-Clause
+- HTTPX 0.28.1 and HTTPCore 1.0.9 — BSD-3-Clause
 - Uvicorn — BSD-3-Clause
 - pytest-asyncio — Apache-2.0
 - Ruff — MIT

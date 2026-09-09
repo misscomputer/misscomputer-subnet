@@ -15,12 +15,15 @@ process, or file capability.
 
 from __future__ import annotations
 
+import os
 import select
+import signal
 import socket
 import ssl
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 
 import httpcore
 import httpx
@@ -106,6 +109,8 @@ class DeadlineNetworkStream(httpcore.NetworkStream):
                 raise httpcore.WriteTimeout(str(exc)) from exc
             except OSError as exc:
                 raise httpcore.WriteError(str(exc)) from exc
+            if sent == 0:
+                raise httpcore.WriteError("socket closed during write")
             view = view[sent:]
 
     def close(self) -> None:
@@ -226,6 +231,70 @@ MAX_OUTSTANDING_RESOLUTIONS = 16
 _RESOLUTION_SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING_RESOLUTIONS)
 
 
+def _reset_resolution_slots_after_fork() -> None:
+    # Parent workers do not survive fork. Never inherit their held permits or
+    # mutexes; existing default backends resolve the process-local pool on use.
+    global _RESOLUTION_SLOTS
+    _RESOLUTION_SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING_RESOLUTIONS)
+
+
+os.register_at_fork(after_in_child=_reset_resolution_slots_after_fork)
+
+
+@contextmanager
+def _lease_transition() -> Iterator[None]:
+    """Defer SIGINT across the semaphore/state update, not across DNS or waits.
+
+    Python delivers signal handlers on the main thread. Masking SIGINT here
+    closes the acquire-before-record and mark-before-release interruption
+    windows. A pending interrupt is delivered after the invariant is restored.
+    Arbitrary interpreter thread-exception injection is not a supported API.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+class _ResolutionLease:
+    """Exactly-once creator -> worker ownership, with cancellation before claim."""
+
+    def __init__(self, slots: threading.BoundedSemaphore) -> None:
+        self._slots = slots
+        self._lock = threading.Lock()
+        self._state = "new"
+
+    def acquire(self) -> None:
+        with _lease_transition(), self._lock:
+            if not self._slots.acquire(blocking=False):
+                raise httpcore.ConnectError("resolver capacity exhausted")
+            self._state = "creator"
+
+    def claim(self) -> bool:
+        with self._lock:
+            if self._state != "creator":
+                return False
+            self._state = "worker"
+            return True
+
+    def cancel(self) -> None:
+        with _lease_transition(), self._lock:
+            if self._state == "creator":
+                self._state = "released"
+                self._slots.release()
+
+    def finish(self) -> None:
+        with _lease_transition(), self._lock:
+            if self._state == "worker":
+                self._state = "released"
+                self._slots.release()
+
+
 class DeadlineNetworkBackend(httpcore.NetworkBackend):
     """The synchronous httpcore backend with every connection bounded by one budget.
 
@@ -253,41 +322,55 @@ class DeadlineNetworkBackend(httpcore.NetworkBackend):
         self._remaining = remaining
         self._resolver = resolver
         self._dialer = dialer
-        self._slots = resolution_slots or _RESOLUTION_SLOTS
+        self._slots = resolution_slots
 
     def _resolve_within_budget(self, host: str, port: int) -> list[ResolvedAddress]:
-        remaining = self._remaining()
-        if remaining <= 0.0:
+        if self._remaining() <= 0.0:
             raise httpcore.ConnectTimeout("whole-request budget exhausted")
-        if not self._slots.acquire(blocking=False):
-            raise httpcore.ConnectError("resolver capacity exhausted")
+        # Allocate every fallible object before admission. The creator owns
+        # the lease until the worker claims it under the same lock used by
+        # cancellation. A launched-but-not-yet-running worker may be cancelled
+        # safely: it will then never enter the resolver.
         outcome: list[list[ResolvedAddress] | BaseException] = []
         done = threading.Event()
+        lease = _ResolutionLease(self._slots or _RESOLUTION_SLOTS)
 
         def resolve() -> None:
             try:
-                outcome.append(self._resolver(host, port))
-            except BaseException as exc:  # noqa: BLE001 - surfaced to the caller below
-                outcome.append(exc)
+                if not lease.claim():
+                    return
+                try:
+                    outcome.append(self._resolver(host, port))
+                except BaseException as exc:
+                    outcome.append(exc)
             finally:
-                done.set()
-                # The slot is held for as long as the lookup itself is alive,
-                # abandoned or not.
-                self._slots.release()
+                # Signaling failure cannot leak a completed lookup's permit.
+                try:
+                    done.set()
+                finally:
+                    lease.finish()
 
+        worker = threading.Thread(target=resolve, name="misscomputer-probe-resolve", daemon=True)
         try:
-            threading.Thread(target=resolve, name="misscomputer-probe-resolve", daemon=True).start()
-        except BaseException:
-            self._slots.release()
-            raise
-        if not done.wait(timeout=remaining) or not outcome:
-            raise httpcore.ConnectTimeout("name resolution exceeded the whole-request budget")
-        result = outcome[0]
-        if isinstance(result, BaseException):
-            raise httpcore.ConnectError(str(result)) from result
-        if not result:
-            raise httpcore.ConnectError("name resolved to no addresses")
-        return result
+            lease.acquire()
+            if self._remaining() <= 0.0:
+                raise httpcore.ConnectTimeout("whole-request budget exhausted")
+            worker.start()
+            remaining = self._remaining()
+            if remaining <= 0.0 or not done.wait(timeout=remaining) or not outcome:
+                raise httpcore.ConnectTimeout("name resolution exceeded the whole-request budget")
+            if self._remaining() <= 0.0:
+                raise httpcore.ConnectTimeout("name resolution exceeded the whole-request budget")
+            result = outcome[0]
+            if isinstance(result, BaseException):
+                raise httpcore.ConnectError(str(result)) from result
+            if not result:
+                raise httpcore.ConnectError("name resolved to no addresses")
+            return result
+        finally:
+            # This can release only creator ownership. Once claimed, even an
+            # asynchronous exception from Thread.start leaves the worker owner.
+            lease.cancel()
 
     def connect_tcp(
         self,
@@ -315,10 +398,16 @@ class DeadlineNetworkBackend(httpcore.NetworkBackend):
             except OSError as exc:
                 last_error = httpcore.ConnectError(str(exc))
                 continue
-            for option in socket_options or ():
-                sock.setsockopt(*option)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            return DeadlineNetworkStream(_SocketStream(sock), self._remaining)
+            try:
+                for option in socket_options or ():
+                    sock.setsockopt(*option)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self._remaining() <= 0.0:
+                    raise httpcore.ConnectTimeout("whole-request budget exhausted")
+                return DeadlineNetworkStream(_SocketStream(sock), self._remaining)
+            except BaseException:
+                sock.close()
+                raise
         raise last_error or httpcore.ConnectError("no address could be dialled")
 
     def connect_unix_socket(
