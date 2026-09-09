@@ -11,9 +11,10 @@ deliberately implements no runtime endpoint, no publisher daemon, no
 coordinator loop, no service wiring, and no weight submission.
 
 Four contracts are added. Every pre-existing contract is byte-pinned by the
-test suite. Two compatibility events are declared, both against contracts no
+test suite. Three compatibility events are declared, all against contracts no
 consumer is live on: `assignment-manifest-chain-state` gains
-`last_finalized_epoch`, and `validator-weight-decision` gains `trust_policies`
+`last_finalized_epoch`, `validator-weight-decision` gains `trust_policies`,
+and `validator-probe-report` observations gain `trust_policy_digest_sha256`
 (see "Compatibility matrix"; the supported mixed-version pairings and the
 coordinated pause that upgrades each writer/reader pair are in
 [`api-migrations.md`](api-migrations.md): neither the decision nor the
@@ -554,14 +555,16 @@ Frozen invariants:
   report's `probe_timeout_millis` and `max_response_bytes` are the policy's
   own scalars; and every observation must be one `evaluate_probe_response`
   could have produced under that policy
-  (`verify_observation_policy_binding`: every response-derived outcome, that
+  (`verify_observation_policy_binding`: the observation names that policy's
+  digest, `trust_policy_digest_sha256`; every response-derived outcome, that
   is a serving outcome or any failure other than a transport failure, has
   `latency_millis <= probe_timeout_millis`, because the transport applies the
   policy's whole-request budget and a slower response is a `timeout`; a
   serving outcome, or any failure code reached only after the pin check,
-  carries a pinned edge certificate when the policy pins any; and a serving
+  carries a pinned edge certificate when the policy pins any; a serving
   outcome or any failure reached only after the size check has
-  `response_bytes <= max_response_bytes`). Producer codes are
+  `response_bytes <= max_response_bytes`; and a `response_oversized` verdict
+  carries size evidence above it). Producer codes are
   `decision_round_policy_rejected` and `decision_terminal_policy_rejected`;
   parser codes `report_policy_rejected` and `terminal_policy_rejected`
   (`scoring_window_evidence_inconsistent` for the probe-bound scalars).
@@ -642,8 +645,9 @@ come from the sealed trust policies.
 | Report or terminal claims an evaluation instant its verification never admitted, or an instant at which its policy was not yet (or no longer) valid | `report_evaluation_epoch_mismatch`/`trust_policy_mismatch` at report construction; `decision_round_invalid`/`decision_round_policy_rejected`/`decision_terminal_future`/`decision_terminal_policy_rejected` at the decision; `scoring_window_evidence_inconsistent`/`report_policy_rejected`/`terminal_manifest_future`/`terminal_policy_rejected` on parse | the verification result carries its epoch and policy digest, and the sealed policy re-derives every evaluation-time admission rule |
 | Responses judged under a looser same-authority policy (longer request budget, no certificate pins, larger body ceiling) relabelled under the stricter policy that verified the manifest | `observation_policy_violation` at report construction; `decision_round_policy_rejected` at the decision; `report_policy_rejected` on parse | every observation records the certificate and body size the policy-dependent checks judged, so the named policy's constraints are re-derived from the observation itself |
 | Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation; recycles a nonce, ticket, or receipt retired by any earlier replacement (A → B → A); or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_incarnation_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id` and every signed fact it ever accepted in the era; a replacement is a new generation with never-seen facts |
-| Lineage restored from a stale backup, resealed with retired facts removed, fed a capture out of order, or grown past its bounds | `snapshot_lineage_anchor_mismatch`/`snapshot_lineage_gap`/`snapshot_lineage_overflow`; publisher refuses and forgets nothing | the lineage is a hash chain whose head the operator anchors out of band; sequences are contiguous; only an explicit, recorded era boundary sheds retired facts |
-| Probe response whose headers or body arrive after the policy's whole-request budget but inside every per-operation timeout, including a byte-by-byte trickle | `ProbeTransportFailure("timeout")` at the transport within a small margin of the budget; `observation_policy_violation` if an older transport reports it as a response | every connect, TLS, write, and read on the connection is clamped to the time remaining in one budget on one monotonic clock (`DeadlineNetworkBackend`), and the same budget is judged before every response-derived return; the binding re-derives the same bound from the recorded latency |
+| Lineage restored from a stale backup, resealed with retired facts removed or with impossible boundary claims, fed a capture out of order or a duplicate/rolled-back history, or grown past its bounds | `snapshot_lineage_anchor_mismatch`/`lineage_era_invalid`/`lineage_replica_facts_duplicate`/`snapshot_lineage_gap`/`snapshot_sequence_not_increasing`/`snapshot_lineage_overflow`; publisher refuses and forgets nothing | the lineage is a hash chain whose head the operator anchors out of band; sequences are contiguous and a history preflight refuses rollbacks; boundary claims are bounded and tied to the document's predecessor; only an explicit, recorded era boundary sheds retired facts, and at the replica cap it is taken for the capture it admits |
+| Probe request stalled anywhere inside per-operation timeouts: slow name resolution, several unreachable addresses, a partial send drained just fast enough, or a byte-by-byte header or body trickle | `ProbeTransportFailure("timeout")` at the transport within a small margin of the budget; `observation_policy_violation` if an older transport reports it as a response | name resolution is waited on for the remaining budget and abandoned, each address is dialled with the remaining budget, and every TLS step, `send`, and read on the connection is clamped to the time remaining in one budget on one monotonic clock (`DeadlineNetworkBackend`); the same budget is judged before every response-derived return; the binding re-derives the same bound from the recorded latency |
+| The same wire outcome sealed under a policy other than the one that judged it (a 100ms `timeout` carried into a 5000ms report, a 64-byte `response_oversized` carried into a 4096-byte report, or the reverse) | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | every observation seals the digest of the policy that judged it and its size evidence, and every consumer requires equality with the report's policy |
 | Peer answers with a wire status outside `100..599` | `ProbeTransportFailure("transport_error")` with no status at the transport; the same at `evaluate_probe_response` for a leaked `ProbeResponse` | the contract's status range is enforced before an observation exists; no raw validation error reaches the CLI |
 | `tls_pin_mismatch` judged under a pinning policy carried into a report naming a policy without pins, or whose pins include the leaf | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | every policy-dependent failure branch is bound in both directions |
 
@@ -653,7 +657,8 @@ come from the sealed trust policies.
 | --- | --- | --- |
 | `active-assignment-manifest.v1`, `assignment-manifest-trust-policy.v1`, `assignment-manifest-signature-envelope.v1` | unchanged; schema and fixture digest-pinned in tests | none |
 | `assignment-manifest-chain-state.v1` | **declared compatibility event**: gains required `last_finalized_epoch` (`null` at genesis); schema and fixture re-pinned; previously persisted states must be re-anchored (no validator is live on the old form) | private producer and every chain-state holder re-vendor; `advance_manifest_chain_state`/`rebind_manifest_chain_state_trust_policy` produce the new form |
-| `validator-probe-report.v1`, `miner-probe-attestation.v1` | schemas unchanged and pinned; the probe-report fixture is re-pinned because it embeds chain-state digests | none |
+| `validator-probe-report.v1` | **declared compatibility event**: every observation gains `trust_policy_digest_sha256` (the policy that judged it; every consumer requires it to equal the report's policy) and an oversized verdict preserves its size evidence in `response_bytes`; schema and fixture re-pinned; a report sealed without the field does not parse (no validator is live on the old form) | probe CLI emits the new form; coordinators and parsers require it |
+| `miner-probe-attestation.v1` | schema and fixture unchanged and pinned | none |
 | `weight-plan.v1` | unchanged, pinned; `build_weight_plan` unchanged, `build_weight_plan_from_decision` added in front of it | validator coordinator uses the decision-aware builder |
 | Manifest verification (`verify_active_assignment_manifest`, `anchor_manifest_chain_state`) | effective horizon replaces `expires_at_epoch` as the validity bound; **`current_finalized_height` is required** (breaking signature); historical variant added and lease-free | every live fetcher passes its finalized height |
 | `misscomputer-assignment-probe` CLI | **`--finalized-height` required** (breaking invocation) | operators add the flag from their finalized chain view |

@@ -1208,6 +1208,38 @@ def negative_documents() -> dict[str, bytes]:
             },
         ),
     )
+    # An observation names the policy that judged it; a report may only carry
+    # observations judged by the policy it names.
+    add(
+        "validator-weight-decision",
+        "submit-with-observation-under-foreign-policy",
+        "model",
+        "report_policy_rejected",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={"trust_policy_digest_sha256": "1" * 64},
+        ),
+    )
+    # An oversized verdict needs size evidence above the policy's ceiling.
+    add(
+        "validator-weight-decision",
+        "submit-with-oversized-below-policy-ceiling",
+        "model",
+        "report_policy_rejected",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={
+                "outcome": "failed",
+                "failure_code": "response_oversized",
+                "response_bytes": first_report["max_response_bytes"],
+                "build_id_header_verified": False,
+                "attestation_status": "not_presented",
+                "attestation": None,
+            },
+        ),
+    )
     lineage = documents["active-assignment-snapshot-lineage"]
     lineage_doc = json.loads(lineage)
     add(
@@ -1281,6 +1313,17 @@ def negative_documents() -> dict[str, bytes]:
         "model",
         "lineage_history_not_contiguous",
         _mutate(lineage, last_snapshot_sequence=lineage_doc["last_snapshot_sequence"] + 5),
+    )
+    duplicated = json.loads(lineage)
+    duplicated["replicas"][1]["receipt_digest_sha256"] = duplicated["replicas"][0][
+        "receipt_digest_sha256"
+    ]
+    add(
+        "active-assignment-snapshot-lineage",
+        "replica-facts-duplicate",
+        "model",
+        "lineage_replica_facts_duplicate",
+        duplicated,
     )
     add(
         "active-assignment-snapshot-lineage",

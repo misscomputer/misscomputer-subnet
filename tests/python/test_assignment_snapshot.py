@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,8 @@ from misscomputer_subnet.assignment_probe import (
 )
 from misscomputer_subnet.assignment_snapshot import (
     MAX_LINEAGE_ERAS,
+    MAX_LINEAGE_FACTS,
+    MAX_LINEAGE_REPLICAS,
     TICKET_MAX_FUTURE_SKEW_SECONDS,
     ActiveAssignmentSnapshot,
     AssignmentSnapshotError,
@@ -45,6 +49,7 @@ from misscomputer_subnet.assignment_snapshot import (
     advance_snapshot_lineage,
     begin_snapshot_lineage_era,
     build_initial_snapshot_lineage,
+    build_snapshot_deployment,
     build_snapshot_replica,
     parse_active_assignment_snapshot,
     parse_snapshot_lineage,
@@ -1239,6 +1244,310 @@ def test_history_gap_preflight_names_every_legacy_sequence_jump() -> None:
     )
     seeded = replay_snapshot_lineage(restarted, [fifth, sixth])
     assert (seeded.history_start_snapshot_sequence, seeded.last_snapshot_sequence) == (5, 6)
+
+
+def _fresh_capture(
+    sequence: int, *, deployments: list[SnapshotDeployment]
+) -> ActiveAssignmentSnapshot:
+    return build_snapshot(
+        snapshot_sequence=sequence, state_revision=6 + sequence, snapshot_deployments=deployments
+    )
+
+
+def test_exact_cap_turnover_recovers_only_through_a_boundary_taken_for_the_candidate() -> None:
+    """At the replica-lineage cap, replacing every replica_id needs boundary-plus-candidate.
+
+    A plain era boundary keeps every active lineage, so a capture that
+    continues none of them still overflows; a boundary taken for that capture
+    keeps only what it continues and the capture is then accepted. The bound is
+    injected small so the lifecycle is exercised exactly at the cap.
+    """
+
+    golden = build_snapshot()
+    alpha, beta = fixture_deployments()
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    only_alpha = _fresh_capture(1, deployments=[snapshot_deployment_from(alpha)])
+    lineage = advance_snapshot_lineage(genesis, only_alpha, max_replicas=3)
+    assert len(lineage.replicas) == 3
+    turnover = _fresh_capture(2, deployments=[snapshot_deployment_from(beta)])
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(lineage, turnover, max_replicas=3)
+    assert failure.value.code == "snapshot_lineage_overflow"
+    plain = begin_snapshot_lineage_era(lineage)
+    assert len(plain.replicas) == 3
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(plain, turnover, max_replicas=3)
+    assert failure.value.code == "snapshot_lineage_overflow"
+    taken = begin_snapshot_lineage_era(lineage, retain_for=turnover)
+    assert taken.replicas == [] and taken.era == 2
+    boundary = taken.era_boundaries[0]
+    assert boundary.retained_for_snapshot_digest_sha256 == turnover.snapshot_digest_sha256
+    assert boundary.dropped_replica_lineages == 3
+    recovered = advance_snapshot_lineage(taken, turnover, max_replicas=3)
+    assert [item.deployment_id for item in recovered.replicas] == ["fixture-beta"] * 3
+    assert parse_snapshot_lineage(snapshot_lineage_bytes(recovered)) == recovered
+    # The candidate must be the very next capture and share the authority.
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        begin_snapshot_lineage_era(
+            lineage, retain_for=_fresh_capture(3, deployments=[snapshot_deployment_from(beta)])
+        )
+    assert failure.value.code == "snapshot_lineage_gap"
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        begin_snapshot_lineage_era(
+            lineage,
+            retain_for=build_snapshot(
+                snapshot_sequence=2, state_revision=8, central_authority=label_digest("other")
+            ),
+        )
+    assert failure.value.code == "snapshot_authority_mismatch"
+    # A partially continued capture keeps exactly the continued lineages.
+    partial = begin_snapshot_lineage_era(
+        advance_snapshot_lineage(genesis, golden),
+        retain_for=_fresh_capture(2, deployments=[snapshot_deployment_from(beta)]),
+    )
+    assert [item.deployment_id for item in partial.replicas] == ["fixture-beta"] * 3
+
+
+def test_history_preflight_rejects_duplicates_and_rollbacks_as_never_compatible() -> None:
+    """Only a forward skip is a compatibility gap; a repeated or lower sequence is refused."""
+
+    golden = build_snapshot()
+    _, beta = fixture_deployments()
+    duplicate_empty = build_snapshot([], snapshot_sequence=1, state_revision=8)
+    reuse = build_snapshot(snapshot_sequence=2, state_revision=9)
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        snapshot_history_gaps([golden, duplicate_empty, reuse])
+    assert failure.value.code == "snapshot_sequence_not_increasing"
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        snapshot_history_gaps([reuse, golden])
+    assert failure.value.code == "snapshot_sequence_not_increasing"
+    # Every other base-contract invariant is enforced across the skip too.
+    skipped = build_snapshot(
+        snapshot_sequence=5, state_revision=6, snapshot_deployments=[snapshot_deployment_from(beta)]
+    )
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        snapshot_history_gaps([golden, skipped])
+    assert failure.value.code == "snapshot_revision_rollback"
+    forward = build_snapshot(
+        snapshot_sequence=5, state_revision=9, snapshot_deployments=[snapshot_deployment_from(beta)]
+    )
+    assert snapshot_history_gaps([golden, forward]) == [(1, 5)]
+    assert snapshot_history_gaps([golden]) == [] and snapshot_history_gaps([]) == []
+
+
+def test_lineage_parser_refuses_duplicate_facts_among_current_replicas() -> None:
+    golden = build_snapshot()
+    lineage = advance_snapshot_lineage(
+        build_initial_snapshot_lineage(
+            central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+        ),
+        golden,
+    )
+    base = json.loads(snapshot_lineage_bytes(lineage))
+    for field, source in (
+        ("assignment_nonce", "assignment_nonce"),
+        ("ticket_digest_sha256", "ticket_digest_sha256"),
+        ("receipt_digest_sha256", "receipt_digest_sha256"),
+        ("receipt_digest_sha256", "ticket_digest_sha256"),  # cross-role copy
+    ):
+        document = json.loads(json.dumps(base))
+        replica = document["replicas"][1]
+        replica[field] = document["replicas"][0][source]
+        if field == "assignment_nonce":
+            replica["endpoint_id"] = (
+                f"{replica['replica_id']}-g{replica['generation']}-{replica[field]}"
+            )
+        unsigned = {k: v for k, v in document.items() if k != "lineage_digest_sha256"}
+        document["lineage_digest_sha256"] = canonical_digest(unsigned)
+        with pytest.raises(ValidationError, match="lineage_replica_facts_duplicate"):
+            SnapshotLineage.model_validate(document)
+
+
+def test_era_boundary_claims_are_validated_exactly() -> None:
+    golden = build_snapshot()
+    _, beta = fixture_deployments()
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    lineage = advance_snapshot_lineage(genesis, golden)
+    era_two = begin_snapshot_lineage_era(lineage)
+
+    def reseal(base: SnapshotLineage, **changes: Any) -> dict[str, Any]:
+        document = {**json.loads(snapshot_lineage_bytes(base)), **changes}
+        unsigned = {k: v for k, v in document.items() if k != "lineage_digest_sha256"}
+        return {**document, "lineage_digest_sha256": canonical_digest(unsigned)}
+
+    boundary = json.loads(snapshot_lineage_bytes(era_two))["era_boundaries"][0]
+    for field, ceiling in (
+        ("dropped_assignment_nonces", MAX_LINEAGE_FACTS),
+        ("dropped_ticket_digests", MAX_LINEAGE_FACTS),
+        ("dropped_receipt_digests", MAX_LINEAGE_FACTS),
+        ("dropped_replica_lineages", MAX_LINEAGE_REPLICAS),
+    ):
+        with pytest.raises(ValidationError, match="less_than_equal"):
+            SnapshotLineage.model_validate(
+                reseal(era_two, era_boundaries=[{**boundary, field: ceiling + 1}])
+            )
+    # An immediate boundary is this document's own transition: its predecessor
+    # is the top-level predecessor.
+    with pytest.raises(ValidationError, match="lineage_era_invalid"):
+        SnapshotLineage.model_validate(
+            reseal(
+                era_two,
+                era_boundaries=[{**boundary, "previous_lineage_digest_sha256": "0" * 64}],
+            )
+        )
+    # Dropped lineages plus the retained ones cannot exceed the cap.
+    with pytest.raises(ValidationError, match="lineage_era_invalid"):
+        SnapshotLineage.model_validate(
+            reseal(
+                era_two,
+                era_boundaries=[{**boundary, "dropped_replica_lineages": MAX_LINEAGE_REPLICAS}],
+            )
+        )
+    # Once a capture follows the boundary, the top-level predecessor moves on
+    # and the boundary keeps its own; that is the valid shape.
+    followed = advance_snapshot_lineage(
+        era_two,
+        build_snapshot(
+            snapshot_sequence=2,
+            state_revision=8,
+            snapshot_deployments=[snapshot_deployment_from(beta)],
+        ),
+    )
+    assert followed.previous_lineage_digest_sha256 == era_two.lineage_digest_sha256
+    assert (
+        followed.era_boundaries[0].previous_lineage_digest_sha256 == lineage.lineage_digest_sha256
+    )
+    assert parse_snapshot_lineage(snapshot_lineage_bytes(followed)) == followed
+
+
+def _many_fresh_replicas(count: int, *, sequence: int) -> ActiveAssignmentSnapshot:
+    golden = build_snapshot()
+    deployments = []
+    for index in range(count):
+        deployment_id = f"d{index:05d}"
+        replica = build_snapshot_replica(
+            miner_uid=10,
+            miner_hotkey="MinerA",
+            miner_service_public_key=fixture_deployments()[0].replicas[0].miner_service_public_key,
+            generation=1,
+            assignment_nonce=label_digest(f"nonce-{deployment_id}-{sequence}")[:32],
+            deployment_id=deployment_id,
+            ticket_digest_sha256=label_digest(f"ticket-{deployment_id}-{sequence}"),
+            receipt_digest_sha256=label_digest(f"receipt-{deployment_id}-{sequence}"),
+            chain_block=golden.finalized_height - 60,
+            expires_at_block=golden.finalized_height + 60,
+            ticket_issued_at_epoch=BASE_EPOCH - 500,
+            ticket_expires_at_epoch=BASE_EPOCH + 3_500,
+            route_activated_at_epoch=BASE_EPOCH - 100,
+        )
+        deployments.append(
+            build_snapshot_deployment(
+                deployment_id=deployment_id,
+                campaign_sequence=1,
+                route_host=f"{deployment_id}.mock.local",
+                build_id="0" * 24,
+                challenge_sha256=label_digest(f"challenge-{deployment_id}"),
+                image_digest="sha256:" + label_digest("image"),
+                workload_spec_digest_sha256=label_digest("workload"),
+                attestation_requirement="miner_service_key_v1",
+                replicas=[replica],
+            )
+        )
+    return build_snapshot(
+        snapshot_sequence=sequence, state_revision=6 + sequence, snapshot_deployments=deployments
+    )
+
+
+def test_freshness_checking_scales_linearly_with_the_capture() -> None:
+    """Advancing over N fresh replicas must not rebuild the retained-fact union per replica.
+
+    Quadratic behaviour makes 4x the replicas cost ~16x; linear costs ~4x. The
+    ratio is measured rather than an absolute time so the guard holds on slow
+    CI runners.
+    """
+
+    golden = build_snapshot()
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    small = _many_fresh_replicas(512, sequence=1)
+    large = _many_fresh_replicas(2_048, sequence=1)
+    advance_snapshot_lineage(genesis, small)  # warm caches
+    best_small = min(_timed(lambda: advance_snapshot_lineage(genesis, small)) for _ in range(3))
+    best_large = min(_timed(lambda: advance_snapshot_lineage(genesis, large)) for _ in range(2))
+    assert best_large < 7 * best_small, (best_small, best_large)
+
+
+def _timed(action: Callable[[], object]) -> float:
+    started = time.perf_counter()
+    action()
+    return time.perf_counter() - started
+
+
+def test_replay_reproduces_recorded_era_boundaries() -> None:
+    """A history with a boundary replays to the same lineage, boundary and all."""
+
+    golden = build_snapshot()
+    alpha, beta = fixture_deployments()
+    a1 = snapshot_deployment_from(alpha)
+    b2 = snapshot_deployment_from(
+        alpha, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 1
+    )
+    second = _capture(2, b2)
+    third = _capture(3, _reincarnation(b2, a1, generation=3))  # A's era-1 facts back in era 2
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    live = advance_snapshot_lineage(
+        begin_snapshot_lineage_era(
+            advance_snapshot_lineage(advance_snapshot_lineage(genesis, golden), second)
+        ),
+        third,
+    )
+    assert live.era == 2
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        replay_snapshot_lineage(genesis, [golden, second, third])
+    assert failure.value.code == "snapshot_incarnation_facts_reused"
+    replayed = replay_snapshot_lineage(
+        genesis, [golden, second, third], era_boundaries=live.era_boundaries
+    )
+    assert replayed == live
+    # A boundary taken for a candidate replays with that candidate and must match it.
+    taken = begin_snapshot_lineage_era(
+        advance_snapshot_lineage(advance_snapshot_lineage(genesis, golden), second),
+        retain_for=third,
+    )
+    live_taken = advance_snapshot_lineage(taken, third)
+    assert (
+        replay_snapshot_lineage(
+            genesis, [golden, second, third], era_boundaries=live_taken.era_boundaries
+        )
+        == live_taken
+    )
+    wrong_candidate = live_taken.era_boundaries[0].model_copy(
+        update={"retained_for_snapshot_digest_sha256": golden.snapshot_digest_sha256}
+    )
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        replay_snapshot_lineage(genesis, [golden, second, third], era_boundaries=[wrong_candidate])
+    assert failure.value.code == "snapshot_lineage_replay_mismatch"
+    forged = live.era_boundaries[0].model_copy(update={"dropped_ticket_digests": 1})
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        replay_snapshot_lineage(genesis, [golden, second, third], era_boundaries=[forged])
+    assert failure.value.code == "snapshot_lineage_replay_mismatch"
+    # A boundary no retained capture reaches cannot have happened.
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        replay_snapshot_lineage(genesis, [golden], era_boundaries=live.era_boundaries)
+    assert failure.value.code == "snapshot_lineage_replay_mismatch"
+    # Resuming from a persisted mid-history lineage replays only the remainder.
+    partial = advance_snapshot_lineage(genesis, golden)
+    assert (
+        replay_snapshot_lineage(partial, [second, third], era_boundaries=live.era_boundaries)
+        == live
+    )
 
 
 def test_builder_never_trusts_a_supplied_projection_digest_or_order() -> None:

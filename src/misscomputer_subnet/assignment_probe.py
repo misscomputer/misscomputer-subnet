@@ -581,6 +581,11 @@ class ProbeObservation(_StrictFrozenModel):
     route_host: RouteHost
     challenge_path: ChallengePath
     assignment_digest_sha256: Digest
+    #: The trust policy whose bounds (request budget, certificate pins,
+    #: response ceiling) judged this observation. Every consumer requires it
+    #: to equal the policy the report names, so an observation can never be
+    #: relabelled under a looser or stricter policy than the one that made it.
+    trust_policy_digest_sha256: Digest
     probe_nonce: Hex64
     latency_millis: int = Field(ge=0, le=MAX_LATENCY_MILLIS)
     outcome: ProbeOutcome
@@ -718,6 +723,11 @@ class ProbeTransportFailure:
     latency_millis: int
     response_status: int | None = None
     tls_leaf_certificate_sha256: str | None = None
+    #: For ``response_oversized``: the size evidence the transport judged, the
+    #: declared ``Content-Length`` or the bytes received before the ceiling
+    #: was crossed (``MAX_RESPONSE_BYTES_CEILING + 1`` for an unparseable
+    #: declaration). Zero for every other code.
+    response_bytes: int = 0
 
 
 def build_assignment_manifest_trust_policy(
@@ -1112,8 +1122,13 @@ def verify_observation_policy_binding(
 ) -> None:
     """Refuse an observation ``evaluate_probe_response`` could not have produced under ``policy``.
 
-    An observation records the facts the policy-dependent checks judged: the
-    request latency, the edge leaf certificate, and the response size. Any
+    An observation names the policy that judged it
+    (``trust_policy_digest_sha256``), which must be this one; the remaining
+    rules re-derive that policy's bounds from the recorded facts so a document
+    that names the right policy but describes facts it could not have produced
+    is refused as well. An observation records the facts the policy-dependent
+    checks judged: the request latency, the edge leaf certificate, and the
+    response size. Any
     response-derived outcome (``serving`` or a failure other than a transport
     failure) requires ``latency_millis <= probe_timeout_millis``: the transport
     applies the policy's budget to the whole request, so a response that took
@@ -1129,11 +1144,20 @@ def verify_observation_policy_binding(
     (``observation_policy_violation``).
     """
 
+    if observation.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256:
+        _reject("observation_policy_violation")
     pins = policy.pinned_edge_leaf_certificate_sha256
     serving = observation.outcome == "serving"
     if (
         serving or observation.failure_code not in _TRANSPORT_FAILURE_CODES
     ) and observation.latency_millis > policy.probe_timeout_millis:
+        _reject("observation_policy_violation")
+    if (
+        observation.failure_code == "response_oversized"
+        and observation.response_bytes <= policy.max_response_bytes
+    ):
+        # The size check only fails above this policy's ceiling; the sealed
+        # size evidence (declared or observed lower bound) must show that.
         _reject("observation_policy_violation")
     if observation.failure_code == "tls_pin_mismatch" and (
         not pins or observation.tls_leaf_certificate_sha256 in pins
@@ -1610,6 +1634,7 @@ def evaluate_probe_response(
         "route_host": deployment.route_host,
         "challenge_path": deployment.challenge_path,
         "assignment_digest_sha256": deployment.assignment_digest_sha256,
+        "trust_policy_digest_sha256": policy.trust_policy_digest_sha256,
         "probe_nonce": probe_nonce,
         "latency_millis": min(max(result.latency_millis, 0), MAX_LATENCY_MILLIS),
         "outcome": "failed",
@@ -1625,6 +1650,12 @@ def evaluate_probe_response(
     if isinstance(result, ProbeTransportFailure):
         document["failure_code"] = result.code
         document["response_status"] = result.response_status
+        if result.code == "response_oversized":
+            # Preserve the size evidence the transport judged, bounded to the
+            # contract's ceiling sentinel.
+            document["response_bytes"] = min(
+                max(result.response_bytes, 0), MAX_RESPONSE_BYTES_CEILING + 1
+            )
         return _seal_observation(document)
     if not 100 <= result.status <= 599:
         # A wire status outside the contract is a peer fault, not an

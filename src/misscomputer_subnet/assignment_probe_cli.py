@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import os
 import re
@@ -24,12 +25,11 @@ import ssl
 import stat
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, NoReturn, Protocol, cast
 from urllib.parse import urlsplit
 
-import httpcore
 import httpx
 from pydantic import ValidationError
 
@@ -37,6 +37,7 @@ from .assignment_probe import (
     MAX_DOCUMENT_BYTES,
     MAX_EPOCH,
     MAX_KEYS,
+    MAX_RESPONSE_BYTES_CEILING,
     PROBE_NONCE_HEADER,
     ActiveAssignmentManifest,
     AssignmentManifestChainState,
@@ -57,6 +58,11 @@ from .assignment_probe import (
     parse_assignment_manifest_trust_policy,
     validator_probe_report_bytes,
     verify_active_assignment_manifest,
+)
+from .probe_transport import (
+    RequestBudget,
+    TransportBuilder,
+    default_httpx_transport,
 )
 from .score_checkpoint_relay_cli import (
     CheckpointRelayCLIError,
@@ -217,148 +223,20 @@ def _peer_leaf_sha256(response: httpx.Response) -> str | None:
     return hashlib.sha256(der).hexdigest()
 
 
-class RequestBudget:
-    """One absolute whole-request budget, measured on one monotonic clock.
-
-    Exact-boundary semantics, shared with
-    :func:`~misscomputer_subnet.assignment_probe.verify_observation_policy_binding`:
-    latency is the whole-request elapsed time in whole milliseconds (floor),
-    the budget is the policy's ``probe_timeout_millis`` (``timeout_seconds``
-    rounded to the millisecond), and a response-derived outcome is admissible
-    only while ``latency_millis <= budget_millis``. A latency of exactly the
-    budget is a response; one millisecond more is a ``timeout``. Latency is
-    measured once per decision, so the value recorded is the value judged.
-    """
-
-    __slots__ = ("_clock", "_started", "budget_millis")
-
-    def __init__(self, timeout_seconds: float, *, clock: Callable[[], float]) -> None:
-        self._clock = clock
-        self._started = clock()
-        self.budget_millis = max(0, round(timeout_seconds * 1000))
-
-    def latency_millis(self) -> int:
-        return max(0, int((self._clock() - self._started) * 1000))
-
-    def exhausted(self, latency_millis: int) -> bool:
-        return latency_millis > self.budget_millis
-
-    def remaining_seconds(self) -> float:
-        """Seconds left before the budget is exhausted; never negative."""
-
-        return max(0.0, self.budget_millis / 1000 - (self._clock() - self._started))
-
-
-#: httpcore's socket option shape, restated so no private module is imported.
-SOCKET_OPTION = (
-    tuple[int, int, int] | tuple[int, int, bytes | bytearray] | tuple[int, int, None, int]
-)
-
-
-class DeadlineNetworkStream(httpcore.NetworkStream):
-    """A socket stream whose every operation is bounded by the remaining request budget.
-
-    httpcore applies one timeout per read or write, so a peer that trickles
-    bytes just inside it can hold a request open indefinitely. This wrapper
-    clamps every operation's timeout to ``min(per-operation, remaining)`` and
-    raises the matching httpcore timeout when nothing remains, so the whole
-    request, across TLS, headers, and body, ends at the budget. It never
-    closes a socket from another thread, so no file descriptor can be reused
-    under a still-blocked read.
-    """
-
-    def __init__(self, inner: httpcore.NetworkStream, remaining: Callable[[], float]) -> None:
-        self._inner = inner
-        self._remaining = remaining
-
-    def _bounded(self, timeout: float | None, expired: type[Exception]) -> float:
-        remaining = self._remaining()
-        if remaining <= 0.0:
-            raise expired("whole-request budget exhausted")
-        return remaining if timeout is None else min(timeout, remaining)
-
-    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        return self._inner.read(max_bytes, timeout=self._bounded(timeout, httpcore.ReadTimeout))
-
-    def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        self._inner.write(buffer, timeout=self._bounded(timeout, httpcore.WriteTimeout))
-
-    def close(self) -> None:
-        self._inner.close()
-
-    def start_tls(
-        self,
-        ssl_context: ssl.SSLContext,
-        server_hostname: str | None = None,
-        timeout: float | None = None,
-    ) -> httpcore.NetworkStream:
-        upgraded = self._inner.start_tls(
-            ssl_context,
-            server_hostname=server_hostname,
-            timeout=self._bounded(timeout, httpcore.ConnectTimeout),
-        )
-        return DeadlineNetworkStream(upgraded, self._remaining)
-
-    def get_extra_info(self, info: str) -> object:
-        return self._inner.get_extra_info(info)
-
-
-class DeadlineNetworkBackend(httpcore.NetworkBackend):
-    """The synchronous httpcore backend with every connection bounded by one budget."""
-
-    def __init__(self, remaining: Callable[[], float]) -> None:
-        self._inner = httpcore.SyncBackend()
-        self._remaining = remaining
-
-    def connect_tcp(
-        self,
-        host: str,
-        port: int,
-        timeout: float | None = None,
-        local_address: str | None = None,
-        socket_options: Iterable[SOCKET_OPTION] | None = None,
-    ) -> httpcore.NetworkStream:
-        remaining = self._remaining()
-        if remaining <= 0.0:
-            raise httpcore.ConnectTimeout("whole-request budget exhausted")
-        stream = self._inner.connect_tcp(
-            host,
-            port,
-            timeout=remaining if timeout is None else min(timeout, remaining),
-            local_address=local_address,
-            socket_options=socket_options,
-        )
-        return DeadlineNetworkStream(stream, self._remaining)
-
-    def connect_unix_socket(
-        self,
-        path: str,
-        timeout: float | None = None,
-        socket_options: Iterable[SOCKET_OPTION] | None = None,
-    ) -> httpcore.NetworkStream:  # pragma: no cover - probes never use unix sockets
-        raise httpcore.ConnectError("unix sockets are not probe targets")
-
-    def sleep(self, seconds: float) -> None:  # pragma: no cover - retries are disabled
-        self._inner.sleep(seconds)
-
-
-class _DeadlineHTTPTransport(httpx.HTTPTransport):
-    """``httpx.HTTPTransport`` whose connection pool uses :class:`DeadlineNetworkBackend`."""
-
-    def __init__(self, context: ssl.SSLContext, remaining: Callable[[], float]) -> None:
-        super().__init__(verify=context, retries=0, http2=False, trust_env=False)
-        self._pool = httpcore.ConnectionPool(
-            ssl_context=context,
-            max_connections=1,
-            max_keepalive_connections=0,
-            http1=True,
-            http2=False,
-            retries=0,
-            network_backend=DeadlineNetworkBackend(remaining),
-        )
-
-
-TransportBuilder = Callable[[ssl.SSLContext, Callable[[], float]], httpx.BaseTransport]
+def _oversized(
+    latency_millis: int,
+    *,
+    response_status: int | None,
+    tls_leaf_certificate_sha256: str | None,
+    response_bytes: int,
+) -> ProbeTransportFailure:
+    return ProbeTransportFailure(
+        "response_oversized",
+        latency_millis,
+        response_status=response_status,
+        tls_leaf_certificate_sha256=tls_leaf_certificate_sha256,
+        response_bytes=response_bytes,
+    )
 
 
 class HttpsProbeTransport:
@@ -389,7 +267,7 @@ class HttpsProbeTransport:
     ) -> None:
         self._context = ssl_context
         self._clock = clock
-        self._transport_factory = transport_factory or _default_httpx_transport
+        self._transport_factory = transport_factory or default_httpx_transport
 
     def fetch(
         self,
@@ -449,17 +327,20 @@ class HttpsProbeTransport:
                             "transport_error", arrival, tls_leaf_certificate_sha256=leaf
                         )
                     declared = response.headers.get("content-length")
-                    if declared is not None and (
-                        not declared.isascii()
-                        or not declared.isdigit()
-                        or int(declared) > max_bytes
-                    ):
+                    declared_bytes: int | None = None
+                    if declared is not None:
+                        declared_bytes = (
+                            int(declared)
+                            if declared.isascii() and declared.isdigit()
+                            else MAX_RESPONSE_BYTES_CEILING + 1
+                        )
+                    if declared_bytes is not None and declared_bytes > max_bytes:
                         return response_derived(
-                            lambda latency_millis: ProbeTransportFailure(
-                                "response_oversized",
-                                latency_millis,
+                            functools.partial(
+                                _oversized,
                                 response_status=status,
                                 tls_leaf_certificate_sha256=leaf,
+                                response_bytes=min(declared_bytes, MAX_RESPONSE_BYTES_CEILING + 1),
                             )
                         )
                     chunks: list[bytes] = []
@@ -471,11 +352,11 @@ class HttpsProbeTransport:
                         total += len(chunk)
                         if total > max_bytes:
                             return response_derived(
-                                lambda latency_millis: ProbeTransportFailure(
-                                    "response_oversized",
-                                    latency_millis,
+                                functools.partial(
+                                    _oversized,
                                     response_status=status,
                                     tls_leaf_certificate_sha256=leaf,
+                                    response_bytes=min(total, MAX_RESPONSE_BYTES_CEILING + 1),
                                 )
                             )
                         chunks.append(chunk)
@@ -509,12 +390,6 @@ class HttpsProbeTransport:
                 budget.latency_millis(),
                 tls_leaf_certificate_sha256=leaf,
             )
-
-
-def _default_httpx_transport(
-    context: ssl.SSLContext, remaining: Callable[[], float]
-) -> httpx.BaseTransport:
-    return _DeadlineHTTPTransport(context, remaining)
 
 
 def _default_transport_factory(context: ssl.SSLContext) -> ProbeTransport:

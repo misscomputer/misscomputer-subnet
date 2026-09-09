@@ -5,6 +5,7 @@ import ast
 import hashlib
 import ipaddress
 import json
+import socket
 import ssl
 import threading
 import time
@@ -15,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import httpcore
 import httpx
 import pytest
 from assignment_probe_context import (
@@ -38,6 +40,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 import misscomputer_subnet.assignment_probe_cli as probe_cli
+import misscomputer_subnet.probe_transport as probe_transport
 from misscomputer_subnet.assignment_probe import (
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
@@ -1215,6 +1218,165 @@ def test_out_of_contract_wire_status_is_a_transport_fault_under_and_over_budget(
         "transport_error",
         None,
     )
+
+
+def _budget(seconds: float) -> Callable[[], float]:
+    started = time.monotonic()
+    return lambda: max(0.0, seconds - (time.monotonic() - started))
+
+
+def test_name_resolution_and_every_address_dial_are_bounded_by_the_budget() -> None:
+    """DNS that overruns and multi-address blackholes cost at most one budget.
+
+    ``getaddrinfo`` cannot be cancelled, so the backend waits on it for exactly
+    the remaining budget and abandons it; each resolved address is dialled with
+    the time remaining at that instant, so three unreachable addresses do not
+    receive three full timeouts.
+    """
+
+    def slow_resolver(host: str, port: int) -> list[probe_transport.ResolvedAddress]:
+        time.sleep(0.35)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", port))]
+
+    started = time.monotonic()
+    backend = probe_transport.DeadlineNetworkBackend(_budget(0.1), resolver=slow_resolver)
+    with pytest.raises(httpcore.ConnectTimeout):
+        backend.connect_tcp("slow.invalid", 1, timeout=0.1)
+    assert time.monotonic() - started < 0.25
+
+    def three(host: str, port: int) -> list[probe_transport.ResolvedAddress]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, (f"10.255.255.{index}", port))
+            for index in (1, 2, 3)
+        ]
+
+    dial_timeouts: list[float] = []
+
+    def blackhole(
+        address: probe_transport.ResolvedAddress, timeout: float, local_address: str | None
+    ) -> socket.socket:
+        dial_timeouts.append(timeout)
+        time.sleep(timeout)
+        raise TimeoutError("blackhole")
+
+    started = time.monotonic()
+    backend = probe_transport.DeadlineNetworkBackend(_budget(0.1), resolver=three, dialer=blackhole)
+    with pytest.raises(httpcore.ConnectTimeout):
+        backend.connect_tcp("blackhole.invalid", 9, timeout=0.1)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2, elapsed
+    assert dial_timeouts and dial_timeouts[0] <= 0.1
+    assert all(
+        later <= earlier for earlier, later in zip(dial_timeouts, dial_timeouts[1:], strict=False)
+    )
+
+    # A refused first address falls through to a reachable second one, still
+    # inside the budget, and the resulting stream is a real socket stream.
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def two(host: str, _port: int) -> list[probe_transport.ResolvedAddress]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", 1)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", port)),
+        ]
+
+    backend = probe_transport.DeadlineNetworkBackend(_budget(1.0), resolver=two)
+    stream = backend.connect_tcp("two.invalid", port, timeout=1.0)
+    assert isinstance(stream.get_extra_info("socket"), socket.socket)
+    stream.close()
+    listener.close()
+    # Exhausted before resolving: refused without touching the resolver.
+    backend = probe_transport.DeadlineNetworkBackend(lambda: 0.0, resolver=three)
+    with pytest.raises(httpcore.ConnectTimeout):
+        backend.connect_tcp("late.invalid", 9, timeout=0.1)
+
+
+def test_partial_sends_recompute_the_remaining_budget_before_every_send() -> None:
+    """A peer draining the socket just inside each send timeout cannot outlast the budget.
+
+    httpcore loops ``send`` with one fixed timeout per call; the deadline stream
+    re-derives the remaining budget before every ``send`` instead.
+    """
+
+    sender, receiver = socket.socketpair()
+    sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4_096)
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4_096)
+    stop = threading.Event()
+
+    def drain_slowly() -> None:
+        # Frees a little buffer every 60ms: below a 100ms per-send timeout,
+        # so httpcore's own loop would keep sending for the whole 4 MiB.
+        while not stop.is_set():
+            time.sleep(0.06)
+            try:
+                if not receiver.recv(4_096):
+                    return
+            except OSError:
+                return
+
+    drainer = threading.Thread(target=drain_slowly, daemon=True)
+    drainer.start()
+    try:
+        started = time.monotonic()
+        stream = probe_transport.DeadlineNetworkStream(
+            probe_transport._SocketStream(sender), _budget(0.1)
+        )
+        with pytest.raises(httpcore.WriteTimeout):
+            stream.write(b"x" * (4 << 20), timeout=0.1)
+        assert time.monotonic() - started < 0.3
+    finally:
+        stop.set()
+        sender.close()
+        receiver.close()
+
+
+def test_probe_transport_module_is_bounded_network_plumbing_only() -> None:
+    """The socket-level module may open TCP/TLS under the caller's context and nothing more."""
+
+    source = (ROOT / "src" / "misscomputer_subnet" / "probe_transport.py").read_text()
+    tree = ast.parse(source)
+    imported: set[str] = set()
+    identifiers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.add(node.module.split(".", maxsplit=1)[0])
+        elif isinstance(node, ast.Name):
+            identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr)
+    assert imported <= {
+        "__future__",
+        "collections",
+        "httpcore",
+        "httpx",
+        "select",
+        "socket",
+        "ssl",
+        "threading",
+        "time",
+    }
+    assert not identifiers & {
+        "Ed25519PrivateKey",
+        "Popen",
+        "Wallet",
+        "environ",
+        "open",
+        "set_weights",
+        "sign",
+        "subprocess",
+        "system",
+        "urlopen",
+        "wallet",
+    }
+    assert "https://" not in source
+    # The CLI itself stays free of raw sockets; it only composes this module.
+    cli_source = (ROOT / "src" / "misscomputer_subnet" / "assignment_probe_cli.py").read_text()
+    assert "import socket" not in cli_source and "import httpcore" not in cli_source
 
 
 def test_probe_requires_the_finalized_height_and_refuses_expired_leases(

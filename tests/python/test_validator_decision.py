@@ -57,6 +57,7 @@ from pydantic import ValidationError
 
 from misscomputer_subnet import weight_plan as weight_plan_module
 from misscomputer_subnet.assignment_probe import (
+    MAX_RESPONSE_BYTES_CEILING,
     AssignmentProbeError,
     ProbeObservation,
     ProbeTransportFailure,
@@ -1613,6 +1614,149 @@ def test_pin_mismatch_cannot_be_relabelled_under_a_looser_policy() -> None:
             )
 
 
+def test_observations_seal_their_evaluation_policy_and_size_evidence() -> None:
+    """One wire outcome judged under two policies yields two non-interchangeable observations.
+
+    A 101ms response is a ``timeout`` under a 100ms budget and ``serving``
+    under 5000ms; a 128-byte body is ``response_oversized`` under a 64-byte
+    ceiling and ``serving`` under 4096. Each observation seals the digest of
+    the policy that judged it and, for an oversized verdict, the size evidence
+    judged, so the strict observation cannot be carried into a report,
+    decision, or record naming the loose policy (nor the reverse).
+    """
+
+    context = make_window_context()
+    strict_time = build_policy(context.keys, max_age=3_600, probe_timeout_millis=100)
+    loose_time = build_policy(context.keys, max_age=3_600, probe_timeout_millis=5_000)
+    strict_size = build_policy(context.keys, max_age=3_600, max_response_bytes=64)
+    loose_size = build_policy(context.keys, max_age=3_600, max_response_bytes=4_096)
+    alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
+    beta = window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
+
+    def judged(
+        policy: Any, *, latency_millis: int = 42, body: bytes | None = None
+    ) -> list[ProbeObservation]:
+        items = []
+        for deployment in (alpha, beta):
+            nonce = label_digest(f"seal-{deployment.deployment_id}")
+            response = serving_response(
+                deployment,
+                attestation=sign_attestation(deployment, deployment.replicas[0], probe_nonce=nonce),
+                latency_millis=latency_millis,
+            )
+            if body is not None:
+                response = replace(response, body=body)
+            result: Any = response
+            if latency_millis > policy.probe_timeout_millis:
+                result = ProbeTransportFailure("timeout", latency_millis)
+            items.append(
+                evaluate_probe_response(deployment, policy, probe_nonce=nonce, result=result)
+            )
+        return items
+
+    strict_timeouts = judged(strict_time, latency_millis=101)
+    loose_serving = judged(loose_time, latency_millis=101)
+    assert {item.failure_code for item in strict_timeouts} == {"timeout"}
+    assert {item.outcome for item in loose_serving} == {"serving"}
+    assert strict_timeouts[0].trust_policy_digest_sha256 == strict_time.trust_policy_digest_sha256
+    assert loose_serving[0].trust_policy_digest_sha256 == loose_time.trust_policy_digest_sha256
+    strict_oversized = judged(strict_size, body=b"y" * 128)
+    loose_fits = judged(loose_size, body=b"y" * 128)
+    assert {item.failure_code for item in strict_oversized} == {"response_oversized"}
+    assert {item.response_bytes for item in strict_oversized} == {128}
+    assert {item.failure_code for item in loose_fits} == {"body_digest_mismatch"}
+
+    for policy, foreign in (
+        (loose_time, strict_timeouts),
+        (strict_time, loose_serving),
+        (loose_size, strict_oversized),
+        (strict_size, loose_fits),
+    ):
+        with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+            verify_observation_policy_binding(foreign[0], policy)
+        manifest = build_probe_manifest(policy, [alpha, beta])
+        genesis = build_initial_manifest_chain_state(policy)
+        verification = verify_active_assignment_manifest(
+            manifest,
+            sign_manifest(manifest, context.keys),
+            policy,
+            genesis,
+            evaluation_epoch=BASE_EPOCH + 60,
+            current_finalized_height=FINALIZED_HEIGHT,
+        )
+
+        def report(items: list[ProbeObservation]) -> ValidatorProbeReport:
+            return build_validator_probe_report(
+                verification,  # noqa: B023 - bound per loop iteration
+                policy,  # noqa: B023
+                genesis,  # noqa: B023
+                items,
+                validator_uid=VALIDATOR_UID,
+                validator_hotkey=VALIDATOR_HOTKEY,
+                evaluation_epoch=BASE_EPOCH + 60,
+                edge_origin_override=False,
+            )
+
+        with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+            report(foreign)
+        genuine = report(judged(policy))
+        relabelled = ValidatorProbeReport.model_validate(
+            reseal_report_observations(
+                genuine.model_dump(mode="json", by_alias=True),
+                [item.model_dump(mode="json", by_alias=True) for item in foreign],
+            )
+        )
+
+        def decide(round_report: ValidatorProbeReport) -> ValidatorWeightDecision:
+            return decide_weight_submission(
+                [ProbeRound(manifest=manifest, report=round_report)],  # noqa: B023
+                terminal=TerminalManifestObservation(
+                    status="verified",
+                    evaluated_at_epoch=WINDOW_END,
+                    manifest=manifest,  # noqa: B023
+                ),
+                registered=context.registered,
+                trust_policies=[policy],  # noqa: B023
+                window_start_epoch=WINDOW_START,
+                window_end_epoch=WINDOW_END,
+            )
+
+        accepted = decide(genuine)
+        with pytest.raises(WeightDecisionError) as failure:
+            decide(relabelled)
+        assert failure.value.code == "decision_round_policy_rejected"
+        with pytest.raises(ValidationError, match="report_policy_rejected"):
+            ValidatorWeightDecision.model_validate(
+                forged_decision_with_report(
+                    validator_weight_decision_bytes(accepted),
+                    report_digest_sha256=genuine.report_digest_sha256,
+                    observation_changes={
+                        "trust_policy_digest_sha256": foreign[0].trust_policy_digest_sha256
+                    },
+                )
+            )
+    # Size evidence from a declared Content-Length is preserved and bounded.
+    declared = evaluate_probe_response(
+        alpha,
+        strict_size,
+        probe_nonce=label_digest("declared"),
+        result=ProbeTransportFailure(
+            "response_oversized", 5, response_status=200, response_bytes=6_000
+        ),
+    )
+    assert (declared.failure_code, declared.response_bytes) == ("response_oversized", 6_000)
+    verify_observation_policy_binding(declared, strict_size)
+    unparseable = evaluate_probe_response(
+        alpha,
+        strict_size,
+        probe_nonce=label_digest("declared"),
+        result=ProbeTransportFailure(
+            "response_oversized", 5, response_status=200, response_bytes=10**12
+        ),
+    )
+    assert unparseable.response_bytes == MAX_RESPONSE_BYTES_CEILING + 1
+
+
 def test_observation_policy_binding_is_branch_complete() -> None:
     pin = label_digest("edge-leaf-a")
     pinned = build_policy(signer_keys(), pinned_edge_leaf_certificate_sha256=(pin,))
@@ -1626,94 +1770,138 @@ def test_observation_policy_binding_is_branch_complete() -> None:
     )
     assert failed.failure_code == "timeout"
 
-    def variant(base: ProbeObservation, **changes: Any) -> ProbeObservation:
+    def variant(base: ProbeObservation, policy: Any, **changes: Any) -> ProbeObservation:
+        """``base`` re-sealed as if ``policy`` had judged it, with ``changes`` applied."""
+
         return ProbeObservation.model_validate(
-            reseal_observation({**base.model_dump(mode="json", by_alias=True), **changes})
+            reseal_observation(
+                {
+                    **base.model_dump(mode="json", by_alias=True),
+                    "trust_policy_digest_sha256": policy.trust_policy_digest_sha256,
+                    **changes,
+                }
+            )
         )
 
-    # Serving: pinned certificate and body within the ceiling are required.
-    verify_observation_policy_binding(variant(serving, tls_leaf_certificate_sha256=pin), pinned)
-    verify_observation_policy_binding(
-        variant(serving, tls_leaf_certificate_sha256=pin, response_bytes=pinned.max_response_bytes),
-        pinned,
-    )
-    for bad in (
-        variant(serving),  # no certificate recorded under a pinning policy
-        variant(serving, tls_leaf_certificate_sha256=label_digest("edge-leaf-b")),
-        variant(serving, response_bytes=pinned.max_response_bytes + 1),
-    ):
+    def accepts(observation: ProbeObservation, policy: Any) -> None:
+        verify_observation_policy_binding(observation, policy)
+
+    def refuses(observation: ProbeObservation, policy: Any) -> None:
         with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-            verify_observation_policy_binding(bad, pinned)
-    # Without pins the certificate is free; the size ceiling still binds.
-    verify_observation_policy_binding(variant(serving), unpinned)
-    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-        verify_observation_policy_binding(
-            variant(serving, response_bytes=unpinned.max_response_bytes + 1), unpinned
-        )
-    # Every response-derived outcome fits the whole-request budget; a transport
-    # failure, including a timeout, carries whatever latency it took.
-    verify_observation_policy_binding(
+            verify_observation_policy_binding(observation, policy)
+
+    # The observation must name the policy that judged it, before any bound.
+    refuses(serving, unpinned)
+    refuses(variant(failed, pinned), unpinned)
+
+    # Serving: pinned certificate and body within the ceiling are required.
+    accepts(variant(serving, pinned, tls_leaf_certificate_sha256=pin), pinned)
+    accepts(
         variant(
-            serving, tls_leaf_certificate_sha256=pin, latency_millis=pinned.probe_timeout_millis
+            serving,
+            pinned,
+            tls_leaf_certificate_sha256=pin,
+            response_bytes=pinned.max_response_bytes,
         ),
         pinned,
     )
-    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-        verify_observation_policy_binding(
-            variant(
-                serving,
-                tls_leaf_certificate_sha256=pin,
-                latency_millis=pinned.probe_timeout_millis + 1,
-            ),
-            pinned,
-        )
-    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-        verify_observation_policy_binding(
-            variant(
-                failed,
-                failure_code="tls_pin_mismatch",
-                response_status=200,
-                latency_millis=pinned.probe_timeout_millis + 1,
-            ),
-            pinned,
-        )
-    verify_observation_policy_binding(
-        variant(failed, latency_millis=pinned.probe_timeout_millis + 1), pinned
+    refuses(variant(serving, pinned), pinned)  # no certificate recorded under a pinning policy
+    refuses(
+        variant(serving, pinned, tls_leaf_certificate_sha256=label_digest("edge-leaf-b")), pinned
     )
-    # Transport failures precede the pin check and carry no policy claim; a
-    # pin mismatch is the pin check; post-pin failures need a pinned certificate.
-    verify_observation_policy_binding(failed, pinned)
-    verify_observation_policy_binding(
-        variant(failed, failure_code="tls_pin_mismatch", response_status=200), pinned
-    )
-    # A pin mismatch is bound in both directions: it needs a pinning policy
-    # and a recorded leaf outside the pins.
-    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-        verify_observation_policy_binding(
-            variant(failed, failure_code="tls_pin_mismatch", response_status=200), unpinned
-        )
-    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-        verify_observation_policy_binding(
-            variant(
-                failed,
-                failure_code="tls_pin_mismatch",
-                response_status=200,
-                tls_leaf_certificate_sha256=pin,
-            ),
+    refuses(
+        variant(
+            serving,
             pinned,
-        )
-    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
-        verify_observation_policy_binding(
-            variant(failed, failure_code="unexpected_status", response_status=503), pinned
-        )
-    verify_observation_policy_binding(
+            tls_leaf_certificate_sha256=pin,
+            response_bytes=pinned.max_response_bytes + 1,
+        ),
+        pinned,
+    )
+    # Without pins the certificate is free; the size ceiling still binds.
+    accepts(variant(serving, unpinned), unpinned)
+    refuses(variant(serving, unpinned, response_bytes=unpinned.max_response_bytes + 1), unpinned)
+    # Every response-derived outcome fits the whole-request budget; a transport
+    # failure, including a timeout, carries whatever latency it took.
+    accepts(
+        variant(
+            serving,
+            pinned,
+            tls_leaf_certificate_sha256=pin,
+            latency_millis=pinned.probe_timeout_millis,
+        ),
+        pinned,
+    )
+    refuses(
+        variant(
+            serving,
+            pinned,
+            tls_leaf_certificate_sha256=pin,
+            latency_millis=pinned.probe_timeout_millis + 1,
+        ),
+        pinned,
+    )
+    refuses(
         variant(
             failed,
+            pinned,
+            failure_code="tls_pin_mismatch",
+            response_status=200,
+            latency_millis=pinned.probe_timeout_millis + 1,
+        ),
+        pinned,
+    )
+    accepts(variant(failed, pinned, latency_millis=pinned.probe_timeout_millis + 1), pinned)
+    # Transport failures precede the pin check and carry no policy claim; a
+    # pin mismatch is the pin check; post-pin failures need a pinned certificate.
+    accepts(variant(failed, pinned), pinned)
+    accepts(variant(failed, pinned, failure_code="tls_pin_mismatch", response_status=200), pinned)
+    # A pin mismatch is bound in both directions: it needs a pinning policy
+    # and a recorded leaf outside the pins.
+    refuses(
+        variant(failed, unpinned, failure_code="tls_pin_mismatch", response_status=200), unpinned
+    )
+    refuses(
+        variant(
+            failed,
+            pinned,
+            failure_code="tls_pin_mismatch",
+            response_status=200,
+            tls_leaf_certificate_sha256=pin,
+        ),
+        pinned,
+    )
+    refuses(variant(failed, pinned, failure_code="unexpected_status", response_status=503), pinned)
+    accepts(
+        variant(
+            failed,
+            pinned,
             failure_code="unexpected_status",
             response_status=503,
             tls_leaf_certificate_sha256=pin,
         ),
         pinned,
+    )
+    # An oversized verdict needs size evidence above this policy's ceiling.
+    accepts(
+        variant(
+            failed,
+            unpinned,
+            failure_code="response_oversized",
+            response_status=200,
+            response_bytes=unpinned.max_response_bytes + 1,
+        ),
+        unpinned,
+    )
+    refuses(
+        variant(
+            failed,
+            unpinned,
+            failure_code="response_oversized",
+            response_status=200,
+            response_bytes=unpinned.max_response_bytes,
+        ),
+        unpinned,
     )
 
 

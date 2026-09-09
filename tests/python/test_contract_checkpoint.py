@@ -59,10 +59,10 @@ PARSERS: dict[str, Any] = {
 # the private producer byte-for-byte. This checkpoint extends around them and
 # must not move them; any change here is a compatibility event, not a fix.
 # Every schema and every golden fixture of those families is pinned. The one
-# declared compatibility event in this checkpoint is the chain state gaining
-# ``last_finalized_epoch`` (see docs/contract-checkpoint-v1.md); its schema and
-# fixture, and the probe-report fixture that carries a chain-state digest, are
-# pinned at their post-change bytes.
+# declared compatibility events in this checkpoint are the chain state gaining
+# ``last_finalized_epoch`` and the probe report's observations gaining
+# ``trust_policy_digest_sha256`` (see docs/contract-checkpoint-v1.md); their
+# schemas and fixtures are pinned at their post-change bytes.
 FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
     "schemas/active-assignment-manifest.v1.schema.json": (
         "9a4f4c1ebd5cf25c3ab7670579041c9b35093d5d3fc3fbd528bb13c38c4d4180"
@@ -80,7 +80,7 @@ FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
         "a32d5fd52081ca9442fa393d3449102f852a0ebb18bd515f322377c08235b328"
     ),
     "schemas/validator-probe-report.v1.schema.json": (
-        "29df0c5521ef1810339adf54e9197c522248921093d05b2e7540e7feb3f9da0b"
+        "4042b8cf307e8807e7a94b39ce22c6a3dfdb7fccf0ff92f84b6586970da222fe"
     ),
     "schemas/weight-plan.v1.schema.json": (
         "d4fa8861c0683a05796834952363498cbae8afd6c0a9c80b64ef3cf888445b53"
@@ -101,7 +101,7 @@ FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
         "9b6d1d70f09a1817df1acbe2c885493cd1a742ee3a0b5d0e95468e79eb5b8ce7"
     ),
     "fixtures/validator-probe-report.v1.json": (
-        "b726a5ed9a160097244f669353080d53a9186ad05ce132806a02f0acd2e4f924"
+        "b88d5b2fb7b0ed89fcec242de1d07d11bce811581f3542f95998c0192048592c"
     ),
     "fixtures/weight-plan.v1.json": (
         "c73297fd0c2ed35bcae2dec304d9e8e4c288d30f697026b3e43c143bc28a117c"
@@ -230,6 +230,7 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "genesis-with-history",
         "history-not-contiguous",
         "history-overclaimed",
+        "replica-facts-duplicate",
         "replicas-not-canonical",
         "retired-facts-forgotten",
         "self-digest-mismatch",
@@ -263,6 +264,8 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "submit-with-noncanonical-expected-attribution",
         "submit-with-observation-oversized-for-policy",
         "submit-with-observation-slower-than-policy-timeout",
+        "submit-with-observation-under-foreign-policy",
+        "submit-with-oversized-below-policy-ceiling",
         "submit-with-padded-terminal-count",
         "submit-with-pin-mismatch-under-unpinned-policy",
         "submit-with-positive-weight-below-min-attributions",

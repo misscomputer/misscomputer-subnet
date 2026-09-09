@@ -907,6 +907,11 @@
             }
           ],
           "title": "Tls Leaf Certificate Sha256"
+        },
+        "trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Trust Policy Digest Sha256",
+          "type": "string"
         }
       },
       "required": [
@@ -914,6 +919,7 @@
         "route_host",
         "challenge_path",
         "assignment_digest_sha256",
+        "trust_policy_digest_sha256",
         "probe_nonce",
         "latency_millis",
         "outcome",

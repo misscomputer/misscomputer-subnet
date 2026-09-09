@@ -5,21 +5,25 @@
       "description": "One explicit reset of a lineage's retired-fact memory.\n\nA boundary is the only way retired facts leave a lineage. It records the\nera it opened, the last capture accepted before it, how many retired\nfacts of each kind were dropped, and the digest of the lineage it was\ntaken from, so a consumer can see exactly where the never-reuse guarantee\nwas re-scoped and can never mistake one era for another.",
       "properties": {
         "dropped_assignment_nonces": {
+          "maximum": 131072,
           "minimum": 0,
           "title": "Dropped Assignment Nonces",
           "type": "integer"
         },
         "dropped_receipt_digests": {
+          "maximum": 131072,
           "minimum": 0,
           "title": "Dropped Receipt Digests",
           "type": "integer"
         },
         "dropped_replica_lineages": {
+          "maximum": 32768,
           "minimum": 0,
           "title": "Dropped Replica Lineages",
           "type": "integer"
         },
         "dropped_ticket_digests": {
+          "maximum": 131072,
           "minimum": 0,
           "title": "Dropped Ticket Digests",
           "type": "integer"
@@ -40,6 +44,18 @@
           "pattern": "^[0-9a-f]{64}$",
           "title": "Previous Lineage Digest Sha256",
           "type": "string"
+        },
+        "retained_for_snapshot_digest_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Retained For Snapshot Digest Sha256"
         }
       },
       "required": [
@@ -49,7 +65,8 @@
         "dropped_assignment_nonces",
         "dropped_ticket_digests",
         "dropped_receipt_digests",
-        "previous_lineage_digest_sha256"
+        "previous_lineage_digest_sha256",
+        "retained_for_snapshot_digest_sha256"
       ],
       "title": "LineageEraBoundary",
       "type": "object"
