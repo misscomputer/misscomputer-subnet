@@ -60,6 +60,7 @@ chain, randomness, or signing capability.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
 from typing import Final, Literal, NoReturn, Self, cast
 
@@ -136,6 +137,8 @@ SnapshotRejectionCode = Literal[
     "snapshot_generation_not_increasing",
     "snapshot_incarnation_rewritten",
     "snapshot_lineage_anchor_mismatch",
+    "snapshot_lineage_boundary_pending",
+    "snapshot_lineage_candidate_mismatch",
     "snapshot_lineage_gap",
     "snapshot_lineage_overflow",
     "snapshot_lineage_replay_mismatch",
@@ -680,7 +683,7 @@ class SnapshotLineage(StrictFrozenModel):
             if genesis:
                 raise ValueError("lineage_era_invalid")
             opened = [item.opened_after_snapshot_sequence for item in self.era_boundaries]
-            if opened != sorted(opened) or any(
+            if opened != sorted(set(opened)) or any(
                 not self.history_start_snapshot_sequence
                 <= value
                 <= cast(int, self.last_snapshot_sequence)
@@ -835,37 +838,12 @@ def advance_snapshot_lineage(
         _reject("snapshot_authority_mismatch")
     if lineage.network != snapshot.network or lineage.netuid != snapshot.netuid:
         _reject("snapshot_network_mismatch")
-    deployments_digest = digest([model_document(item) for item in snapshot.deployments])
-    if lineage.accepted_snapshot_count == 0:
-        if snapshot.snapshot_sequence != lineage.history_start_snapshot_sequence:
-            _reject("snapshot_lineage_gap")
-    else:
-        last_sequence = cast(int, lineage.last_snapshot_sequence)
-        last_revision = cast(int, lineage.last_state_revision)
-        last_captured = cast(int, lineage.last_captured_at_epoch)
-        last_height = cast(int, lineage.last_finalized_height)
-        last_epoch = cast(int, lineage.last_finalized_epoch)
-        if snapshot.snapshot_sequence <= last_sequence:
-            _reject("snapshot_sequence_not_increasing")
-        if snapshot.snapshot_sequence != last_sequence + 1:
-            _reject("snapshot_lineage_gap")
-        if snapshot.state_revision < last_revision:
-            _reject("snapshot_revision_rollback")
-        if snapshot.state_revision == last_revision and (
-            deployments_digest != lineage.last_deployments_digest_sha256
-        ):
-            _reject("snapshot_revision_content_divergence")
-        if snapshot.captured_at_epoch < last_captured:
-            _reject("snapshot_capture_rollback")
-        if snapshot.finalized_height < last_height:
-            _reject("snapshot_finalized_rollback")
-        if snapshot.finalized_height == last_height and (
-            snapshot.finalized_block_hash != lineage.last_finalized_block_hash
-            or snapshot.finalized_epoch != last_epoch
-        ):
-            _reject("snapshot_finalized_fork")
-        if snapshot.finalized_epoch < last_epoch:
-            _reject("snapshot_finalized_epoch_rollback")
+    deployments_digest = _verify_lineage_order(lineage, snapshot)
+    committed = _pending_candidate(lineage)
+    if committed is not None and committed != snapshot.snapshot_digest_sha256:
+        # The latest boundary was taken for one specific capture and dropped
+        # history on that basis; only that capture may follow it.
+        _reject("snapshot_lineage_candidate_mismatch")
     retained = {item.replica_id: item for item in lineage.replicas}
     used_nonces = set(lineage.used_assignment_nonces)
     used_tickets = set(lineage.used_ticket_digests)
@@ -927,6 +905,76 @@ def advance_snapshot_lineage(
     return SnapshotLineage.model_validate({**unsigned, "lineage_digest_sha256": digest(unsigned)})
 
 
+def _verify_lineage_order(lineage: SnapshotLineage, snapshot: ActiveAssignmentSnapshot) -> str:
+    """The transactional rules a capture must satisfy to follow ``lineage``.
+
+    Returns the canonical digest of the capture's deployments.
+    """
+
+    if lineage.central_authority_fingerprint_sha256 != (
+        snapshot.central_authority_fingerprint_sha256
+    ):
+        _reject("snapshot_authority_mismatch")
+    if lineage.network != snapshot.network or lineage.netuid != snapshot.netuid:
+        _reject("snapshot_network_mismatch")
+    deployments_digest = digest([model_document(item) for item in snapshot.deployments])
+    if lineage.accepted_snapshot_count == 0:
+        if snapshot.snapshot_sequence != lineage.history_start_snapshot_sequence:
+            _reject("snapshot_lineage_gap")
+        return deployments_digest
+    last_sequence = cast(int, lineage.last_snapshot_sequence)
+    last_revision = cast(int, lineage.last_state_revision)
+    last_captured = cast(int, lineage.last_captured_at_epoch)
+    last_height = cast(int, lineage.last_finalized_height)
+    last_epoch = cast(int, lineage.last_finalized_epoch)
+    if snapshot.snapshot_sequence <= last_sequence:
+        _reject("snapshot_sequence_not_increasing")
+    if snapshot.snapshot_sequence != last_sequence + 1:
+        _reject("snapshot_lineage_gap")
+    if snapshot.state_revision < last_revision:
+        _reject("snapshot_revision_rollback")
+    if snapshot.state_revision == last_revision and (
+        deployments_digest != lineage.last_deployments_digest_sha256
+    ):
+        _reject("snapshot_revision_content_divergence")
+    if snapshot.captured_at_epoch < last_captured:
+        _reject("snapshot_capture_rollback")
+    if snapshot.finalized_height < last_height:
+        _reject("snapshot_finalized_rollback")
+    if snapshot.finalized_height == last_height and (
+        snapshot.finalized_block_hash != lineage.last_finalized_block_hash
+        or snapshot.finalized_epoch != last_epoch
+    ):
+        _reject("snapshot_finalized_fork")
+    if snapshot.finalized_epoch < last_epoch:
+        _reject("snapshot_finalized_epoch_rollback")
+    return deployments_digest
+
+
+def _pending_candidate(lineage: SnapshotLineage) -> str | None:
+    """The capture digest the latest boundary was taken for, if no capture has followed it yet."""
+
+    if not lineage.era_boundaries or lineage.accepted_snapshot_count == 0:
+        return None
+    latest = lineage.era_boundaries[-1]
+    if latest.opened_after_snapshot_sequence != lineage.last_snapshot_sequence:
+        return None
+    return latest.retained_for_snapshot_digest_sha256
+
+
+def _boundary_pending(lineage: SnapshotLineage) -> bool:
+    """Whether the latest boundary has not yet been followed by an accepted capture."""
+
+    return (
+        bool(lineage.era_boundaries)
+        and lineage.accepted_snapshot_count > 0
+        and (
+            lineage.era_boundaries[-1].opened_after_snapshot_sequence
+            == lineage.last_snapshot_sequence
+        )
+    )
+
+
 def begin_snapshot_lineage_era(
     lineage: SnapshotLineage,
     *,
@@ -942,8 +990,14 @@ def begin_snapshot_lineage_era(
     cannot be accepted after a plain boundary (which keeps all active
     lineages), but is accepted after a boundary taken for it, because the
     retained set is then exactly what it continues and the capture itself never
-    exceeds the bound. The candidate must be the very next sequence
-    (``snapshot_lineage_gap``).
+    exceeds the bound. The candidate is validated as the next capture in full
+    (sequence, authority, revision, instants, finalized view) before anything
+    is dropped, and the commitment is enforced: only that exact capture may be
+    accepted next (``snapshot_lineage_candidate_mismatch``). One boundary per
+    accepted capture: a second boundary before any capture follows the first
+    is refused (``snapshot_lineage_boundary_pending``), so no boundary can hide
+    behind another and every boundary's ``opened_after_snapshot_sequence`` is
+    unique.
 
     This is the only operation that forgets. It is for a lineage that has hit
     ``snapshot_lineage_overflow`` (or that an operator must otherwise re-scope)
@@ -966,6 +1020,8 @@ def begin_snapshot_lineage_era(
         _reject("snapshot_lineage_gap")
     if lineage.era >= MAX_LINEAGE_ERAS:
         _reject("snapshot_lineage_overflow")
+    if _boundary_pending(lineage):
+        _reject("snapshot_lineage_boundary_pending")
     active = [
         item
         for item in lineage.replicas
@@ -974,13 +1030,7 @@ def begin_snapshot_lineage_era(
     candidate_digest: str | None = None
     if retain_for is not None:
         candidate = revalidate(retain_for, ActiveAssignmentSnapshot)
-        if candidate.snapshot_sequence != cast(int, lineage.last_snapshot_sequence) + 1:
-            _reject("snapshot_lineage_gap")
-        if (
-            candidate.central_authority_fingerprint_sha256
-            != lineage.central_authority_fingerprint_sha256
-        ):
-            _reject("snapshot_authority_mismatch")
+        _verify_lineage_order(lineage, candidate)
         continued = {
             replica.replica_id for item in candidate.deployments for replica in item.replicas
         }
@@ -1116,20 +1166,20 @@ def replay_snapshot_lineage(
     """
 
     current = revalidate(lineage, SnapshotLineage)
-    pending = sorted(
+    recorded_boundaries = sorted(
         (revalidate(item, LineageEraBoundary) for item in era_boundaries),
         key=lambda item: (item.opened_after_snapshot_sequence, item.era),
     )
-    already = len(current.era_boundaries)
-    pending = pending[already:]
-    upcoming = list(snapshots)
+    # Deques: replay is one pass with one-item lookahead, linear in the history.
+    pending = deque(recorded_boundaries[len(current.era_boundaries) :])
+    upcoming = deque(snapshots)
     while pending or upcoming:
         if (
             pending
             and current.accepted_snapshot_count > 0
             and pending[0].opened_after_snapshot_sequence == current.last_snapshot_sequence
         ):
-            recorded = pending.pop(0)
+            recorded = pending.popleft()
             candidate = upcoming[0] if upcoming else None
             retain: ActiveAssignmentSnapshot | None = None
             if recorded.retained_for_snapshot_digest_sha256 is not None:
@@ -1149,7 +1199,7 @@ def replay_snapshot_lineage(
             # cannot have produced them.
             _reject("snapshot_lineage_replay_mismatch")
         current = advance_snapshot_lineage(
-            current, upcoming.pop(0), max_facts=max_facts, max_replicas=max_replicas
+            current, upcoming.popleft(), max_facts=max_facts, max_replicas=max_replicas
         )
     return current
 

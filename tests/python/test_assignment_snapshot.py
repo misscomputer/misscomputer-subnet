@@ -1009,10 +1009,16 @@ def test_lineage_recovery_never_silently_resets_retired_fact_memory() -> None:
             ),
         )
     assert failure.value.code == "snapshot_incarnation_rewritten"
-    # Eras chain and are bounded.
-    era_three = begin_snapshot_lineage_era(era_two)
+    # Eras chain, one boundary per accepted capture, and are bounded.
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        begin_snapshot_lineage_era(era_two)
+    assert failure.value.code == "snapshot_lineage_boundary_pending"
+    era_two_followed = advance_snapshot_lineage(
+        era_two, build_snapshot([], snapshot_sequence=3, state_revision=9)
+    )
+    era_three = begin_snapshot_lineage_era(era_two_followed)
     assert [item.era for item in era_three.era_boundaries] == [2, 3]
-    assert era_three.previous_lineage_digest_sha256 == era_two.lineage_digest_sha256
+    assert era_three.previous_lineage_digest_sha256 == era_two_followed.lineage_digest_sha256
     forged = json.loads(snapshot_lineage_bytes(era_three))
     forged["era_boundaries"] = forged["era_boundaries"][:1]
     unsigned = {k: v for k, v in forged.items() if k != "lineage_digest_sha256"}
@@ -1079,15 +1085,31 @@ def test_era_boundary_prunes_only_inactive_lineage_and_eras_are_capped() -> None
     )
     assert len(returned.replicas) == 6 and returned.era == 2
 
-    # Era cap: era never exceeds MAX_LINEAGE_ERAS, so at most MAX - 1 boundaries.
+    # Era cap: era never exceeds MAX_LINEAGE_ERAS, so at most MAX - 1 boundaries,
+    # each separated from the next by at least one accepted capture.
     current = after_golden
-    for _ in range(MAX_LINEAGE_ERAS - 1):
+    for step in range(MAX_LINEAGE_ERAS - 1):
         current = begin_snapshot_lineage_era(current)
+        current = advance_snapshot_lineage(
+            current, build_snapshot([], snapshot_sequence=2 + step, state_revision=8 + step)
+        )
     assert current.era == MAX_LINEAGE_ERAS and len(current.era_boundaries) == MAX_LINEAGE_ERAS - 1
     with pytest.raises(AssignmentSnapshotError) as failure:
         begin_snapshot_lineage_era(current)
     assert failure.value.code == "snapshot_lineage_overflow"
     assert parse_snapshot_lineage(snapshot_lineage_bytes(current)) == current
+    replayed = replay_snapshot_lineage(
+        genesis,
+        [
+            golden,
+            *[
+                build_snapshot([], snapshot_sequence=2 + step, state_revision=8 + step)
+                for step in range(MAX_LINEAGE_ERAS - 1)
+            ],
+        ],
+        era_boundaries=current.era_boundaries,
+    )
+    assert replayed == current
 
 
 def test_signed_fact_freshness_is_judged_across_every_fact_role() -> None:
@@ -1548,6 +1570,108 @@ def test_replay_reproduces_recorded_era_boundaries() -> None:
         replay_snapshot_lineage(partial, [second, third], era_boundaries=live.era_boundaries)
         == live
     )
+
+
+def test_boundary_candidate_commitment_is_enforced_by_the_live_lineage() -> None:
+    """A boundary taken for one capture admits exactly that capture, and nothing else.
+
+    The boundary dropped history on the candidate's account, so the live
+    lineage refuses any other next capture (``snapshot_lineage_candidate_mismatch``),
+    refuses a second boundary while one is pending (``snapshot_lineage_boundary_pending``),
+    validates the candidate as the next capture before dropping anything, and
+    every accepted live history replays to itself.
+    """
+
+    golden = build_snapshot()
+    _, beta = fixture_deployments()
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    lineage = advance_snapshot_lineage(genesis, golden)
+    empty_two = build_snapshot([], snapshot_sequence=2, state_revision=8)
+    other_two = build_snapshot(
+        snapshot_sequence=2, state_revision=8, snapshot_deployments=[snapshot_deployment_from(beta)]
+    )
+    prepared = begin_snapshot_lineage_era(lineage, retain_for=empty_two)
+    assert prepared.replicas == []
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(prepared, other_two)
+    assert failure.value.code == "snapshot_lineage_candidate_mismatch"
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        begin_snapshot_lineage_era(prepared)
+    assert failure.value.code == "snapshot_lineage_boundary_pending"
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        begin_snapshot_lineage_era(prepared, retain_for=other_two)
+    assert failure.value.code == "snapshot_lineage_boundary_pending"
+    live = advance_snapshot_lineage(prepared, empty_two)
+    assert live.era == 2 and live.replicas == []
+    assert (
+        replay_snapshot_lineage(genesis, [golden, empty_two], era_boundaries=live.era_boundaries)
+        == live
+    )
+    # A plain boundary (no candidate) admits any valid next capture; once a
+    # capture followed it, a new boundary may open.
+    plain = begin_snapshot_lineage_era(lineage)
+    followed = advance_snapshot_lineage(plain, other_two)
+    assert followed.era == 2
+    assert begin_snapshot_lineage_era(followed).era == 3
+    # An invalid candidate is refused before any history is dropped, with the
+    # transition's own code.
+    for candidate, code in (
+        (build_snapshot(snapshot_sequence=2, state_revision=6), "snapshot_revision_rollback"),
+        (build_snapshot(snapshot_sequence=3, state_revision=8), "snapshot_lineage_gap"),
+        (build_snapshot(snapshot_sequence=1, state_revision=8), "snapshot_sequence_not_increasing"),
+        (
+            build_snapshot(snapshot_sequence=2, state_revision=8, captured_at_epoch=BASE_EPOCH - 1),
+            "snapshot_capture_rollback",
+        ),
+        (
+            build_snapshot(
+                snapshot_sequence=2, state_revision=8, finalized_block_hash=label_digest("fork")
+            ),
+            "snapshot_finalized_fork",
+        ),
+    ):
+        with pytest.raises(AssignmentSnapshotError) as failure:
+            begin_snapshot_lineage_era(lineage, retain_for=candidate)
+        assert failure.value.code == code, code
+    # The parser refuses two boundaries at one sequence.
+    document = json.loads(snapshot_lineage_bytes(followed))
+    boundary = document["era_boundaries"][0]
+    second = {
+        **boundary,
+        "era": 3,
+        "previous_lineage_digest_sha256": followed.lineage_digest_sha256,
+    }
+    document["era"] = 3
+    document["era_boundaries"] = [boundary, second]
+    unsigned = {k: v for k, v in document.items() if k != "lineage_digest_sha256"}
+    document["lineage_digest_sha256"] = canonical_digest(unsigned)
+    with pytest.raises(ValidationError, match="lineage_era_invalid"):
+        SnapshotLineage.model_validate(document)
+
+
+def test_replay_scales_linearly_with_the_retained_history() -> None:
+    golden = build_snapshot()
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+
+    def history(count: int) -> list[ActiveAssignmentSnapshot]:
+        return [
+            build_snapshot([], snapshot_sequence=index, state_revision=7 + index)
+            for index in range(1, count + 1)
+        ]
+
+    short, long = history(300), history(1_200)
+    replay_snapshot_lineage(genesis, short)  # warm
+    best_short = min(_timed(lambda: replay_snapshot_lineage(genesis, short)) for _ in range(2))
+    best_long = min(_timed(lambda: replay_snapshot_lineage(genesis, long)) for _ in range(2))
+    assert best_long < 7 * best_short, (best_short, best_long)
+    sequential = genesis
+    for snapshot in long:
+        sequential = advance_snapshot_lineage(sequential, snapshot)
+    assert replay_snapshot_lineage(genesis, long) == sequential
 
 
 def test_builder_never_trusts_a_supplied_projection_digest_or_order() -> None:

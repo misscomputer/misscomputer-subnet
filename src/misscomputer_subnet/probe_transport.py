@@ -218,6 +218,14 @@ class _SocketStream(httpcore.NetworkStream):
         return None
 
 
+#: Name resolutions that may be in flight at once, process-wide. ``getaddrinfo``
+#: cannot be cancelled, so a lookup that overruns its budget is abandoned on its
+#: helper thread; this bounds how many such threads can exist, and a request
+#: that finds no slot fails fast instead of queueing.
+MAX_OUTSTANDING_RESOLUTIONS = 16
+_RESOLUTION_SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING_RESOLUTIONS)
+
+
 class DeadlineNetworkBackend(httpcore.NetworkBackend):
     """The synchronous httpcore backend with every connection bounded by one budget.
 
@@ -227,8 +235,11 @@ class DeadlineNetworkBackend(httpcore.NetworkBackend):
     cannot be cancelled and involves no file descriptor, so abandoning it is
     safe), and each resolved address is dialled with the budget remaining at
     that instant, so three unreachable addresses cost one budget, not three.
-    ``resolver`` and ``dialer`` exist so both paths can be tested
-    deterministically.
+    Helper threads are drawn from a process-wide pool of
+    ``MAX_OUTSTANDING_RESOLUTIONS`` slots with no queue: while that many
+    lookups are still blocked, a new request fails fast with a connection
+    error rather than adding another thread. ``resolver``, ``dialer``, and
+    ``resolution_slots`` exist so every path can be tested deterministically.
     """
 
     def __init__(
@@ -237,15 +248,19 @@ class DeadlineNetworkBackend(httpcore.NetworkBackend):
         *,
         resolver: Resolver = _resolve_addresses,
         dialer: Dialer = _dial_address,
+        resolution_slots: threading.BoundedSemaphore | None = None,
     ) -> None:
         self._remaining = remaining
         self._resolver = resolver
         self._dialer = dialer
+        self._slots = resolution_slots or _RESOLUTION_SLOTS
 
     def _resolve_within_budget(self, host: str, port: int) -> list[ResolvedAddress]:
         remaining = self._remaining()
         if remaining <= 0.0:
             raise httpcore.ConnectTimeout("whole-request budget exhausted")
+        if not self._slots.acquire(blocking=False):
+            raise httpcore.ConnectError("resolver capacity exhausted")
         outcome: list[list[ResolvedAddress] | BaseException] = []
         done = threading.Event()
 
@@ -256,8 +271,15 @@ class DeadlineNetworkBackend(httpcore.NetworkBackend):
                 outcome.append(exc)
             finally:
                 done.set()
+                # The slot is held for as long as the lookup itself is alive,
+                # abandoned or not.
+                self._slots.release()
 
-        threading.Thread(target=resolve, name="misscomputer-probe-resolve", daemon=True).start()
+        try:
+            threading.Thread(target=resolve, name="misscomputer-probe-resolve", daemon=True).start()
+        except BaseException:
+            self._slots.release()
+            raise
         if not done.wait(timeout=remaining) or not outcome:
             raise httpcore.ConnectTimeout("name resolution exceeded the whole-request budget")
         result = outcome[0]

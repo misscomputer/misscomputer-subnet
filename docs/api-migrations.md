@@ -146,7 +146,12 @@ that owns name resolution, address dialling, the TLS handshake, and every
 socket read and write and bounds each by the time remaining in the budget:
 `getaddrinfo` runs on a helper thread that the caller waits on for exactly the
 remaining budget and then abandons (it cannot be cancelled and holds no file
-descriptor), each resolved address is dialled with the budget remaining at
+descriptor); helper threads come from a process-wide pool of
+`MAX_OUTSTANDING_RESOLUTIONS` (16) slots with no queue, so however many
+lookups are blocked at once, at most that many threads exist and a request
+that finds no free slot fails fast with a connection error instead of waiting
+(the slot is released when the lookup itself returns); each resolved address
+is dialled with the budget remaining at
 that instant so three unreachable addresses cost one budget rather than three,
 every `send` of a partial write re-derives the remaining budget, and every
 read is clamped the same way. A slow trickle anywhere in the request ends
@@ -254,7 +259,14 @@ on parse). History is anchored, contiguous, and era-scoped:
   **for that capture** (`retain_for=capture`): only the active lineages the
   capture continues are kept, the boundary records the capture's digest, and
   the capture is accepted next (it never exceeds the bound by itself). The
-  candidate must be the very next sequence and share the authority. The
+  candidate is validated as the next capture in full before anything is
+  dropped, the commitment is enforced by the live lineage (only that exact
+  capture may follow; `snapshot_lineage_candidate_mismatch`), and one boundary
+  per accepted capture is allowed (`snapshot_lineage_boundary_pending`), so a
+  prepared boundary can never be spent on a different capture and a boundary
+  can never hide behind another at the same sequence (the parser requires
+  strictly increasing `opened_after_snapshot_sequence`). Every live history is
+  therefore replayable to itself. The
   never-reuse guarantee is therefore exactly: no nonce, ticket digest, or
   receipt digest accepted since `history_start_snapshot_sequence` within the
   current `era` is ever accepted again in any role, and no incarnation kept
@@ -273,10 +285,14 @@ facts the live lineage legitimately accepted. Freshness checking is linear in
 the capture: the union of retained facts is built once and updated as facts
 are accepted (a scale guard in the suite fails on quadratic behaviour).
 
+Replay is linear in the history (one pass over deques with one-item
+lookahead; a scale guard in the suite covers it).
+
 New codes: `snapshot_generation_not_increasing`,
 `snapshot_incarnation_facts_reused`, `snapshot_lineage_gap`,
 `snapshot_lineage_overflow`, `snapshot_lineage_anchor_mismatch`,
-`snapshot_lineage_replay_mismatch`; parser codes `lineage_chain_link_missing`,
+`snapshot_lineage_replay_mismatch`, `snapshot_lineage_candidate_mismatch`,
+`snapshot_lineage_boundary_pending`; parser codes `lineage_chain_link_missing`,
 `lineage_history_not_contiguous`, `lineage_replica_seen_out_of_range`,
 `lineage_replica_facts_duplicate`, `lineage_used_facts_overlap`,
 `lineage_era_invalid`. A publisher
@@ -346,7 +362,7 @@ procedure that follows keeps every pairing inside the supported set.
 | `validator-weight-decision` v1 | **unsupported**: an old coordinator seals records without `trust_policies`; the new parser refuses them (digest mismatch) | **unsupported**: the new coordinator seals `trust_policies`; the old parser refuses them (`additionalProperties: false`) | no weight plan can be built from the refused record; the validator keeps its previous weights (abstain-equivalent) until the pairing is corrected |
 | `active-assignment-snapshot` v1 | **conditionally supported**: every capture an old runtime could emit that satisfied the old rules is accepted by the new publisher *except* captures that rewrite a retained incarnation or recycle retired facts (`snapshot_incarnation_rewritten`, `snapshot_generation_not_increasing`, `snapshot_incarnation_facts_reused`), which the old rules never tested; the new publisher refuses those and stops publishing | **unsupported once the new runtime uses the tolerance**: a capture whose ticket is stamped after activation within the 30s tolerance is refused by an old publisher (`replica_activation_order_invalid`); the old publisher stops publishing | the publisher fails closed; the last manifest reaches its effective horizon and every validator abstains (`manifest_expired_at_close`); no miner is zeroed, no weight moves |
 | `active-assignment-snapshot-lineage` v1 | n/a (new; publisher-local) | n/a | none |
-| `validator-probe-report` v1 | **conditionally supported**: an old CLI's transport can report a response-derived observation whose whole-request latency exceeds the policy budget (headers late or trickled inside every per-operation timeout), and an old CLI crashes on a wire status outside `100..599` instead of reporting a transport fault; the new coordinator refuses the over-budget round (`decision_round_policy_rejected`) and the new parser the record (`report_policy_rejected`); every other old report is accepted unchanged | supported: report bytes are unchanged and the new CLI emits only observations the old coordinator also accepted | a refused round is dropped from the window by the coordinator's own input handling before sealing; if the coordinator does not drop it, the window is refused and the validator abstains; no wrong weight is produced |
+| `validator-probe-report` v1 | **unsupported**: an old CLI's observations lack `trust_policy_digest_sha256`, so the new report parser refuses the report (digest and required field) before any round can be considered | **unsupported**: a new CLI's observations carry `trust_policy_digest_sha256`, which an old parser refuses (`additionalProperties: false`) | the coordinator holds no admissible reports from the mismatched CLIs for that window and abstains (`rounds_insufficient`/`coverage_insufficient`); no wrong weight is produced |
 | `active-assignment-snapshot` sequence numbering | **conditionally supported**: a legacy runtime that skipped sequence values (allowed by the base contract) produces `snapshot_lineage_gap` at the skip; preflight with `snapshot_history_gaps` and start the lineage after the last skip | supported: contiguous sequences are strictly increasing | the publisher refuses the capture after the skip until the lineage is restarted at the documented late start; validators abstain after the horizon meanwhile |
 | manifests, envelopes, trust policy, pointer, weight plan | supported (bytes unchanged) | supported (bytes unchanged) | none |
 
@@ -383,18 +399,22 @@ by tolerance:
    visible to every reader (it keeps only the incarnations of the last
    accepted capture). Never downgrade the publisher to make a lineage refusal
    disappear. Do not upgrade the runtime before the publisher.
-3. **Validators (probe CLI) and coordinator.** Upgrade every probe CLI before
-   the coordinator that consumes their reports: an old CLI can still report a
-   response-derived observation beyond the whole-request budget, and the new
-   coordinator refuses that round. Report bytes are unchanged, so a new CLI's
-   reports are accepted by an old coordinator, and validators may upgrade in
-   any order among themselves.
+3. **Probe CLIs and coordinator (report pair).** Reports are a writer/reader
+   pair with no compatible direction, so they are cut over together inside the
+   same coordinator pause: stop the coordinator at a window boundary, upgrade
+   every probe CLI that feeds it and the coordinator itself, then restart the
+   coordinator at the next window boundary. Reports sealed by old CLIs during
+   the pause are not admissible under the new coordinator and are archived
+   only; reports sealed by new CLIs before the coordinator restarts would be
+   refused by an old coordinator, which is why the CLIs never lead. A
+   validator operating its own coordinator upgrades both binaries in one step.
 
 Rollback is **writers first**, and for snapshots it is not a binary swap:
 
-- Coordinator: stop it at a window boundary, downgrade coordinator and its
-  consumers together, restart. Records sealed by the new coordinator stay in
-  the archive and are readable only by the new parser (below).
+- Coordinator and probe CLIs: stop the coordinator at a window boundary,
+  downgrade every probe CLI, the coordinator, and its consumers together,
+  restart. Records sealed by the new coordinator, and reports sealed by new
+  CLIs, stay in the archive and are readable only by the new parsers (below).
 - Runtime and publisher: downgrading the runtime binary does not drain or
   rewrite the assignments it already issued; every active incarnation whose
   ticket was stamped after its activation within the +1..+30s tolerance stays
@@ -413,11 +433,14 @@ Rollback is **writers first**, and for snapshots it is not a binary swap:
 - Never roll back a reader while a writer of the new form is running.
 
 Archive readers: base readers refuse every decision that carries
-`trust_policies`, and new readers refuse every decision without it. Any
-archive that spans the upgrade therefore needs either a dual-version reader
-(dispatch on the presence of `trust_policies` to the matching parser, never a
-lenient one) or segregated archives per form; a single-version reader over a
-mixed archive is unsupported.
+`trust_policies` and every report whose observations carry
+`trust_policy_digest_sha256`; new readers refuse every decision and report
+without them. Any archive that spans the upgrade therefore needs either a
+dual-version reader (dispatch on the presence of those fields to the matching
+parser, never a lenient one) or segregated archives per form; a single-version
+reader over a mixed archive is unsupported. This release ships no
+compatibility reader: the field is required in both directions so that no
+reader ever admits an observation whose judging policy is unknown.
 
 Retention and reprocessing:
 

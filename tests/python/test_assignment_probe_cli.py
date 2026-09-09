@@ -1379,6 +1379,56 @@ def test_probe_transport_module_is_bounded_network_plumbing_only() -> None:
     assert "import socket" not in cli_source and "import httpcore" not in cli_source
 
 
+def test_blocked_name_resolutions_cannot_exceed_the_process_wide_slot_cap() -> None:
+    """Permanently blocked lookups hold at most the slot cap in threads; the rest fail fast.
+
+    ``getaddrinfo`` cannot be cancelled, so each overrun is abandoned on its
+    helper thread; the slots bound how many such threads can exist at once,
+    there is no queue, and a lookup that finds no free slot fails immediately
+    with a connection error rather than a full budget wait.
+    """
+
+    release = threading.Event()
+
+    def blocked(host: str, port: int) -> list[probe_transport.ResolvedAddress]:
+        release.wait()
+        return []
+
+    slots = threading.BoundedSemaphore(4)
+    prefix = "misscomputer-probe-resolve"
+    before = sum(1 for thread in threading.enumerate() if thread.name.startswith(prefix))
+    outcomes: list[tuple[str, float]] = []
+    try:
+        for _ in range(40):
+            backend = probe_transport.DeadlineNetworkBackend(
+                lambda: 0.02, resolver=blocked, resolution_slots=slots
+            )
+            started = time.monotonic()
+            try:
+                backend.connect_tcp("blocked.invalid", 1, timeout=0.02)
+            except httpcore.ConnectTimeout:
+                outcomes.append(("timeout", time.monotonic() - started))
+            except httpcore.ConnectError:
+                outcomes.append(("capacity", time.monotonic() - started))
+        live = sum(1 for thread in threading.enumerate() if thread.name.startswith(prefix)) - before
+        assert live <= 4, live
+        assert [kind for kind, _ in outcomes[:4]] == ["timeout"] * 4
+        assert {kind for kind, _ in outcomes[4:]} == {"capacity"}
+        assert all(elapsed < 0.01 for kind, elapsed in outcomes if kind == "capacity")
+        assert probe_transport.MAX_OUTSTANDING_RESOLUTIONS == 16
+    finally:
+        release.set()
+    time.sleep(0.05)
+    # Released lookups return their slots: new lookups get threads again.
+    done = probe_transport.DeadlineNetworkBackend(
+        lambda: 1.0,
+        resolver=lambda host, port: [(socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", 1))],
+        resolution_slots=slots,
+    )
+    with pytest.raises(httpcore.ConnectError, match="refused|Connection"):
+        done.connect_tcp("released.invalid", 1, timeout=1.0)
+
+
 def test_probe_requires_the_finalized_height_and_refuses_expired_leases(
     tmp_path: Path, tls_server: TLSFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
