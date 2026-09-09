@@ -76,7 +76,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "Durable, append-only memory of every capture a publisher has accepted.\n\nThe lineage carries the transactional position of the last accepted\ncapture (so the succession rules hold across every capture, not only\nbetween two adjacent ones) and, for every ``replica_id`` ever exported,\nthe latest incarnation accepted for it, including incarnations that later\ncaptures dropped. A publisher advances it with every capture it accepts\nand persists the result; an incarnation that disappears from a capture and\nreappears later is still held to the facts first accepted for it.",
+  "description": "Durable, append-only memory of every capture a publisher has accepted.\n\nThe lineage carries the transactional position of the last accepted\ncapture (so the succession rules hold across every capture, not only\nbetween two adjacent ones); for every ``replica_id`` ever exported, the\nlatest incarnation accepted for it, including incarnations that later\ncaptures dropped; and every assignment nonce, ticket digest, and receipt\ndigest ever accepted for any incarnation of any replica, so a fact retired\nby one replacement can never be recycled by a later one. A publisher\nadvances it with every capture it accepts and persists the result; an\nincarnation that disappears from a capture and reappears later is still\nheld to the facts first accepted for it.",
   "properties": {
     "accepted_snapshot_count": {
       "minimum": 0,
@@ -226,6 +226,33 @@
       "const": 1,
       "title": "Schema Version",
       "type": "integer"
+    },
+    "used_assignment_nonces": {
+      "items": {
+        "pattern": "^[0-9a-f]{32}$",
+        "type": "string"
+      },
+      "maxItems": 131072,
+      "title": "Used Assignment Nonces",
+      "type": "array"
+    },
+    "used_receipt_digests": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "maxItems": 131072,
+      "title": "Used Receipt Digests",
+      "type": "array"
+    },
+    "used_ticket_digests": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "maxItems": 131072,
+      "title": "Used Ticket Digests",
+      "type": "array"
     }
   },
   "required": [
@@ -245,6 +272,9 @@
     "last_snapshot_digest_sha256",
     "last_deployments_digest_sha256",
     "replicas",
+    "used_assignment_nonces",
+    "used_ticket_digests",
+    "used_receipt_digests",
     "lineage_digest_sha256"
   ],
   "title": "SnapshotLineage",

@@ -167,6 +167,20 @@ def test_lineage_fixture_is_the_two_capture_history_of_the_snapshot_goldens() ->
     assert lineage.last_snapshot_digest_sha256 == successor.snapshot_digest_sha256
     assert lineage.last_snapshot_sequence == successor.snapshot_sequence
     assert {item.generation for item in lineage.replicas} == {2}
+    # Both generations' facts are remembered: six retired plus six current.
+    assert len(lineage.used_assignment_nonces) == 12
+    assert len(lineage.used_ticket_digests) == 12 and len(lineage.used_receipt_digests) == 12
+    assert all(
+        item.assignment_nonce in lineage.used_assignment_nonces
+        and item.ticket_digest_sha256 in lineage.used_ticket_digests
+        and item.receipt_digest_sha256 in lineage.used_receipt_digests
+        for item in lineage.replicas
+    )
+    assert all(
+        replica.assignment_nonce in lineage.used_assignment_nonces
+        for item in golden.deployments
+        for replica in item.replicas
+    )
     assert [item.replica_id for item in lineage.replicas] == sorted(
         replica.replica_id for item in golden.deployments for replica in item.replicas
     )
@@ -205,8 +219,10 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
     "active-assignment-snapshot-lineage": {
         "genesis-with-history",
         "replicas-not-canonical",
+        "retired-facts-forgotten",
         "self-digest-mismatch",
         "unknown-field",
+        "used-facts-not-canonical",
     },
     "assignment-manifest-latest-pointer": {
         "genesis-with-previous-link",
@@ -233,6 +249,7 @@ EXPECTED_NEGATIVE_CASES: dict[str, set[str]] = {
         "submit-with-mass-drop",
         "submit-with-noncanonical-expected-attribution",
         "submit-with-observation-oversized-for-policy",
+        "submit-with-observation-slower-than-policy-timeout",
         "submit-with-padded-terminal-count",
         "submit-with-positive-weight-below-min-attributions",
         "submit-with-positive-weight-without-attributions",

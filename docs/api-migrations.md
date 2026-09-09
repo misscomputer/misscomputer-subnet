@@ -14,7 +14,8 @@ checkpoint now carries two), one new publisher-local contract
 than its verification's), and one semantic relaxation plus one semantic
 tightening of `active-assignment-snapshot` v1 invariants that change no schema
 or golden bytes. No other contract, fixture, Go API, or CLI changes. The
-upgrade order and rollback rules are at the end of this section.
+supported mixed-version pairings, the coordinated pause that keeps operation
+inside them, rollback order, and retention are at the end of this section.
 
 ### `validator-weight-decision` v1 gains `trust_policies` (compatibility event; breaking `decide_weight_submission`)
 
@@ -54,9 +55,10 @@ policy document:
   policy valid at the instant; the manifest inside the policy interval and
   lifetime; future skew; staleness), and every observation must satisfy
   `assignment_probe.verify_observation_policy_binding(observation, policy)`
-  (a pinned certificate when the policy pins, `response_bytes` within
-  `max_response_bytes`, judged on the outcomes and failure codes that could
-  only follow those checks). Producer codes:
+  (every response-derived outcome inside the policy's whole-request budget,
+  `latency_millis <= probe_timeout_millis`; a pinned certificate when the
+  policy pins; `response_bytes` within `max_response_bytes`; each judged on the
+  outcomes and failure codes that could only follow that check). Producer codes:
   `decision_round_policy_rejected`, `decision_terminal_policy_rejected`; parser
   codes: `report_policy_rejected`, `terminal_policy_rejected`. Signatures,
   block leases, and the effective horizon are not re-derived: the first two
@@ -101,9 +103,9 @@ refuses an `evaluation_epoch` other than the verification's
 manifest's `trust_policy_digest_sha256` (`trust_policy_mismatch`), and any
 observation that `evaluate_probe_response` could not have produced under that
 policy (`observation_policy_violation`, new `ProbeRejectionCode`): responses
-judged under a same-authority policy without certificate pins or with a larger
-body ceiling cannot be relabelled as serving under the pinned policy that
-verified the manifest. A report can therefore never claim an evaluation
+judged under a same-authority policy with a longer request budget, without
+certificate pins, or with a larger body ceiling cannot be relabelled as serving
+under the stricter policy that verified the manifest. A report can therefore never claim an evaluation
 instant, a clock skew, or a serving verdict that its verification did not
 admit. The `misscomputer-assignment-probe` CLI already passes the same epoch
 and policy to every call and is unaffected.
@@ -118,13 +120,20 @@ successor), and negative fixtures under `contracts/negative/`. The lineage is
 the durable form of snapshot succession: it carries the last accepted
 capture's transactional position and the latest accepted incarnation of every
 `replica_id` ever exported (generation, nonce, endpoint, ticket and receipt
-digests, replica-document digest, ticket-bound deployment-facts digest). New
-codes: `snapshot_generation_not_increasing` (a replacement must advance the
-generation), `snapshot_replacement_facts_reused` (a replacement must carry a
-fresh nonce, ticket digest, and receipt digest), `snapshot_lineage_overflow`
-(more than `MAX_LINEAGE_REPLICAS` distinct `replica_id`s; re-anchor). A
-publisher persists the lineage beside its manifest chain state and advances it
-with every accepted capture. There is no Go counterpart.
+digests, replica-document digest, ticket-bound deployment-facts digest) and
+every assignment nonce, ticket digest, and receipt digest ever accepted for
+any incarnation (`used_assignment_nonces`, `used_ticket_digests`,
+`used_receipt_digests`, sorted and unique; the current incarnations' facts are
+among them, `lineage_used_facts_not_canonical`/`lineage_used_facts_not_derived`
+on parse). New codes: `snapshot_generation_not_increasing` (a replacement must
+advance the generation), `snapshot_incarnation_facts_reused` (a new
+incarnation must carry a nonce, ticket digest, and receipt digest no
+incarnation of any replica ever carried, however many replacements or captures
+ago, so A → B → A cannot recycle A's first facts), `snapshot_lineage_overflow`
+(more than `MAX_LINEAGE_REPLICAS` distinct `replica_id`s or
+`MAX_LINEAGE_FACTS` retained facts; re-anchor). A publisher persists the
+lineage beside its manifest chain state and advances it with every accepted
+capture. There is no Go counterpart.
 
 ### `active-assignment-snapshot` v1: incarnation immutability across captures (semantics only)
 
@@ -133,13 +142,14 @@ from genesis over the two captures, and therefore adds
 `snapshot_incarnation_rewritten` (a retained `endpoint_id` must carry the
 identical replica document and identical ticket-bound deployment facts:
 image digest, challenge digest, workload spec, campaign, build, route),
-`snapshot_generation_not_increasing`, and `snapshot_replacement_facts_reused`.
+`snapshot_generation_not_increasing`, and `snapshot_incarnation_facts_reused`.
 A signed ticket binds its own issuance and its assignment, so a retained ticket
 digest with a restamped `ticket_issued_at_epoch`, a moved
 `route_activated_at_epoch`, a changed parent fact, or a replacement that keeps
 the generation, nonce, ticket, or receipt is an impossible rewrite, not a
 re-assignment. The two-capture form cannot see an incarnation dropped by one
-capture and rewritten by a later one; the persisted lineage can. Schema and
+capture and rewritten by a later one, nor a fact retired two or more
+replacements ago; the persisted lineage can. Schema and
 golden bytes are unchanged. There is no Go counterpart: succession is a
 publisher-side rule and `pkg/assignment` has no succession API.
 
@@ -174,43 +184,84 @@ beside the other rollback and fork codes in both the pre-request rejection
 list and the fork/rollback/equivocation response procedure; the retention and
 escalation steps are unchanged and apply to it.
 
-### Upgrade order, rollback, and retention
+### Mixed-version operation, coordinated upgrade, rollback, and retention
 
-New-form documents are not downgrade compatible in place: an old
-`validator-weight-decision` parser refuses a record carrying `trust_policies`
-(`additionalProperties: false`), an old snapshot consumer refuses a capture
-whose ticket is stamped after activation within the new tolerance
-(`replica_activation_order_invalid`), and no old consumer knows the lineage
-document. Conversely the new decision parser refuses every old-form record
-(digest mismatch) and the new snapshot rules refuse captures an old publisher
-would have accepted (rewritten incarnations). Roll out accordingly:
+This release is **not** transparently mixed-version compatible for two of its
+contracts, and the checkpoint's own fail-closed rules turn an incompatible
+pairing into a publication or decision stop, never into a wrong weight. The
+matrix below states exactly which writer/reader pairings are supported; the
+procedure that follows keeps every pairing inside the supported set.
 
-1. **Consumers first, writers last.** Upgrade every reader of a contract
-   before any writer of it: decision parsers and the weight-plan builder
-   before the coordinator that seals decisions; snapshot consumers (the
-   publisher's derivation and succession checks, and every validator that
-   cross-references captures) before the runtime that exports captures. The
-   new consumers accept everything the old writers produce that was valid
-   under the old rules, except old-form decision records, which are re-sealed
-   (below).
-2. **Rollback writers first.** To roll back, stop or downgrade the writer
-   before any consumer, so that no new-form document reaches a downgraded
-   reader. Documents already produced in the new form stay in the archive and
-   are not rewritten.
-3. **Retention and reprocessing.** Retain every sealed decision, capture,
-   report, and lineage as produced; never rewrite an archived document. A
-   decision sealed before this release does not parse under the new rules and
-   is reprocessed by re-running `decide_weight_submission` over its retained
-   rounds, terminal observation, registered set, and the approved trust-policy
-   documents; the re-sealed record carries a new digest and is archived beside
-   the original. A publisher adopting the lineage starts it from genesis at
-   the first capture it accepts after the upgrade (or replays its retained
-   captures in order); captures accepted before that are outside the lineage's
-   memory and are documented as such.
-4. **No mixed windows.** A coordinator seals a scoring window entirely under
-   one code version; a window whose rounds were verified by old and new
-   probe-report builders is still valid input, because report bytes are
-   unchanged, but the decision is sealed only by the new coordinator.
+| Contract | Old writer → new reader | New writer → old reader | Consequence of an unsupported pairing |
+| --- | --- | --- | --- |
+| `validator-weight-decision` v1 | **unsupported**: an old coordinator seals records without `trust_policies`; the new parser refuses them (digest mismatch) | **unsupported**: the new coordinator seals `trust_policies`; the old parser refuses them (`additionalProperties: false`) | no weight plan can be built from the refused record; the validator keeps its previous weights (abstain-equivalent) until the pairing is corrected |
+| `active-assignment-snapshot` v1 | **conditionally supported**: every capture an old runtime could emit that satisfied the old rules is accepted by the new publisher *except* captures that rewrite a retained incarnation or recycle retired facts (`snapshot_incarnation_rewritten`, `snapshot_generation_not_increasing`, `snapshot_incarnation_facts_reused`), which the old rules never tested; the new publisher refuses those and stops publishing | **unsupported once the new runtime uses the tolerance**: a capture whose ticket is stamped after activation within the 30s tolerance is refused by an old publisher (`replica_activation_order_invalid`); the old publisher stops publishing | the publisher fails closed; the last manifest reaches its effective horizon and every validator abstains (`manifest_expired_at_close`); no miner is zeroed, no weight moves |
+| `active-assignment-snapshot-lineage` v1 | n/a (new; publisher-local) | n/a | none |
+| `validator-probe-report` v1, manifests, envelopes, trust policy, pointer, weight plan | supported (bytes unchanged) | supported (bytes unchanged) | none |
+
+There is no compatibility reader: neither parser accepts the other form, by
+design (`additionalProperties: false`, self digests). Mixed-version operation
+is therefore made safe by a **coordinated pause** per writer/reader pair, not
+by tolerance:
+
+1. **Decision pair (coordinator and every consumer of its records).** Pause
+   the coordinator at a scoring-window boundary: let the current window close
+   and its record be sealed and consumed under the *old* code, then stop the
+   coordinator. Upgrade the decision consumers (parser, weight-plan builder,
+   archive readers) and the coordinator together, and restart the coordinator
+   at the next window boundary with its approved trust-policy documents. No
+   window is sealed by one version and consumed by the other. The pause costs
+   at most one window of weight submission; the chain keeps the previous
+   weights meanwhile, which is the abstain outcome and is safe. A pause longer
+   than the window is not an outage of the network, only of this validator's
+   weight updates.
+2. **Snapshot pair (runtime and publisher).** Upgrade the publisher first (it
+   accepts everything a correct old runtime emits), then the runtime, within
+   one manifest lifetime so the publisher never sits idle past the effective
+   horizon. If the new publisher refuses an old runtime's capture with a
+   lineage code, the runtime state is genuinely inconsistent (a rewritten
+   incarnation): keep the refusal, re-anchor the lineage only after the
+   runtime's assignments have been repaired, and expect validators to abstain
+   until publication resumes. Never downgrade the publisher to make a lineage
+   refusal disappear. Do not upgrade the runtime before the publisher.
+3. **Validators.** Report bytes are unchanged, so old and new probe CLIs
+   interoperate; a new coordinator consumes reports from either. Upgrade
+   validators in any order.
+
+Rollback is the mirror image, **writers first**: stop the coordinator at a
+window boundary, downgrade coordinator and consumers together, restart; for
+snapshots, downgrade the runtime first (so no tolerance-stamped capture reaches
+an old publisher), then the publisher. Never roll back a reader while a writer
+of the new form is running.
+
+Retention and reprocessing:
+
+- Retain every sealed decision, capture, report, trust policy, and lineage as
+  produced; never rewrite an archived document. Old-form and new-form
+  decisions coexist in the archive and are told apart by the presence of
+  `trust_policies`.
+- A decision sealed before this release does not parse under the new rules. If
+  a new consumer needs it, reprocess by re-running `decide_weight_submission`
+  over its retained rounds, terminal observation, registered set, and the
+  approved trust-policy documents in force at the time; archive the re-sealed
+  record beside the original with its new digest. Reprocessing is offline and
+  optional: live weight submission never depends on a past record.
+- A publisher adopting the lineage starts it from genesis at the first capture
+  it accepts after the upgrade, or replays its retained captures in order
+  through `advance_snapshot_lineage` to seed the lineage with every fact they
+  carried (recommended, so retired facts from before the upgrade are also
+  protected). Captures accepted before the lineage's first entry and not
+  replayed are outside its memory; record the seed point in the operator log.
+- A lineage past `MAX_LINEAGE_REPLICAS` or `MAX_LINEAGE_FACTS` refuses every
+  capture (`snapshot_lineage_overflow`); the operator re-anchors it from
+  genesis over the current capture and records the re-anchor.
+
+Outage prevention checklist: pause the coordinator only at a window boundary;
+finish each writer/reader pair within one manifest lifetime; verify the
+publisher accepts the runtime's first post-upgrade capture before the previous
+manifest's effective horizon; keep the old binaries available for the
+writers-first rollback; and treat any `manifest_expired_at_close` abstention
+during the window as the intended safe outcome, not as data loss.
 
 ## Contract checkpoint v1
 

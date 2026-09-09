@@ -37,6 +37,7 @@ from misscomputer_subnet.assignment_snapshot import (
     ActiveAssignmentSnapshot,
     AssignmentSnapshotError,
     SnapshotDeployment,
+    SnapshotLineage,
     SnapshotReplica,
     active_assignment_snapshot_bytes,
     advance_snapshot_lineage,
@@ -49,6 +50,7 @@ from misscomputer_subnet.assignment_snapshot import (
     verify_manifest_derived_from_snapshot,
     verify_snapshot_succession,
 )
+from misscomputer_subnet.contract_codec import digest as canonical_digest
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "contracts" / "fixtures"
@@ -543,7 +545,7 @@ def test_incarnation_lineage_refuses_every_rewrite_and_reuse() -> None:
 
     # g1 -> g2 keeping nonce, ticket, and receipt: a replacement without fresh facts.
     rejects(
-        "snapshot_replacement_facts_reused",
+        "snapshot_incarnation_facts_reused",
         _alpha_with(
             {
                 "generation": 2,
@@ -571,7 +573,7 @@ def test_incarnation_lineage_refuses_every_rewrite_and_reuse() -> None:
         {"ticket_digest_sha256": label_digest("fresh-ticket")},
     ):
         rejects(
-            "snapshot_replacement_facts_reused",
+            "snapshot_incarnation_facts_reused",
             _alpha_with(
                 {
                     "generation": 2,
@@ -656,6 +658,177 @@ def test_incarnation_lineage_refuses_every_rewrite_and_reuse() -> None:
             genesis, build_snapshot(central_authority=label_digest("other-authority"))
         )
     assert failure.value.code == "snapshot_authority_mismatch"
+
+
+def _reincarnation(
+    template: SnapshotDeployment, facts_from: SnapshotDeployment, *, generation: int
+) -> SnapshotDeployment:
+    """``template`` re-exported at ``generation`` with the signed facts of ``facts_from``."""
+
+    replicas = []
+    for current, old in zip(template.replicas, facts_from.replicas, strict=True):
+        replicas.append(
+            SnapshotReplica.model_validate(
+                {
+                    **current.model_dump(mode="json"),
+                    "generation": generation,
+                    "assignment_nonce": old.assignment_nonce,
+                    "ticket_digest_sha256": old.ticket_digest_sha256,
+                    "receipt_digest_sha256": old.receipt_digest_sha256,
+                    "endpoint_id": f"{old.replica_id}-g{generation}-{old.assignment_nonce}",
+                }
+            ).model_dump(mode="json")
+        )
+    return SnapshotDeployment.model_validate(
+        {**template.model_dump(mode="json"), "replicas": replicas}
+    )
+
+
+def test_retired_incarnation_facts_are_never_recycled() -> None:
+    """A -> B -> A: facts retired by one replacement cannot return at a later generation.
+
+    The lineage remembers every nonce, ticket digest, and receipt digest it has
+    ever accepted, not only the latest incarnation per ``replica_id``, so a
+    third-generation incarnation that recycles the first generation's facts
+    is refused after any number of intervening captures, empty or not, while a
+    third generation with fresh facts is accepted. Partial recycling (one fact
+    only) and recycling another replica's facts are refused the same way.
+    """
+
+    golden = build_snapshot()
+    alpha, beta = fixture_deployments()
+    a1 = snapshot_deployment_from(alpha)
+    b2 = snapshot_deployment_from(
+        alpha, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 1
+    )
+    second = _capture(2, b2)
+    genesis = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    lineage = advance_snapshot_lineage(advance_snapshot_lineage(genesis, golden), second)
+    assert len(lineage.used_assignment_nonces) == 9
+    assert len(lineage.used_ticket_digests) == 9 and len(lineage.used_receipt_digests) == 9
+    a1_facts = {
+        (r.assignment_nonce, r.ticket_digest_sha256, r.receipt_digest_sha256) for r in a1.replicas
+    }
+    assert all(nonce in lineage.used_assignment_nonces for nonce, _, _ in a1_facts)
+    assert {
+        item.generation for item in lineage.replicas if item.deployment_id == "fixture-alpha"
+    } == {2}
+
+    recycled = _capture(3, _reincarnation(b2, a1, generation=3))
+    assert {
+        (r.assignment_nonce, r.ticket_digest_sha256, r.receipt_digest_sha256)
+        for r in recycled.deployments[0].replicas
+    } == a1_facts
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(lineage, recycled)
+    assert failure.value.code == "snapshot_incarnation_facts_reused"
+    # An empty capture in between changes nothing: the facts stay retired.
+    after_empty = advance_snapshot_lineage(
+        lineage, build_snapshot([], snapshot_sequence=3, state_revision=9)
+    )
+    assert after_empty.used_assignment_nonces == lineage.used_assignment_nonces
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(after_empty, _capture(4, _reincarnation(b2, a1, generation=3)))
+    assert failure.value.code == "snapshot_incarnation_facts_reused"
+    # The two-capture form cannot know what B replaced; only the durable lineage can.
+    verify_snapshot_succession(second, recycled)
+
+    # Partial recycling of a single retired fact is refused too.
+    fresh = snapshot_deployment_from(
+        alpha, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 2
+    )
+    for changes in (
+        {"assignment_nonce": a1.replicas[0].assignment_nonce},
+        {"ticket_digest_sha256": a1.replicas[0].ticket_digest_sha256},
+        {"receipt_digest_sha256": a1.replicas[0].receipt_digest_sha256},
+    ):
+        first = fresh.replicas[0].model_dump(mode="json")
+        first = {**first, **changes, "generation": 3}
+        first["endpoint_id"] = f"{first['replica_id']}-g3-{first['assignment_nonce']}"
+        partial = SnapshotDeployment.model_validate(
+            {
+                **fresh.model_dump(mode="json"),
+                "replicas": [
+                    SnapshotReplica.model_validate(first).model_dump(mode="json"),
+                    *[
+                        SnapshotReplica.model_validate(
+                            {**r.model_dump(mode="json"), "generation": 3}
+                            | {"endpoint_id": f"{r.replica_id}-g3-{r.assignment_nonce}"}
+                        ).model_dump(mode="json")
+                        for r in fresh.replicas[1:]
+                    ],
+                ],
+            }
+        )
+        with pytest.raises(AssignmentSnapshotError) as failure:
+            advance_snapshot_lineage(lineage, _capture(3, partial))
+        assert failure.value.code == "snapshot_incarnation_facts_reused", changes
+    # Recycling another replica's retired ticket under a brand-new replica_id is refused.
+    beta_lifted = snapshot_deployment_from(beta)
+    stolen = SnapshotDeployment.model_validate(
+        {
+            **beta_lifted.model_dump(mode="json"),
+            "deployment_id": "fixture-gamma",
+            "route_host": "fixture-gamma.mock.local",
+            "replicas": [
+                SnapshotReplica.model_validate(
+                    {
+                        **beta_lifted.replicas[0].model_dump(mode="json"),
+                        "replica_id": f"fixture-gamma-{beta_lifted.replicas[0].miner_hotkey}",
+                        "endpoint_id": (
+                            f"fixture-gamma-{beta_lifted.replicas[0].miner_hotkey}-g1-"
+                            f"{label_digest('gamma-nonce')[:32]}"
+                        ),
+                        "assignment_nonce": label_digest("gamma-nonce")[:32],
+                        "receipt_digest_sha256": label_digest("gamma-receipt"),
+                        "ticket_digest_sha256": a1.replicas[0].ticket_digest_sha256,
+                    }
+                ).model_dump(mode="json")
+            ],
+        }
+    )
+    with pytest.raises(AssignmentSnapshotError) as failure:
+        advance_snapshot_lineage(
+            lineage,
+            build_snapshot(
+                snapshot_sequence=3,
+                state_revision=9,
+                snapshot_deployments=[b2, beta_lifted, stolen],
+            ),
+        )
+    assert failure.value.code == "snapshot_incarnation_facts_reused"
+
+    # A genuine third generation with fresh facts is accepted and remembered.
+    third = _capture(
+        3,
+        SnapshotDeployment.model_validate(
+            {
+                **fresh.model_dump(mode="json"),
+                "replicas": [
+                    SnapshotReplica.model_validate(
+                        {**r.model_dump(mode="json"), "generation": 3}
+                        | {"endpoint_id": f"{r.replica_id}-g3-{r.assignment_nonce}"}
+                    ).model_dump(mode="json")
+                    for r in fresh.replicas
+                ],
+            }
+        ),
+    )
+    advanced = advance_snapshot_lineage(lineage, third)
+    assert len(advanced.used_assignment_nonces) == 12
+    assert {
+        item.generation for item in advanced.replicas if item.deployment_id == "fixture-alpha"
+    } == {3}
+    assert parse_snapshot_lineage(snapshot_lineage_bytes(advanced)) == advanced
+    # A lineage whose used-fact sets omit a current incarnation's facts is refused on parse.
+    document = json.loads(snapshot_lineage_bytes(advanced))
+    document["used_ticket_digests"].remove(document["replicas"][0]["ticket_digest_sha256"])
+    unsigned = {k: v for k, v in document.items() if k != "lineage_digest_sha256"}
+    document["lineage_digest_sha256"] = canonical_digest(unsigned)
+    with pytest.raises(ValidationError, match="lineage_used_facts_not_derived"):
+        SnapshotLineage.model_validate(document)
 
 
 def test_builder_never_trusts_a_supplied_projection_digest_or_order() -> None:

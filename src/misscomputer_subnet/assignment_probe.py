@@ -1083,6 +1083,18 @@ _POST_PIN_FAILURE_CODES: Final = frozenset(
         "attestation_invalid",
     }
 )
+#: Failure codes the transport boundary reports before any response exists;
+#: every other outcome describes a response the transport delivered inside the
+#: policy's ``probe_timeout_millis`` budget.
+_TRANSPORT_FAILURE_CODES: Final = frozenset(
+    {
+        "connection_failed",
+        "timeout",
+        "tls_certificate_invalid",
+        "tls_handshake_failed",
+        "transport_error",
+    }
+)
 #: Failure codes an observation can only carry after the policy's response-size
 #: check passed.
 _POST_SIZE_FAILURE_CODES: Final = frozenset(
@@ -1101,16 +1113,24 @@ def verify_observation_policy_binding(
     """Refuse an observation ``evaluate_probe_response`` could not have produced under ``policy``.
 
     An observation records the facts the policy-dependent checks judged: the
-    edge leaf certificate and the response size. A ``serving`` outcome, or any
-    failure code reached only after the pin check, requires a pinned
-    certificate when the policy pins any; a ``serving`` outcome, or any failure
-    code reached only after the size check, requires a body within
+    request latency, the edge leaf certificate, and the response size. Any
+    response-derived outcome (``serving`` or a failure other than a transport
+    failure) requires ``latency_millis <= probe_timeout_millis``: the transport
+    applies the policy's budget to the whole request, so a response that took
+    longer is a ``timeout`` under this policy, never a response. A ``serving``
+    outcome, or any failure code reached only after the pin check, requires a
+    pinned certificate when the policy pins any; a ``serving`` outcome, or any
+    failure code reached only after the size check, requires a body within
     ``max_response_bytes``. An observation evaluated under a looser policy and
     relabelled with this one is therefore refused (``observation_policy_violation``).
     """
 
     pins = policy.pinned_edge_leaf_certificate_sha256
     serving = observation.outcome == "serving"
+    if (
+        serving or observation.failure_code not in _TRANSPORT_FAILURE_CODES
+    ) and observation.latency_millis > policy.probe_timeout_millis:
+        _reject("observation_policy_violation")
     if (
         pins
         and (serving or observation.failure_code in _POST_PIN_FAILURE_CODES)

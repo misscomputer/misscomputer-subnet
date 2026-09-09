@@ -116,6 +116,10 @@ LINEAGE_PURPOSE: Final = "active_assignment_snapshot_lineage_v1"
 #: Every ``replica_id`` a runtime has ever exported; a lineage past this must be
 #: re-anchored by its operator.
 MAX_LINEAGE_REPLICAS: Final = MAX_DEPLOYMENTS * MAX_REPLICAS
+#: Every assignment nonce, ticket digest, and receipt digest a runtime has ever
+#: exported, kept so no later incarnation can recycle any of them; a lineage
+#: past this must be re-anchored by its operator.
+MAX_LINEAGE_FACTS: Final = 1 << 17
 MAX_LINEAGE_BYTES: Final = 64 * 1_024 * 1_024
 
 SnapshotRejectionCode = Literal[
@@ -132,7 +136,7 @@ SnapshotRejectionCode = Literal[
     "snapshot_manifest_route_mismatch",
     "snapshot_manifest_vector_mismatch",
     "snapshot_network_mismatch",
-    "snapshot_replacement_facts_reused",
+    "snapshot_incarnation_facts_reused",
     "snapshot_revision_content_divergence",
     "snapshot_revision_rollback",
     "snapshot_sequence_not_increasing",
@@ -501,11 +505,14 @@ class SnapshotLineage(StrictFrozenModel):
 
     The lineage carries the transactional position of the last accepted
     capture (so the succession rules hold across every capture, not only
-    between two adjacent ones) and, for every ``replica_id`` ever exported,
-    the latest incarnation accepted for it, including incarnations that later
-    captures dropped. A publisher advances it with every capture it accepts
-    and persists the result; an incarnation that disappears from a capture and
-    reappears later is still held to the facts first accepted for it.
+    between two adjacent ones); for every ``replica_id`` ever exported, the
+    latest incarnation accepted for it, including incarnations that later
+    captures dropped; and every assignment nonce, ticket digest, and receipt
+    digest ever accepted for any incarnation of any replica, so a fact retired
+    by one replacement can never be recycled by a later one. A publisher
+    advances it with every capture it accepts and persists the result; an
+    incarnation that disappears from a capture and reappears later is still
+    held to the facts first accepted for it.
     """
 
     contract_schema: Literal[
@@ -528,6 +535,11 @@ class SnapshotLineage(StrictFrozenModel):
     #: unchanged ``state_revision`` can be held to identical content.
     last_deployments_digest_sha256: Digest | None
     replicas: list[ReplicaLineage] = Field(max_length=MAX_LINEAGE_REPLICAS)
+    #: Every fact ever accepted for any incarnation, sorted and unique. The
+    #: facts of every current ``replicas`` entry are among them.
+    used_assignment_nonces: list[Hex32] = Field(max_length=MAX_LINEAGE_FACTS)
+    used_ticket_digests: list[Digest] = Field(max_length=MAX_LINEAGE_FACTS)
+    used_receipt_digests: list[Digest] = Field(max_length=MAX_LINEAGE_FACTS)
     lineage_digest_sha256: Digest
 
     @model_validator(mode="after")
@@ -555,6 +567,25 @@ class SnapshotLineage(StrictFrozenModel):
         endpoints = [item.endpoint_id for item in self.replicas]
         if len(set(endpoints)) != len(endpoints):
             raise ValueError("lineage_endpoint_duplicate")
+        for used in (
+            self.used_assignment_nonces,
+            self.used_ticket_digests,
+            self.used_receipt_digests,
+        ):
+            if used != sorted(set(used)):
+                raise ValueError("lineage_used_facts_not_canonical")
+        nonces = set(self.used_assignment_nonces)
+        tickets = set(self.used_ticket_digests)
+        receipts = set(self.used_receipt_digests)
+        if any(
+            item.assignment_nonce not in nonces
+            or item.ticket_digest_sha256 not in tickets
+            or item.receipt_digest_sha256 not in receipts
+            for item in self.replicas
+        ):
+            raise ValueError("lineage_used_facts_not_derived")
+        if genesis and (nonces or tickets or receipts):
+            raise ValueError("lineage_genesis_invalid")
         verify_model_digest(self, "lineage_digest_sha256")
         return self
 
@@ -602,6 +633,9 @@ def build_initial_snapshot_lineage(*, central_authority_fingerprint_sha256: str)
         "last_snapshot_digest_sha256": None,
         "last_deployments_digest_sha256": None,
         "replicas": [],
+        "used_assignment_nonces": [],
+        "used_ticket_digests": [],
+        "used_receipt_digests": [],
     }
     return SnapshotLineage.model_validate({**unsigned, "lineage_digest_sha256": digest(unsigned)})
 
@@ -626,9 +660,12 @@ def advance_snapshot_lineage(
       ticket with a restamped instant, a moved activation, or a changed image,
       challenge, or workload spec is an impossible rewrite;
     - a replacement (a different ``endpoint_id`` for the same ``replica_id``)
-      must advance the generation (``snapshot_generation_not_increasing``) and
-      carry a fresh nonce, ticket digest, and receipt digest
-      (``snapshot_replacement_facts_reused``).
+      must advance the generation (``snapshot_generation_not_increasing``);
+    - every new incarnation, replacement or first appearance, must carry a
+      nonce, ticket digest, and receipt digest that no incarnation of any
+      replica ever carried before, however many captures or replacements ago
+      (``snapshot_incarnation_facts_reused``); the lineage keeps every fact it
+      has accepted for exactly this purpose.
     """
 
     lineage = revalidate(lineage, SnapshotLineage)
@@ -666,27 +703,30 @@ def advance_snapshot_lineage(
         if snapshot.finalized_epoch < last_epoch:
             _reject("snapshot_finalized_epoch_rollback")
     retained = {item.replica_id: item for item in lineage.replicas}
+    used_nonces = set(lineage.used_assignment_nonces)
+    used_tickets = set(lineage.used_ticket_digests)
+    used_receipts = set(lineage.used_receipt_digests)
     for deployment in snapshot.deployments:
         for replica in deployment.replicas:
             current = _replica_lineage(deployment, replica)
             known = retained.get(current.replica_id)
-            if known is None:
-                retained[current.replica_id] = current
-                continue
-            if known.endpoint_id == current.endpoint_id:
+            if known is not None and known.endpoint_id == current.endpoint_id:
                 if known != current:
                     _reject("snapshot_incarnation_rewritten")
                 continue
-            if current.generation <= known.generation:
+            if known is not None and current.generation <= known.generation:
                 _reject("snapshot_generation_not_increasing")
             if (
-                current.assignment_nonce == known.assignment_nonce
-                or current.ticket_digest_sha256 == known.ticket_digest_sha256
-                or current.receipt_digest_sha256 == known.receipt_digest_sha256
+                current.assignment_nonce in used_nonces
+                or current.ticket_digest_sha256 in used_tickets
+                or current.receipt_digest_sha256 in used_receipts
             ):
-                _reject("snapshot_replacement_facts_reused")
+                _reject("snapshot_incarnation_facts_reused")
+            used_nonces.add(current.assignment_nonce)
+            used_tickets.add(current.ticket_digest_sha256)
+            used_receipts.add(current.receipt_digest_sha256)
             retained[current.replica_id] = current
-    if len(retained) > MAX_LINEAGE_REPLICAS:
+    if len(retained) > MAX_LINEAGE_REPLICAS or len(used_nonces) > MAX_LINEAGE_FACTS:
         _reject("snapshot_lineage_overflow")
     unsigned: dict[str, object] = {
         "schema": LINEAGE_SCHEMA,
@@ -705,6 +745,9 @@ def advance_snapshot_lineage(
         "last_snapshot_digest_sha256": snapshot.snapshot_digest_sha256,
         "last_deployments_digest_sha256": deployments_digest,
         "replicas": [model_document(retained[key]) for key in sorted(retained)],
+        "used_assignment_nonces": sorted(used_nonces),
+        "used_ticket_digests": sorted(used_tickets),
+        "used_receipt_digests": sorted(used_receipts),
     }
     return SnapshotLineage.model_validate({**unsigned, "lineage_digest_sha256": digest(unsigned)})
 

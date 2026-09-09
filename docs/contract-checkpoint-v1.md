@@ -14,8 +14,10 @@ Four contracts are added. Every pre-existing contract is byte-pinned by the
 test suite. Two compatibility events are declared, both against contracts no
 consumer is live on: `assignment-manifest-chain-state` gains
 `last_finalized_epoch`, and `validator-weight-decision` gains `trust_policies`
-(see "Compatibility matrix" and the upgrade order in
-[`api-migrations.md`](api-migrations.md)).
+(see "Compatibility matrix"; the supported mixed-version pairings and the
+coordinated pause that upgrades each writer/reader pair are in
+[`api-migrations.md`](api-migrations.md): neither the decision nor the
+snapshot form is transparently mixed-version compatible).
 
 | Contract | Version | Producer | Consumer | Module |
 | --- | --- | --- | --- | --- |
@@ -144,8 +146,14 @@ accepts a capture or refuses it:
   changed image digest, challenge digest, workload spec, or campaign is an
   impossible rewrite, not a re-assignment;
 - a replacement (a new `endpoint_id` for a known `replica_id`) must advance
-  the generation (`snapshot_generation_not_increasing`) and carry a fresh
-  nonce, ticket digest, and receipt digest (`snapshot_replacement_facts_reused`);
+  the generation (`snapshot_generation_not_increasing`);
+- every new incarnation, first appearance or replacement, must carry a nonce,
+  ticket digest, and receipt digest that no incarnation of any replica ever
+  carried (`snapshot_incarnation_facts_reused`): the lineage keeps every fact
+  it has accepted (`used_assignment_nonces`, `used_ticket_digests`,
+  `used_receipt_digests`), so A → B → A cannot recycle A's first-generation
+  facts at generation three, however many captures or replacements lie
+  between;
 - incarnations that a capture drops stay in the lineage, so an old endpoint
   re-exported rewritten after an empty or unrelated capture is still refused;
   the identical incarnation re-exported is accepted.
@@ -154,12 +162,14 @@ accepts a capture or refuses it:
 advanced from genesis over the two captures, for a caller that holds only
 them; a publisher that persists its lineage (`snapshot_lineage_bytes`,
 `parse_snapshot_lineage`, `build_initial_snapshot_lineage`) gets the same
-rules across its whole history. The lineage is bounded by
-`MAX_LINEAGE_REPLICAS` distinct `replica_id`s (`snapshot_lineage_overflow`); a
-runtime past that is re-anchored by its operator. Nonce and digest freshness
-is judged per lineage, not across different `replica_id`s. The lineage is a
-Python publisher-side rule with no Go counterpart: `pkg/assignment` produces
-captures and has no succession API.
+rules across its whole history, which the two-capture form cannot: a
+rewrite after an intervening capture, or a fact retired two replacements ago.
+The lineage is bounded by `MAX_LINEAGE_REPLICAS` distinct `replica_id`s and
+`MAX_LINEAGE_FACTS` retained facts (`snapshot_lineage_overflow`); a runtime
+past that is re-anchored by its operator. Nonce and digest freshness is judged
+across every incarnation of every `replica_id` the lineage has accepted. The
+lineage is a Python publisher-side rule with no Go counterpart:
+`pkg/assignment` produces captures and has no succession API.
 
 An empty snapshot is a valid state meaning "nothing is route-active". A
 manifest cannot be derived from it (manifest v1 requires at least one
@@ -520,10 +530,14 @@ Frozen invariants:
   report's `probe_timeout_millis` and `max_response_bytes` are the policy's
   own scalars; and every observation must be one `evaluate_probe_response`
   could have produced under that policy
-  (`verify_observation_policy_binding`: a serving outcome, or any failure code
-  reached only after the pin check, carries a pinned edge certificate when the
-  policy pins any, and a serving outcome or any failure reached only after the
-  size check has `response_bytes <= max_response_bytes`). Producer codes are
+  (`verify_observation_policy_binding`: every response-derived outcome, that
+  is a serving outcome or any failure other than a transport failure, has
+  `latency_millis <= probe_timeout_millis`, because the transport applies the
+  policy's whole-request budget and a slower response is a `timeout`; a
+  serving outcome, or any failure code reached only after the pin check,
+  carries a pinned edge certificate when the policy pins any; and a serving
+  outcome or any failure reached only after the size check has
+  `response_bytes <= max_response_bytes`). Producer codes are
   `decision_round_policy_rejected` and `decision_terminal_policy_rejected`;
   parser codes `report_policy_rejected` and `terminal_policy_rejected`
   (`scoring_window_evidence_inconsistent` for the probe-bound scalars).
@@ -602,8 +616,8 @@ come from the sealed trust policies.
 | Key rotation half-applied | `trust_policy_mismatch`; abstain until re-anchored | rotation never resets non-equivocation history |
 | Clock skew | manifest issuance ahead of the validator bounded by the verifying trust policy's `max_future_skew_seconds` at verification and, per manifest, by the same sealed policy document at the decision (reports and terminal alike); signer-clock ticket issuance ahead of the runtime's activation and capture instants bounded at 30s by one rule in Python and Go | all time is explicit input to pure code; no stage applies a bound other than the one carried by the policy that admitted the evidence, and that policy is sealed with the evidence |
 | Report or terminal claims an evaluation instant its verification never admitted, or an instant at which its policy was not yet (or no longer) valid | `report_evaluation_epoch_mismatch`/`trust_policy_mismatch` at report construction; `decision_round_invalid`/`decision_round_policy_rejected`/`decision_terminal_future`/`decision_terminal_policy_rejected` at the decision; `scoring_window_evidence_inconsistent`/`report_policy_rejected`/`terminal_manifest_future`/`terminal_policy_rejected` on parse | the verification result carries its epoch and policy digest, and the sealed policy re-derives every evaluation-time admission rule |
-| Responses judged under a looser same-authority policy (no certificate pins, larger body ceiling) relabelled under the pinned policy that verified the manifest | `observation_policy_violation` at report construction; `decision_round_policy_rejected` at the decision; `report_policy_rejected` on parse | every observation records the certificate and body size the policy-dependent checks judged, so the named policy's constraints are re-derived from the observation itself |
-| Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation or reusing its nonce, ticket, or receipt; or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_replacement_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id`; a replacement is a new generation with fresh signed facts |
+| Responses judged under a looser same-authority policy (longer request budget, no certificate pins, larger body ceiling) relabelled under the stricter policy that verified the manifest | `observation_policy_violation` at report construction; `decision_round_policy_rejected` at the decision; `report_policy_rejected` on parse | every observation records the certificate and body size the policy-dependent checks judged, so the named policy's constraints are re-derived from the observation itself |
+| Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation; recycles a nonce, ticket, or receipt retired by any earlier replacement (A → B → A); or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_incarnation_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id` and every signed fact it ever accepted; a replacement is a new generation with never-seen facts |
 
 ## Compatibility matrix
 
@@ -617,7 +631,7 @@ come from the sealed trust policies.
 | `misscomputer-assignment-probe` CLI | **`--finalized-height` required** (breaking invocation) | operators add the flag from their finalized chain view |
 | `misscomputer-checkpoint-boundary` protocol `misscomputer.checkpoint-boundary.v1` | additive operations; `bind_latest_pointer_to_manifest` takes `signatures`; `verify_manifest_latest_pointer` response adds `history_depth`; **`verify_manifest` requires `current_finalized_height`** (`current_finalized_height_required`); other existing operations and response shapes unchanged | private producer passes the finalized height and may adopt the new operations |
 | `active-assignment-snapshot-lineage.v1` | new; publisher-local durable document; `advance_snapshot_lineage` is the durable form of `verify_snapshot_succession`; Python only (no Go succession API) | manifest publisher persists it beside its chain state |
-| `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity and incarnation lineage rules (`snapshot_incarnation_rewritten`, `snapshot_generation_not_increasing`, `snapshot_replacement_facts_reused`). **Clock-domain rule**: the replica ordering check is `ticket_issued_at_epoch <= route_activated_at_epoch + 30` (was `<=` with no tolerance), so the documented capture+30 ticket tolerance is reachable; schema and golden fixture bytes unchanged, supplementary `active-assignment-snapshot-signer-skew.v1.json` added (fresh generation-2 incarnations, a valid successor of the golden) | runtime snapshot endpoint (Go), publisher; a producer that stamped activation from the signer's clock keeps validating; a publisher must never restamp a retained incarnation |
+| `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity and incarnation lineage rules (`snapshot_incarnation_rewritten`, `snapshot_generation_not_increasing`, `snapshot_incarnation_facts_reused`). **Clock-domain rule**: the replica ordering check is `ticket_issued_at_epoch <= route_activated_at_epoch + 30` (was `<=` with no tolerance), so the documented capture+30 ticket tolerance is reachable; schema and golden fixture bytes unchanged, supplementary `active-assignment-snapshot-signer-skew.v1.json` added (fresh generation-2 incarnations, a valid successor of the golden) | runtime snapshot endpoint (Go), publisher; a producer that stamped activation from the signer's clock keeps validating; a publisher must never restamp a retained incarnation |
 | `assignment-manifest-latest-pointer.v1` | new; carries `finalized_epoch`; immutable `.pointer.json` copy per manifest | publisher, validator fetcher |
 | `validator-weight-decision.v1` | new; self-enforcing on parse, including sealed serving evidence, registered-only assigned counts, and the guarded-baseline rule; carries terminal hash/epoch/horizon/lease, `assigned_at_close`, baselines; `decide_weight_submission` takes `archived_manifests`. **Declared compatibility event**: the record gains `trust_policies` (the approved trust-policy documents its manifests name, sorted by digest) and `decide_weight_submission` requires `trust_policies`; the schema, golden fixture, and every decision negative fixture are re-pinned, and a record sealed without the field no longer digest-verifies (no coordinator is live on the old form) | validator coordinator supplies every accepted intermediate manifest it did not probe and the approved trust-policy documents it verified under |
 | `contracts/negative/` | new convention: golden invalid documents with pinned rejection reasons, including digest-valid forged `submit-with-*` decisions | contract test suites |

@@ -59,6 +59,7 @@ from misscomputer_subnet import weight_plan as weight_plan_module
 from misscomputer_subnet.assignment_probe import (
     AssignmentProbeError,
     ProbeObservation,
+    ProbeTransportFailure,
     ValidatorProbeReport,
     build_initial_manifest_chain_state,
     build_validator_probe_report,
@@ -1371,6 +1372,135 @@ def test_observations_judged_under_a_looser_policy_cannot_be_relabelled() -> Non
     assert failure.value.code == "decision_trust_policy_missing"
 
 
+def test_timeout_policy_cannot_be_relabelled() -> None:
+    """A response judged under a 5000ms budget cannot be sealed under a 100ms policy.
+
+    The transport applies the named policy's ``probe_timeout_millis`` to the
+    whole request, so under the strict policy a 1000ms response is a
+    ``timeout``, never a response. Report construction, the decision producer,
+    and the parser all refuse the relabelled observations; a genuine transport
+    timeout under the strict policy is admitted whatever its latency.
+    """
+
+    context = make_window_context()
+    loose = build_policy(context.keys, max_age=3_600, probe_timeout_millis=5_000)
+    strict = build_policy(context.keys, max_age=3_600, probe_timeout_millis=100)
+    alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
+    beta = window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
+    manifest = build_probe_manifest(strict, [alpha, beta])
+    genesis = build_initial_manifest_chain_state(strict)
+    verification = verify_active_assignment_manifest(
+        manifest,
+        sign_manifest(manifest, context.keys),
+        strict,
+        genesis,
+        evaluation_epoch=BASE_EPOCH + 60,
+        current_finalized_height=FINALIZED_HEIGHT,
+    )
+
+    def observations(latency_millis: int, policy: Any) -> list[ProbeObservation]:
+        items = []
+        for deployment in manifest.deployments:
+            nonce = label_digest(f"slow-{deployment.deployment_id}")
+            replica = deployment.replicas[0]
+            response = serving_response(
+                deployment,
+                attestation=sign_attestation(deployment, replica, probe_nonce=nonce),
+                latency_millis=latency_millis,
+            )
+            items.append(
+                evaluate_probe_response(deployment, policy, probe_nonce=nonce, result=response)
+            )
+        return items
+
+    def report(items: list[ProbeObservation]) -> ValidatorProbeReport:
+        return build_validator_probe_report(
+            verification,
+            strict,
+            genesis,
+            items,
+            validator_uid=VALIDATOR_UID,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            evaluation_epoch=BASE_EPOCH + 60,
+            edge_origin_override=False,
+        )
+
+    slow = observations(1_000, loose)
+    assert {item.outcome for item in slow} == {"serving"}
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        report(slow)
+    # At the budget exactly the response is admissible; one millisecond over is not.
+    genuine = report(observations(100, strict))
+    assert genuine.serving_count == 2 and genuine.probe_timeout_millis == 100
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        report(observations(101, strict))
+    # A post-transport failure is response-derived too: it needs a response
+    # inside the budget. A transport timeout carries any latency.
+    timed_out = [
+        evaluate_probe_response(
+            deployment,
+            strict,
+            probe_nonce=label_digest(f"timeout-{deployment.deployment_id}"),
+            result=ProbeTransportFailure(code="timeout", latency_millis=5_000),
+        )
+        for deployment in manifest.deployments
+    ]
+    assert report(timed_out).serving_count == 0
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        report(
+            [
+                ProbeObservation.model_validate(
+                    reseal_observation(
+                        {
+                            **item.model_dump(mode="json", by_alias=True),
+                            "outcome": "failed",
+                            "failure_code": "unexpected_status",
+                            "response_status": 503,
+                            "attestation_status": "not_presented",
+                            "attestation": None,
+                            "latency_millis": 1_000,
+                        }
+                    )
+                )
+                for item in genuine.observations
+            ]
+        )
+
+    def decide(round_report: ValidatorProbeReport) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            [ProbeRound(manifest=manifest, report=round_report)],
+            terminal=TerminalManifestObservation(
+                status="verified", evaluated_at_epoch=WINDOW_END, manifest=manifest
+            ),
+            registered=context.registered,
+            trust_policies=[strict],
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+
+    accepted = decide(genuine)
+    assert accepted.round_count == 1
+    rendered = validator_weight_decision_bytes(accepted)
+    assert parse_validator_weight_decision(rendered) == accepted
+    relabelled = ValidatorProbeReport.model_validate(
+        reseal_report_observations(
+            genuine.model_dump(mode="json", by_alias=True),
+            [item.model_dump(mode="json", by_alias=True) for item in slow],
+        )
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(relabelled)
+    assert failure.value.code == "decision_round_policy_rejected"
+    with pytest.raises(ValidationError, match="report_policy_rejected"):
+        ValidatorWeightDecision.model_validate(
+            forged_decision_with_report(
+                rendered,
+                report_digest_sha256=genuine.report_digest_sha256,
+                observation_changes={"latency_millis": 101},
+            )
+        )
+
+
 def test_observation_policy_binding_is_branch_complete() -> None:
     pin = label_digest("edge-leaf-a")
     pinned = build_policy(signer_keys(), pinned_edge_leaf_certificate_sha256=(pin,))
@@ -1408,6 +1538,36 @@ def test_observation_policy_binding_is_branch_complete() -> None:
         verify_observation_policy_binding(
             variant(serving, response_bytes=unpinned.max_response_bytes + 1), unpinned
         )
+    # Every response-derived outcome fits the whole-request budget; a transport
+    # failure, including a timeout, carries whatever latency it took.
+    verify_observation_policy_binding(
+        variant(
+            serving, tls_leaf_certificate_sha256=pin, latency_millis=pinned.probe_timeout_millis
+        ),
+        pinned,
+    )
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        verify_observation_policy_binding(
+            variant(
+                serving,
+                tls_leaf_certificate_sha256=pin,
+                latency_millis=pinned.probe_timeout_millis + 1,
+            ),
+            pinned,
+        )
+    with pytest.raises(AssignmentProbeError, match="observation_policy_violation"):
+        verify_observation_policy_binding(
+            variant(
+                failed,
+                failure_code="tls_pin_mismatch",
+                response_status=200,
+                latency_millis=pinned.probe_timeout_millis + 1,
+            ),
+            pinned,
+        )
+    verify_observation_policy_binding(
+        variant(failed, latency_millis=pinned.probe_timeout_millis + 1), pinned
+    )
     # Transport failures precede the pin check and carry no policy claim; a
     # pin mismatch is the pin check; post-pin failures need a pinned certificate.
     verify_observation_policy_binding(failed, pinned)

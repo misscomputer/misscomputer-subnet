@@ -1171,6 +1171,20 @@ def negative_documents() -> dict[str, bytes]:
             observation_changes={"response_bytes": first_report["max_response_bytes"] + 1},
         ),
     )
+    # A response-derived observation slower than the policy's whole-request
+    # budget could only have been judged under a looser policy: the transport
+    # would have reported a timeout, never a response.
+    add(
+        "validator-weight-decision",
+        "submit-with-observation-slower-than-policy-timeout",
+        "model",
+        "report_policy_rejected",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={"latency_millis": first_report["probe_timeout_millis"] + 1},
+        ),
+    )
     lineage = documents["active-assignment-snapshot-lineage"]
     lineage_doc = json.loads(lineage)
     add(
@@ -1200,6 +1214,22 @@ def negative_documents() -> dict[str, bytes]:
         "model",
         "lineage_genesis_invalid",
         _mutate(lineage, accepted_snapshot_count=0),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "used-facts-not-canonical",
+        "model",
+        "lineage_used_facts_not_canonical",
+        _mutate(
+            lineage, used_assignment_nonces=list(reversed(lineage_doc["used_assignment_nonces"]))
+        ),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "retired-facts-forgotten",
+        "model",
+        "lineage_used_facts_not_derived",
+        _mutate(lineage, used_receipt_digests=lineage_doc["used_receipt_digests"][:1]),
     )
     add(
         "validator-weight-decision",
