@@ -24,6 +24,21 @@ What it binds
   capture was read at under one lock; two captures at one revision must carry
   identical deployments).
 
+Clock domains
+-------------
+A snapshot mixes two clocks. ``ticket_issued_at_epoch`` and
+``ticket_expires_at_epoch`` are stamped by the ticket signer; ``captured_at_epoch``
+and every ``route_activated_at_epoch`` are stamped by the runtime that
+activated the route and took the capture. Comparisons inside one domain are
+exact: a route is activated at or before the capture that exports it.
+Comparisons across the two domains tolerate the signer's clock leading the
+runtime's by at most :data:`TICKET_MAX_FUTURE_SKEW_SECONDS`: a ticket may be
+stamped as issued up to that many seconds after the activation it authorised
+and up to that many seconds after the capture instant, and never more. The
+same constant governs both cross-domain checks, so a ticket issued at
+``captured_at_epoch + TICKET_MAX_FUTURE_SKEW_SECONDS`` for a route activated
+at the capture instant is a valid capture; one second more is not.
+
 What it never carries
 ---------------------
 The raw challenge value, retained ticket or receipt bytes, credentials, axon
@@ -90,8 +105,9 @@ SNAPSHOT_SCHEMA_VERSION: Final = 1
 SNAPSHOT_PURPOSE: Final = "active_assignment_snapshot_v1"
 MAINNET_NETWORK: Final = "finney"
 MAINNET_NETUID: Final = 24
-#: A ticket issued after the capture instant is impossible for a consistent
-#: read; this is the only clock skew tolerated between signer and capture.
+#: The only clock skew tolerated between the ticket signer's clock and the
+#: runtime's: a ticket may be stamped as issued at most this many seconds after
+#: the route activation it authorised and after the capture instant.
 TICKET_MAX_FUTURE_SKEW_SECONDS: Final = 30
 MAX_SNAPSHOT_BYTES: Final = 64 * 1_024 * 1_024
 
@@ -141,8 +157,10 @@ class SnapshotReplica(StrictFrozenModel):
     ticket_issued_at_epoch: Epoch
     ticket_expires_at_epoch: PositiveEpoch
     route_state: Literal["active"]
-    #: Instant the edge activated this exact incarnation (at or after the
-    #: ready receipt). Consumers anchor activation grace on it.
+    #: Instant the runtime activated this exact incarnation (at or after the
+    #: ready receipt), on the runtime's clock. Consumers anchor activation
+    #: grace on it. The signer-stamped ``ticket_issued_at_epoch`` may lead it
+    #: by at most :data:`TICKET_MAX_FUTURE_SKEW_SECONDS`.
     route_activated_at_epoch: Epoch
 
     @model_validator(mode="after")
@@ -154,7 +172,9 @@ class SnapshotReplica(StrictFrozenModel):
             raise ValueError("replica_ticket_window_invalid")
         if self.ticket_digest_sha256 == self.receipt_digest_sha256:
             raise ValueError("replica_digest_binding_invalid")
-        if self.route_activated_at_epoch < self.ticket_issued_at_epoch:
+        if self.ticket_issued_at_epoch > (
+            self.route_activated_at_epoch + TICKET_MAX_FUTURE_SKEW_SECONDS
+        ):
             raise ValueError("replica_activation_order_invalid")
         return self
 

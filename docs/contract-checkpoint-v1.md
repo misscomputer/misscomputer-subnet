@@ -67,8 +67,8 @@ valid manifest source.
 | `replicas[].generation`, `assignment_nonce`, `replica_id`, `endpoint_id` | exact endpoint incarnation, `endpoint_id == <deployment_id>-<hotkey>-g<generation>-<nonce>`, unique across the snapshot |
 | `replicas[].ticket_digest_sha256`, `receipt_digest_sha256` | **digests only** of the retained signed ticket and ready receipt |
 | `replicas[].chain_block`, `expires_at_block` | assignment block window; must contain `finalized_height` |
-| `replicas[].ticket_issued_at_epoch`, `ticket_expires_at_epoch` | signed ticket window; unexpired at capture, issued no more than 30s after capture |
-| `replicas[].route_activated_at_epoch` | edge activation instant of this exact incarnation; `>= ticket_issued_at_epoch`, `<= captured_at_epoch` |
+| `replicas[].ticket_issued_at_epoch`, `ticket_expires_at_epoch` | signed ticket window on the **signer's clock**; unexpired at capture; issued no more than `TICKET_MAX_FUTURE_SKEW_SECONDS` (30s) after the capture instant and no more than 30s after the replica's `route_activated_at_epoch` |
+| `replicas[].route_activated_at_epoch` | runtime activation instant of this exact incarnation on the **runtime's clock**; `<= captured_at_epoch` exactly (same clock); `>= ticket_issued_at_epoch - 30` (cross-clock) |
 | `replicas[].route_state` | constant `active`; pending, quarantined, and deactivated incarnations are never exported |
 | `projected_assignment_vector_digest_sha256` | digest of `project_manifest_deployments(snapshot)` |
 | `snapshot_digest_sha256` | self digest |
@@ -77,6 +77,30 @@ The snapshot never carries the raw challenge value, ticket or receipt bytes,
 axon addresses, TLS pins, artifact or image keys, provider or tunnel
 identifiers, scheduler queue state, signer seeds, wallets, or weights; the
 golden fixture is scanned for each of those.
+
+### Clock domains
+
+A capture mixes two clocks. `ticket_issued_at_epoch` and
+`ticket_expires_at_epoch` are stamped by the ticket signer;
+`route_activated_at_epoch` and `captured_at_epoch` are stamped by the runtime
+that activated the route and read the capture. Same-clock comparisons are
+exact: a route is activated at or before the capture that exports it
+(`snapshot_replica_activated_after_capture`). Cross-clock comparisons tolerate
+the signer's clock leading the runtime's by at most
+`TICKET_MAX_FUTURE_SKEW_SECONDS` = 30, applied identically to both runtime
+instants: a ticket may be stamped as issued up to 30s after the activation it
+authorised (`replica_activation_order_invalid` beyond that) and up to 30s
+after the capture instant (`snapshot_replica_ticket_issued_after_capture`
+beyond that). A ticket issued at `captured_at_epoch + 30` for a route activated
+at the capture instant is therefore a valid capture, at `+ 31` it is not, and
+an activation more than 30s before its ticket's issuance is an ordering
+violation whatever the capture instant. Go (`pkg/assignment`) enforces the
+same rule with the same codes; the supplementary golden
+`active-assignment-snapshot-signer-skew.v1.json` (alpha's tickets at `+30`,
+beta's at `+1`, every route activated at capture) is parsed and re-sealed
+byte-for-byte by both suites, and the negative fixtures
+`replica-ticket-issued-beyond-capture-skew` and
+`replica-activated-before-ticket-skew` pin the two rejection branches.
 
 ### Consistency semantics
 
@@ -122,7 +146,7 @@ what surrounds them.
 | Threshold and trust policy | `threshold` distinct verified keys and every `required_roles` entry covered; roles are `assignment_issuer`, `assignment_auditor`, `assignment_security`; per-key validity window and `revoked_at_epoch`; purpose fixed to `active_assignment_manifest_publication_v1` |
 | Sequence and linkage | `sequence` starts at 1, `previous_manifest_digest_sha256` is `null` exactly at 1 and otherwise equals the previous accepted manifest digest; each actual digest-linked transition has a positive sequence delta no greater than `max_sequence_gap` (integer values between the endpoints do not imply publications) |
 | Finalized-chain binding | `finalized_height`/`finalized_block_hash`/`finalized_epoch` copied from the snapshot; height and epoch never decrease, each actual transition's height delta is no greater than `max_finalized_height_gap`, and the same height implies the same hash and epoch; the chain state carries all three (`last_finalized_height`, `last_finalized_block_hash`, `last_finalized_epoch`) |
-| Issued/expiry | `issued_at_epoch == captured_at_epoch`; `expires_at_epoch - issued_at_epoch <= max_manifest_lifetime_seconds`; not future beyond `max_future_skew_seconds`; not older than `max_manifest_age_seconds` at evaluation |
+| Issued/expiry | `issued_at_epoch == captured_at_epoch`; `expires_at_epoch - issued_at_epoch <= max_manifest_lifetime_seconds`; not future beyond `max_future_skew_seconds` (the manifest's `issued_at_epoch` may lead the validator's `evaluation_epoch` by at most that many seconds; ceiling 300); not older than `max_manifest_age_seconds` at evaluation |
 | Effective horizon | a manifest is valid only until `min(expires_at_epoch, min(replicas[].ticket_expires_at_epoch))` (`manifest_effective_expires_at_epoch`); every live verifier enforces every `replicas[].expires_at_block` against its own finalized height, which is required input (`current_finalized_height` of `verify_active_assignment_manifest`, `anchor_manifest_chain_state`, and the `verify_manifest` boundary operation; `--finalized-height` of the probe CLI) with no lease-free live path (`manifest_replica_lease_expired`); expired assignment authority is never scoreable, whatever `expires_at_epoch` claims. A publisher should set `expires_at_epoch` no later than the earliest ticket expiry; the verifier does not rely on it doing so |
 | Immutable objects | `v1/manifests/<manifest_digest>.json`, `v1/manifests/<manifest_digest>.<signer_key_id>.signature.json`, and `v1/manifests/<manifest_digest>.pointer.json` (the pointer as published for that manifest); content-addressed, never modified or deleted while any validator could still need them to catch up |
 | Atomic latest pointer | `v1/latest.json` is an `assignment-manifest-latest-pointer` v1 written only after every object it names, including the immutable pointer copy, is readable; replaced atomically; never rewritten to a lower sequence |
@@ -409,6 +433,23 @@ Frozen invariants:
   is taken at or after `window_end`; the registered set is a finalized view
   carrying `metagraph_identity_fingerprint_sha256`, which the weight plan
   repeats.
+- **One clock-skew bound from verification to decision.** Live verification
+  admits a manifest whose `issued_at_epoch` leads the validator's
+  `evaluation_epoch` by at most the trust policy's `max_future_skew_seconds`,
+  so a verified report may legitimately precede its manifest's issuance by
+  that much. The decision applies the same bound, never a stricter one of its
+  own: a round is bound to its manifest only if
+  `manifest.issued_at_epoch <= report.evaluation_epoch +
+  decision_policy.max_future_skew_seconds` (`decision_round_invalid`
+  otherwise), and the parser re-applies the sealed bound to every embedded
+  report (`scoring_window_evidence_inconsistent`). A coordinator mirrors its
+  trust policy's value into `decision_policy.max_future_skew_seconds`; the
+  field defaults to the contract ceiling (300), so an unpinned decision never
+  refuses a round that live verification admitted, and a tighter sealed bound
+  is enforced exactly. The golden window carries one such round: manifest 2's
+  first probe is evaluated 5s before its issuance under a trust policy and a
+  mirrored decision policy of 5s; rewriting the sealed bound to 4s is the
+  negative fixture `submit-with-report-preceding-manifest-beyond-skew`.
 - **Repeated probing** is how replicas are covered: expected attributions are
   `opportunities / replica_count` summed over the rounds a miner was
   published in, with opportunity counts sealed by replica cardinality so the
@@ -424,8 +465,9 @@ Frozen invariants:
   becomes zero in the next window.
 
 Default policy: 24 verified rounds, 3 expected attributions, 1800s grace,
-500‰ drop guard, 600-block registered gap, 86400s baseline age. These are
-defaults, not consensus.
+500‰ drop guard, 600-block registered gap, 86400s baseline age, 300s report
+clock-skew bound (the trust-policy ceiling; pin it to the trust policy's
+`max_future_skew_seconds`). These are defaults, not consensus.
 
 ## Threat and failure semantics
 
@@ -460,7 +502,7 @@ defaults, not consensus.
 | Miner registered but never assigned | `unassigned`, zero under safe preconditions | assignment is the central authority's prerogative; weight follows serving |
 | Registered set from a different chain segment (behind, too far ahead, same height with another hash or epoch, lower epoch) | `registered_set_unbound`; abstain | plan and manifest views must agree |
 | Key rotation half-applied | `trust_policy_mismatch`; abstain until re-anchored | rotation never resets non-equivocation history |
-| Clock skew | bounded by `max_future_skew_seconds`; capture-side ticket skew bounded at 30s | all time is explicit input to pure code |
+| Clock skew | manifest issuance ahead of the validator bounded by `max_future_skew_seconds` at verification and by the identical sealed `decision_policy.max_future_skew_seconds` at the decision; signer-clock ticket issuance ahead of the runtime's activation and capture instants bounded at 30s by one rule in Python and Go | all time is explicit input to pure code; no stage applies an undocumented tighter bound than the stage that admitted the evidence |
 
 ## Compatibility matrix
 
@@ -473,9 +515,9 @@ defaults, not consensus.
 | Manifest verification (`verify_active_assignment_manifest`, `anchor_manifest_chain_state`) | effective horizon replaces `expires_at_epoch` as the validity bound; **`current_finalized_height` is required** (breaking signature); historical variant added and lease-free | every live fetcher passes its finalized height |
 | `misscomputer-assignment-probe` CLI | **`--finalized-height` required** (breaking invocation) | operators add the flag from their finalized chain view |
 | `misscomputer-checkpoint-boundary` protocol `misscomputer.checkpoint-boundary.v1` | additive operations; `bind_latest_pointer_to_manifest` takes `signatures`; `verify_manifest_latest_pointer` response adds `history_depth`; **`verify_manifest` requires `current_finalized_height`** (`current_finalized_height_required`); other existing operations and response shapes unchanged | private producer passes the finalized height and may adopt the new operations |
-| `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity | runtime snapshot endpoint (Go), publisher |
+| `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity. **Clock-domain rule**: the replica ordering check is `ticket_issued_at_epoch <= route_activated_at_epoch + 30` (was `<=` with no tolerance), so the documented capture+30 ticket tolerance is reachable; schema and golden fixture bytes unchanged, supplementary `active-assignment-snapshot-signer-skew.v1.json` added | runtime snapshot endpoint (Go), publisher; a producer that stamped activation from the signer's clock keeps validating |
 | `assignment-manifest-latest-pointer.v1` | new; carries `finalized_epoch`; immutable `.pointer.json` copy per manifest | publisher, validator fetcher |
-| `validator-weight-decision.v1` | new; self-enforcing on parse, including sealed serving evidence, registered-only assigned counts, and the guarded-baseline rule; carries terminal hash/epoch/horizon/lease, `assigned_at_close`, baselines; `decide_weight_submission` takes `archived_manifests` | validator coordinator supplies every accepted intermediate manifest it did not probe |
+| `validator-weight-decision.v1` | new; self-enforcing on parse, including sealed serving evidence, registered-only assigned counts, and the guarded-baseline rule; carries terminal hash/epoch/horizon/lease, `assigned_at_close`, baselines; `decide_weight_submission` takes `archived_manifests`. **Declared compatibility event**: `decision_policy` gains `max_future_skew_seconds` (default 300, the trust-policy ceiling); the schema, golden fixture, and every decision negative fixture are re-pinned, and a record sealed without the field no longer digest-verifies (no coordinator is live on the old form) | validator coordinator supplies every accepted intermediate manifest it did not probe and mirrors its trust policy's `max_future_skew_seconds` into the decision policy |
 | `contracts/negative/` | new convention: golden invalid documents with pinned rejection reasons, including digest-valid forged `submit-with-*` decisions | contract test suites |
 | Go `pkg/assignment` | new package; no existing Go API changed | runtime snapshot endpoint |
 

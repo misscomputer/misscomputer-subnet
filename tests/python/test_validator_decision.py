@@ -643,6 +643,164 @@ def test_sealed_first_seen_rejects_later_rewrite_and_accepts_earlier_archive() -
     )
 
 
+def test_golden_window_seals_its_skewed_round_under_the_mirrored_bound() -> None:
+    """The golden window probes manifest 2 once before its issuance, inside the trust bound."""
+
+    context = make_window_context()
+    skew = context.policy.max_future_skew_seconds
+    assert skew > 0
+    assert context.decision.decision_policy.max_future_skew_seconds == skew
+    leads = sorted(
+        entry.report.manifest_issued_at_epoch - entry.report.evaluation_epoch
+        for entry in context.rounds
+        if entry.report.evaluation_epoch < entry.report.manifest_issued_at_epoch
+    )
+    assert leads == [skew]
+    rendered = validator_weight_decision_bytes(context.decision)
+    assert parse_validator_weight_decision(rendered) == context.decision
+    assert context.decision.decision == "submit" and context.decision.round_count == 45
+
+    # An unpinned policy defaults to the contract ceiling and admits the same rounds.
+    unpinned = decide_weight_submission(
+        context.rounds,
+        terminal=context.terminal,
+        registered=context.registered,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+    )
+    assert unpinned.decision_policy.max_future_skew_seconds == 300
+    assert unpinned.round_count == 45 and unpinned.decision == "submit"
+    assert unpinned.rows == context.decision.rows
+
+    # A sealed bound tighter than the evidence is refused by the parser, whether
+    # the record is rewritten (digest-valid) or produced under that bound.
+    document = json.loads(rendered)
+    tightened = forged_decision(
+        rendered,
+        decision_policy={**document["decision_policy"], "max_future_skew_seconds": skew - 1},
+    )
+    with pytest.raises(ValidationError, match="scoring_window_evidence_inconsistent"):
+        ValidatorWeightDecision.model_validate(tightened)
+    with pytest.raises(WeightDecisionError) as failure:
+        decide_weight_submission(
+            context.rounds,
+            terminal=context.terminal,
+            registered=context.registered,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+            decision_policy=WeightDecisionPolicy(max_future_skew_seconds=skew - 1),
+        )
+    assert failure.value.code == "decision_round_invalid"
+    # The window without the skewed round seals fine under the tighter bound.
+    without = decide_weight_submission(
+        [*context.rounds[:24], *context.rounds[25:]],
+        terminal=context.terminal,
+        registered=context.registered,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+        decision_policy=WeightDecisionPolicy(max_future_skew_seconds=skew - 1),
+    )
+    assert without.round_count == 44
+    for invalid in (-1, 301):
+        with pytest.raises(ValidationError):
+            WeightDecisionPolicy(max_future_skew_seconds=invalid)
+
+
+@pytest.mark.parametrize("lead_seconds", [1, 5])
+def test_report_verified_within_trust_skew_is_admitted_end_to_end(lead_seconds: int) -> None:
+    """Live verification and decision admission share one clock-skew bound.
+
+    A validator whose clock trails the publisher's by up to the trust policy's
+    ``max_future_skew_seconds`` verifies the manifest and seals a report whose
+    ``evaluation_epoch`` precedes ``issued_at_epoch``. The decision, pinned to
+    the same bound, admits that round; one second beyond the bound is refused
+    live (``manifest_future``) before any report exists, and a decision policy
+    stricter than the bound the round was verified under refuses it with the
+    stable ``decision_round_invalid`` code instead of silently dropping it.
+    """
+
+    context = make_window_context()
+    skew = context.policy.max_future_skew_seconds
+    assert skew == 5 and 1 <= lead_seconds <= skew
+    manifest_one, manifest_two, _ = context.manifests
+    _, state_one, _ = context.states
+    issued_at = manifest_two.issued_at_epoch
+    evaluation_epoch = issued_at - lead_seconds
+
+    skewed = build_round(
+        context.policy,
+        manifest_two,
+        state_one,
+        context.keys,
+        responders={"fixture-alpha": "MinerA", "fixture-beta": "MinerB", "fixture-gamma": "MinerE"},
+        label=f"skewed-{lead_seconds}",
+        evaluation_epoch=evaluation_epoch,
+    )
+    assert skewed.report.evaluation_epoch == issued_at - lead_seconds
+    with pytest.raises(AssignmentProbeError, match="manifest_future"):
+        verify_active_assignment_manifest(
+            manifest_two,
+            sign_manifest(manifest_two, context.keys),
+            context.policy,
+            state_one,
+            evaluation_epoch=issued_at - skew - 1,
+            current_finalized_height=FINALIZED_HEIGHT,
+        )
+
+    rounds = [*context.rounds[:24], skewed, *context.rounds[25:]]
+    terminal = TerminalManifestObservation(
+        status="verified", evaluated_at_epoch=WINDOW_END, manifest=context.manifests[2]
+    )
+    pinned = WeightDecisionPolicy(max_future_skew_seconds=skew)
+    decision = decide_weight_submission(
+        rounds,
+        terminal=terminal,
+        registered=context.registered,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+        decision_policy=pinned,
+    )
+    assert decision.decision == "submit" and decision.round_count == 45
+    assert decision.decision_policy.max_future_skew_seconds == skew
+    sealed_reports = [
+        report
+        for item in decision.assignment_manifest_evidence
+        if item.manifest.sequence == 2
+        for report in item.scoring_reports
+    ]
+    assert skewed.report.report_digest_sha256 in {
+        report.report_digest_sha256 for report in sealed_reports
+    }
+    assert decision.scoring_window is not None
+    assert skewed.report.report_digest_sha256 in decision.scoring_window.report_digests
+    rendered = validator_weight_decision_bytes(decision)
+    assert parse_validator_weight_decision(rendered) == decision
+    window = accumulate_scoring_window(
+        rounds,
+        validator_uid=VALIDATOR_UID,
+        validator_hotkey=VALIDATOR_HOTKEY,
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+    )
+    assert canonical_digest(window.model_dump(mode="json")) == decision.scoring_window_digest_sha256
+
+    stricter = WeightDecisionPolicy(max_future_skew_seconds=lead_seconds - 1)
+    with pytest.raises(WeightDecisionError) as failure:
+        decide_weight_submission(
+            rounds,
+            terminal=terminal,
+            registered=context.registered,
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+            decision_policy=stricter,
+        )
+    assert failure.value.code == "decision_round_invalid"
+    # Manifest 1 is issued at window start, so a report evaluated before it
+    # also falls outside the window and is refused by the window rule, not
+    # by clock skew.
+    assert manifest_one.issued_at_epoch == WINDOW_START
+
+
 def test_uid_republication_never_erases_the_earning_identity_sighting() -> None:
     """An endpoint republished under a new UID keeps the earlier identity's first sighting.
 
@@ -1364,6 +1522,7 @@ def test_mutated_verified_reports_are_refused_not_consumed() -> None:
         registered=context.registered,
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
+        decision_policy=context.decision.decision_policy,
     )
     assert validator_weight_decision_bytes(clean) == validator_weight_decision_bytes(
         context.decision
@@ -1439,6 +1598,7 @@ def test_decision_is_deterministic_under_round_reordering() -> None:
         registered=context.registered,
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
+        decision_policy=context.decision.decision_policy,
         scoring_policy=ProbeScoringPolicy(),
     )
     assert validator_weight_decision_bytes(again) == validator_weight_decision_bytes(

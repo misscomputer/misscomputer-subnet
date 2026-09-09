@@ -53,6 +53,7 @@ from misscomputer_subnet.assignment_probe import (
     verify_active_assignment_manifest,
 )
 from misscomputer_subnet.assignment_snapshot import (
+    TICKET_MAX_FUTURE_SKEW_SECONDS,
     ActiveAssignmentSnapshot,
     SnapshotDeployment,
     active_assignment_snapshot_bytes,
@@ -167,8 +168,13 @@ def snapshot_deployment_from(
     deployment: ActiveDeploymentAssignment,
     *,
     route_activated_at_epoch: int = ROUTE_ACTIVATED_AT,
+    ticket_issued_at_epoch: int | None = None,
 ) -> SnapshotDeployment:
-    """Lift a manifest deployment back into its snapshot form with activation timing."""
+    """Lift a manifest deployment back into its snapshot form with activation timing.
+
+    ``ticket_issued_at_epoch`` re-stamps every replica's ticket issuance (the
+    signer's clock) so a capture can exercise the signer-skew tolerance.
+    """
 
     replicas = [
         build_snapshot_replica(
@@ -182,7 +188,11 @@ def snapshot_deployment_from(
             receipt_digest_sha256=replica.receipt_digest_sha256,
             chain_block=replica.chain_block,
             expires_at_block=replica.expires_at_block,
-            ticket_issued_at_epoch=replica.ticket_issued_at_epoch,
+            ticket_issued_at_epoch=(
+                replica.ticket_issued_at_epoch
+                if ticket_issued_at_epoch is None
+                else ticket_issued_at_epoch
+            ),
             ticket_expires_at_epoch=replica.ticket_expires_at_epoch,
             route_activated_at_epoch=route_activated_at_epoch,
         )
@@ -211,8 +221,16 @@ def build_snapshot(
     finalized_block_hash: str = FINALIZED_BLOCK_HASH,
     finalized_epoch: int = 42,
     central_authority: str | None = None,
+    snapshot_deployments: Sequence[SnapshotDeployment] | None = None,
 ) -> ActiveAssignmentSnapshot:
+    """Seal a capture; ``snapshot_deployments`` supplies pre-lifted deployments verbatim."""
+
     policy = build_policy(signer_keys())
+    if snapshot_deployments is None:
+        snapshot_deployments = [
+            snapshot_deployment_from(item)
+            for item in (fixture_deployments() if deployments is None else deployments)
+        ]
     return build_active_assignment_snapshot(
         central_authority_fingerprint_sha256=(
             central_authority or policy.central_authority_fingerprint_sha256
@@ -225,9 +243,35 @@ def build_snapshot(
         finalized_epoch=finalized_epoch,
         route_host_suffix=ROUTE_SUFFIX,
         probe_port=PROBE_PORT,
-        deployments=[
-            snapshot_deployment_from(item)
-            for item in (fixture_deployments() if deployments is None else deployments)
+        deployments=list(snapshot_deployments),
+    )
+
+
+def build_signer_skew_snapshot() -> ActiveAssignmentSnapshot:
+    """The golden capture with the signer's clock leading the runtime's.
+
+    Every route was activated exactly at the capture instant (the runtime
+    clock), while the signer stamped alpha's tickets
+    ``TICKET_MAX_FUTURE_SKEW_SECONDS`` after it and beta's one second after it:
+    the full and the minimal cross-domain tolerance, at both bounds of the
+    activation-ordering rule. It is the shared Go/Python parity fixture for the
+    clock-domain rule; one more second on alpha is
+    ``replica_activation_order_invalid``.
+    """
+
+    alpha, beta = fixture_deployments()
+    return build_snapshot(
+        snapshot_sequence=SNAPSHOT_SEQUENCE + 1,
+        state_revision=STATE_REVISION + 1,
+        snapshot_deployments=[
+            snapshot_deployment_from(
+                alpha,
+                route_activated_at_epoch=BASE_EPOCH,
+                ticket_issued_at_epoch=BASE_EPOCH + TICKET_MAX_FUTURE_SKEW_SECONDS,
+            ),
+            snapshot_deployment_from(
+                beta, route_activated_at_epoch=BASE_EPOCH, ticket_issued_at_epoch=BASE_EPOCH + 1
+            ),
         ],
     )
 
@@ -377,18 +421,27 @@ def make_window_context(
     - manifest 1 (sequence 1, issued at window start): alpha(A,B,C), beta(B,C,D);
       probed 24 times, every replica answers in turn;
     - manifest 2 (sequence 2, issued +1500s): adds gamma(E); probed 12 times,
-      E answers, so E is a newly activated miner that earned weight;
+      E answers, so E is a newly activated miner that earned weight; its first
+      probe is evaluated ``max_future_skew_seconds`` *before* the manifest's
+      issuance, exactly as a validator whose clock trails the publisher's by
+      the trust policy's tolerance would record it;
     - manifest 3 (sequence 3, issued +3000s): adds delta(F); probed 9 times,
       delta never answers, so F is unverified but inside activation grace;
     - G is registered and never assigned; the terminal fetch at window close
       re-verifies manifest 3.
 
     The golden record is a first window: it carries no prior baseline and
-    seals manifest 3's assigned set as the baseline for its successor.
+    seals manifest 3's assigned set as the baseline for its successor. Its
+    default decision policy mirrors the trust policy's
+    ``max_future_skew_seconds``, as a coordinator's must.
     """
 
     keys = signer_keys()
     policy = build_policy(keys, max_age=3_600)
+    if decision_policy is None:
+        decision_policy = WeightDecisionPolicy(
+            max_future_skew_seconds=policy.max_future_skew_seconds
+        )
     alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
     beta = window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
     gamma = window_deployment("fixture-gamma", EXTRA_MINERS[:1], campaign_sequence=3)
@@ -462,7 +515,11 @@ def make_window_context(
                     "fixture-gamma": "MinerE",
                 },
                 label=f"window-two-{index}",
-                evaluation_epoch=BASE_EPOCH + 1_560 + 60 * index,
+                evaluation_epoch=(
+                    BASE_EPOCH + 1_500 - policy.max_future_skew_seconds
+                    if index == 0
+                    else BASE_EPOCH + 1_560 + 60 * index
+                ),
                 latency_millis=57,
             )
         )
@@ -523,6 +580,9 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
 def fixture_documents() -> dict[str, bytes]:
     return {
         "active-assignment-snapshot": active_assignment_snapshot_bytes(build_snapshot()),
+        "active-assignment-snapshot-signer-skew": active_assignment_snapshot_bytes(
+            build_signer_skew_snapshot()
+        ),
         "assignment-manifest-latest-pointer": assignment_manifest_latest_pointer_bytes(
             build_pointer()
         ),
@@ -641,6 +701,33 @@ def negative_documents() -> dict[str, bytes]:
         "replica-activated-after-capture",
         "model",
         "snapshot_replica_activated_after_capture",
+        mutated,
+    )
+    mutated = json.loads(snapshot)
+    mutated["deployments"][0]["replicas"][0]["ticket_issued_at_epoch"] = (
+        BASE_EPOCH + TICKET_MAX_FUTURE_SKEW_SECONDS + 1
+    )
+    mutated["deployments"][0]["replicas"][0]["route_activated_at_epoch"] = (
+        BASE_EPOCH + TICKET_MAX_FUTURE_SKEW_SECONDS + 1
+    )
+    add(
+        "active-assignment-snapshot",
+        "replica-ticket-issued-beyond-capture-skew",
+        "model",
+        "snapshot_replica_ticket_issued_after_capture",
+        mutated,
+    )
+    mutated = json.loads(snapshot)
+    mutated["deployments"][0]["replicas"][0]["route_activated_at_epoch"] = (
+        mutated["deployments"][0]["replicas"][0]["ticket_issued_at_epoch"]
+        - TICKET_MAX_FUTURE_SKEW_SECONDS
+        - 1
+    )
+    add(
+        "active-assignment-snapshot",
+        "replica-activated-before-ticket-skew",
+        "model",
+        "replica_activation_order_invalid",
         mutated,
     )
     mutated = json.loads(snapshot)
@@ -817,6 +904,24 @@ def negative_documents() -> dict[str, bytes]:
                 else row
                 for row in decision_doc["rows"]
             ],
+        ),
+    )
+    # The sealed record admits its skewed round only under the bound it seals;
+    # a rewrite that tightens the sealed bound below that round's skew must be
+    # refused by the evidence check, never silently accepted.
+    add(
+        "validator-weight-decision",
+        "submit-with-report-preceding-manifest-beyond-skew",
+        "model",
+        "scoring_window_evidence_inconsistent",
+        forged_decision(
+            decision,
+            decision_policy={
+                **decision_doc["decision_policy"],
+                "max_future_skew_seconds": (
+                    decision_doc["decision_policy"]["max_future_skew_seconds"] - 1
+                ),
+            },
         ),
     )
     add(

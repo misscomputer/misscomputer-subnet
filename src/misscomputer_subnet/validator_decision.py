@@ -46,7 +46,13 @@ Frozen rules
    ``window_start_epoch <= evaluation_epoch < window_end_epoch`` and before
    their manifest's effective horizon; the terminal manifest observation is
    taken at or after ``window_end_epoch``; the registered set is a finalized
-   view.
+   view. A report's ``evaluation_epoch`` may precede its manifest's
+   ``issued_at_epoch`` by at most ``max_future_skew_seconds``: the same
+   configured clock-skew bound under which live verification admitted the
+   manifest, mirrored into the decision policy and sealed in the record, so a
+   round the validator verified is never refused here for skew the trust
+   policy allowed, and a record cannot pair a report with a manifest issued
+   further ahead of it than its own sealed bound.
 8. **Replicas need repeated probing.** Coverage is measured in expected
    attributions, ``opportunities / replica_count`` summed over the rounds a
    miner was published in, so a three-replica deployment needs at least
@@ -109,6 +115,7 @@ from pydantic import Field, StringConstraints, ValidationError, model_validator
 
 from .assignment_probe import (
     MAX_EPOCH,
+    MAX_FUTURE_SKEW_SECONDS,
     MAX_REPLICAS,
     UID,
     ActiveAssignmentManifest,
@@ -230,6 +237,16 @@ class WeightDecisionPolicy(StrictFrozenModel):
     #: clears the guard; a guarded drop carries the largest set forward.
     assigned_baseline_max_age_seconds: int = Field(
         default=86_400, ge=0, le=MAX_BASELINE_AGE_SECONDS
+    )
+    #: Seconds a report's ``evaluation_epoch`` may precede its manifest's
+    #: ``issued_at_epoch``. Live verification admits a manifest issued up to the
+    #: trust policy's ``max_future_skew_seconds`` ahead of the validator's
+    #: clock; a coordinator mirrors that value here so the sealed decision
+    #: re-enforces exactly the bound its rounds were verified under. The
+    #: default is the contract ceiling on that trust-policy field, so an
+    #: unpinned decision never refuses a round that live verification admitted.
+    max_future_skew_seconds: int = Field(
+        default=MAX_FUTURE_SKEW_SECONDS, ge=0, le=MAX_FUTURE_SKEW_SECONDS
     )
 
 
@@ -816,11 +833,12 @@ class ValidatorWeightDecision(StrictFrozenModel):
 
         sealed_rounds: list[ProbeRound] = []
         linked_report_digests: list[str] = []
+        max_future_skew_seconds = self.decision_policy.max_future_skew_seconds
         for item in evidence:
             manifest = item.manifest
             for report in item.scoring_reports:
                 if not _report_matches_manifest(
-                    report, manifest
+                    report, manifest, max_future_skew_seconds=max_future_skew_seconds
                 ) or report.evaluation_epoch >= manifest_effective_expires_at_epoch(manifest):
                     raise ValueError("scoring_window_evidence_inconsistent")
                 sealed_rounds.append(ProbeRound(manifest=manifest, report=report))
@@ -1159,13 +1177,17 @@ def _identity_first_seen(
     return identity_first_seen
 
 
-def _revalidate_rounds(rounds: Sequence[ProbeRound]) -> list[ProbeRound]:
+def _revalidate_rounds(
+    rounds: Sequence[ProbeRound], *, max_future_skew_seconds: int
+) -> list[ProbeRound]:
     """Rebuild every round from its canonical document so later mutation cannot leak in.
 
     Frozen models still hold mutable lists; a report whose ``observations``
     were appended to after verification would otherwise be consumed with its
     stale digest and declared counts. Re-validation re-runs every digest and
-    count check, so a tampered round is refused here.
+    count check, so a tampered round is refused here. Each report is then
+    bound to its manifest under ``max_future_skew_seconds``, the clock-skew
+    bound the decision policy mirrors from the trust policy.
     """
 
     fresh: list[ProbeRound] = []
@@ -1180,15 +1202,27 @@ def _revalidate_rounds(rounds: Sequence[ProbeRound]) -> list[ProbeRound]:
         except (ValidationError, ValueError, TypeError, AttributeError):
             _reject("decision_round_invalid")
     for entry in fresh:
-        if not _report_matches_manifest(entry.report, entry.manifest):
+        if not _report_matches_manifest(
+            entry.report, entry.manifest, max_future_skew_seconds=max_future_skew_seconds
+        ):
             _reject("decision_round_invalid")
     return fresh
 
 
 def _report_matches_manifest(
-    report: ValidatorProbeReport, manifest: ActiveAssignmentManifest
+    report: ValidatorProbeReport,
+    manifest: ActiveAssignmentManifest,
+    *,
+    max_future_skew_seconds: int,
 ) -> bool:
-    """Bind every report claim used by a decision to its full manifest."""
+    """Bind every report claim used by a decision to its full manifest.
+
+    The report may have been evaluated up to ``max_future_skew_seconds`` before
+    the manifest's ``issued_at_epoch``: live verification admits a manifest
+    whose issuer clock leads the validator's by at most the trust policy's
+    ``max_future_skew_seconds``, and the decision mirrors that bound rather
+    than imposing a stricter, unconfigured one of its own.
+    """
 
     return (
         report.network == manifest.network
@@ -1205,7 +1239,7 @@ def _report_matches_manifest(
         and report.finalized_epoch == manifest.finalized_epoch
         and report.probe_scheme == manifest.probe_scheme
         and report.probe_port == manifest.probe_port
-        and manifest.issued_at_epoch <= report.evaluation_epoch
+        and manifest.issued_at_epoch <= report.evaluation_epoch + max_future_skew_seconds
         and {item.deployment_id for item in report.observations}
         == {item.deployment_id for item in manifest.deployments}
     )
@@ -1345,7 +1379,7 @@ def decide_weight_submission(
         _reject("decision_round_invalid")
     if len(archived_manifests) > MAX_ROUNDS:
         _reject("decision_archived_manifest_invalid")
-    rounds = _revalidate_rounds(rounds)
+    rounds = _revalidate_rounds(rounds, max_future_skew_seconds=policy.max_future_skew_seconds)
     manifests = [entry.manifest for entry in rounds]
     for entry in rounds:
         if entry.report.evaluation_epoch >= manifest_effective_expires_at_epoch(entry.manifest):

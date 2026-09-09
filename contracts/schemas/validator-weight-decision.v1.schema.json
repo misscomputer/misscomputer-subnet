@@ -1182,6 +1182,13 @@
           "title": "Max Assigned Drop Permille",
           "type": "integer"
         },
+        "max_future_skew_seconds": {
+          "default": 300,
+          "maximum": 300,
+          "minimum": 0,
+          "title": "Max Future Skew Seconds",
+          "type": "integer"
+        },
         "max_registered_height_gap": {
           "default": 600,
           "maximum": 1000000,

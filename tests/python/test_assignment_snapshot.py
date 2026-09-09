@@ -22,6 +22,7 @@ from assignment_probe_context import (
 )
 from contract_checkpoint_context import (
     ROUTE_ACTIVATED_AT,
+    build_signer_skew_snapshot,
     build_snapshot,
     snapshot_deployment_from,
 )
@@ -236,16 +237,154 @@ def test_replica_model_rejects_impossible_timing_and_digest_bindings() -> None:
         return build_snapshot_replica(**values)  # type: ignore[arg-type]
 
     replica()
+    # The signer's clock may lead the runtime's by the tolerance, never more:
+    # activation on the runtime clock may trail ticket issuance by exactly
+    # TICKET_MAX_FUTURE_SKEW_SECONDS.
+    replica(route_activated_at_epoch=BASE_EPOCH - 500 - TICKET_MAX_FUTURE_SKEW_SECONDS)
     for code, overrides in {
         "replica_block_window_invalid": {"expires_at_block": FINALIZED_HEIGHT - 60},
         "replica_ticket_window_invalid": {"ticket_expires_at_epoch": BASE_EPOCH - 500},
         "replica_digest_binding_invalid": {"receipt_digest_sha256": label_digest("ticket")},
-        "replica_activation_order_invalid": {"route_activated_at_epoch": BASE_EPOCH - 501},
+        "replica_activation_order_invalid": {
+            "route_activated_at_epoch": BASE_EPOCH - 500 - TICKET_MAX_FUTURE_SKEW_SECONDS - 1
+        },
         "ed25519_public_key_small_order": {"miner_service_public_key": "01" + "00" * 31},
     }.items():
         with pytest.raises(ValidationError) as failure:
             replica(**overrides)
         assert code in str(failure.value)
+
+
+def _skewed_capture(
+    *, ticket_issued_at_epoch: int, route_activated_at_epoch: int
+) -> ActiveAssignmentSnapshot:
+    """The golden capture at BASE_EPOCH with alpha's replicas re-stamped."""
+
+    alpha, beta = fixture_deployments()
+    return build_snapshot(
+        snapshot_deployments=[
+            snapshot_deployment_from(
+                alpha,
+                route_activated_at_epoch=route_activated_at_epoch,
+                ticket_issued_at_epoch=ticket_issued_at_epoch,
+            ),
+            snapshot_deployment_from(beta),
+        ]
+    )
+
+
+@pytest.mark.parametrize("lead_seconds", [1, TICKET_MAX_FUTURE_SKEW_SECONDS])
+def test_signer_clock_may_lead_capture_by_the_documented_tolerance(lead_seconds: int) -> None:
+    """A ticket stamped after the capture instant, within tolerance, is a valid capture.
+
+    The route is activated exactly at the capture (runtime clock) while the
+    signer stamped issuance ``lead_seconds`` later; both cross-domain checks
+    apply the same tolerance, so the advertised capture+30 branch is reachable.
+    """
+
+    snapshot = _skewed_capture(
+        ticket_issued_at_epoch=BASE_EPOCH + lead_seconds, route_activated_at_epoch=BASE_EPOCH
+    )
+    replica = snapshot.deployments[0].replicas[0]
+    assert replica.ticket_issued_at_epoch == snapshot.captured_at_epoch + lead_seconds
+    assert replica.route_activated_at_epoch == snapshot.captured_at_epoch
+    rendered = active_assignment_snapshot_bytes(snapshot)
+    assert parse_active_assignment_snapshot(rendered) == snapshot
+    assert ActiveAssignmentSnapshot.model_validate(json.loads(rendered)) == snapshot
+    # The skewed capture still projects to a valid manifest issued at capture.
+    manifest = build_active_assignment_manifest(
+        build_policy(signer_keys()),
+        finalized_height=FINALIZED_HEIGHT,
+        finalized_block_hash=snapshot.finalized_block_hash,
+        finalized_epoch=snapshot.finalized_epoch,
+        sequence=1,
+        previous_manifest_digest_sha256=None,
+        issued_at_epoch=snapshot.captured_at_epoch,
+        expires_at_epoch=snapshot.captured_at_epoch + 3_000,
+        route_host_suffix=snapshot.route_host_suffix,
+        probe_port=snapshot.probe_port,
+        deployments=project_manifest_deployments(snapshot),
+    )
+    verify_manifest_derived_from_snapshot(manifest, snapshot)
+    assert manifest.deployments[0].replicas[0].ticket_issued_at_epoch == (BASE_EPOCH + lead_seconds)
+
+
+def test_signer_clock_skew_rejections_are_branch_complete() -> None:
+    def rejects(code: str, *, ticket_issued_at_epoch: int, route_activated_at_epoch: int) -> None:
+        with pytest.raises(ValidationError) as failure:
+            _skewed_capture(
+                ticket_issued_at_epoch=ticket_issued_at_epoch,
+                route_activated_at_epoch=route_activated_at_epoch,
+            )
+        assert code in str(failure.value)
+
+    beyond = BASE_EPOCH + TICKET_MAX_FUTURE_SKEW_SECONDS + 1
+    # One second past the tolerance: the replica's own ordering rule refuses a
+    # route activated at capture, and the capture rule refuses a route whose
+    # activation was pushed past the capture to keep the ordering rule happy.
+    rejects(
+        "replica_activation_order_invalid",
+        ticket_issued_at_epoch=beyond,
+        route_activated_at_epoch=BASE_EPOCH,
+    )
+    rejects(
+        "snapshot_replica_ticket_issued_after_capture",
+        ticket_issued_at_epoch=beyond,
+        route_activated_at_epoch=beyond,
+    )
+    # Activation and capture share one clock: no tolerance between them.
+    rejects(
+        "snapshot_replica_activated_after_capture",
+        ticket_issued_at_epoch=BASE_EPOCH + 1,
+        route_activated_at_epoch=BASE_EPOCH + 1,
+    )
+    rejects(
+        "snapshot_replica_activated_after_capture",
+        ticket_issued_at_epoch=BASE_EPOCH - 500,
+        route_activated_at_epoch=BASE_EPOCH + 1,
+    )
+    # Activation trailing issuance by exactly the tolerance is the last valid
+    # instant; one more second is an ordering violation.
+    _skewed_capture(
+        ticket_issued_at_epoch=BASE_EPOCH - 500,
+        route_activated_at_epoch=BASE_EPOCH - 500 - TICKET_MAX_FUTURE_SKEW_SECONDS,
+    )
+    rejects(
+        "replica_activation_order_invalid",
+        ticket_issued_at_epoch=BASE_EPOCH - 500,
+        route_activated_at_epoch=BASE_EPOCH - 500 - TICKET_MAX_FUTURE_SKEW_SECONDS - 1,
+    )
+
+
+def test_signer_skew_fixture_is_the_golden_capture_at_both_tolerances() -> None:
+    """The shared Go/Python parity fixture pins the +30 and +1 branches together."""
+
+    rendered = (FIXTURES / "active-assignment-snapshot-signer-skew.v1.json").read_bytes()
+    snapshot = parse_active_assignment_snapshot(rendered)
+    assert snapshot == build_signer_skew_snapshot()
+    assert active_assignment_snapshot_bytes(snapshot) == rendered
+    leads = {
+        item.deployment_id: {
+            replica.ticket_issued_at_epoch - snapshot.captured_at_epoch for replica in item.replicas
+        }
+        for item in snapshot.deployments
+    }
+    assert leads == {
+        "fixture-alpha": {TICKET_MAX_FUTURE_SKEW_SECONDS},
+        "fixture-beta": {1},
+    }
+    assert all(
+        replica.route_activated_at_epoch == snapshot.captured_at_epoch
+        for item in snapshot.deployments
+        for replica in item.replicas
+    )
+    # Same content as the golden capture apart from the re-stamped timing, so
+    # it is the successor capture of the golden snapshot at the next revision.
+    verify_snapshot_succession(build_snapshot(), snapshot)
+    document = json.loads(rendered)
+    document["deployments"][0]["replicas"][0]["ticket_issued_at_epoch"] += 1
+    with pytest.raises(ValidationError, match="replica_activation_order_invalid"):
+        ActiveAssignmentSnapshot.model_validate(document)
 
 
 def test_builder_never_trusts_a_supplied_projection_digest_or_order() -> None:

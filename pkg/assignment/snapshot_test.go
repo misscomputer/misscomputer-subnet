@@ -338,6 +338,113 @@ func TestGoRejectsEveryPythonNegativeFixture(t *testing.T) {
 	}
 }
 
+func TestSignerSkewFixtureRoundTripsAndResealsByteExactly(t *testing.T) {
+	// The shared parity fixture: every route activated at the capture instant,
+	// alpha's tickets stamped TicketMaxFutureSkewSeconds after it, beta's one
+	// second after it. Python generated it; Go must accept and reproduce it.
+	payload := fixtureBytes(t, "active-assignment-snapshot-signer-skew.v1.json")
+	snapshot, err := Parse(payload)
+	if err != nil {
+		t.Fatalf("parse signer-skew snapshot: %v", err)
+	}
+	encoded, err := Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encoded, payload) {
+		t.Fatalf("Go canonical bytes drifted from the Python signer-skew fixture\nfixture: %s\nencoded: %s", payload, encoded)
+	}
+	leads := map[string]map[uint64]struct{}{}
+	for _, deployment := range snapshot.Deployments {
+		for _, replica := range deployment.Replicas {
+			if replica.RouteActivatedAtEpoch != snapshot.CapturedAtEpoch {
+				t.Fatalf("%s: activation %d must equal capture %d", replica.EndpointID, replica.RouteActivatedAtEpoch, snapshot.CapturedAtEpoch)
+			}
+			if leads[deployment.DeploymentID] == nil {
+				leads[deployment.DeploymentID] = map[uint64]struct{}{}
+			}
+			leads[deployment.DeploymentID][replica.TicketIssuedAtEpoch-snapshot.CapturedAtEpoch] = struct{}{}
+		}
+	}
+	if _, ok := leads["fixture-alpha"][TicketMaxFutureSkewSeconds]; !ok || len(leads["fixture-alpha"]) != 1 {
+		t.Fatalf("alpha must lead capture by exactly the tolerance: %v", leads["fixture-alpha"])
+	}
+	if _, ok := leads["fixture-beta"][1]; !ok || len(leads["fixture-beta"]) != 1 {
+		t.Fatalf("beta must lead capture by exactly one second: %v", leads["fixture-beta"])
+	}
+	resealed, err := Seal(snapshot)
+	if err != nil {
+		t.Fatalf("seal signer-skew snapshot: %v", err)
+	}
+	reencoded, err := Marshal(resealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reencoded, payload) {
+		t.Fatalf("resealed signer-skew snapshot drifted from the fixture\nencoded: %s", reencoded)
+	}
+}
+
+func TestClockDomainRuleIsBranchCompleteAndMirrorsPython(t *testing.T) {
+	golden, err := Parse(fixtureBytes(t, "active-assignment-snapshot.v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := golden.CapturedAtEpoch
+	goldenIssued := golden.Deployments[0].Replicas[0].TicketIssuedAtEpoch
+	cases := []struct {
+		name      string
+		issued    uint64
+		activated uint64
+		wantErr   string
+	}{
+		// Cross-domain: the signer may lead the runtime by the tolerance.
+		{"issued at capture, activated at capture", capture, capture, ""},
+		{"issued capture+1, activated at capture", capture + 1, capture, ""},
+		{"issued capture+30, activated at capture", capture + TicketMaxFutureSkewSeconds, capture, ""},
+		{"issued capture+31, activated at capture", capture + TicketMaxFutureSkewSeconds + 1, capture, "replica_activation_order_invalid"},
+		{"issued capture+31, activated with it", capture + TicketMaxFutureSkewSeconds + 1, capture + TicketMaxFutureSkewSeconds + 1, "snapshot_replica_ticket_issued_after_capture"},
+		// Same domain: activation never follows the capture, by any margin.
+		{"issued capture+1, activated capture+1", capture + 1, capture + 1, "snapshot_replica_activated_after_capture"},
+		{"golden issuance, activated capture+1", goldenIssued, capture + 1, "snapshot_replica_activated_after_capture"},
+		// Ordering boundary: activation may trail issuance by the tolerance only.
+		{"activated tolerance before issuance", goldenIssued, goldenIssued - TicketMaxFutureSkewSeconds, ""},
+		{"activated one more second before issuance", goldenIssued, goldenIssued - TicketMaxFutureSkewSeconds - 1, "replica_activation_order_invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := golden
+			input.Deployments = cloneDeployments(golden.Deployments)
+			for r := range input.Deployments[0].Replicas {
+				replica := &input.Deployments[0].Replicas[r]
+				replica.TicketIssuedAtEpoch = tc.issued
+				replica.RouteActivatedAtEpoch = tc.activated
+			}
+			sealed, err := Seal(input)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("must be accepted, got %v", err)
+				}
+				encoded, err := Marshal(sealed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				reparsed, err := Parse(encoded)
+				if err != nil {
+					t.Fatalf("sealed snapshot must parse: %v", err)
+				}
+				if reparsed.SnapshotDigestSHA256 != sealed.SnapshotDigestSHA256 || reparsed.SnapshotDigestSHA256 == golden.SnapshotDigestSHA256 {
+					t.Fatalf("digest round trip failed: %s vs %s", reparsed.SnapshotDigestSHA256, sealed.SnapshotDigestSHA256)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want %s, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsSmallOrderServiceKeys(t *testing.T) {
 	snapshot, err := Parse(fixtureBytes(t, "active-assignment-snapshot.v1.json"))
 	if err != nil {

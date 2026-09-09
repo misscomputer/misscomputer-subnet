@@ -71,6 +71,9 @@ MAX_ATTESTATION_BYTES: Final = 8 * 1_024
 MAX_RESPONSE_BYTES_CEILING: Final = 1_024 * 1_024
 MAX_LATENCY_MILLIS: Final = 3_600_000
 MAX_EPOCH: Final = (1 << 63) - 1
+#: Ceiling on a trust policy's ``max_future_skew_seconds``: no policy may let a
+#: manifest's ``issued_at_epoch`` lead the evaluating validator's clock by more.
+MAX_FUTURE_SKEW_SECONDS: Final = 300
 
 Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Hex24 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{24}$")]
@@ -433,7 +436,7 @@ class AssignmentManifestTrustPolicy(_StrictFrozenModel):
     valid_from_epoch: Epoch
     valid_until_epoch: Epoch
     max_manifest_age_seconds: int = Field(ge=1, le=86_400)
-    max_future_skew_seconds: int = Field(ge=0, le=300)
+    max_future_skew_seconds: int = Field(ge=0, le=MAX_FUTURE_SKEW_SECONDS)
     max_manifest_lifetime_seconds: int = Field(ge=1, le=86_400)
     max_sequence_gap: int = Field(ge=1, le=64)
     max_finalized_height_gap: int = Field(ge=1, le=1_000_000)

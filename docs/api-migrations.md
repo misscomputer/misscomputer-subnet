@@ -1,5 +1,73 @@
 # Public API migrations
 
+## Contract checkpoint v1: clock-skew coherence
+
+This release makes the two clock-skew tolerances of the checkpoint coherent
+across the stages that apply them. It contains one declared contract
+compatibility event (`validator-weight-decision` v1 gains a decision-policy
+field) and one semantic relaxation of an `active-assignment-snapshot` v1
+invariant that changes no schema or golden bytes. No other contract, fixture,
+Go API, or CLI changes.
+
+### `validator-weight-decision` v1: `decision_policy.max_future_skew_seconds` (compatibility event)
+
+Live manifest verification admits a manifest whose `issued_at_epoch` leads the
+validator's `evaluation_epoch` by at most the trust policy's
+`max_future_skew_seconds`, so a verified probe report may precede its
+manifest's issuance by that much. `decide_weight_submission` previously bound
+each report to its manifest with an undocumented zero tolerance
+(`manifest.issued_at_epoch <= report.evaluation_epoch`), refusing such rounds
+as `decision_round_invalid`. The decision now applies the configured bound:
+
+- `WeightDecisionPolicy` gains `max_future_skew_seconds` (`0..300`, default
+  `300`, the ceiling of the trust-policy field, exported as
+  `assignment_probe.MAX_FUTURE_SKEW_SECONDS`). A coordinator mirrors its pinned
+  trust policy's value; the default never refuses a round live verification
+  admitted, a pinned value re-enforces exactly that bound.
+- A round is admitted only if
+  `manifest.issued_at_epoch <= report.evaluation_epoch + max_future_skew_seconds`
+  (`decision_round_invalid` otherwise); the parser re-applies the sealed bound
+  to every report embedded in `assignment_manifest_evidence`
+  (`scoring_window_evidence_inconsistent`).
+- The `validator-weight-decision` schema, its golden fixture, and every
+  negative fixture under `contracts/negative/validator-weight-decision.v1/`
+  are re-pinned. The golden window now probes manifest 2 once 5s before its
+  issuance under a 5s trust bound and a mirrored 5s decision bound; the new
+  negative `submit-with-report-preceding-manifest-beyond-skew` tightens the
+  sealed bound to 4s. A record sealed before this release lacks the field:
+  its canonical document, and therefore `decision_digest_sha256`, no longer
+  matches, so it does not parse and must be re-sealed from its rounds. No
+  coordinator is live on the previous form.
+
+### `active-assignment-snapshot` v1: one clock-domain rule (semantics only)
+
+The replica invariant `route_activated_at_epoch >= ticket_issued_at_epoch`
+together with `route_activated_at_epoch <= captured_at_epoch` made the
+documented capture+30 ticket-issuance tolerance unreachable: no valid capture
+could carry a ticket stamped after the capture instant. The contract now
+names its two clocks (ticket window on the signer's clock; activation and
+capture on the runtime's) and applies `TICKET_MAX_FUTURE_SKEW_SECONDS` (30)
+to both cross-clock comparisons: the replica rule is
+`ticket_issued_at_epoch <= route_activated_at_epoch + 30`
+(`replica_activation_order_invalid`), the capture rule stays
+`ticket_issued_at_epoch <= captured_at_epoch + 30`
+(`snapshot_replica_ticket_issued_after_capture`), and the same-clock rule
+`route_activated_at_epoch <= captured_at_epoch` stays exact. Python
+(`assignment_snapshot`) and Go (`pkg/assignment`) apply the identical rule and
+codes. Every previously valid snapshot remains valid; schema and golden fixture
+bytes are unchanged. Added: the supplementary golden
+`contracts/fixtures/active-assignment-snapshot-signer-skew.v1.json` (both
+suites parse and re-seal it byte-for-byte) and the negatives
+`replica-ticket-issued-beyond-capture-skew` and
+`replica-activated-before-ticket-skew`.
+
+### Operator runbook
+
+`public-validator-live-probe-runbook.md` lists `finalized_epoch_rollback`
+beside the other rollback and fork codes in both the pre-request rejection
+list and the fork/rollback/equivocation response procedure; the retention and
+escalation steps are unchanged and apply to it.
+
 ## Contract checkpoint v1
 
 This release adds three versioned contracts and their pure verification code;

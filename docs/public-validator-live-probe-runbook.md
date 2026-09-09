@@ -79,8 +79,8 @@ The state advances only when a new manifest sequence is accepted. Re-probing
 the exact last-accepted manifest is expected and leaves the state unchanged
 (`manifest_reprobe:true` in the report). A lower sequence, a different manifest
 at the same sequence, a broken previous link, a finalized-height rollback or
-fork, or an issue-time rollback is rejected before any request is sent, and
-the state file is not modified.
+fork, a finalized-epoch rollback, or an issue-time rollback is rejected before
+any request is sent, and the state file is not modified.
 
 ## Invocation
 
@@ -166,8 +166,8 @@ to one miner replica.
 ## Fork, rollback, and equivocation response
 
 On `sequence_rollback`, `same_sequence_divergence`, `previous_link_mismatch`,
-`same_height_fork`, `finalized_height_rollback`, `issued_at_rollback`, or a
-state-anchor mismatch:
+`same_height_fork`, `finalized_height_rollback`, `finalized_epoch_rollback`,
+`issued_at_rollback`, or a state-anchor mismatch:
 
 1. stop; do not reset the state root to genesis to make the error disappear;
 2. retain the state root, the received manifest, and its envelopes unchanged;
