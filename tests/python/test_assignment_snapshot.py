@@ -36,6 +36,8 @@ from misscomputer_subnet.assignment_snapshot import (
     TICKET_MAX_FUTURE_SKEW_SECONDS,
     ActiveAssignmentSnapshot,
     AssignmentSnapshotError,
+    SnapshotDeployment,
+    SnapshotReplica,
     active_assignment_snapshot_bytes,
     build_snapshot_replica,
     parse_active_assignment_snapshot,
@@ -266,7 +268,7 @@ def _skewed_capture(
             snapshot_deployment_from(
                 alpha,
                 route_activated_at_epoch=route_activated_at_epoch,
-                ticket_issued_at_epoch=ticket_issued_at_epoch,
+                reissued_ticket_at_epoch=ticket_issued_at_epoch,
             ),
             snapshot_deployment_from(beta),
         ]
@@ -356,8 +358,13 @@ def test_signer_clock_skew_rejections_are_branch_complete() -> None:
     )
 
 
-def test_signer_skew_fixture_is_the_golden_capture_at_both_tolerances() -> None:
-    """The shared Go/Python parity fixture pins the +30 and +1 branches together."""
+def test_signer_skew_fixture_is_a_fresh_incarnation_successor_at_both_tolerances() -> None:
+    """The shared Go/Python parity fixture pins the +30 and +1 branches together.
+
+    Its replicas are fresh incarnations (generation 2 with fresh nonce, endpoint,
+    ticket and receipt digests), never the golden incarnation with a rewritten
+    ticket instant, so it is a legitimate successor of the golden capture.
+    """
 
     rendered = (FIXTURES / "active-assignment-snapshot-signer-skew.v1.json").read_bytes()
     snapshot = parse_active_assignment_snapshot(rendered)
@@ -378,13 +385,96 @@ def test_signer_skew_fixture_is_the_golden_capture_at_both_tolerances() -> None:
         for item in snapshot.deployments
         for replica in item.replicas
     )
-    # Same content as the golden capture apart from the re-stamped timing, so
-    # it is the successor capture of the golden snapshot at the next revision.
-    verify_snapshot_succession(build_snapshot(), snapshot)
+    golden = build_snapshot()
+    golden_replicas = {
+        replica.endpoint_id: replica for item in golden.deployments for replica in item.replicas
+    }
+    golden_facts = {
+        (replica.assignment_nonce, replica.ticket_digest_sha256, replica.receipt_digest_sha256)
+        for replica in golden_replicas.values()
+    }
+    for item in snapshot.deployments:
+        for replica in item.replicas:
+            assert replica.generation == 2
+            assert replica.endpoint_id not in golden_replicas
+            assert replica.assignment_nonce not in {
+                r.assignment_nonce for r in golden_replicas.values()
+            }
+            assert (
+                replica.assignment_nonce,
+                replica.ticket_digest_sha256,
+                replica.receipt_digest_sha256,
+            ) not in golden_facts
+    verify_snapshot_succession(golden, snapshot)
     document = json.loads(rendered)
     document["deployments"][0]["replicas"][0]["ticket_issued_at_epoch"] += 1
     with pytest.raises(ValidationError, match="replica_activation_order_invalid"):
         ActiveAssignmentSnapshot.model_validate(document)
+
+
+def test_succession_refuses_rewritten_incarnation_facts() -> None:
+    """One incarnation has one set of signed facts across every capture that exports it.
+
+    A signed ticket binds its own issuance, so a successor capture that keeps an
+    endpoint's ticket digest, nonce, and receipt digest while restamping
+    ``ticket_issued_at_epoch`` (or any other fact of that incarnation) is an
+    impossible rewrite, not a re-assignment, and is refused.
+    """
+
+    golden = build_snapshot()
+    alpha, beta = fixture_deployments()
+
+    def successor(**replica_changes: object) -> ActiveAssignmentSnapshot:
+        lifted = snapshot_deployment_from(alpha)
+        replicas = [
+            SnapshotReplica.model_validate({**replica.model_dump(mode="json"), **replica_changes})
+            if index == 0
+            else replica
+            for index, replica in enumerate(lifted.replicas)
+        ]
+        rewritten = SnapshotDeployment.model_validate(
+            {
+                **lifted.model_dump(mode="json"),
+                "replicas": [item.model_dump(mode="json") for item in replicas],
+            }
+        )
+        return build_snapshot(
+            snapshot_sequence=2,
+            state_revision=8,
+            snapshot_deployments=[rewritten, snapshot_deployment_from(beta)],
+        )
+
+    # Unchanged incarnations succeed; every rewrite of a retained incarnation fails.
+    verify_snapshot_succession(golden, successor())
+    for changes in (
+        {"ticket_issued_at_epoch": BASE_EPOCH - 499},
+        {"ticket_issued_at_epoch": BASE_EPOCH + 1, "route_activated_at_epoch": BASE_EPOCH},
+        {"ticket_digest_sha256": label_digest("rewritten-ticket")},
+        {"receipt_digest_sha256": label_digest("rewritten-receipt")},
+        {"ticket_expires_at_epoch": BASE_EPOCH + 3_501},
+        {"route_activated_at_epoch": ROUTE_ACTIVATED_AT + 1},
+        {"expires_at_block": FINALIZED_HEIGHT + 61},
+        {"chain_block": FINALIZED_HEIGHT - 61},
+    ):
+        with pytest.raises(AssignmentSnapshotError) as failure:
+            verify_snapshot_succession(golden, successor(**changes))
+        assert failure.value.code == "snapshot_incarnation_rewritten", changes
+    # A genuinely re-issued ticket is a new incarnation and succeeds.
+    verify_snapshot_succession(
+        golden,
+        build_snapshot(
+            snapshot_sequence=2,
+            state_revision=8,
+            snapshot_deployments=[
+                snapshot_deployment_from(
+                    alpha,
+                    route_activated_at_epoch=BASE_EPOCH,
+                    reissued_ticket_at_epoch=BASE_EPOCH + 1,
+                ),
+                snapshot_deployment_from(beta),
+            ],
+        ),
+    )
 
 
 def test_builder_never_trusts_a_supplied_projection_digest_or_order() -> None:

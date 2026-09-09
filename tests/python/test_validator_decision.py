@@ -19,6 +19,7 @@ from assignment_probe_context import (
     FINALIZED_HEIGHT,
     MINERS,
     build_deployment,
+    build_policy,
     label_digest,
     sign_manifest,
 )
@@ -34,12 +35,16 @@ from contract_checkpoint_context import (
     WINDOW_START,
     MetagraphNeuron,
     assigned_baseline,
+    build_future_terminal,
     build_round,
     forged_decision,
+    forged_decision_with_report,
+    future_terminal_decision,
     make_window_context,
     metagraph_view,
     registered_set,
     reseal_decision,
+    reseal_report,
     window_deployment,
 )
 from pydantic import ValidationError
@@ -50,10 +55,12 @@ from misscomputer_subnet.assignment_probe import (
     ProbeObservation,
     ValidatorProbeReport,
     build_initial_manifest_chain_state,
+    build_validator_probe_report,
     manifest_effective_expires_at_epoch,
     verify_active_assignment_manifest,
 )
 from misscomputer_subnet.contract_codec import digest as canonical_digest
+from misscomputer_subnet.manifest_publication import rebind_manifest_chain_state_trust_policy
 from misscomputer_subnet.probe_scoring import (
     ProbeRound,
     ProbeScoringError,
@@ -263,6 +270,7 @@ def test_abstain_record_can_never_become_a_plan() -> None:
             status="unavailable", evaluated_at_epoch=WINDOW_END, rejection_code="timeout"
         ),
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
     )
@@ -332,6 +340,7 @@ def test_invalid_stale_or_expired_manifest_at_close_abstains() -> None:
             context.rounds,
             terminal=terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
@@ -446,6 +455,7 @@ def test_manifest_validity_never_outlives_ticket_or_block_leases() -> None:
             context.rounds,
             terminal=terminal,
             registered=changes.get("registered", context.registered),
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             decision_policy=WeightDecisionPolicy(
@@ -497,6 +507,7 @@ def test_manifest_validity_never_outlives_ticket_or_block_leases() -> None:
                 status="verified", evaluated_at_epoch=WINDOW_END + 2, manifest=short
             ),
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END + 2,
         )
@@ -509,6 +520,7 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
         context.rounds,
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=WeightDecisionPolicy(min_verified_rounds=46),
@@ -524,6 +536,7 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
         context.rounds,
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=WeightDecisionPolicy(min_expected_attributions=10),
@@ -538,6 +551,7 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
         context.rounds,
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         identity_first_seen_epoch={miner_f: BASE_EPOCH},
@@ -550,6 +564,7 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
             context.rounds,
             terminal=context.terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             identity_first_seen_epoch={miner_f: BASE_EPOCH + 3_001},
@@ -563,6 +578,7 @@ def test_insufficient_sampling_abstains_instead_of_zeroing() -> None:
                 context.rounds,
                 terminal=context.terminal,
                 registered=context.registered,
+                trust_policies=[context.policy],
                 window_start_epoch=WINDOW_START,
                 window_end_epoch=WINDOW_END,
                 identity_first_seen_epoch={(99, "MinerZ"): invalid},
@@ -578,6 +594,7 @@ def test_positive_evidence_does_not_bypass_minimum_coverage() -> None:
         context.rounds,
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=WeightDecisionPolicy(min_expected_attributions=46),
@@ -595,6 +612,7 @@ def test_positive_evidence_does_not_bypass_minimum_coverage() -> None:
             context.rounds,
             terminal=context.terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             decision_policy=WeightDecisionPolicy(min_expected_attributions=15),
@@ -643,13 +661,27 @@ def test_sealed_first_seen_rejects_later_rewrite_and_accepts_earlier_archive() -
     )
 
 
-def test_golden_window_seals_its_skewed_round_under_the_mirrored_bound() -> None:
-    """The golden window probes manifest 2 once before its issuance, inside the trust bound."""
+def _forged_report(report: ValidatorProbeReport, **changes: Any) -> ValidatorProbeReport:
+    """A digest-valid report claiming facts live verification never produced."""
+
+    document = report.model_dump(mode="json", by_alias=True)
+    return ValidatorProbeReport.model_validate(reseal_report({**document, **changes}))
+
+
+def test_golden_window_seals_its_skewed_round_under_the_verifying_policy() -> None:
+    """The golden window probes manifest 2 once before its issuance, inside the trust bound.
+
+    The bound is the sealed trust policy's ``max_future_skew_seconds``, never a
+    decision-local number: the decision policy carries no skew field, the
+    record embeds the exact policy document every round was verified under,
+    and the parser re-derives the bound from it.
+    """
 
     context = make_window_context()
     skew = context.policy.max_future_skew_seconds
     assert skew > 0
-    assert context.decision.decision_policy.max_future_skew_seconds == skew
+    assert "max_future_skew_seconds" not in WeightDecisionPolicy.model_fields
+    assert context.decision.trust_policies == [context.policy]
     leads = sorted(
         entry.report.manifest_issued_at_epoch - entry.report.evaluation_epoch
         for entry in context.rounds
@@ -660,63 +692,68 @@ def test_golden_window_seals_its_skewed_round_under_the_mirrored_bound() -> None
     assert parse_validator_weight_decision(rendered) == context.decision
     assert context.decision.decision == "submit" and context.decision.round_count == 45
 
-    # An unpinned policy defaults to the contract ceiling and admits the same rounds.
-    unpinned = decide_weight_submission(
-        context.rounds,
-        terminal=context.terminal,
-        registered=context.registered,
-        window_start_epoch=WINDOW_START,
-        window_end_epoch=WINDOW_END,
-    )
-    assert unpinned.decision_policy.max_future_skew_seconds == 300
-    assert unpinned.round_count == 45 and unpinned.decision == "submit"
-    assert unpinned.rows == context.decision.rows
-
-    # A sealed bound tighter than the evidence is refused by the parser, whether
-    # the record is rewritten (digest-valid) or produced under that bound.
-    document = json.loads(rendered)
-    tightened = forged_decision(
-        rendered,
-        decision_policy={**document["decision_policy"], "max_future_skew_seconds": skew - 1},
-    )
-    with pytest.raises(ValidationError, match="scoring_window_evidence_inconsistent"):
-        ValidatorWeightDecision.model_validate(tightened)
-    with pytest.raises(WeightDecisionError) as failure:
+    # The verifying policy is not optional: without it no round can be bound.
+    with pytest.raises(WeightDecisionError) as missing:
         decide_weight_submission(
             context.rounds,
             terminal=context.terminal,
             registered=context.registered,
+            trust_policies=[],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
-            decision_policy=WeightDecisionPolicy(max_future_skew_seconds=skew - 1),
+        )
+    assert missing.value.code == "decision_trust_policy_missing"
+    other = build_policy(context.keys, max_age=3_600, max_future_skew=300)
+    with pytest.raises(WeightDecisionError) as wrong:
+        decide_weight_submission(
+            context.rounds,
+            terminal=context.terminal,
+            registered=context.registered,
+            trust_policies=[other],
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+    assert wrong.value.code == "decision_trust_policy_missing"
+
+    # A digest-valid rewrite of the skewed report one second further before its
+    # manifest is refused on parse under the sealed policy, and the same
+    # impossible report is refused by the producer.
+    skewed = context.rounds[24]
+    assert skewed.report.evaluation_epoch == skewed.report.manifest_issued_at_epoch - skew
+    document = forged_decision_with_report(
+        rendered,
+        report_digest_sha256=skewed.report.report_digest_sha256,
+        evaluation_epoch=skewed.report.evaluation_epoch - 1,
+    )
+    with pytest.raises(ValidationError, match="scoring_window_evidence_inconsistent"):
+        ValidatorWeightDecision.model_validate(document)
+    impossible = ProbeRound(
+        manifest=skewed.manifest,
+        report=_forged_report(skewed.report, evaluation_epoch=skewed.report.evaluation_epoch - 1),
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide_weight_submission(
+            [*context.rounds[:24], impossible, *context.rounds[25:]],
+            terminal=context.terminal,
+            registered=context.registered,
+            trust_policies=[context.policy],
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
         )
     assert failure.value.code == "decision_round_invalid"
-    # The window without the skewed round seals fine under the tighter bound.
-    without = decide_weight_submission(
-        [*context.rounds[:24], *context.rounds[25:]],
-        terminal=context.terminal,
-        registered=context.registered,
-        window_start_epoch=WINDOW_START,
-        window_end_epoch=WINDOW_END,
-        decision_policy=WeightDecisionPolicy(max_future_skew_seconds=skew - 1),
-    )
-    assert without.round_count == 44
-    for invalid in (-1, 301):
-        with pytest.raises(ValidationError):
-            WeightDecisionPolicy(max_future_skew_seconds=invalid)
 
 
 @pytest.mark.parametrize("lead_seconds", [1, 5])
 def test_report_verified_within_trust_skew_is_admitted_end_to_end(lead_seconds: int) -> None:
-    """Live verification and decision admission share one clock-skew bound.
+    """Live verification and decision admission share the verifying policy's bound.
 
     A validator whose clock trails the publisher's by up to the trust policy's
     ``max_future_skew_seconds`` verifies the manifest and seals a report whose
-    ``evaluation_epoch`` precedes ``issued_at_epoch``. The decision, pinned to
-    the same bound, admits that round; one second beyond the bound is refused
-    live (``manifest_future``) before any report exists, and a decision policy
-    stricter than the bound the round was verified under refuses it with the
-    stable ``decision_round_invalid`` code instead of silently dropping it.
+    ``evaluation_epoch`` precedes ``issued_at_epoch``. The decision, sealing
+    that policy, admits the round; one second beyond the bound is refused live
+    (``manifest_future``) before any report exists, a report cannot be built
+    for an epoch other than the one its manifest was verified at, and a report
+    forged past the bound is refused with the stable ``decision_round_invalid``.
     """
 
     context = make_window_context()
@@ -746,22 +783,55 @@ def test_report_verified_within_trust_skew_is_admitted_end_to_end(lead_seconds: 
             evaluation_epoch=issued_at - skew - 1,
             current_finalized_height=FINALIZED_HEIGHT,
         )
+    # Report construction is bound to the verification it seals: the epoch and
+    # policy are the ones the manifest was actually verified at and under.
+    verification = verify_active_assignment_manifest(
+        manifest_two,
+        sign_manifest(manifest_two, context.keys),
+        context.policy,
+        state_one,
+        evaluation_epoch=evaluation_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
+    )
+    assert verification.evaluation_epoch == evaluation_epoch
+    assert verification.trust_policy_digest_sha256 == context.policy.trust_policy_digest_sha256
+    with pytest.raises(AssignmentProbeError, match="report_evaluation_epoch_mismatch"):
+        build_validator_probe_report(
+            verification,
+            context.policy,
+            state_one,
+            skewed.report.observations,
+            validator_uid=VALIDATOR_UID,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            evaluation_epoch=issued_at - skew - 1,
+            edge_origin_override=False,
+        )
+    with pytest.raises(AssignmentProbeError, match="trust_policy_mismatch"):
+        build_validator_probe_report(
+            verification,
+            build_policy(context.keys, max_age=3_600, max_future_skew=300),
+            state_one,
+            skewed.report.observations,
+            validator_uid=VALIDATOR_UID,
+            validator_hotkey=VALIDATOR_HOTKEY,
+            evaluation_epoch=evaluation_epoch,
+            edge_origin_override=False,
+        )
 
     rounds = [*context.rounds[:24], skewed, *context.rounds[25:]]
     terminal = TerminalManifestObservation(
         status="verified", evaluated_at_epoch=WINDOW_END, manifest=context.manifests[2]
     )
-    pinned = WeightDecisionPolicy(max_future_skew_seconds=skew)
     decision = decide_weight_submission(
         rounds,
         terminal=terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
-        decision_policy=pinned,
     )
     assert decision.decision == "submit" and decision.round_count == 45
-    assert decision.decision_policy.max_future_skew_seconds == skew
+    assert decision.trust_policies == [context.policy]
     sealed_reports = [
         report
         for item in decision.assignment_manifest_evidence
@@ -784,21 +854,213 @@ def test_report_verified_within_trust_skew_is_admitted_end_to_end(lead_seconds: 
     )
     assert canonical_digest(window.model_dump(mode="json")) == decision.scoring_window_digest_sha256
 
-    stricter = WeightDecisionPolicy(max_future_skew_seconds=lead_seconds - 1)
+    # The same report forged one second past the policy's bound is impossible
+    # under the policy that verified it and is refused, not silently admitted.
+    forged = ProbeRound(
+        manifest=manifest_two,
+        report=_forged_report(skewed.report, evaluation_epoch=issued_at - skew - 1),
+    )
     with pytest.raises(WeightDecisionError) as failure:
         decide_weight_submission(
-            rounds,
+            [*context.rounds[:24], forged, *context.rounds[25:]],
             terminal=terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
-            decision_policy=stricter,
         )
     assert failure.value.code == "decision_round_invalid"
     # Manifest 1 is issued at window start, so a report evaluated before it
     # also falls outside the window and is refused by the window rule, not
     # by clock skew.
     assert manifest_one.issued_at_epoch == WINDOW_START
+
+
+def test_policy_rotation_inside_a_window_binds_each_report_to_its_own_policy() -> None:
+    """Rotating to a policy with a different skew mid-window keeps every bound exact.
+
+    Manifests 1 and 2 (and their rounds, including the one probed 5s before
+    manifest 2's issuance) were verified under the 5s policy; manifest 3 is
+    republished under a successor policy with zero tolerance. One bound could
+    not serve both: it would refuse genuine evidence or admit impossible
+    evidence. The record seals both policy documents and binds every report
+    and the terminal to the policy that verified them.
+    """
+
+    context = make_window_context()
+    current = context.policy
+    successor = build_policy(context.keys, max_age=3_600, max_future_skew=0)
+    assert successor.trust_policy_digest_sha256 != current.trust_policy_digest_sha256
+    manifest_two = context.manifests[1]
+    alpha = window_deployment("fixture-alpha", MINERS[:3], campaign_sequence=1)
+    beta = window_deployment("fixture-beta", MINERS[1:], campaign_sequence=2)
+    gamma = window_deployment("fixture-gamma", EXTRA_MINERS[:1], campaign_sequence=3)
+    delta = window_deployment("fixture-delta", EXTRA_MINERS[1:2], campaign_sequence=4)
+    rotated_three = build_probe_manifest(
+        successor,
+        [alpha, beta, gamma, delta],
+        sequence=3,
+        previous=manifest_two.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 3_000,
+        expires_at=BASE_EPOCH + 3_000 + 3_600,
+        finalized_height=FINALIZED_HEIGHT + 40,
+        finalized_block_hash=label_digest("contract-checkpoint-block-three"),
+    )
+    state_two = rebind_manifest_chain_state_trust_policy(
+        context.states[2], current, successor, evaluation_epoch=BASE_EPOCH + 3_000
+    )
+    rounds = list(context.rounds[:36])
+    for index in range(9):
+        rounds.append(
+            build_round(
+                successor,
+                rotated_three,
+                state_two,
+                context.keys,
+                responders={
+                    "fixture-alpha": "MinerA",
+                    "fixture-beta": "MinerB",
+                    "fixture-gamma": "MinerE",
+                    "fixture-delta": None,
+                },
+                label=f"rotated-three-{index}",
+                evaluation_epoch=BASE_EPOCH + 3_060 + 60 * index,
+            )
+        )
+    terminal = TerminalManifestObservation(
+        status="verified", evaluated_at_epoch=WINDOW_END, manifest=rotated_three
+    )
+
+    def decide(window_rounds: list[ProbeRound], *policies: Any) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            window_rounds,
+            terminal=terminal,
+            registered=context.registered,
+            trust_policies=list(policies),
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+
+    decision = decide(rounds, successor, current)
+    assert decision.decision == "submit" and decision.round_count == 45
+    assert [item.trust_policy_digest_sha256 for item in decision.trust_policies] == sorted(
+        [current.trust_policy_digest_sha256, successor.trust_policy_digest_sha256]
+    )
+    assert parse_validator_weight_decision(validator_weight_decision_bytes(decision)) == decision
+    # Genuine 5s-skewed evidence under the current policy is admitted...
+    assert rounds[24].report.evaluation_epoch == manifest_two.issued_at_epoch - 5
+    # ...while a report one second before manifest 3's issuance is impossible
+    # under the zero-skew successor that verified it, even though the current
+    # policy would have allowed it.
+    forged = ProbeRound(
+        manifest=rotated_three,
+        report=_forged_report(
+            rounds[36].report, evaluation_epoch=rotated_three.issued_at_epoch - 1
+        ),
+    )
+    with pytest.raises(WeightDecisionError) as failure:
+        decide([*rounds[:36], forged, *rounds[37:]], successor, current)
+    assert failure.value.code == "decision_round_invalid"
+    # Each policy is required for the manifests it verified.
+    for supplied in ((current,), (successor,)):
+        with pytest.raises(WeightDecisionError) as missing:
+            decide(rounds, *supplied)
+        assert missing.value.code == "decision_trust_policy_missing"
+    # Sealed policies are exactly the verifying set, canonically ordered.
+    rendered = validator_weight_decision_bytes(decision)
+    document = json.loads(rendered)
+    with pytest.raises(ValidationError, match="trust_policies_not_canonical"):
+        ValidatorWeightDecision.model_validate(
+            forged_decision(rendered, trust_policies=list(reversed(document["trust_policies"])))
+        )
+    with pytest.raises(ValidationError, match="trust_policies_not_derived"):
+        ValidatorWeightDecision.model_validate(
+            forged_decision(rendered, trust_policies=document["trust_policies"][:1])
+        )
+    unrelated = build_policy(context.keys, max_age=3_600, max_future_skew=300)
+    padded = sorted(
+        [*document["trust_policies"], unrelated.model_dump(mode="json", by_alias=True)],
+        key=lambda item: item["trust_policy_digest_sha256"],
+    )
+    with pytest.raises(ValidationError, match="trust_policies_not_derived"):
+        ValidatorWeightDecision.model_validate(forged_decision(rendered, trust_policies=padded))
+    foreign = build_policy(
+        context.keys, max_age=3_600, central_authority=label_digest("other-authority")
+    )
+    with pytest.raises(WeightDecisionError) as authority:
+        decide(rounds, successor, current, foreign)
+    assert authority.value.code == "decision_trust_policy_invalid"
+
+
+def test_terminal_manifest_issued_beyond_its_policy_skew_is_refused() -> None:
+    """The terminal observation is bound to the skew of the policy that verified it.
+
+    A manifest republished after the close instant may lead the validator's
+    close evaluation by at most the trust policy's ``max_future_skew_seconds``,
+    exactly as live verification requires. Producer and parser both refuse a
+    terminal issued further ahead, so a record cannot seal a terminal that
+    could never have verified at its evaluation instant.
+    """
+
+    context = make_window_context()
+    context_policy = context.policy
+    skew = context_policy.max_future_skew_seconds
+    within, state_three = build_future_terminal(context, lead_seconds=skew)
+    beyond, _ = build_future_terminal(context, lead_seconds=skew + 1)
+    for manifest, epoch, ok in (
+        (within, WINDOW_END, True),
+        (beyond, WINDOW_END, False),
+        (beyond, WINDOW_END + 1, True),
+    ):
+        if ok:
+            verify_active_assignment_manifest(
+                manifest,
+                sign_manifest(manifest, context.keys),
+                context_policy,
+                state_three,
+                evaluation_epoch=epoch,
+                current_finalized_height=FINALIZED_HEIGHT,
+            )
+        else:
+            with pytest.raises(AssignmentProbeError, match="manifest_future"):
+                verify_active_assignment_manifest(
+                    manifest,
+                    sign_manifest(manifest, context.keys),
+                    context_policy,
+                    state_three,
+                    evaluation_epoch=epoch,
+                    current_finalized_height=FINALIZED_HEIGHT,
+                )
+
+    def decide(manifest: Any, evaluated_at_epoch: int) -> ValidatorWeightDecision:
+        return decide_weight_submission(
+            context.rounds,
+            terminal=TerminalManifestObservation(
+                status="verified", evaluated_at_epoch=evaluated_at_epoch, manifest=manifest
+            ),
+            registered=context.registered,
+            trust_policies=[context_policy],
+            window_start_epoch=WINDOW_START,
+            window_end_epoch=WINDOW_END,
+        )
+
+    at_bound = decide(within, WINDOW_END)
+    assert at_bound.decision == "submit" and at_bound.terminal_manifest_sequence == 4
+    assert parse_validator_weight_decision(validator_weight_decision_bytes(at_bound)) == at_bound
+    with pytest.raises(WeightDecisionError) as failure:
+        decide(beyond, WINDOW_END)
+    assert failure.value.code == "decision_terminal_future"
+    later = decide(beyond, WINDOW_END + 1)
+    assert later.decision == "submit" and later.terminal_evaluated_at_epoch == WINDOW_END + 1
+    rendered = validator_weight_decision_bytes(later)
+    assert parse_validator_weight_decision(rendered) == later
+    assert later == future_terminal_decision(skew + 1, evaluated_at_epoch=WINDOW_END + 1)
+    # Rewriting the evaluation instant back to the close is digest-valid and
+    # still refused: the terminal could not have verified then.
+    with pytest.raises(ValidationError, match="terminal_manifest_future"):
+        ValidatorWeightDecision.model_validate(
+            forged_decision(rendered, terminal_evaluated_at_epoch=WINDOW_END)
+        )
 
 
 def test_uid_republication_never_erases_the_earning_identity_sighting() -> None:
@@ -847,6 +1109,7 @@ def test_uid_republication_never_erases_the_earning_identity_sighting() -> None:
         return decide_weight_submission(
             context.rounds[:24],
             terminal=terminal,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             **{"registered": context.registered, **changes},
@@ -964,6 +1227,7 @@ def test_archived_sighting_of_old_uid_never_leaves_republished_uid_grace() -> No
             context.rounds[:24],
             terminal=terminal,
             registered=reregistered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             **changes,
@@ -1034,6 +1298,7 @@ def test_no_positive_evidence_means_no_transaction() -> None:
         [],
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
     )
@@ -1058,6 +1323,7 @@ def test_safe_preconditions_for_zeroing_absent_miners() -> None:
             context.rounds,
             terminal=terminal or context.terminal,
             registered=registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             decision_policy=policy,
@@ -1219,6 +1485,7 @@ def _reduced_window(
             status="verified", evaluated_at_epoch=window_start + 3_000, manifest=reduced
         ),
         registered=registered_set(finalized_height=reduced.finalized_height + 15),
+        trust_policies=[context.policy],
         window_start_epoch=window_start,
         window_end_epoch=window_start + 3_000,
         decision_policy=policy,
@@ -1297,6 +1564,7 @@ def test_mass_unassignment_baseline_survives_the_window_boundary() -> None:
             status="unavailable", evaluated_at_epoch=WINDOW_END, rejection_code="timeout"
         ),
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         prior_assigned_baseline=assigned_baseline(
@@ -1314,6 +1582,7 @@ def test_mass_unassignment_baseline_survives_the_window_boundary() -> None:
             status="unavailable", evaluated_at_epoch=WINDOW_END, rejection_code="timeout"
         ),
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         prior_assigned_baseline=assigned_baseline(
@@ -1350,6 +1619,7 @@ def test_outage_window_carries_verified_max_into_next_reduction(
             rejection_code="timeout" if terminal_status == "unavailable" else "manifest_stale",
         ),
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         prior_assigned_baseline=prior,
@@ -1377,6 +1647,7 @@ def test_window_manifests_must_form_one_coherent_chain() -> None:
             rounds,
             terminal=terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
@@ -1479,6 +1750,7 @@ def test_manifest_finalized_epoch_rollback_is_incoherent() -> None:
                 status="verified", evaluated_at_epoch=WINDOW_END, manifest=rolled
             ),
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
@@ -1502,6 +1774,7 @@ def test_mutated_verified_reports_are_refused_not_consumed() -> None:
             [tampered, *context.rounds[1:]],
             terminal=context.terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
@@ -1520,6 +1793,7 @@ def test_mutated_verified_reports_are_refused_not_consumed() -> None:
         context.rounds,
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=context.decision.decision_policy,
@@ -1537,6 +1811,7 @@ def test_mutated_verified_reports_are_refused_not_consumed() -> None:
                 status="verified", evaluated_at_epoch=WINDOW_END, manifest=terminal_manifest
             ),
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
@@ -1552,6 +1827,7 @@ def test_input_consistency_errors_are_not_abstentions() -> None:
                 status="verified", evaluated_at_epoch=WINDOW_END, manifest=context.manifests[0]
             ),
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
@@ -1561,6 +1837,7 @@ def test_input_consistency_errors_are_not_abstentions() -> None:
             context.rounds,
             terminal=context.terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             decision_policy=WeightDecisionPolicy(activation_grace_seconds=3_601),
@@ -1571,6 +1848,7 @@ def test_input_consistency_errors_are_not_abstentions() -> None:
             context.rounds,
             terminal=context.terminal,
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_END,
             window_end_epoch=WINDOW_START,
         )
@@ -1580,6 +1858,7 @@ def test_input_consistency_errors_are_not_abstentions() -> None:
             context.rounds,
             terminal=context.terminal,
             registered=context.registered.model_copy(update={"validator_hotkey": "Impostor"}),
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )
@@ -1596,6 +1875,7 @@ def test_decision_is_deterministic_under_round_reordering() -> None:
         shuffled,
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=context.decision.decision_policy,
@@ -1761,6 +2041,7 @@ def test_mass_guard_counts_registered_identities_only() -> None:
                 status="verified", evaluated_at_epoch=WINDOW_END, manifest=padded
             ),
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             decision_policy=policy,
@@ -1958,6 +2239,7 @@ def test_manifest_chain_must_be_unbroken_across_omitted_sequences() -> None:
                 status="verified", evaluated_at_epoch=WINDOW_END, manifest=terminal_manifest
             ),
             registered=context.registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
             archived_manifests=archived or [],
@@ -2210,6 +2492,7 @@ def test_positive_weight_requires_sealed_serving_evidence() -> None:
         context.rounds,
         terminal=context.terminal,
         registered=context.registered,
+        trust_policies=[context.policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         scoring_policy=ProbeScoringPolicy(min_attributions=16),
@@ -2265,6 +2548,7 @@ def test_decision_rows_must_cover_the_complete_eligible_set(monkeypatch: Any) ->
             context.rounds,
             terminal=context.terminal,
             registered=registered,
+            trust_policies=[context.policy],
             window_start_epoch=WINDOW_START,
             window_end_epoch=WINDOW_END,
         )

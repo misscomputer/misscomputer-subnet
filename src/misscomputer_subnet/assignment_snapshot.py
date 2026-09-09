@@ -117,6 +117,7 @@ SnapshotRejectionCode = Literal[
     "snapshot_finalized_epoch_rollback",
     "snapshot_finalized_fork",
     "snapshot_finalized_rollback",
+    "snapshot_incarnation_rewritten",
     "snapshot_manifest_chain_mismatch",
     "snapshot_manifest_issued_at_mismatch",
     "snapshot_manifest_route_mismatch",
@@ -460,7 +461,15 @@ def verify_snapshot_succession(
     ``snapshot_sequence`` strictly increases; ``state_revision``, the capture
     instant, the finalized height, and the finalized epoch never go
     backwards; an unchanged revision must carry byte-identical deployments;
-    one finalized height has one block hash and one epoch.
+    one finalized height has one block hash and one epoch; and one endpoint
+    incarnation has one set of facts. A signed ticket binds its own issuance,
+    so an incarnation (``endpoint_id``: deployment, hotkey, generation, nonce)
+    exported by both captures must carry the identical replica document in
+    both; a retained ticket digest, nonce, and receipt digest with a restamped
+    ``ticket_issued_at_epoch``, a moved activation instant, or any other
+    changed fact is an impossible rewrite, not a re-assignment
+    (``snapshot_incarnation_rewritten``). A re-issued ticket is a new
+    incarnation with a new generation and nonce.
     """
 
     previous = revalidate(previous, ActiveAssignmentSnapshot)
@@ -492,6 +501,16 @@ def verify_snapshot_succession(
         _reject("snapshot_finalized_fork")
     if current.finalized_epoch < previous.finalized_epoch:
         _reject("snapshot_finalized_epoch_rollback")
+    previous_incarnations = {
+        replica.endpoint_id: model_document(replica)
+        for item in previous.deployments
+        for replica in item.replicas
+    }
+    for item in current.deployments:
+        for replica in item.replicas:
+            retained = previous_incarnations.get(replica.endpoint_id)
+            if retained is not None and retained != model_document(replica):
+                _reject("snapshot_incarnation_rewritten")
 
 
 def verify_manifest_derived_from_snapshot(

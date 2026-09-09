@@ -2,42 +2,92 @@
 
 ## Contract checkpoint v1: clock-skew coherence
 
-This release makes the two clock-skew tolerances of the checkpoint coherent
-across the stages that apply them. It contains one declared contract
-compatibility event (`validator-weight-decision` v1 gains a decision-policy
-field) and one semantic relaxation of an `active-assignment-snapshot` v1
-invariant that changes no schema or golden bytes. No other contract, fixture,
-Go API, or CLI changes.
+This release makes the checkpoint's clock-skew tolerances coherent across the
+stages that apply them, and binds every tolerance to the policy document that
+admitted the evidence. It contains one declared contract compatibility event
+(`validator-weight-decision` v1 gains `trust_policies`), two breaking pure-API
+changes (`decide_weight_submission` requires `trust_policies`;
+`build_validator_probe_report` refuses an epoch or policy other than its
+verification's), one semantic relaxation and one semantic tightening of
+`active-assignment-snapshot` v1 invariants that change no schema or golden
+bytes. No other contract, fixture, Go API, or CLI changes.
 
-### `validator-weight-decision` v1: `decision_policy.max_future_skew_seconds` (compatibility event)
+### `validator-weight-decision` v1 gains `trust_policies` (compatibility event; breaking `decide_weight_submission`)
 
 Live manifest verification admits a manifest whose `issued_at_epoch` leads the
 validator's `evaluation_epoch` by at most the trust policy's
 `max_future_skew_seconds`, so a verified probe report may precede its
-manifest's issuance by that much. `decide_weight_submission` previously bound
-each report to its manifest with an undocumented zero tolerance
-(`manifest.issued_at_epoch <= report.evaluation_epoch`), refusing such rounds
-as `decision_round_invalid`. The decision now applies the configured bound:
+manifest's issuance by that much, and the bound may differ between manifests
+verified under different policies across a rotation inside one window.
+`decide_weight_submission` previously bound each report to its manifest with an
+undocumented zero tolerance (`manifest.issued_at_epoch <=
+report.evaluation_epoch`), refusing such rounds as `decision_round_invalid`,
+and never checked the terminal manifest's issuance against its evaluation
+instant at all. The decision now binds every time bound to the verifying
+policy document:
 
-- `WeightDecisionPolicy` gains `max_future_skew_seconds` (`0..300`, default
-  `300`, the ceiling of the trust-policy field, exported as
-  `assignment_probe.MAX_FUTURE_SKEW_SECONDS`). A coordinator mirrors its pinned
-  trust policy's value; the default never refuses a round live verification
-  admitted, a pinned value re-enforces exactly that bound.
-- A round is admitted only if
-  `manifest.issued_at_epoch <= report.evaluation_epoch + max_future_skew_seconds`
-  (`decision_round_invalid` otherwise); the parser re-applies the sealed bound
-  to every report embedded in `assignment_manifest_evidence`
-  (`scoring_window_evidence_inconsistent`).
-- The `validator-weight-decision` schema, its golden fixture, and every
-  negative fixture under `contracts/negative/validator-weight-decision.v1/`
-  are re-pinned. The golden window now probes manifest 2 once 5s before its
-  issuance under a 5s trust bound and a mirrored 5s decision bound; the new
-  negative `submit-with-report-preceding-manifest-beyond-skew` tightens the
-  sealed bound to 4s. A record sealed before this release lacks the field:
-  its canonical document, and therefore `decision_digest_sha256`, no longer
-  matches, so it does not parse and must be re-sealed from its rounds. No
-  coordinator is live on the previous form.
+- `decide_weight_submission` requires the keyword argument `trust_policies`
+  (**breaking**): the approved `assignment-manifest-trust-policy` documents the
+  coordinator verified the window's manifests under. Each must re-validate,
+  be unique by digest, and name the registered set's network and netuid and
+  one central authority (`decision_trust_policy_invalid`, at most 16). Every
+  window, archived, and terminal manifest must name one of them by
+  `trust_policy_digest_sha256` (`decision_trust_policy_missing`).
+- A round is admitted only if `manifest.issued_at_epoch <=
+  report.evaluation_epoch + policy.max_future_skew_seconds` for that
+  manifest's policy (`decision_round_invalid`). A verified terminal manifest
+  must satisfy `issued_at_epoch <= terminal_evaluated_at_epoch +
+  policy.max_future_skew_seconds` for its policy (`decision_terminal_future`),
+  exactly as live verification at that instant requires.
+- The record gains `trust_policies`: exactly the policy documents its sealed
+  manifests name, sorted by digest. Parsing re-validates each document
+  (digests and key material), requires the canonical order and the exact set
+  (`trust_policies_not_canonical`, `trust_policies_not_derived`), requires them
+  to match the record's network, netuid, and the manifests' authority
+  (`trust_policy_authority_mismatch`), and re-applies each manifest's own bound
+  to every embedded report (`scoring_window_evidence_inconsistent`) and to the
+  terminal (`terminal_manifest_future`).
+- `WeightDecisionPolicy` carries no clock-skew field; there is no
+  decision-local or default bound.
+- The `validator-weight-decision` schema (now embedding the trust-policy
+  definition), its golden fixture, and every negative fixture under
+  `contracts/negative/validator-weight-decision.v1/` are re-pinned. The golden
+  window seals one policy (5s) and probes manifest 2 once 5s before its
+  issuance. New negatives: `submit-with-report-preceding-manifest-beyond-skew`
+  (that report resealed one second earlier, with the scoring window and record
+  resealed), `submit-with-terminal-issued-beyond-skew` (a terminal issued 6s
+  after the close, legitimately produced at close+1, evaluation instant
+  rewritten to the close), `submit-without-verifying-trust-policy`. A record
+  sealed before this release lacks `trust_policies`: its canonical document,
+  and therefore `decision_digest_sha256`, no longer matches, so it does not
+  parse and must be re-sealed from its rounds. No coordinator is live on the
+  previous form.
+
+### Report construction is bound to its verification (breaking)
+
+`ManifestVerificationResult` gains `evaluation_epoch` and
+`trust_policy_digest_sha256`: the instant and policy the freshness, skew,
+signer-validity, and chain rules were applied at and under (live, historical,
+and anchor verification all record them). `build_validator_probe_report`
+refuses an `evaluation_epoch` other than the verification's
+(`report_evaluation_epoch_mismatch`, new `ProbeRejectionCode`) and a
+`trust_policy` whose digest differs from the verification's or from the
+manifest's `trust_policy_digest_sha256` (`trust_policy_mismatch`). A report can
+therefore never claim an evaluation instant, and so a clock skew, that its
+verification did not admit. The `misscomputer-assignment-probe` CLI already
+passes the same epoch and policy to both calls and is unaffected.
+
+### `active-assignment-snapshot` v1: incarnation immutability across captures (semantics only)
+
+`verify_snapshot_succession` adds `snapshot_incarnation_rewritten`: an
+`endpoint_id` (deployment, hotkey, generation, nonce) exported by both the
+previous and the current capture must carry the identical replica document in
+both. A signed ticket binds its own issuance, so a retained ticket digest,
+nonce, and receipt digest with a restamped `ticket_issued_at_epoch`, a moved
+`route_activated_at_epoch`, or any other changed fact is an impossible rewrite,
+not a re-assignment; a re-issued ticket is a new generation and nonce. Schema
+and golden bytes are unchanged. There is no Go counterpart: succession is a
+publisher-side rule and `pkg/assignment` has no succession API.
 
 ### `active-assignment-snapshot` v1: one clock-domain rule (semantics only)
 
@@ -57,7 +107,9 @@ to both cross-clock comparisons: the replica rule is
 codes. Every previously valid snapshot remains valid; schema and golden fixture
 bytes are unchanged. Added: the supplementary golden
 `contracts/fixtures/active-assignment-snapshot-signer-skew.v1.json` (both
-suites parse and re-seal it byte-for-byte) and the negatives
+suites parse and re-seal it byte-for-byte; its replicas are fresh
+generation-2 incarnations with fresh nonces, endpoints, ticket and receipt
+digests, so it is a valid successor of the golden capture) and the negatives
 `replica-ticket-issued-beyond-capture-skew` and
 `replica-activated-before-ticket-skew`.
 

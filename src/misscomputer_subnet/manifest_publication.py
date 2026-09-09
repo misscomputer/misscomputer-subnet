@@ -603,6 +603,8 @@ def anchor_manifest_chain_state(
             {**anchored, "state_digest_sha256": digest(anchored)}
         ),
         reprobe=False,
+        evaluation_epoch=result.evaluation_epoch,
+        trust_policy_digest_sha256=result.trust_policy_digest_sha256,
     )
 
 

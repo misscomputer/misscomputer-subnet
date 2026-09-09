@@ -46,13 +46,16 @@ Frozen rules
    ``window_start_epoch <= evaluation_epoch < window_end_epoch`` and before
    their manifest's effective horizon; the terminal manifest observation is
    taken at or after ``window_end_epoch``; the registered set is a finalized
-   view. A report's ``evaluation_epoch`` may precede its manifest's
-   ``issued_at_epoch`` by at most ``max_future_skew_seconds``: the same
-   configured clock-skew bound under which live verification admitted the
-   manifest, mirrored into the decision policy and sealed in the record, so a
-   round the validator verified is never refused here for skew the trust
-   policy allowed, and a record cannot pair a report with a manifest issued
-   further ahead of it than its own sealed bound.
+   view. Every manifest names the trust policy it was verified under, and the
+   record seals exactly those policy documents (``trust_policies``); a
+   report's ``evaluation_epoch`` may precede its manifest's ``issued_at_epoch``
+   by at most *that* policy's ``max_future_skew_seconds``, and the terminal
+   manifest's ``issued_at_epoch`` may lead ``terminal_evaluated_at_epoch`` by
+   at most its policy's bound: exactly what live verification admitted, no
+   decision-local bound. A round the validator verified is never refused here
+   for skew its policy allowed, a report or terminal that no verification
+   under its policy could have produced is refused, and a policy rotation
+   inside the window binds each manifest to its own policy.
 8. **Replicas need repeated probing.** Coverage is measured in expected
    attributions, ``opportunities / replica_count`` summed over the rounds a
    miner was published in, so a three-replica deployment needs at least
@@ -115,10 +118,10 @@ from pydantic import Field, StringConstraints, ValidationError, model_validator
 
 from .assignment_probe import (
     MAX_EPOCH,
-    MAX_FUTURE_SKEW_SECONDS,
     MAX_REPLICAS,
     UID,
     ActiveAssignmentManifest,
+    AssignmentManifestTrustPolicy,
     Digest,
     Epoch,
     Hotkey,
@@ -158,6 +161,8 @@ PERMILLE: Final = 1_000
 MAX_BASELINE_AGE_SECONDS: Final = 30 * 86_400
 MAX_MANIFEST_EVIDENCE: Final = 2 * MAX_ROUNDS + 1
 MAX_SCORING_IDENTITIES: Final = 1 << 16
+#: Distinct trust policies one window's manifests may have been verified under.
+MAX_TRUST_POLICIES: Final = 16
 
 ManifestFetchStatus = Literal["rejected", "unavailable", "verified"]
 Decision = Literal["abstain", "submit"]
@@ -195,7 +200,10 @@ DecisionRejectionCode = Literal[
     "decision_round_after_terminal",
     "decision_round_invalid",
     "decision_terminal_before_close",
+    "decision_terminal_future",
     "decision_terminal_status_invalid",
+    "decision_trust_policy_invalid",
+    "decision_trust_policy_missing",
 ]
 RejectionCodeText = Annotated[str, StringConstraints(pattern=r"^[a-z0-9_]{1,64}$")]
 
@@ -237,16 +245,6 @@ class WeightDecisionPolicy(StrictFrozenModel):
     #: clears the guard; a guarded drop carries the largest set forward.
     assigned_baseline_max_age_seconds: int = Field(
         default=86_400, ge=0, le=MAX_BASELINE_AGE_SECONDS
-    )
-    #: Seconds a report's ``evaluation_epoch`` may precede its manifest's
-    #: ``issued_at_epoch``. Live verification admits a manifest issued up to the
-    #: trust policy's ``max_future_skew_seconds`` ahead of the validator's
-    #: clock; a coordinator mirrors that value here so the sealed decision
-    #: re-enforces exactly the bound its rounds were verified under. The
-    #: default is the contract ceiling on that trust-policy field, so an
-    #: unpinned decision never refuses a round that live verification admitted.
-    max_future_skew_seconds: int = Field(
-        default=MAX_FUTURE_SKEW_SECONDS, ge=0, le=MAX_FUTURE_SKEW_SECONDS
     )
 
 
@@ -589,6 +587,10 @@ class ValidatorWeightDecision(StrictFrozenModel):
     abstain_reasons: list[AbstainReason] = Field(max_length=9)
     decision_policy: WeightDecisionPolicy
     scoring_policy: ProbeScoringPolicy
+    #: Exactly the trust policies the sealed manifests name, sorted by digest.
+    #: Each manifest, its reports, and the terminal observation are bound to
+    #: the clock-skew tolerance of the policy they were verified under.
+    trust_policies: list[AssignmentManifestTrustPolicy] = Field(max_length=MAX_TRUST_POLICIES)
     terminal_manifest_status: ManifestFetchStatus
     terminal_manifest_rejection_code: RejectionCodeText | None
     terminal_evaluated_at_epoch: Epoch
@@ -786,6 +788,24 @@ class ValidatorWeightDecision(StrictFrozenModel):
             ):
                 raise ValueError("assignment_evidence_chain_incoherent")
 
+        policy_digests = [item.trust_policy_digest_sha256 for item in self.trust_policies]
+        if policy_digests != sorted(set(policy_digests)):
+            raise ValueError("trust_policies_not_canonical")
+        if set(policy_digests) != {manifest.trust_policy_digest_sha256 for manifest in manifests}:
+            raise ValueError("trust_policies_not_derived")
+        for policy in self.trust_policies:
+            if (
+                policy.network != self.network
+                or policy.netuid != self.netuid
+                or any(
+                    policy.central_authority_fingerprint_sha256
+                    != manifest.central_authority_fingerprint_sha256
+                    for manifest in manifests
+                )
+            ):
+                raise ValueError("trust_policy_authority_mismatch")
+        policy_by_digest = {item.trust_policy_digest_sha256: item for item in self.trust_policies}
+
         registered_keys = {(row.uid, row.hotkey) for row in self.rows}
 
         terminal_evidence: ManifestAssignmentEvidence | None = None
@@ -811,6 +831,11 @@ class ValidatorWeightDecision(StrictFrozenModel):
                 or self.terminal_finalized_epoch != terminal_manifest.finalized_epoch
             ):
                 raise ValueError("assignment_evidence_terminal_mismatch")
+            terminal_policy = policy_by_digest[terminal_manifest.trust_policy_digest_sha256]
+            if terminal_manifest.issued_at_epoch > (
+                self.terminal_evaluated_at_epoch + terminal_policy.max_future_skew_seconds
+            ):
+                raise ValueError("terminal_manifest_future")
             derived_close = _evidence_identities(terminal_evidence, registered_keys)
         elif evidence:
             derived_close = _evidence_identities(evidence[-1], registered_keys)
@@ -833,9 +858,11 @@ class ValidatorWeightDecision(StrictFrozenModel):
 
         sealed_rounds: list[ProbeRound] = []
         linked_report_digests: list[str] = []
-        max_future_skew_seconds = self.decision_policy.max_future_skew_seconds
         for item in evidence:
             manifest = item.manifest
+            max_future_skew_seconds = policy_by_digest[
+                manifest.trust_policy_digest_sha256
+            ].max_future_skew_seconds
             for report in item.scoring_reports:
                 if not _report_matches_manifest(
                     report, manifest, max_future_skew_seconds=max_future_skew_seconds
@@ -1177,8 +1204,56 @@ def _identity_first_seen(
     return identity_first_seen
 
 
+def _revalidate_trust_policies(
+    trust_policies: Sequence[AssignmentManifestTrustPolicy],
+    registered: RegisteredMinerSet,
+) -> dict[str, AssignmentManifestTrustPolicy]:
+    """The approved policy documents a window's manifests may have been verified under.
+
+    Each is rebuilt from its canonical form (re-verifying its digest and key
+    material), must name the registered set's network and netuid, and all of
+    them must name one central authority. Duplicates are refused: one digest,
+    one document.
+    """
+
+    if len(trust_policies) > MAX_TRUST_POLICIES:
+        _reject("decision_trust_policy_invalid")
+    by_digest: dict[str, AssignmentManifestTrustPolicy] = {}
+    for supplied in trust_policies:
+        try:
+            policy = revalidate(supplied, AssignmentManifestTrustPolicy)
+        except (ValidationError, ValueError, TypeError, AttributeError):
+            _reject("decision_trust_policy_invalid")
+        if (
+            policy.network != registered.network
+            or policy.netuid != registered.netuid
+            or policy.trust_policy_digest_sha256 in by_digest
+        ):
+            _reject("decision_trust_policy_invalid")
+        by_digest[policy.trust_policy_digest_sha256] = policy
+    if len({item.central_authority_fingerprint_sha256 for item in by_digest.values()}) > 1:
+        _reject("decision_trust_policy_invalid")
+    return by_digest
+
+
+def _verifying_policy(
+    manifest: ActiveAssignmentManifest,
+    trust_policies: Mapping[str, AssignmentManifestTrustPolicy],
+) -> AssignmentManifestTrustPolicy:
+    """The approved policy a manifest names; a manifest without one cannot be bound."""
+
+    policy = trust_policies.get(manifest.trust_policy_digest_sha256)
+    if policy is None:
+        _reject("decision_trust_policy_missing")
+    if policy.central_authority_fingerprint_sha256 != manifest.central_authority_fingerprint_sha256:
+        _reject("decision_trust_policy_invalid")
+    return policy
+
+
 def _revalidate_rounds(
-    rounds: Sequence[ProbeRound], *, max_future_skew_seconds: int
+    rounds: Sequence[ProbeRound],
+    *,
+    trust_policies: Mapping[str, AssignmentManifestTrustPolicy],
 ) -> list[ProbeRound]:
     """Rebuild every round from its canonical document so later mutation cannot leak in.
 
@@ -1186,8 +1261,8 @@ def _revalidate_rounds(
     were appended to after verification would otherwise be consumed with its
     stale digest and declared counts. Re-validation re-runs every digest and
     count check, so a tampered round is refused here. Each report is then
-    bound to its manifest under ``max_future_skew_seconds``, the clock-skew
-    bound the decision policy mirrors from the trust policy.
+    bound to its manifest under the clock-skew bound of the trust policy that
+    manifest names, the policy it was verified under.
     """
 
     fresh: list[ProbeRound] = []
@@ -1202,8 +1277,11 @@ def _revalidate_rounds(
         except (ValidationError, ValueError, TypeError, AttributeError):
             _reject("decision_round_invalid")
     for entry in fresh:
+        policy = _verifying_policy(entry.manifest, trust_policies)
         if not _report_matches_manifest(
-            entry.report, entry.manifest, max_future_skew_seconds=max_future_skew_seconds
+            entry.report,
+            entry.manifest,
+            max_future_skew_seconds=policy.max_future_skew_seconds,
         ):
             _reject("decision_round_invalid")
     return fresh
@@ -1220,8 +1298,8 @@ def _report_matches_manifest(
     The report may have been evaluated up to ``max_future_skew_seconds`` before
     the manifest's ``issued_at_epoch``: live verification admits a manifest
     whose issuer clock leads the validator's by at most the trust policy's
-    ``max_future_skew_seconds``, and the decision mirrors that bound rather
-    than imposing a stricter, unconfigured one of its own.
+    ``max_future_skew_seconds``, and the caller passes exactly that policy's
+    value, never a decision-local one.
     """
 
     return (
@@ -1312,6 +1390,7 @@ def decide_weight_submission(
     *,
     terminal: TerminalManifestObservation,
     registered: RegisteredMinerSet,
+    trust_policies: Sequence[AssignmentManifestTrustPolicy],
     window_start_epoch: int,
     window_end_epoch: int,
     decision_policy: WeightDecisionPolicy | None = None,
@@ -1324,6 +1403,15 @@ def decide_weight_submission(
 
     ``rounds`` are the verified ``(manifest, report)`` pairs probed inside the
     window. ``terminal`` is the manifest fetch made at or after window close.
+    ``trust_policies`` are the approved trust-policy documents the coordinator
+    verified those manifests under (the current policy, plus its predecessor
+    or successor across a rotation inside the window); every manifest in the
+    window, archived or terminal, must name one of them
+    (``decision_trust_policy_missing``), each report is bound to its
+    manifest under that policy's ``max_future_skew_seconds``, the terminal
+    manifest may lead its evaluation instant by at most its policy's bound
+    (``decision_terminal_future``), and exactly the policies the sealed
+    manifests name are sealed in the record.
     ``archived_manifests`` are the actual publications the coordinator accepted
     into its chain state between the window's first probed manifest and the
     terminal but did not probe; the whole span must be one unbroken digest
@@ -1346,6 +1434,7 @@ def decide_weight_submission(
     policy = revalidate(decision_policy or WeightDecisionPolicy(), WeightDecisionPolicy)
     scoring = revalidate(scoring_policy or ProbeScoringPolicy(), ProbeScoringPolicy)
     registered = revalidate(registered, RegisteredMinerSet)
+    approved_policies = _revalidate_trust_policies(trust_policies, registered)
     window_start_epoch = _validate_epoch(window_start_epoch)
     window_end_epoch = _validate_epoch(window_end_epoch)
     if window_end_epoch <= window_start_epoch:
@@ -1365,6 +1454,11 @@ def decide_weight_submission(
             terminal_manifest = revalidate(terminal.manifest, ActiveAssignmentManifest)
         except (ValidationError, ValueError, TypeError, AttributeError):
             _reject("decision_terminal_status_invalid")
+        terminal_policy = _verifying_policy(terminal_manifest, approved_policies)
+        if terminal_manifest.issued_at_epoch > (
+            evaluated_at + terminal_policy.max_future_skew_seconds
+        ):
+            _reject("decision_terminal_future")
     elif terminal.manifest is not None or not terminal.rejection_code:
         _reject("decision_terminal_status_invalid")
     prior = (
@@ -1379,12 +1473,14 @@ def decide_weight_submission(
         _reject("decision_round_invalid")
     if len(archived_manifests) > MAX_ROUNDS:
         _reject("decision_archived_manifest_invalid")
-    rounds = _revalidate_rounds(rounds, max_future_skew_seconds=policy.max_future_skew_seconds)
+    rounds = _revalidate_rounds(rounds, trust_policies=approved_policies)
     manifests = [entry.manifest for entry in rounds]
     for entry in rounds:
         if entry.report.evaluation_epoch >= manifest_effective_expires_at_epoch(entry.manifest):
             _reject("decision_round_after_horizon")
     archived = _revalidate_archived_manifests(archived_manifests)
+    for manifest in archived:
+        _verifying_policy(manifest, approved_policies)
     chain = [*manifests, *archived]
     if terminal_manifest is not None:
         for manifest in manifests:
@@ -1395,6 +1491,10 @@ def decide_weight_submission(
                 _reject("decision_archived_manifest_invalid")
         chain.append(terminal_manifest)
     _verify_manifest_chain(chain, registered)
+    sealed_policies = [
+        approved_policies[digest_value]
+        for digest_value in sorted({manifest.trust_policy_digest_sha256 for manifest in chain})
+    ]
     if prior is not None:
         if terminal_manifest is not None and prior.manifest_sequence > terminal_manifest.sequence:
             _reject("decision_baseline_invalid")
@@ -1621,6 +1721,7 @@ def decide_weight_submission(
         "abstain_reasons": sorted(reasons),
         "decision_policy": model_document(policy),
         "scoring_policy": model_document(scoring),
+        "trust_policies": [model_document(item) for item in sealed_policies],
         "terminal_manifest_status": terminal.status,
         "terminal_manifest_rejection_code": (
             None if terminal_manifest is not None else terminal.rejection_code

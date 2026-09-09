@@ -160,6 +160,7 @@ ProbeRejectionCode = Literal[
     "observation_coverage_mismatch",
     "previous_link_mismatch",
     "probe_scheme_mismatch",
+    "report_evaluation_epoch_mismatch",
     "required_role_missing",
     "route_host_policy_violation",
     "same_height_fork",
@@ -681,11 +682,22 @@ class ValidatorProbeReport(_StrictFrozenModel):
 
 @dataclass(frozen=True)
 class ManifestVerificationResult:
+    """One verification of one manifest, with the context it was verified in.
+
+    ``evaluation_epoch`` and ``trust_policy_digest_sha256`` are the instant and
+    the policy the freshness, skew, signer-validity, and chain rules were
+    applied under. A report sealed from this result must name exactly them, so
+    the report's ``evaluation_epoch`` can never drift from the epoch its
+    manifest was actually verified at.
+    """
+
     manifest: ActiveAssignmentManifest
     verified_signer_key_ids: list[str]
     verified_roles: list[ManifestRole]
     next_chain_state: AssignmentManifestChainState
     reprobe: bool
+    evaluation_epoch: int
+    trust_policy_digest_sha256: str
 
 
 @dataclass(frozen=True)
@@ -1315,6 +1327,8 @@ def verify_active_assignment_manifest(
         verified_roles=roles,
         next_chain_state=next_state,
         reprobe=reprobe,
+        evaluation_epoch=evaluation_epoch,
+        trust_policy_digest_sha256=policy.trust_policy_digest_sha256,
     )
 
 
@@ -1372,6 +1386,8 @@ def verify_historical_active_assignment_manifest(
         verified_roles=roles,
         next_chain_state=next_state,
         reprobe=reprobe,
+        evaluation_epoch=evaluation_epoch,
+        trust_policy_digest_sha256=policy.trust_policy_digest_sha256,
     )
 
 
@@ -1561,10 +1577,26 @@ def build_validator_probe_report(
     evaluation_epoch: int,
     edge_origin_override: bool,
 ) -> ValidatorProbeReport:
-    """Seal one archivable report covering exactly the manifest's deployments."""
+    """Seal one archivable report covering exactly the manifest's deployments.
 
+    The report is bound to the verification it describes: ``evaluation_epoch``
+    must be the instant the manifest was verified at
+    (``report_evaluation_epoch_mismatch``) and ``trust_policy`` the policy it
+    was verified under, which is also the policy the manifest names
+    (``trust_policy_mismatch``). A report therefore never claims an evaluation
+    instant, and so a clock skew, that its verification did not admit.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
     policy = _revalidate(trust_policy, AssignmentManifestTrustPolicy)
     manifest = verification.manifest
+    if evaluation_epoch != verification.evaluation_epoch:
+        _reject("report_evaluation_epoch_mismatch")
+    if (
+        policy.trust_policy_digest_sha256 != verification.trust_policy_digest_sha256
+        or policy.trust_policy_digest_sha256 != manifest.trust_policy_digest_sha256
+    ):
+        _reject("trust_policy_mismatch")
     prior = _revalidate(prior_chain_state, AssignmentManifestChainState)
     ordered = sorted(
         (_revalidate(item, ProbeObservation) for item in observations),
