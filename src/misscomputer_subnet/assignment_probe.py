@@ -71,6 +71,9 @@ MAX_ATTESTATION_BYTES: Final = 8 * 1_024
 MAX_RESPONSE_BYTES_CEILING: Final = 1_024 * 1_024
 MAX_LATENCY_MILLIS: Final = 3_600_000
 MAX_EPOCH: Final = (1 << 63) - 1
+#: Ceiling on a trust policy's ``max_future_skew_seconds``: no policy may let a
+#: manifest's ``issued_at_epoch`` lead the evaluating validator's clock by more.
+MAX_FUTURE_SKEW_SECONDS: Final = 300
 
 Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Hex24 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{24}$")]
@@ -155,8 +158,11 @@ ProbeRejectionCode = Literal[
     "manifest_stale",
     "network_mismatch",
     "observation_coverage_mismatch",
+    "observation_policy_violation",
     "previous_link_mismatch",
     "probe_scheme_mismatch",
+    "report_evaluation_epoch_mismatch",
+    "historical_verification_not_reportable",
     "required_role_missing",
     "route_host_policy_violation",
     "same_height_fork",
@@ -433,7 +439,7 @@ class AssignmentManifestTrustPolicy(_StrictFrozenModel):
     valid_from_epoch: Epoch
     valid_until_epoch: Epoch
     max_manifest_age_seconds: int = Field(ge=1, le=86_400)
-    max_future_skew_seconds: int = Field(ge=0, le=300)
+    max_future_skew_seconds: int = Field(ge=0, le=MAX_FUTURE_SKEW_SECONDS)
     max_manifest_lifetime_seconds: int = Field(ge=1, le=86_400)
     max_sequence_gap: int = Field(ge=1, le=64)
     max_finalized_height_gap: int = Field(ge=1, le=1_000_000)
@@ -576,6 +582,11 @@ class ProbeObservation(_StrictFrozenModel):
     route_host: RouteHost
     challenge_path: ChallengePath
     assignment_digest_sha256: Digest
+    #: The trust policy whose bounds (request budget, certificate pins,
+    #: response ceiling) judged this observation. Every consumer requires it
+    #: to equal the policy the report names. This self-digest is NOT authenticated
+    #: provenance; consumers also re-derive policy-dependent outcomes from facts.
+    trust_policy_digest_sha256: Digest
     probe_nonce: Hex64
     latency_millis: int = Field(ge=0, le=MAX_LATENCY_MILLIS)
     outcome: ProbeOutcome
@@ -660,6 +671,14 @@ class ValidatorProbeReport(_StrictFrozenModel):
         deployment_ids = [item.deployment_id for item in self.observations]
         if deployment_ids != sorted(set(deployment_ids)):
             raise ValueError("report_observations_not_canonical")
+        if any(
+            item.trust_policy_digest_sha256 != self.trust_policy_digest_sha256
+            for item in self.observations
+        ):
+            raise ValueError("observation_policy_violation")
+        for item in self.observations:
+            _verify_observation_budget(item, self.probe_timeout_millis)
+            _verify_observation_size(item, self.max_response_bytes)
         serving = sum(item.outcome == "serving" for item in self.observations)
         if (
             self.deployment_count != len(self.observations)
@@ -678,11 +697,24 @@ class ValidatorProbeReport(_StrictFrozenModel):
 
 @dataclass(frozen=True)
 class ManifestVerificationResult:
+    """One verification of one manifest, with the context it was verified in.
+
+    ``evaluation_epoch`` and ``trust_policy_digest_sha256`` are the instant and
+    the policy the freshness, skew, signer-validity, and chain rules were
+    applied under. A report sealed from this result must name exactly them, so
+    the report's ``evaluation_epoch`` can never drift from the epoch its
+    manifest was actually verified at.
+    """
+
     manifest: ActiveAssignmentManifest
     verified_signer_key_ids: list[str]
     verified_roles: list[ManifestRole]
     next_chain_state: AssignmentManifestChainState
     reprobe: bool
+    evaluation_epoch: int
+    trust_policy_digest_sha256: str
+    # Historical chain walking never authorizes live report production.
+    reportable: bool = True
 
 
 @dataclass(frozen=True)
@@ -702,6 +734,11 @@ class ProbeTransportFailure:
     latency_millis: int
     response_status: int | None = None
     tls_leaf_certificate_sha256: str | None = None
+    #: For ``response_oversized``: the size evidence the transport judged, the
+    #: declared ``Content-Length`` or the bytes received before the ceiling
+    #: was crossed (``MAX_RESPONSE_BYTES_CEILING + 1`` for an unparseable
+    #: declaration). Zero for every other code.
+    response_bytes: int = 0
 
 
 def build_assignment_manifest_trust_policy(
@@ -1027,6 +1064,108 @@ def _verify_policy_binding(
         _reject("manifest_future")
 
 
+def verify_manifest_policy_admission(
+    manifest: ActiveAssignmentManifest,
+    policy: AssignmentManifestTrustPolicy,
+    *,
+    evaluation_epoch: int,
+) -> None:
+    """Re-derive what live verification demands of a manifest under a policy at an instant.
+
+    Everything :func:`verify_active_assignment_manifest` requires that depends
+    only on the manifest, the policy, and the evaluation instant: the
+    policy-digest, network, authority, scheme and route-suffix binding; the
+    policy's own validity window at ``evaluation_epoch``; the manifest's
+    issue and expiry inside that window; the manifest lifetime; the future
+    skew; and staleness. Signatures, block leases, and the effective horizon
+    are the caller's own rules and are not repeated here. A decision uses this
+    to refuse a report or terminal observation that its named policy could not
+    have admitted at the instant it claims.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
+    _verify_policy_binding(manifest, policy, evaluation_epoch=evaluation_epoch)
+    if (
+        evaluation_epoch > manifest.issued_at_epoch
+        and evaluation_epoch - manifest.issued_at_epoch > policy.max_manifest_age_seconds
+    ):
+        _reject("manifest_stale")
+
+
+#: Failure codes an observation can only carry after the policy's certificate
+#: pin check passed inside :func:`evaluate_probe_response`.
+_POST_PIN_FAILURE_CODES: Final = frozenset(
+    {
+        "redirect_rejected",
+        "unexpected_status",
+        "body_digest_mismatch",
+        "build_id_header_mismatch",
+        "attestation_missing",
+        "attestation_invalid",
+    }
+)
+#: Failure codes an observation can only carry after the policy's response-size
+#: check passed.
+_POST_SIZE_FAILURE_CODES: Final = frozenset(
+    {
+        "body_digest_mismatch",
+        "build_id_header_mismatch",
+        "attestation_missing",
+        "attestation_invalid",
+    }
+)
+
+
+def _verify_observation_budget(observation: ProbeObservation, budget_millis: int) -> None:
+    """Timeout means whole-request expiry, never an early per-operation fault."""
+
+    expired = observation.latency_millis > budget_millis
+    if (observation.failure_code == "timeout") != expired:
+        _reject("observation_policy_violation")
+
+
+def _verify_observation_size(observation: ProbeObservation, max_bytes: int) -> None:
+    if (
+        observation.failure_code == "response_oversized" and observation.response_bytes <= max_bytes
+    ) or (
+        (observation.outcome == "serving" or observation.failure_code in _POST_SIZE_FAILURE_CODES)
+        and observation.response_bytes > max_bytes
+    ):
+        _reject("observation_policy_violation")
+
+
+def verify_observation_policy_binding(
+    observation: ProbeObservation, policy: AssignmentManifestTrustPolicy
+) -> None:
+    """Re-derive policy-dependent outcomes from the recorded observation facts.
+
+    Self digests are integrity checks, not authenticated telemetry. With facts
+    unchanged, resealing a policy label cannot make a timeout fit a longer
+    budget: timeout iff floor(elapsed milliseconds) exceeds this budget.
+    Earlier OS/per-operation timeouts are transport_error, independent of the
+    policy. Response-size and certificate-pin failures bind in both directions.
+    Authenticity of the recorded facts remains the local observer's trust
+    boundary; these unsigned reports cannot prove what a malicious observer saw.
+    """
+
+    if observation.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256:
+        _reject("observation_policy_violation")
+    _verify_observation_budget(observation, policy.probe_timeout_millis)
+    _verify_observation_size(observation, policy.max_response_bytes)
+    pins = policy.pinned_edge_leaf_certificate_sha256
+    serving = observation.outcome == "serving"
+    if observation.failure_code == "tls_pin_mismatch" and (
+        not pins or observation.tls_leaf_certificate_sha256 in pins
+    ):
+        _reject("observation_policy_violation")
+    if (
+        pins
+        and (serving or observation.failure_code in _POST_PIN_FAILURE_CODES)
+        and observation.tls_leaf_certificate_sha256 not in pins
+    ):
+        _reject("observation_policy_violation")
+
+
 def manifest_effective_expires_at_epoch(manifest: ActiveAssignmentManifest) -> int:
     """The instant a manifest stops being valid: its own expiry or the earliest ticket expiry.
 
@@ -1312,6 +1451,8 @@ def verify_active_assignment_manifest(
         verified_roles=roles,
         next_chain_state=next_state,
         reprobe=reprobe,
+        evaluation_epoch=evaluation_epoch,
+        trust_policy_digest_sha256=policy.trust_policy_digest_sha256,
     )
 
 
@@ -1369,6 +1510,9 @@ def verify_historical_active_assignment_manifest(
         verified_roles=roles,
         next_chain_state=next_state,
         reprobe=reprobe,
+        reportable=False,
+        evaluation_epoch=evaluation_epoch,
+        trust_policy_digest_sha256=policy.trust_policy_digest_sha256,
     )
 
 
@@ -1479,6 +1623,7 @@ def evaluate_probe_response(
         "route_host": deployment.route_host,
         "challenge_path": deployment.challenge_path,
         "assignment_digest_sha256": deployment.assignment_digest_sha256,
+        "trust_policy_digest_sha256": policy.trust_policy_digest_sha256,
         "probe_nonce": probe_nonce,
         "latency_millis": min(max(result.latency_millis, 0), MAX_LATENCY_MILLIS),
         "outcome": "failed",
@@ -1491,9 +1636,23 @@ def evaluate_probe_response(
         "attestation_status": "not_presented",
         "attestation": None,
     }
+    if result.latency_millis > policy.probe_timeout_millis:
+        document["failure_code"] = "timeout"
+        return _seal_observation(document)
     if isinstance(result, ProbeTransportFailure):
-        document["failure_code"] = result.code
+        document["failure_code"] = "transport_error" if result.code == "timeout" else result.code
         document["response_status"] = result.response_status
+        if result.code == "response_oversized":
+            # Preserve the size evidence the transport judged, bounded to the
+            # contract's ceiling sentinel.
+            document["response_bytes"] = min(
+                max(result.response_bytes, 0), MAX_RESPONSE_BYTES_CEILING + 1
+            )
+        return _seal_observation(document)
+    if not 100 <= result.status <= 599:
+        # A wire status outside the contract is a peer fault, not an
+        # observation with a status; the transport reports it the same way.
+        document["failure_code"] = "transport_error"
         return _seal_observation(document)
 
     document["response_status"] = result.status
@@ -1558,10 +1717,32 @@ def build_validator_probe_report(
     evaluation_epoch: int,
     edge_origin_override: bool,
 ) -> ValidatorProbeReport:
-    """Seal one archivable report covering exactly the manifest's deployments."""
+    """Seal one archivable report covering exactly the manifest's deployments.
 
+    The report is bound to the verification it describes: ``evaluation_epoch``
+    must be the instant the manifest was verified at
+    (``report_evaluation_epoch_mismatch``) and ``trust_policy`` the policy it
+    was verified under, which is also the policy the manifest names
+    (``trust_policy_mismatch``), and every observation must be one that
+    :func:`evaluate_probe_response` could have produced under that policy
+    (``observation_policy_violation``). A report therefore never claims an
+    evaluation instant, a clock skew, or a serving verdict that its
+    verification's policy did not admit.
+    """
+
+    _validate_evaluation_epoch(evaluation_epoch)
+    if verification.reportable is not True:
+        _reject("historical_verification_not_reportable")
     policy = _revalidate(trust_policy, AssignmentManifestTrustPolicy)
-    manifest = verification.manifest
+    manifest = _revalidate(verification.manifest, ActiveAssignmentManifest)
+    if evaluation_epoch != verification.evaluation_epoch:
+        _reject("report_evaluation_epoch_mismatch")
+    if (
+        policy.trust_policy_digest_sha256 != verification.trust_policy_digest_sha256
+        or policy.trust_policy_digest_sha256 != manifest.trust_policy_digest_sha256
+    ):
+        _reject("trust_policy_mismatch")
+    _verify_trust_and_freshness(manifest, policy, evaluation_epoch=evaluation_epoch)
     prior = _revalidate(prior_chain_state, AssignmentManifestChainState)
     ordered = sorted(
         (_revalidate(item, ProbeObservation) for item in observations),
@@ -1579,6 +1760,7 @@ def build_validator_probe_report(
             or observation.challenge_path != deployment.challenge_path
         ):
             _reject("observation_coverage_mismatch")
+        verify_observation_policy_binding(observation, policy)
     vector = [_model_document(item) for item in ordered]
     serving = sum(item.outcome == "serving" for item in ordered)
     unsigned: dict[str, object] = {

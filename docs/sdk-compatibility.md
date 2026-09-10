@@ -11,6 +11,13 @@ The implementation was selected after checking the stable PyPI package, the offi
 - `bittensor==11.1.0`
 - `fastapi==0.141.1`
 - `httpx==0.28.1`
+- `httpcore==1.0.9` for the deadline backend and HTTPX pool adapter. Both are
+  exact direct pins: `_DeadlineHTTPTransport` replaces HTTPX's private `_pool`
+  with the reviewed HTTPCore `ConnectionPool`. Upgrade them together only
+  after DNS/admission, cancellation, multi-address, TLS, partial-write, and
+  trickle tests pass. No Python transitive lock is committed; `pyproject.toml`
+  is the direct-version source, `go.sum` locks Go module checksums, and the
+  release artifact pipeline must provide its own hashed resolved inputs.
 - `cryptography==50.0.0` for public X.509 parsing, validity checks, and
   certificate/key matching without private `ssl` internals
 - `pydantic==2.13.4`

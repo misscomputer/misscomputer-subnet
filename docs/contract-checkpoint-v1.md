@@ -10,13 +10,20 @@ code, golden and negative fixtures, and cross-language parity tests. It
 deliberately implements no runtime endpoint, no publisher daemon, no
 coordinator loop, no service wiring, and no weight submission.
 
-Three contracts are added. Every pre-existing contract is byte-pinned by the
-test suite, with one declared compatibility event: `assignment-manifest-chain-state`
-gains `last_finalized_epoch` (see "Compatibility matrix").
+Four contracts are added. Every pre-existing contract is byte-pinned by the
+test suite. Three compatibility events are declared, all against contracts no
+consumer is live on: `assignment-manifest-chain-state` gains
+`last_finalized_epoch`, `validator-weight-decision` gains `trust_policies`,
+and `validator-probe-report` observations gain `trust_policy_digest_sha256`
+(see "Compatibility matrix"; the supported mixed-version pairings and the
+coordinated pause that upgrades each writer/reader pair are in
+[`api-migrations.md`](api-migrations.md): neither the decision nor the
+snapshot form is transparently mixed-version compatible).
 
 | Contract | Version | Producer | Consumer | Module |
 | --- | --- | --- | --- | --- |
 | `active-assignment-snapshot` | 1 | scheduler runtime (Go, `pkg/assignment`) | manifest publisher | `assignment_snapshot.py` |
+| `active-assignment-snapshot-lineage` | 1 | manifest publisher (durable, local) | manifest publisher | `assignment_snapshot.py` |
 | `assignment-manifest-latest-pointer` | 1 | manifest publisher | validator fetcher | `manifest_publication.py` |
 | `validator-weight-decision` | 1 | validator coordinator | validator weight plan | `validator_decision.py` |
 
@@ -54,7 +61,7 @@ valid manifest source.
 
 | Field | Meaning |
 | --- | --- |
-| `snapshot_sequence` | strictly increasing per capture from one runtime |
+| `snapshot_sequence` | increases by exactly one per capture from one runtime (tightened from "strictly increasing"); a publisher's lineage treats a jump as a missed capture to replay, and a legacy history with skips is preflighted with `snapshot_history_gaps` and restarted after the last skip |
 | `state_revision` | scheduler durable revision the capture was read at; two captures at one revision carry byte-identical `deployments` |
 | `captured_at_epoch` | capture instant; becomes the manifest's `issued_at_epoch` |
 | `finalized_height`, `finalized_block_hash`, `finalized_epoch` | finalized chain view the scheduler held at capture; copied into the manifest |
@@ -67,8 +74,8 @@ valid manifest source.
 | `replicas[].generation`, `assignment_nonce`, `replica_id`, `endpoint_id` | exact endpoint incarnation, `endpoint_id == <deployment_id>-<hotkey>-g<generation>-<nonce>`, unique across the snapshot |
 | `replicas[].ticket_digest_sha256`, `receipt_digest_sha256` | **digests only** of the retained signed ticket and ready receipt |
 | `replicas[].chain_block`, `expires_at_block` | assignment block window; must contain `finalized_height` |
-| `replicas[].ticket_issued_at_epoch`, `ticket_expires_at_epoch` | signed ticket window; unexpired at capture, issued no more than 30s after capture |
-| `replicas[].route_activated_at_epoch` | edge activation instant of this exact incarnation; `>= ticket_issued_at_epoch`, `<= captured_at_epoch` |
+| `replicas[].ticket_issued_at_epoch`, `ticket_expires_at_epoch` | signed ticket window on the **signer's clock**; unexpired at capture; issued no more than `TICKET_MAX_FUTURE_SKEW_SECONDS` (30s) after the capture instant and no more than 30s after the replica's `route_activated_at_epoch` |
+| `replicas[].route_activated_at_epoch` | runtime activation instant of this exact incarnation on the **runtime's clock**; `<= captured_at_epoch` exactly (same clock); `>= ticket_issued_at_epoch - 30` (cross-clock) |
 | `replicas[].route_state` | constant `active`; pending, quarantined, and deactivated incarnations are never exported |
 | `projected_assignment_vector_digest_sha256` | digest of `project_manifest_deployments(snapshot)` |
 | `snapshot_digest_sha256` | self digest |
@@ -77,6 +84,32 @@ The snapshot never carries the raw challenge value, ticket or receipt bytes,
 axon addresses, TLS pins, artifact or image keys, provider or tunnel
 identifiers, scheduler queue state, signer seeds, wallets, or weights; the
 golden fixture is scanned for each of those.
+
+### Clock domains
+
+A capture mixes two clocks. `ticket_issued_at_epoch` and
+`ticket_expires_at_epoch` are stamped by the ticket signer;
+`route_activated_at_epoch` and `captured_at_epoch` are stamped by the runtime
+that activated the route and read the capture. Same-clock comparisons are
+exact: a route is activated at or before the capture that exports it
+(`snapshot_replica_activated_after_capture`). Cross-clock comparisons tolerate
+the signer's clock leading the runtime's by at most
+`TICKET_MAX_FUTURE_SKEW_SECONDS` = 30, applied identically to both runtime
+instants: a ticket may be stamped as issued up to 30s after the activation it
+authorised (`replica_activation_order_invalid` beyond that) and up to 30s
+after the capture instant (`snapshot_replica_ticket_issued_after_capture`
+beyond that). A ticket issued at `captured_at_epoch + 30` for a route activated
+at the capture instant is therefore a valid capture, at `+ 31` it is not, and
+an activation more than 30s before its ticket's issuance is an ordering
+violation whatever the capture instant. Go (`pkg/assignment`) enforces the
+same rule with the same codes; the supplementary golden
+`active-assignment-snapshot-signer-skew.v1.json` (alpha's tickets at `+30`,
+beta's at `+1`, every route activated at capture) is parsed and re-sealed
+byte-for-byte by both suites; its replicas are fresh generation-2
+incarnations with fresh nonces, endpoints, ticket and receipt digests, so it
+is a valid successor of the golden capture rather than a rewrite of it. The
+negative fixtures `replica-ticket-issued-beyond-capture-skew` and
+`replica-activated-before-ticket-skew` pin the two rejection branches.
 
 ### Consistency semantics
 
@@ -91,6 +124,83 @@ epoch; authority and network never change. Codes:
 `snapshot_finalized_rollback`, `snapshot_finalized_epoch_rollback`,
 `snapshot_finalized_fork`, `snapshot_authority_mismatch`,
 `snapshot_network_mismatch`.
+
+### Incarnation lineage
+
+`replica_id` (`<deployment_id>-<hotkey>`) is the stable lineage of one miner's
+assignment to one deployment; `endpoint_id` names one incarnation of it
+(generation and nonce), and the ticket and receipt digests are the signed
+facts issued for that incarnation. A publisher keeps an
+`active-assignment-snapshot-lineage` v1 document: the transactional position
+of the last accepted capture plus, for every `replica_id` it has ever
+exported, the latest accepted incarnation (`generation`, `assignment_nonce`,
+`endpoint_id`, ticket and receipt digests, the digest of the complete replica
+document, and the digest of the enclosing deployment's ticket-bound facts:
+everything but its replicas). `advance_snapshot_lineage(lineage, snapshot)`
+accepts a capture or refuses it:
+
+- the transactional rules above, held against the last accepted capture;
+- a retained `endpoint_id` must carry the identical replica document and
+  identical deployment facts (`snapshot_incarnation_rewritten`): a signed
+  ticket binds its own issuance and its assignment, so a retained ticket digest
+  with a restamped `ticket_issued_at_epoch`, a moved activation instant, or a
+  changed image digest, challenge digest, workload spec, or campaign is an
+  impossible rewrite, not a re-assignment;
+- a replacement (a new `endpoint_id` for a known `replica_id`) must advance
+  the generation (`snapshot_generation_not_increasing`);
+- every new incarnation, first appearance or replacement, must carry a nonce,
+  ticket digest, and receipt digest that no incarnation of any replica ever
+  carried (`snapshot_incarnation_facts_reused`): the lineage keeps every fact
+  it has accepted (`used_assignment_nonces`, `used_ticket_digests`,
+  `used_receipt_digests`), so A → B → A cannot recycle A's first-generation
+  facts at generation three, however many captures or replacements lie
+  between;
+- incarnations that a capture drops stay in the lineage, so an old endpoint
+  re-exported rewritten after an empty or unrelated capture is still refused;
+  the identical incarnation re-exported is accepted.
+
+`verify_snapshot_succession(previous, current)` is exactly the lineage
+advanced from genesis over the two captures (so `current` must be the very
+next sequence), for a caller that holds only them; a publisher that persists
+its lineage (`snapshot_lineage_bytes`, `parse_snapshot_lineage`,
+`build_initial_snapshot_lineage`, `replay_snapshot_lineage`) gets the same
+rules across its whole history, which the two-capture form cannot: a rewrite
+after an intervening capture, or a fact retired two replacements ago.
+
+The lineage's history is anchored, contiguous, and era-scoped. Each advanced
+lineage names its predecessor's digest (`previous_lineage_digest_sha256`), so
+persisted lineages form a hash chain; the operator retains the head digest out
+of band and `verify_snapshot_lineage_anchor` refuses a restored lineage that is
+not that head (`snapshot_lineage_anchor_mismatch`), because a stale backup or
+a resealed copy with retired facts removed is digest-valid but false. Captures
+are accepted only in exact sequence order from
+`history_start_snapshot_sequence` (`snapshot_lineage_gap`; the parser requires
+`last == start + count - 1`, `lineage_history_not_contiguous`): a missed
+capture is replayed, never skipped, and a legacy history with skipped values
+is preflighted with `snapshot_history_gaps` and started after the last skip.
+Freshness is judged across every fact role: a new incarnation's nonce, ticket
+digest, and receipt digest must be absent from the union of everything the
+era has accepted (`lineage_used_facts_overlap` on parse if ticket and receipt
+histories overlap). `snapshot_lineage_overflow` (more than
+`MAX_LINEAGE_REPLICAS` replica lineages, `MAX_LINEAGE_FACTS` retained facts of
+one kind, or an era beyond `MAX_LINEAGE_ERAS`) refuses the capture and forgets
+nothing; the only operation that sheds anything is `begin_snapshot_lineage_era`,
+which opens `era + 1`, keeps exactly the incarnations of the last accepted
+capture (every `ReplicaLineage` records `last_seen_snapshot_sequence`) with
+their facts, prunes inactive lineage, and records a `LineageEraBoundary` (era,
+last accepted sequence, dropped lineages and facts, predecessor digest) in
+the document permanently, in range and in order. The never-reuse guarantee is
+therefore exactly "no fact accepted since `history_start_snapshot_sequence`
+within the current `era` is ever accepted again in any role", readable from
+the document. The lineage is a Python
+publisher-side rule with no Go counterpart: `pkg/assignment` produces captures
+and has no succession API. Candidate boundaries fully dry-run the candidate
+before returning a persistable pending head. Replay distinguishes full versus
+suffix boundary events and can reproduce pending heads with `pending_candidate`.
+Immutable replay has an explicit cumulative `MAX_REPLAY_WORK = 1_814_787` limit,
+derived as initial validation plus the maximum producer-admitted atomic boundary
+(4 state charges + 3 candidate charges), not a linear runtime guarantee; see
+`api-migrations.md` for the proof, batching, and exact recovery.
 
 An empty snapshot is a valid state meaning "nothing is route-active". A
 manifest cannot be derived from it (manifest v1 requires at least one
@@ -122,7 +232,7 @@ what surrounds them.
 | Threshold and trust policy | `threshold` distinct verified keys and every `required_roles` entry covered; roles are `assignment_issuer`, `assignment_auditor`, `assignment_security`; per-key validity window and `revoked_at_epoch`; purpose fixed to `active_assignment_manifest_publication_v1` |
 | Sequence and linkage | `sequence` starts at 1, `previous_manifest_digest_sha256` is `null` exactly at 1 and otherwise equals the previous accepted manifest digest; each actual digest-linked transition has a positive sequence delta no greater than `max_sequence_gap` (integer values between the endpoints do not imply publications) |
 | Finalized-chain binding | `finalized_height`/`finalized_block_hash`/`finalized_epoch` copied from the snapshot; height and epoch never decrease, each actual transition's height delta is no greater than `max_finalized_height_gap`, and the same height implies the same hash and epoch; the chain state carries all three (`last_finalized_height`, `last_finalized_block_hash`, `last_finalized_epoch`) |
-| Issued/expiry | `issued_at_epoch == captured_at_epoch`; `expires_at_epoch - issued_at_epoch <= max_manifest_lifetime_seconds`; not future beyond `max_future_skew_seconds`; not older than `max_manifest_age_seconds` at evaluation |
+| Issued/expiry | `issued_at_epoch == captured_at_epoch`; `expires_at_epoch - issued_at_epoch <= max_manifest_lifetime_seconds`; not future beyond `max_future_skew_seconds` (the manifest's `issued_at_epoch` may lead the validator's `evaluation_epoch` by at most that many seconds; ceiling 300); not older than `max_manifest_age_seconds` at evaluation. `ManifestVerificationResult` records the `evaluation_epoch` and `trust_policy_digest_sha256` these were applied at and under; `build_validator_probe_report` seals only that epoch and policy (`report_evaluation_epoch_mismatch`, `trust_policy_mismatch`) |
 | Effective horizon | a manifest is valid only until `min(expires_at_epoch, min(replicas[].ticket_expires_at_epoch))` (`manifest_effective_expires_at_epoch`); every live verifier enforces every `replicas[].expires_at_block` against its own finalized height, which is required input (`current_finalized_height` of `verify_active_assignment_manifest`, `anchor_manifest_chain_state`, and the `verify_manifest` boundary operation; `--finalized-height` of the probe CLI) with no lease-free live path (`manifest_replica_lease_expired`); expired assignment authority is never scoreable, whatever `expires_at_epoch` claims. A publisher should set `expires_at_epoch` no later than the earliest ticket expiry; the verifier does not rely on it doing so |
 | Immutable objects | `v1/manifests/<manifest_digest>.json`, `v1/manifests/<manifest_digest>.<signer_key_id>.signature.json`, and `v1/manifests/<manifest_digest>.pointer.json` (the pointer as published for that manifest); content-addressed, never modified or deleted while any validator could still need them to catch up |
 | Atomic latest pointer | `v1/latest.json` is an `assignment-manifest-latest-pointer` v1 written only after every object it names, including the immutable pointer copy, is readable; replaced atomically; never rewritten to a lower sequence |
@@ -261,10 +371,22 @@ fork can never meet rounds from another chain by omitting the divergence;
 sequence, a broken `previous` link, finalized height or epoch going backwards,
 a second hash or epoch at one height, issue time going backwards); an archived
 manifest that does not re-validate or lies beyond the terminal
-(`decision_archived_manifest_invalid`); more than one authority or trust policy
-(`decision_manifest_authority_mismatch`); and a prior baseline that
-post-dates the window start, names a sequence beyond the terminal, or names a
-different manifest at a sequence the window also saw
+(`decision_archived_manifest_invalid`); more than one central authority, or a
+network or netuid other than the registered set's
+(`decision_manifest_authority_mismatch`; several trust policies from one
+authority are legitimate across a rotation and each manifest is bound to its
+own); a manifest naming a trust policy the coordinator did not supply, or a
+supplied policy that does not re-validate, is duplicated, or names another
+network or authority (`decision_trust_policy_missing`,
+`decision_trust_policy_invalid`); a verified terminal manifest issued further
+ahead of its evaluation instant than its policy's `max_future_skew_seconds`
+(`decision_terminal_future`), or otherwise inadmissible under that policy at
+that instant (`decision_terminal_policy_rejected`); a report whose manifest
+its policy could not have admitted at the report's evaluation epoch, or whose
+observations that policy could not have produced
+(`decision_round_policy_rejected`); and a prior
+baseline that post-dates the window start, names a sequence beyond the
+terminal, or names a different manifest at a sequence the window also saw
 (`decision_baseline_invalid`).
 
 Per-miner classification in the record:
@@ -409,6 +531,74 @@ Frozen invariants:
   is taken at or after `window_end`; the registered set is a finalized view
   carrying `metagraph_identity_fingerprint_sha256`, which the weight plan
   repeats.
+- **Every time bound is the verifying policy's, sealed in the record.** Live
+  verification admits a manifest whose `issued_at_epoch` leads the validator's
+  `evaluation_epoch` by at most the trust policy's `max_future_skew_seconds`,
+  so a verified report may legitimately precede its manifest's issuance by
+  that much, and a policy rotation inside a window may change the bound
+  between manifests. The decision therefore carries no clock-skew number of
+  its own. `decide_weight_submission` takes the approved trust-policy
+  documents (`trust_policies`) the coordinator verified under; every window,
+  archived, and terminal manifest must name one of them by
+  `trust_policy_digest_sha256` (`decision_trust_policy_missing`), the
+  documents must re-validate, be unique, and name the registered set's
+  network, netuid, and one central authority (`decision_trust_policy_invalid`),
+  and the record seals exactly the policies its sealed manifests name, sorted
+  by digest (`trust_policies_not_canonical`, `trust_policies_not_derived`,
+  `trust_policy_authority_mismatch` on parse). A round is bound to its
+  manifest only if `manifest.issued_at_epoch <= report.evaluation_epoch +
+  policy.max_future_skew_seconds` for *that manifest's* policy
+  (`decision_round_invalid`; `scoring_window_evidence_inconsistent` on parse),
+  and a verified terminal manifest may lead `terminal_evaluated_at_epoch` by at
+  most its own policy's bound (`decision_terminal_future`;
+  `terminal_manifest_future` on parse). Beyond the skew, every report and the
+  terminal are re-admitted under their manifest's policy exactly as live
+  verification admits a manifest at an instant
+  (`verify_manifest_policy_admission`): the policy valid at the evaluation
+  epoch (`valid_from_epoch <= evaluation < valid_until_epoch`), the manifest
+  inside the policy's interval, lifetime, route-suffix, scheme, network and
+  authority constraints, and not stale (`max_manifest_age_seconds`); a
+  report's `probe_timeout_millis` and `max_response_bytes` are the policy's
+  own scalars; and every observation must be one `evaluate_probe_response`
+  could have produced under that policy
+  (`verify_observation_policy_binding`: the observation names that policy's
+  digest, `trust_policy_digest_sha256`; `timeout` if and only if
+  `latency_millis > probe_timeout_millis`, with all other outcomes at or below
+  the budget. Early OS/per-operation timeouts are `transport_error`; the pure
+  evaluator and transport use identical precedence. The continuous deadline is
+  `(probe_timeout_millis + 1) / 1000` to match floor-millisecond admission; a
+  serving outcome, or any failure code reached only after the pin check,
+  carries a pinned edge certificate when the policy pins any; a serving
+  outcome or any failure reached only after the size check has
+  `response_bytes <= max_response_bytes`; and a `response_oversized` verdict
+  carries size evidence above it). Budget/size inconsistencies reject first in
+  the report model as `observation_policy_violation` (`decision_round_invalid`
+  at decision production); the standalone scorer enforces these same scalars.
+  Remaining full-policy producer codes are
+  `decision_round_policy_rejected` and `decision_terminal_policy_rejected`;
+  parser codes `report_policy_rejected` and `terminal_policy_rejected`
+  (`scoring_window_evidence_inconsistent` for the probe-bound scalars).
+  Signatures, block leases, and the effective horizon are not re-derived here:
+  the first two are live-only facts and the horizon is governed by the
+  decision's own rules (`decision_round_after_horizon`,
+  `manifest_expired_at_close`). Upstream, `ManifestVerificationResult` records
+  the `evaluation_epoch` and `trust_policy_digest_sha256` a manifest was
+  verified at and under, and `build_validator_probe_report` refuses any other
+  epoch or policy (`report_evaluation_epoch_mismatch`, `trust_policy_mismatch`)
+  and any observation the policy could not have produced
+  (`observation_policy_violation`), so a report never claims an instant, a
+  skew, or a serving verdict its verification did not admit. The golden window
+  seals one policy (5s) and one round evaluated 5s before manifest 2's
+  issuance; the negatives `submit-with-report-preceding-manifest-beyond-skew`
+  (that report resealed one second earlier),
+  `submit-with-terminal-issued-beyond-skew` (a terminal issued 6s after the
+  close, produced at close+1 and rewritten to the close),
+  `submit-with-terminal-before-policy-validity` (a terminal under a successor
+  policy valid from close+5, produced at close+5 and rewritten to the close),
+  `submit-with-report-probe-bounds-not-policy`,
+  `submit-with-observation-oversized-for-policy`, and
+  `submit-without-verifying-trust-policy` (sealed policies removed) are
+  digest-valid and refused.
 - **Repeated probing** is how replicas are covered: expected attributions are
   `opportunities / replica_count` summed over the rounds a miner was
   published in, with opportunity counts sealed by replica cardinality so the
@@ -425,7 +615,8 @@ Frozen invariants:
 
 Default policy: 24 verified rounds, 3 expected attributions, 1800s grace,
 500‰ drop guard, 600-block registered gap, 86400s baseline age. These are
-defaults, not consensus.
+defaults, not consensus. Clock-skew bounds are never decision policy: they
+come from the sealed trust policies.
 
 ## Threat and failure semantics
 
@@ -460,7 +651,15 @@ defaults, not consensus.
 | Miner registered but never assigned | `unassigned`, zero under safe preconditions | assignment is the central authority's prerogative; weight follows serving |
 | Registered set from a different chain segment (behind, too far ahead, same height with another hash or epoch, lower epoch) | `registered_set_unbound`; abstain | plan and manifest views must agree |
 | Key rotation half-applied | `trust_policy_mismatch`; abstain until re-anchored | rotation never resets non-equivocation history |
-| Clock skew | bounded by `max_future_skew_seconds`; capture-side ticket skew bounded at 30s | all time is explicit input to pure code |
+| Clock skew | manifest issuance ahead of the validator bounded by the verifying trust policy's `max_future_skew_seconds` at verification and, per manifest, by the same sealed policy document at the decision (reports and terminal alike); signer-clock ticket issuance ahead of the runtime's activation and capture instants bounded at 30s by one rule in Python and Go | all time is explicit input to pure code; no stage applies a bound other than the one carried by the policy that admitted the evidence, and that policy is sealed with the evidence |
+| Report or terminal claims an evaluation instant its verification never admitted, or an instant at which its policy was not yet (or no longer) valid | `report_evaluation_epoch_mismatch`/`trust_policy_mismatch` at report construction; `decision_round_invalid`/`decision_round_policy_rejected`/`decision_terminal_future`/`decision_terminal_policy_rejected` at the decision; `scoring_window_evidence_inconsistent`/`report_policy_rejected`/`terminal_manifest_future`/`terminal_policy_rejected` on parse | the verification result carries its epoch and policy digest, and the sealed policy re-derives every evaluation-time admission rule |
+| Responses judged under a looser same-authority policy (longer request budget, no certificate pins, larger body ceiling) relabelled under the stricter policy that verified the manifest | `observation_policy_violation` at report construction; `decision_round_policy_rejected` at the decision; `report_policy_rejected` on parse | every observation records the certificate and body size the policy-dependent checks judged, so the named policy's constraints are re-derived from the observation itself |
+| Successor capture restamps a retained incarnation's ticket instant, its receipt, its activation, or the deployment facts its ticket binds; replaces an incarnation without advancing the generation; recycles a nonce, ticket, or receipt retired by any earlier replacement (A → B → A); or re-exports a dropped incarnation rewritten after an intervening capture | `snapshot_incarnation_rewritten`/`snapshot_generation_not_increasing`/`snapshot_incarnation_facts_reused`; publisher refuses | the durable lineage remembers the latest accepted incarnation of every `replica_id` and every signed fact it ever accepted in the era; a replacement is a new generation with never-seen facts |
+| Lineage restored from a stale backup, resealed with retired facts removed or with impossible boundary claims, fed a capture out of order or a duplicate/rolled-back history, spent on a capture other than the one its boundary was taken for, given a second boundary before any capture followed, or grown past its bounds | `snapshot_lineage_anchor_mismatch`/`lineage_era_invalid`/`lineage_replica_facts_duplicate`/`snapshot_lineage_gap`/`snapshot_sequence_not_increasing`/`snapshot_lineage_candidate_mismatch`/`snapshot_lineage_boundary_pending`/`snapshot_lineage_overflow`; publisher refuses and forgets nothing | the lineage is a hash chain whose head the operator anchors out of band; sequences are contiguous and a history preflight refuses rollbacks; boundary claims are bounded, unique per sequence, and tied to the document's predecessor; only an explicit, recorded era boundary sheds retired facts, at the replica cap it is taken for the capture it admits and admits only that capture, and every live history replays to itself |
+| Probe request stalled anywhere inside per-operation timeouts: slow name resolution, several unreachable addresses, a partial send drained just fast enough, or a byte-by-byte header or body trickle; or many lookups blocked at once | `ProbeTransportFailure("timeout")` at the transport within a small margin of the budget, `connection_failed` fast when the process-wide resolver slots are all held; `observation_policy_violation` if an older transport reports it as a response | name resolution is waited on for the remaining budget and abandoned, each address is dialled with the remaining budget, and every TLS step, `send`, and read on the connection is clamped to the time remaining in one budget on one monotonic clock (`DeadlineNetworkBackend`); the same budget is judged before every response-derived return; the binding re-derives the same bound from the recorded latency |
+| The same wire outcome sealed under a policy other than the one that judged it (a 100ms `timeout` carried into a 5000ms report, a 64-byte `response_oversized` carried into a 4096-byte report, or the reverse) | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | self digests do not authenticate telemetry; consumers re-derive timeout iff latency exceeds budget and size failure iff evidence exceeds ceiling, as well as requiring policy-label equality; fully resealed unchanged facts cannot bypass these rules |
+| Peer answers with a wire status outside `100..599` | `ProbeTransportFailure("transport_error")` with no status at the transport; the same at `evaluate_probe_response` for a leaked `ProbeResponse` | the contract's status range is enforced before an observation exists; no raw validation error reaches the CLI |
+| `tls_pin_mismatch` judged under a pinning policy carried into a report naming a policy without pins, or whose pins include the leaf | `observation_policy_violation` at report construction; `decision_round_policy_rejected`/`report_policy_rejected` downstream | every policy-dependent failure branch is bound in both directions |
 
 ## Compatibility matrix
 
@@ -468,19 +667,21 @@ defaults, not consensus.
 | --- | --- | --- |
 | `active-assignment-manifest.v1`, `assignment-manifest-trust-policy.v1`, `assignment-manifest-signature-envelope.v1` | unchanged; schema and fixture digest-pinned in tests | none |
 | `assignment-manifest-chain-state.v1` | **declared compatibility event**: gains required `last_finalized_epoch` (`null` at genesis); schema and fixture re-pinned; previously persisted states must be re-anchored (no validator is live on the old form) | private producer and every chain-state holder re-vendor; `advance_manifest_chain_state`/`rebind_manifest_chain_state_trust_policy` produce the new form |
-| `validator-probe-report.v1`, `miner-probe-attestation.v1` | schemas unchanged and pinned; the probe-report fixture is re-pinned because it embeds chain-state digests | none |
+| `validator-probe-report.v1` | **declared compatibility event**: every observation gains `trust_policy_digest_sha256` (the policy that judged it; every consumer requires it to equal the report's policy) and an oversized verdict preserves its size evidence in `response_bytes`; schema and fixture re-pinned; neither direction is compatible (old readers refuse the new field, new readers require it), so probe CLIs and their coordinator cut over together (see `api-migrations.md`); no validator is live on the old form | probe CLI emits the new form; coordinators and parsers require it |
+| `miner-probe-attestation.v1` | schema and fixture unchanged and pinned | none |
 | `weight-plan.v1` | unchanged, pinned; `build_weight_plan` unchanged, `build_weight_plan_from_decision` added in front of it | validator coordinator uses the decision-aware builder |
 | Manifest verification (`verify_active_assignment_manifest`, `anchor_manifest_chain_state`) | effective horizon replaces `expires_at_epoch` as the validity bound; **`current_finalized_height` is required** (breaking signature); historical variant added and lease-free | every live fetcher passes its finalized height |
 | `misscomputer-assignment-probe` CLI | **`--finalized-height` required** (breaking invocation) | operators add the flag from their finalized chain view |
 | `misscomputer-checkpoint-boundary` protocol `misscomputer.checkpoint-boundary.v1` | additive operations; `bind_latest_pointer_to_manifest` takes `signatures`; `verify_manifest_latest_pointer` response adds `history_depth`; **`verify_manifest` requires `current_finalized_height`** (`current_finalized_height_required`); other existing operations and response shapes unchanged | private producer passes the finalized height and may adopt the new operations |
-| `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity | runtime snapshot endpoint (Go), publisher |
+| `active-assignment-snapshot-lineage.v1` | new; publisher-local durable document; `advance_snapshot_lineage` is the durable form of `verify_snapshot_succession`; hash-chained (`previous_lineage_digest_sha256`), contiguous (`snapshot_lineage_gap`), era-scoped (`begin_snapshot_lineage_era`, `LineageEraBoundary`), anchored (`verify_snapshot_lineage_anchor`); Python only (no Go succession API) | manifest publisher persists it write-ahead beside its chain state, retains the head digest out of band, and seeds it by replaying retained captures |
+| `active-assignment-snapshot.v1` | new; Go and Python parity locked; succession adds epoch monotonicity and incarnation lineage rules (`snapshot_incarnation_rewritten`, `snapshot_generation_not_increasing`, `snapshot_incarnation_facts_reused`). **Clock-domain rule**: the replica ordering check is `ticket_issued_at_epoch <= route_activated_at_epoch + 30` (was `<=` with no tolerance), so the documented capture+30 ticket tolerance is reachable; schema and golden fixture bytes unchanged, supplementary `active-assignment-snapshot-signer-skew.v1.json` added (fresh generation-2 incarnations, a valid successor of the golden) | runtime snapshot endpoint (Go), publisher; a producer that stamped activation from the signer's clock keeps validating; a publisher must never restamp a retained incarnation |
 | `assignment-manifest-latest-pointer.v1` | new; carries `finalized_epoch`; immutable `.pointer.json` copy per manifest | publisher, validator fetcher |
-| `validator-weight-decision.v1` | new; self-enforcing on parse, including sealed serving evidence, registered-only assigned counts, and the guarded-baseline rule; carries terminal hash/epoch/horizon/lease, `assigned_at_close`, baselines; `decide_weight_submission` takes `archived_manifests` | validator coordinator supplies every accepted intermediate manifest it did not probe |
+| `validator-weight-decision.v1` | new; self-enforcing on parse, including sealed serving evidence, registered-only assigned counts, and the guarded-baseline rule; carries terminal hash/epoch/horizon/lease, `assigned_at_close`, baselines; `decide_weight_submission` takes `archived_manifests`. **Declared compatibility event**: the record gains `trust_policies` (the approved trust-policy documents its manifests name, sorted by digest) and `decide_weight_submission` requires `trust_policies`; the schema, golden fixture, and every decision negative fixture are re-pinned, and a record sealed without the field no longer digest-verifies (no coordinator is live on the old form) | validator coordinator supplies every accepted intermediate manifest it did not probe and the approved trust-policy documents it verified under |
 | `contracts/negative/` | new convention: golden invalid documents with pinned rejection reasons, including digest-valid forged `submit-with-*` decisions | contract test suites |
 | Go `pkg/assignment` | new package; no existing Go API changed | runtime snapshot endpoint |
 
 Every schema and every golden fixture of the seven pre-existing contract
-families is SHA-256 pinned in `test_contract_checkpoint.py`; the three new
+families is SHA-256 pinned in `test_contract_checkpoint.py`; the four new
 contracts are pinned by regeneration equality with their generators and by the
 negative-fixture inventory.
 
@@ -520,7 +721,8 @@ contract shape.
   `manifest_publication.py`, `validator_decision.py`;
 - `pkg/assignment/snapshot.go` with fixture-parity tests;
 - `contracts/schemas/*.v1.schema.json` and `contracts/fixtures/*.v1.json` for
-  the three new contracts, regenerated by
+  the four new contracts (plus the supplementary
+  `active-assignment-snapshot-signer-skew.v1.json`), regenerated by
   `tests/python/contract_checkpoint_context.py`;
 - `contracts/negative/<contract>.v1/*.json` golden invalid documents, each
   naming the contract, the expected rejection layer (`schema` or `model`),

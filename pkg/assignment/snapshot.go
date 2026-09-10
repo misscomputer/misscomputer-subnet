@@ -33,7 +33,11 @@ const (
 	RouteState    = "active"
 	// AttestationRequirement is the only mainnet attestation requirement.
 	AttestationRequirement = "miner_service_key_v1"
-	// TicketMaxFutureSkewSeconds bounds ticket issuance after the capture instant.
+	// TicketMaxFutureSkewSeconds is the only clock skew tolerated between the
+	// ticket signer's clock and the runtime's: a ticket may be stamped as issued
+	// at most this many seconds after the route activation it authorised and
+	// after the capture instant. Activation and capture share the runtime clock
+	// and are compared exactly.
 	TicketMaxFutureSkewSeconds = 30
 	// MaxSnapshotBytes matches the Python parser ceiling.
 	MaxSnapshotBytes = 64 * 1024 * 1024
@@ -438,7 +442,7 @@ func validateReplica(deploymentID string, replica Replica) error {
 	if replica.TicketDigestSHA256 == replica.ReceiptDigestSHA256 {
 		return errors.New("replica_digest_binding_invalid")
 	}
-	if replica.RouteActivatedAtEpoch < replica.TicketIssuedAtEpoch {
+	if replica.TicketIssuedAtEpoch > replica.RouteActivatedAtEpoch+TicketMaxFutureSkewSeconds {
 		return errors.New("replica_activation_order_invalid")
 	}
 	return nil

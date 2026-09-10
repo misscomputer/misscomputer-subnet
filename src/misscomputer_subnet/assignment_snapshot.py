@@ -24,6 +24,21 @@ What it binds
   capture was read at under one lock; two captures at one revision must carry
   identical deployments).
 
+Clock domains
+-------------
+A snapshot mixes two clocks. ``ticket_issued_at_epoch`` and
+``ticket_expires_at_epoch`` are stamped by the ticket signer; ``captured_at_epoch``
+and every ``route_activated_at_epoch`` are stamped by the runtime that
+activated the route and took the capture. Comparisons inside one domain are
+exact: a route is activated at or before the capture that exports it.
+Comparisons across the two domains tolerate the signer's clock leading the
+runtime's by at most :data:`TICKET_MAX_FUTURE_SKEW_SECONDS`: a ticket may be
+stamped as issued up to that many seconds after the activation it authorised
+and up to that many seconds after the capture instant, and never more. The
+same constant governs both cross-domain checks, so a ticket issued at
+``captured_at_epoch + TICKET_MAX_FUTURE_SKEW_SECONDS`` for a route activated
+at the capture instant is a valid capture; one second more is not.
+
 What it never carries
 ---------------------
 The raw challenge value, retained ticket or receipt bytes, credentials, axon
@@ -45,13 +60,15 @@ chain, randomness, or signing capability.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Sequence
-from typing import Final, Literal, NoReturn, Self
+from typing import Final, Literal, NoReturn, Self, cast
 
 from pydantic import Field, model_validator
 
 from .assignment_probe import (
     MAX_DEPLOYMENTS,
+    MAX_EPOCH,
     MAX_REPLICAS,
     UID,
     ActiveAssignmentManifest,
@@ -90,10 +107,35 @@ SNAPSHOT_SCHEMA_VERSION: Final = 1
 SNAPSHOT_PURPOSE: Final = "active_assignment_snapshot_v1"
 MAINNET_NETWORK: Final = "finney"
 MAINNET_NETUID: Final = 24
-#: A ticket issued after the capture instant is impossible for a consistent
-#: read; this is the only clock skew tolerated between signer and capture.
+#: The only clock skew tolerated between the ticket signer's clock and the
+#: runtime's: a ticket may be stamped as issued at most this many seconds after
+#: the route activation it authorised and after the capture instant.
 TICKET_MAX_FUTURE_SKEW_SECONDS: Final = 30
 MAX_SNAPSHOT_BYTES: Final = 64 * 1_024 * 1_024
+LINEAGE_SCHEMA: Final = "miss.computer/misscomputer-subnet/active-assignment-snapshot-lineage"
+LINEAGE_SCHEMA_VERSION: Final = 1
+LINEAGE_PURPOSE: Final = "active_assignment_snapshot_lineage_v1"
+#: Every ``replica_id`` a runtime has ever exported; a lineage past this must be
+#: re-anchored by its operator.
+MAX_LINEAGE_REPLICAS: Final = MAX_DEPLOYMENTS * MAX_REPLICAS
+#: Every assignment nonce, ticket digest, and receipt digest a runtime has ever
+#: exported, kept so no later incarnation can recycle any of them; a lineage
+#: past this must be re-anchored by its operator.
+MAX_LINEAGE_FACTS: Final = 1 << 17
+#: Security eras a lineage may pass through (``era`` is at most this value, so
+#: at most ``MAX_LINEAGE_ERAS - 1`` boundaries); each boundary is an explicit,
+#: operator-initiated loss of retired-fact and inactive-lineage memory.
+MAX_LINEAGE_ERAS: Final = 64
+MAX_LINEAGE_BYTES: Final = 64 * 1_024 * 1_024
+#: Largest charged state and candidate, derived from the producer's field caps.
+MAX_REPLAY_STATE_ENTRIES: Final = (
+    1 + MAX_LINEAGE_REPLICAS + 3 * MAX_LINEAGE_FACTS + MAX_LINEAGE_ERAS - 1
+)
+MAX_REPLAY_CANDIDATE_ENTRIES: Final = 1 + MAX_DEPLOYMENTS + MAX_LINEAGE_REPLICAS
+#: Initial validation plus the most expensive atomic event: a candidate boundary
+#: (three passes). Also covers an ordinary capture or pending-head verification.
+#: Keep cumulative accounting intact: larger archives still require batching.
+MAX_REPLAY_WORK: Final = 4 * MAX_REPLAY_STATE_ENTRIES + 3 * MAX_REPLAY_CANDIDATE_ENTRIES
 
 SnapshotRejectionCode = Literal[
     "snapshot_authority_mismatch",
@@ -101,11 +143,21 @@ SnapshotRejectionCode = Literal[
     "snapshot_finalized_epoch_rollback",
     "snapshot_finalized_fork",
     "snapshot_finalized_rollback",
+    "snapshot_generation_not_increasing",
+    "snapshot_incarnation_rewritten",
+    "snapshot_lineage_anchor_mismatch",
+    "snapshot_lineage_boundary_pending",
+    "snapshot_lineage_candidate_mismatch",
+    "snapshot_lineage_gap",
+    "snapshot_lineage_overflow",
+    "snapshot_lineage_replay_mismatch",
+    "snapshot_lineage_replay_work_exceeded",
     "snapshot_manifest_chain_mismatch",
     "snapshot_manifest_issued_at_mismatch",
     "snapshot_manifest_route_mismatch",
     "snapshot_manifest_vector_mismatch",
     "snapshot_network_mismatch",
+    "snapshot_incarnation_facts_reused",
     "snapshot_revision_content_divergence",
     "snapshot_revision_rollback",
     "snapshot_sequence_not_increasing",
@@ -141,8 +193,10 @@ class SnapshotReplica(StrictFrozenModel):
     ticket_issued_at_epoch: Epoch
     ticket_expires_at_epoch: PositiveEpoch
     route_state: Literal["active"]
-    #: Instant the edge activated this exact incarnation (at or after the
-    #: ready receipt). Consumers anchor activation grace on it.
+    #: Instant the runtime activated this exact incarnation (at or after the
+    #: ready receipt), on the runtime's clock. Consumers anchor activation
+    #: grace on it. The signer-stamped ``ticket_issued_at_epoch`` may lead it
+    #: by at most :data:`TICKET_MAX_FUTURE_SKEW_SECONDS`.
     route_activated_at_epoch: Epoch
 
     @model_validator(mode="after")
@@ -154,7 +208,9 @@ class SnapshotReplica(StrictFrozenModel):
             raise ValueError("replica_ticket_window_invalid")
         if self.ticket_digest_sha256 == self.receipt_digest_sha256:
             raise ValueError("replica_digest_binding_invalid")
-        if self.route_activated_at_epoch < self.ticket_issued_at_epoch:
+        if self.ticket_issued_at_epoch > (
+            self.route_activated_at_epoch + TICKET_MAX_FUTURE_SKEW_SECONDS
+        ):
             raise ValueError("replica_activation_order_invalid")
         return self
 
@@ -431,20 +487,656 @@ def build_active_assignment_snapshot(
     )
 
 
-def verify_snapshot_succession(
-    previous: ActiveAssignmentSnapshot,
-    current: ActiveAssignmentSnapshot,
-) -> None:
-    """Enforce the transactional ordering between two captures from one runtime.
+class ReplicaLineage(StrictFrozenModel):
+    """The latest incarnation a lineage has accepted for one stable ``replica_id``.
 
-    ``snapshot_sequence`` strictly increases; ``state_revision``, the capture
-    instant, the finalized height, and the finalized epoch never go
-    backwards; an unchanged revision must carry byte-identical deployments;
-    one finalized height has one block hash and one epoch.
+    ``replica_id`` (deployment and hotkey) is stable across re-assignments;
+    ``generation`` and ``assignment_nonce`` name the incarnation, and the
+    ticket and receipt digests are the signed facts issued for it.
+    ``replica_digest_sha256`` seals the complete replica document and
+    ``deployment_facts_digest_sha256`` the enclosing deployment's ticket-bound
+    facts (everything but its replicas), so a later capture that re-exports
+    this incarnation can be held to exactly what was accepted.
     """
 
-    previous = revalidate(previous, ActiveAssignmentSnapshot)
-    current = revalidate(current, ActiveAssignmentSnapshot)
+    replica_id: ReplicaID
+    deployment_id: DeploymentID
+    miner_hotkey: Hotkey
+    generation: PositiveEpoch
+    assignment_nonce: Hex32
+    endpoint_id: EndpointID
+    ticket_digest_sha256: Digest
+    receipt_digest_sha256: Digest
+    replica_digest_sha256: Digest
+    deployment_facts_digest_sha256: Digest
+    #: The last accepted capture that exported this incarnation. An entry whose
+    #: value is below the lineage's ``last_snapshot_sequence`` is inactive and
+    #: is the only kind an era boundary may prune.
+    last_seen_snapshot_sequence: PositiveEpoch
+
+    @model_validator(mode="after")
+    def canonical_lineage(self) -> Self:
+        if self.replica_id != f"{self.deployment_id}-{self.miner_hotkey}":
+            raise ValueError("lineage_replica_identity_invalid")
+        if self.endpoint_id != f"{self.replica_id}-g{self.generation}-{self.assignment_nonce}":
+            raise ValueError("lineage_replica_identity_invalid")
+        if self.ticket_digest_sha256 == self.receipt_digest_sha256:
+            raise ValueError("lineage_digest_binding_invalid")
+        return self
+
+
+class LineageEraBoundary(StrictFrozenModel):
+    """One explicit reset of a lineage's retired-fact memory.
+
+    A boundary is the only way retired facts leave a lineage. It records the
+    era it opened, the last capture accepted before it, how many retired
+    facts of each kind were dropped, and the digest of the lineage it was
+    taken from, so a consumer can see exactly where the never-reuse guarantee
+    was re-scoped and can never mistake one era for another.
+    """
+
+    era: PositiveEpoch
+    opened_after_snapshot_sequence: PositiveEpoch
+    dropped_replica_lineages: int = Field(ge=0, le=MAX_LINEAGE_REPLICAS)
+    dropped_assignment_nonces: int = Field(ge=0, le=MAX_LINEAGE_FACTS)
+    dropped_ticket_digests: int = Field(ge=0, le=MAX_LINEAGE_FACTS)
+    dropped_receipt_digests: int = Field(ge=0, le=MAX_LINEAGE_FACTS)
+    previous_lineage_digest_sha256: Digest
+    #: Digest of the capture the boundary was taken for, when it was: only the
+    #: replica lineages that capture continues were kept. ``null`` for a
+    #: boundary that kept every active lineage.
+    retained_for_snapshot_digest_sha256: Digest | None
+
+
+class SnapshotLineage(StrictFrozenModel):
+    """Durable, append-only memory of every capture a publisher has accepted.
+
+    The lineage carries the transactional position of the last accepted
+    capture (so the succession rules hold across every capture, not only
+    between two adjacent ones); for every ``replica_id`` ever exported, the
+    latest incarnation accepted for it, including incarnations that later
+    captures dropped; and every assignment nonce, ticket digest, and receipt
+    digest ever accepted for any incarnation of any replica, so a fact retired
+    by one replacement can never be recycled by a later one. A publisher
+    advances it with every capture it accepts and persists the result; an
+    incarnation that disappears from a capture and reappears later is still
+    held to the facts first accepted for it.
+
+    History is anchored, contiguous, and era-scoped. Every advanced lineage
+    names the digest of the lineage it was derived from
+    (``previous_lineage_digest_sha256``), so the sequence of persisted
+    lineages is a hash chain whose head digest an operator retains out of
+    band and re-checks with :func:`verify_snapshot_lineage_anchor` before
+    trusting a restored file. Captures are accepted only in exact sequence
+    order from ``history_start_snapshot_sequence``: a missing capture is a
+    gap that must be replayed, never skipped. Retired facts leave the lineage
+    only through an explicit :func:`begin_snapshot_lineage_era`, which
+    records a :class:`LineageEraBoundary`; the never-reuse guarantee is
+    therefore exactly "no fact accepted since ``history_start_snapshot_sequence``
+    within the current ``era`` is ever accepted again", and a consumer can read
+    that scope from the document.
+    """
+
+    contract_schema: Literal[
+        "miss.computer/misscomputer-subnet/active-assignment-snapshot-lineage"
+    ] = Field(alias="schema")
+    schema_version: Literal[1]
+    purpose: Literal["active_assignment_snapshot_lineage_v1"]
+    network: Literal["finney"]
+    netuid: Literal[24]
+    central_authority_fingerprint_sha256: Digest
+    #: The first ``snapshot_sequence`` this lineage's memory covers; captures
+    #: before it are outside the guarantee and the document says so.
+    history_start_snapshot_sequence: PositiveEpoch
+    #: Current security era; ``1`` until an operator begins a new one.
+    era: PositiveEpoch
+    era_boundaries: list[LineageEraBoundary] = Field(max_length=MAX_LINEAGE_ERAS - 1)
+    #: Digest of the lineage this one was advanced from; ``null`` at genesis.
+    previous_lineage_digest_sha256: Digest | None
+    accepted_snapshot_count: int = Field(ge=0)
+    last_snapshot_sequence: PositiveEpoch | None
+    last_state_revision: Epoch | None
+    last_captured_at_epoch: Epoch | None
+    last_finalized_height: Epoch | None
+    last_finalized_block_hash: Digest | None
+    last_finalized_epoch: Epoch | None
+    last_snapshot_digest_sha256: Digest | None
+    #: Digest of the last capture's canonical ``deployments`` list, so an
+    #: unchanged ``state_revision`` can be held to identical content.
+    last_deployments_digest_sha256: Digest | None
+    replicas: list[ReplicaLineage] = Field(max_length=MAX_LINEAGE_REPLICAS)
+    #: Every fact ever accepted for any incarnation, sorted and unique. The
+    #: facts of every current ``replicas`` entry are among them.
+    used_assignment_nonces: list[Hex32] = Field(max_length=MAX_LINEAGE_FACTS)
+    used_ticket_digests: list[Digest] = Field(max_length=MAX_LINEAGE_FACTS)
+    used_receipt_digests: list[Digest] = Field(max_length=MAX_LINEAGE_FACTS)
+    lineage_digest_sha256: Digest
+
+    @model_validator(mode="after")
+    def canonical_lineage(self) -> Self:
+        last_fields = (
+            self.last_snapshot_sequence,
+            self.last_state_revision,
+            self.last_captured_at_epoch,
+            self.last_finalized_height,
+            self.last_finalized_block_hash,
+            self.last_finalized_epoch,
+            self.last_snapshot_digest_sha256,
+            self.last_deployments_digest_sha256,
+        )
+        genesis = self.accepted_snapshot_count == 0
+        if genesis != all(value is None for value in last_fields) or (
+            not genesis and any(value is None for value in last_fields)
+        ):
+            raise ValueError("lineage_genesis_invalid")
+        if genesis and self.replicas:
+            raise ValueError("lineage_genesis_invalid")
+        replica_ids = [item.replica_id for item in self.replicas]
+        if replica_ids != sorted(set(replica_ids)):
+            raise ValueError("lineage_replicas_not_canonical")
+        endpoints = [item.endpoint_id for item in self.replicas]
+        if len(set(endpoints)) != len(endpoints):
+            raise ValueError("lineage_endpoint_duplicate")
+        for used in (
+            self.used_assignment_nonces,
+            self.used_ticket_digests,
+            self.used_receipt_digests,
+        ):
+            if used != sorted(set(used)):
+                raise ValueError("lineage_used_facts_not_canonical")
+        current_facts = [
+            fact
+            for item in self.replicas
+            for fact in (
+                item.assignment_nonce,
+                item.ticket_digest_sha256,
+                item.receipt_digest_sha256,
+            )
+        ]
+        if len(set(current_facts)) != len(current_facts):
+            raise ValueError("lineage_replica_facts_duplicate")
+        nonces = set(self.used_assignment_nonces)
+        tickets = set(self.used_ticket_digests)
+        receipts = set(self.used_receipt_digests)
+        if any(
+            item.assignment_nonce not in nonces
+            or item.ticket_digest_sha256 not in tickets
+            or item.receipt_digest_sha256 not in receipts
+            for item in self.replicas
+        ):
+            raise ValueError("lineage_used_facts_not_derived")
+        if tickets & receipts:
+            raise ValueError("lineage_used_facts_overlap")
+        if genesis and (nonces or tickets or receipts):
+            raise ValueError("lineage_genesis_invalid")
+        if genesis and self.previous_lineage_digest_sha256 is not None:
+            raise ValueError("lineage_genesis_invalid")
+        if not genesis and self.previous_lineage_digest_sha256 is None:
+            raise ValueError("lineage_chain_link_missing")
+        if not genesis:
+            last_sequence = cast(int, self.last_snapshot_sequence)
+            if last_sequence != (
+                self.history_start_snapshot_sequence + self.accepted_snapshot_count - 1
+            ):
+                raise ValueError("lineage_history_not_contiguous")
+            if any(
+                not self.history_start_snapshot_sequence
+                <= item.last_seen_snapshot_sequence
+                <= last_sequence
+                for item in self.replicas
+            ):
+                raise ValueError("lineage_replica_seen_out_of_range")
+        eras = [item.era for item in self.era_boundaries]
+        if eras != list(range(2, 2 + len(eras))) or self.era != 1 + len(eras):
+            raise ValueError("lineage_era_invalid")
+        if self.era_boundaries:
+            if genesis:
+                raise ValueError("lineage_era_invalid")
+            opened = [item.opened_after_snapshot_sequence for item in self.era_boundaries]
+            if opened != sorted(set(opened)) or any(
+                not self.history_start_snapshot_sequence
+                <= value
+                <= cast(int, self.last_snapshot_sequence)
+                for value in opened
+            ):
+                raise ValueError("lineage_era_invalid")
+            latest = self.era_boundaries[-1]
+            if (
+                latest.opened_after_snapshot_sequence == self.last_snapshot_sequence
+                and latest.previous_lineage_digest_sha256 != self.previous_lineage_digest_sha256
+            ):
+                # No capture followed the latest boundary, so this document is
+                # that boundary's result and must name the same predecessor.
+                raise ValueError("lineage_era_invalid")
+            if any(
+                item.dropped_replica_lineages + len(self.replicas) > MAX_LINEAGE_REPLICAS
+                for item in self.era_boundaries
+                if item.opened_after_snapshot_sequence == self.last_snapshot_sequence
+            ):
+                raise ValueError("lineage_era_invalid")
+        if self.era_boundaries and _boundary_pending(self):
+            latest = self.era_boundaries[-1]
+            kept = len(self.replicas)
+            # A boundary retains exactly active incarnations, with exactly
+            # their facts: no retired facts can survive a boundary by themselves.
+            if any(
+                item.last_seen_snapshot_sequence != self.last_snapshot_sequence
+                for item in self.replicas
+            ) or any(len(facts) != kept for facts in (nonces, tickets, receipts)):
+                raise ValueError("lineage_era_invalid")
+            totals = (
+                latest.dropped_assignment_nonces + kept,
+                latest.dropped_ticket_digests + kept,
+                latest.dropped_receipt_digests + kept,
+            )
+            if max(totals) > MAX_LINEAGE_FACTS or len(set(totals)) != 1:
+                raise ValueError("lineage_era_invalid")
+            if latest.dropped_replica_lineages + kept > totals[0]:
+                raise ValueError("lineage_era_invalid")
+        verify_model_digest(self, "lineage_digest_sha256")
+        return self
+
+
+def _deployment_facts_digest(deployment: SnapshotDeployment) -> str:
+    """Digest of a deployment's ticket-bound facts: everything but its replicas."""
+
+    return digest(
+        {key: value for key, value in model_document(deployment).items() if key != "replicas"}
+    )
+
+
+def _same_incarnation(known: ReplicaLineage, current: ReplicaLineage) -> bool:
+    """Identical incarnation facts; the capture that last exported them may differ."""
+
+    return model_document(known) | {"last_seen_snapshot_sequence": 0} == model_document(current) | {
+        "last_seen_snapshot_sequence": 0
+    }
+
+
+def _replica_lineage(
+    deployment: SnapshotDeployment, replica: SnapshotReplica, *, seen_at: int
+) -> ReplicaLineage:
+    return ReplicaLineage(
+        replica_id=replica.replica_id,
+        deployment_id=deployment.deployment_id,
+        miner_hotkey=replica.miner_hotkey,
+        generation=replica.generation,
+        assignment_nonce=replica.assignment_nonce,
+        endpoint_id=replica.endpoint_id,
+        ticket_digest_sha256=replica.ticket_digest_sha256,
+        receipt_digest_sha256=replica.receipt_digest_sha256,
+        replica_digest_sha256=digest(model_document(replica)),
+        deployment_facts_digest_sha256=_deployment_facts_digest(deployment),
+        last_seen_snapshot_sequence=seen_at,
+    )
+
+
+def build_initial_snapshot_lineage(
+    *, central_authority_fingerprint_sha256: str, first_snapshot_sequence: int = 1
+) -> SnapshotLineage:
+    """The lineage a publisher holds before it has accepted any capture.
+
+    ``first_snapshot_sequence`` is the capture the lineage will accept first
+    and the start of its memory. A publisher adopting the lineage replays its
+    retained captures from the runtime's first sequence (``1``); one that
+    starts later records that start here, and the document then states that
+    facts before it are outside the guarantee.
+    """
+
+    if (
+        isinstance(first_snapshot_sequence, bool)
+        or not isinstance(first_snapshot_sequence, int)
+        or not 1 <= first_snapshot_sequence <= MAX_EPOCH
+    ):
+        raise ValueError("lineage_history_start_invalid")
+    unsigned: dict[str, object] = {
+        "schema": LINEAGE_SCHEMA,
+        "schema_version": LINEAGE_SCHEMA_VERSION,
+        "purpose": LINEAGE_PURPOSE,
+        "network": MAINNET_NETWORK,
+        "netuid": MAINNET_NETUID,
+        "central_authority_fingerprint_sha256": central_authority_fingerprint_sha256,
+        "history_start_snapshot_sequence": first_snapshot_sequence,
+        "era": 1,
+        "era_boundaries": [],
+        "previous_lineage_digest_sha256": None,
+        "accepted_snapshot_count": 0,
+        "last_snapshot_sequence": None,
+        "last_state_revision": None,
+        "last_captured_at_epoch": None,
+        "last_finalized_height": None,
+        "last_finalized_block_hash": None,
+        "last_finalized_epoch": None,
+        "last_snapshot_digest_sha256": None,
+        "last_deployments_digest_sha256": None,
+        "replicas": [],
+        "used_assignment_nonces": [],
+        "used_ticket_digests": [],
+        "used_receipt_digests": [],
+    }
+    return SnapshotLineage.model_validate({**unsigned, "lineage_digest_sha256": digest(unsigned)})
+
+
+def advance_snapshot_lineage(
+    lineage: SnapshotLineage,
+    snapshot: ActiveAssignmentSnapshot,
+    *,
+    max_facts: int = MAX_LINEAGE_FACTS,
+    max_replicas: int = MAX_LINEAGE_REPLICAS,
+) -> SnapshotLineage:
+    """Accept one capture into a lineage, or refuse it with a stable code.
+
+    Transactional rules against the last accepted capture: ``snapshot_sequence``
+    is exactly the next one (a lower or equal sequence is
+    ``snapshot_sequence_not_increasing``, a jump is ``snapshot_lineage_gap``:
+    the missing captures must be replayed in order, never skipped); the first
+    capture is exactly ``history_start_snapshot_sequence``; ``state_revision``,
+    the capture instant, the finalized height, and the finalized epoch never go
+    backwards; an unchanged revision carries identical deployments; one
+    finalized height has one block hash and one epoch; authority and network
+    never change.
+
+    A capture that would push the retained facts past ``max_facts`` is refused
+    (``snapshot_lineage_overflow``) and nothing is forgotten: the only way to
+    shed retired facts is :func:`begin_snapshot_lineage_era`. The result names
+    ``lineage`` as its predecessor (``previous_lineage_digest_sha256``).
+
+    Incarnation rules against every ``replica_id`` the lineage has ever
+    accepted, whether or not the previous capture still exported it:
+
+    - the same ``endpoint_id`` must carry the identical replica document and
+      identical ticket-bound deployment facts (``snapshot_incarnation_rewritten``);
+      a signed ticket binds its own issuance and its assignment, so a retained
+      ticket with a restamped instant, a moved activation, or a changed image,
+      challenge, or workload spec is an impossible rewrite;
+    - a replacement (a different ``endpoint_id`` for the same ``replica_id``)
+      must advance the generation (``snapshot_generation_not_increasing``);
+    - every new incarnation, replacement or first appearance, must carry a
+      nonce, ticket digest, and receipt digest that no incarnation of any
+      replica ever carried before in any role (a retired ticket digest may not
+      return as a receipt digest, nor the reverse), however many captures or
+      replacements ago (``snapshot_incarnation_facts_reused``); the lineage
+      keeps every fact it has accepted in the era for exactly this purpose.
+    """
+
+    lineage = revalidate(lineage, SnapshotLineage)
+    snapshot = revalidate(snapshot, ActiveAssignmentSnapshot)
+    if lineage.central_authority_fingerprint_sha256 != (
+        snapshot.central_authority_fingerprint_sha256
+    ):
+        _reject("snapshot_authority_mismatch")
+    if lineage.network != snapshot.network or lineage.netuid != snapshot.netuid:
+        _reject("snapshot_network_mismatch")
+    deployments_digest = _verify_lineage_order(lineage, snapshot)
+    committed = _pending_candidate(lineage)
+    if committed is not None and committed != snapshot.snapshot_digest_sha256:
+        # The latest boundary was taken for one specific capture and dropped
+        # history on that basis; only that capture may follow it.
+        _reject("snapshot_lineage_candidate_mismatch")
+    retained = {item.replica_id: item for item in lineage.replicas}
+    used_nonces = set(lineage.used_assignment_nonces)
+    used_tickets = set(lineage.used_ticket_digests)
+    used_receipts = set(lineage.used_receipt_digests)
+    # One union, maintained incrementally: freshness is linear in the capture.
+    used_any = used_nonces | used_tickets | used_receipts
+    for deployment in snapshot.deployments:
+        for replica in deployment.replicas:
+            current = _replica_lineage(deployment, replica, seen_at=snapshot.snapshot_sequence)
+            known = retained.get(current.replica_id)
+            if known is not None and known.endpoint_id == current.endpoint_id:
+                if not _same_incarnation(known, current):
+                    _reject("snapshot_incarnation_rewritten")
+                retained[current.replica_id] = current
+                continue
+            if known is not None and current.generation <= known.generation:
+                _reject("snapshot_generation_not_increasing")
+            facts = (
+                current.assignment_nonce,
+                current.ticket_digest_sha256,
+                current.receipt_digest_sha256,
+            )
+            if any(fact in used_any for fact in facts):
+                _reject("snapshot_incarnation_facts_reused")
+            used_nonces.add(current.assignment_nonce)
+            used_tickets.add(current.ticket_digest_sha256)
+            used_receipts.add(current.receipt_digest_sha256)
+            used_any.update(facts)
+            retained[current.replica_id] = current
+    if len(retained) > min(max_replicas, MAX_LINEAGE_REPLICAS) or max(
+        len(used_nonces), len(used_tickets), len(used_receipts)
+    ) > min(max_facts, MAX_LINEAGE_FACTS):
+        _reject("snapshot_lineage_overflow")
+    unsigned: dict[str, object] = {
+        "schema": LINEAGE_SCHEMA,
+        "schema_version": LINEAGE_SCHEMA_VERSION,
+        "purpose": LINEAGE_PURPOSE,
+        "network": lineage.network,
+        "netuid": lineage.netuid,
+        "central_authority_fingerprint_sha256": lineage.central_authority_fingerprint_sha256,
+        "history_start_snapshot_sequence": lineage.history_start_snapshot_sequence,
+        "era": lineage.era,
+        "era_boundaries": [model_document(item) for item in lineage.era_boundaries],
+        "previous_lineage_digest_sha256": lineage.lineage_digest_sha256,
+        "accepted_snapshot_count": lineage.accepted_snapshot_count + 1,
+        "last_snapshot_sequence": snapshot.snapshot_sequence,
+        "last_state_revision": snapshot.state_revision,
+        "last_captured_at_epoch": snapshot.captured_at_epoch,
+        "last_finalized_height": snapshot.finalized_height,
+        "last_finalized_block_hash": snapshot.finalized_block_hash,
+        "last_finalized_epoch": snapshot.finalized_epoch,
+        "last_snapshot_digest_sha256": snapshot.snapshot_digest_sha256,
+        "last_deployments_digest_sha256": deployments_digest,
+        "replicas": [model_document(retained[key]) for key in sorted(retained)],
+        "used_assignment_nonces": sorted(used_nonces),
+        "used_ticket_digests": sorted(used_tickets),
+        "used_receipt_digests": sorted(used_receipts),
+    }
+    return SnapshotLineage.model_validate({**unsigned, "lineage_digest_sha256": digest(unsigned)})
+
+
+def _verify_lineage_order(lineage: SnapshotLineage, snapshot: ActiveAssignmentSnapshot) -> str:
+    """The transactional rules a capture must satisfy to follow ``lineage``.
+
+    Returns the canonical digest of the capture's deployments.
+    """
+
+    if lineage.central_authority_fingerprint_sha256 != (
+        snapshot.central_authority_fingerprint_sha256
+    ):
+        _reject("snapshot_authority_mismatch")
+    if lineage.network != snapshot.network or lineage.netuid != snapshot.netuid:
+        _reject("snapshot_network_mismatch")
+    deployments_digest = digest([model_document(item) for item in snapshot.deployments])
+    if lineage.accepted_snapshot_count == 0:
+        if snapshot.snapshot_sequence != lineage.history_start_snapshot_sequence:
+            _reject("snapshot_lineage_gap")
+        return deployments_digest
+    last_sequence = cast(int, lineage.last_snapshot_sequence)
+    last_revision = cast(int, lineage.last_state_revision)
+    last_captured = cast(int, lineage.last_captured_at_epoch)
+    last_height = cast(int, lineage.last_finalized_height)
+    last_epoch = cast(int, lineage.last_finalized_epoch)
+    if snapshot.snapshot_sequence <= last_sequence:
+        _reject("snapshot_sequence_not_increasing")
+    if snapshot.snapshot_sequence != last_sequence + 1:
+        _reject("snapshot_lineage_gap")
+    if snapshot.state_revision < last_revision:
+        _reject("snapshot_revision_rollback")
+    if snapshot.state_revision == last_revision and (
+        deployments_digest != lineage.last_deployments_digest_sha256
+    ):
+        _reject("snapshot_revision_content_divergence")
+    if snapshot.captured_at_epoch < last_captured:
+        _reject("snapshot_capture_rollback")
+    if snapshot.finalized_height < last_height:
+        _reject("snapshot_finalized_rollback")
+    if snapshot.finalized_height == last_height and (
+        snapshot.finalized_block_hash != lineage.last_finalized_block_hash
+        or snapshot.finalized_epoch != last_epoch
+    ):
+        _reject("snapshot_finalized_fork")
+    if snapshot.finalized_epoch < last_epoch:
+        _reject("snapshot_finalized_epoch_rollback")
+    return deployments_digest
+
+
+def _pending_candidate(lineage: SnapshotLineage) -> str | None:
+    """The capture digest the latest boundary was taken for, if no capture has followed it yet."""
+
+    if not lineage.era_boundaries or lineage.accepted_snapshot_count == 0:
+        return None
+    latest = lineage.era_boundaries[-1]
+    if latest.opened_after_snapshot_sequence != lineage.last_snapshot_sequence:
+        return None
+    return latest.retained_for_snapshot_digest_sha256
+
+
+def _boundary_pending(lineage: SnapshotLineage) -> bool:
+    """Whether the latest boundary has not yet been followed by an accepted capture."""
+
+    return (
+        bool(lineage.era_boundaries)
+        and lineage.accepted_snapshot_count > 0
+        and (
+            lineage.era_boundaries[-1].opened_after_snapshot_sequence
+            == lineage.last_snapshot_sequence
+        )
+    )
+
+
+def begin_snapshot_lineage_era(
+    lineage: SnapshotLineage,
+    *,
+    retain_for: ActiveAssignmentSnapshot | None = None,
+    max_facts: int = MAX_LINEAGE_FACTS,
+    max_replicas: int = MAX_LINEAGE_REPLICAS,
+) -> SnapshotLineage:
+    """Open a new security era: keep the active incarnations, drop everything retired.
+
+    With ``retain_for``, the boundary is taken for a specific next capture and
+    keeps only the active lineages that capture continues (``replica_id``s it
+    exports), recording that capture's digest in the boundary. This is the
+    fully prevalidated boundary preparation for an exact-cap turnover: a
+    capture that replaces every ``replica_id`` at ``MAX_LINEAGE_REPLICAS``
+    cannot be accepted after a plain boundary (which keeps all active
+    lineages), but is accepted after a boundary taken for it, because the
+    retained set is then exactly what it continues and the capture itself never
+    exceeds the bound. Before returning any persistable state, fully dry-run
+    the candidate against the proposed pruned state (ordering, incarnation,
+    generation, reused facts, and the supplied resource limits). Pass the same
+    limits when advancing. The pending head can be restored exactly by replay
+    with ``pending_candidate``. No failing dry-run returns a boundary, and
+    the commitment is enforced: only that exact capture may be
+    accepted next (``snapshot_lineage_candidate_mismatch``). One boundary per
+    accepted capture: a second boundary before any capture follows the first
+    is refused (``snapshot_lineage_boundary_pending``), so no boundary can hide
+    behind another and every boundary's ``opened_after_snapshot_sequence`` is
+    unique.
+
+    This is the only operation that forgets. It is for a lineage that has hit
+    ``snapshot_lineage_overflow`` (or that an operator must otherwise re-scope)
+    and it never happens implicitly: the result carries ``era + 1``, a
+    :class:`LineageEraBoundary` naming the last accepted capture, the counts
+    of inactive replica lineages and retired facts dropped, and the digest of
+    the lineage it was taken from, so downstream readers can see that facts and
+    generations retired before the boundary are no longer guarded. Only the
+    incarnations exported by the last accepted capture are kept, with their
+    facts, so retained endpoints are still held to their documents and a
+    replacement still needs a higher generation and facts unseen in this era;
+    a lineage over ``MAX_LINEAGE_REPLICAS`` therefore recovers here exactly
+    when it holds inactive lineages, which it always does past that bound
+    because one capture cannot hold more. ``era`` may not exceed
+    ``MAX_LINEAGE_ERAS`` (``snapshot_lineage_overflow``).
+    """
+
+    lineage = revalidate(lineage, SnapshotLineage)
+    if lineage.accepted_snapshot_count == 0:
+        _reject("snapshot_lineage_gap")
+    if lineage.era >= MAX_LINEAGE_ERAS:
+        _reject("snapshot_lineage_overflow")
+    if _boundary_pending(lineage):
+        _reject("snapshot_lineage_boundary_pending")
+    active = [
+        item
+        for item in lineage.replicas
+        if item.last_seen_snapshot_sequence == lineage.last_snapshot_sequence
+    ]
+    candidate_digest: str | None = None
+    if retain_for is not None:
+        candidate = revalidate(retain_for, ActiveAssignmentSnapshot)
+        _verify_lineage_order(lineage, candidate)
+        continued = {
+            replica.replica_id for item in candidate.deployments for replica in item.replicas
+        }
+        active = [item for item in active if item.replica_id in continued]
+        candidate_digest = candidate.snapshot_digest_sha256
+    kept_nonces = sorted({item.assignment_nonce for item in active})
+    kept_tickets = sorted({item.ticket_digest_sha256 for item in active})
+    kept_receipts = sorted({item.receipt_digest_sha256 for item in active})
+    boundary = {
+        "era": lineage.era + 1,
+        "opened_after_snapshot_sequence": lineage.last_snapshot_sequence,
+        "dropped_replica_lineages": len(lineage.replicas) - len(active),
+        "dropped_assignment_nonces": len(lineage.used_assignment_nonces) - len(kept_nonces),
+        "dropped_ticket_digests": len(lineage.used_ticket_digests) - len(kept_tickets),
+        "dropped_receipt_digests": len(lineage.used_receipt_digests) - len(kept_receipts),
+        "previous_lineage_digest_sha256": lineage.lineage_digest_sha256,
+        "retained_for_snapshot_digest_sha256": candidate_digest,
+    }
+    document = model_document(lineage)
+    unsigned: dict[str, object] = {
+        **{key: value for key, value in document.items() if key != "lineage_digest_sha256"},
+        "era": lineage.era + 1,
+        "era_boundaries": [*(model_document(item) for item in lineage.era_boundaries), boundary],
+        "previous_lineage_digest_sha256": lineage.lineage_digest_sha256,
+        "replicas": [model_document(item) for item in active],
+        "used_assignment_nonces": kept_nonces,
+        "used_ticket_digests": kept_tickets,
+        "used_receipt_digests": kept_receipts,
+    }
+    prepared = SnapshotLineage.model_validate(
+        {**unsigned, "lineage_digest_sha256": digest(unsigned)}
+    )
+    if retain_for is not None:
+        # Full dry run against the exact pruned state, including incarnation,
+        # lifetime fact reuse, generation and caller resource limits. Failure
+        # returns no state: the original lineage remains the only durable head.
+        advance_snapshot_lineage(
+            prepared, candidate, max_facts=max_facts, max_replicas=max_replicas
+        )
+    return prepared
+
+
+def snapshot_history_gaps(
+    snapshots: Sequence[ActiveAssignmentSnapshot],
+) -> list[tuple[int, int]]:
+    """Preflight a retained capture history: every ``(before, after)`` sequence jump.
+
+    A lineage accepts captures only in exact order, so a publisher adopting it
+    over a history written under the base contract (which allowed any strictly
+    increasing ``snapshot_sequence``) checks for jumps first. An empty result
+    means the history replays without ``snapshot_lineage_gap``; otherwise the
+    lineage must start after the last jump (``first_snapshot_sequence``), and
+    the document then states that facts before it are outside the guarantee.
+    """
+
+    captures = [revalidate(item, ActiveAssignmentSnapshot) for item in snapshots]
+    gaps: list[tuple[int, int]] = []
+    for previous, current in zip(captures, captures[1:], strict=False):
+        # A duplicate or lower sequence is never a compatibility gap: it is a
+        # rollback that a legacy runtime could not have produced either, and a
+        # restart after it would launder whatever the duplicate carried.
+        _verify_transactional_order(previous, current)
+        if current.snapshot_sequence != previous.snapshot_sequence + 1:
+            gaps.append((previous.snapshot_sequence, current.snapshot_sequence))
+    return gaps
+
+
+def _verify_transactional_order(
+    previous: ActiveAssignmentSnapshot, current: ActiveAssignmentSnapshot
+) -> None:
+    """The base contract's invariants between two captures, without contiguity."""
+
     if (
         previous.central_authority_fingerprint_sha256
         != current.central_authority_fingerprint_sha256
@@ -472,6 +1164,183 @@ def verify_snapshot_succession(
         _reject("snapshot_finalized_fork")
     if current.finalized_epoch < previous.finalized_epoch:
         _reject("snapshot_finalized_epoch_rollback")
+
+
+def verify_snapshot_lineage_anchor(
+    lineage: SnapshotLineage, *, expected_lineage_digest_sha256: str
+) -> SnapshotLineage:
+    """Accept a restored lineage only if it is the exact head the operator last persisted.
+
+    The self digest proves internal consistency, not history: a stale backup,
+    or a resealed document with retired facts removed, is digest-valid. A
+    publisher therefore retains the digest of every lineage it persists (the
+    hash-chain head) out of band and checks a restored file against it before
+    accepting any capture (``snapshot_lineage_anchor_mismatch``).
+    """
+
+    lineage = revalidate(lineage, SnapshotLineage)
+    if (
+        not isinstance(expected_lineage_digest_sha256, str)
+        or lineage.lineage_digest_sha256 != expected_lineage_digest_sha256
+    ):
+        _reject("snapshot_lineage_anchor_mismatch")
+    return lineage
+
+
+def replay_snapshot_lineage(
+    lineage: SnapshotLineage,
+    snapshots: Sequence[ActiveAssignmentSnapshot],
+    *,
+    era_boundaries: Sequence[LineageEraBoundary] = (),
+    boundary_mode: Literal["full", "suffix"] = "full",
+    pending_candidate: ActiveAssignmentSnapshot | None = None,
+    max_facts: int = MAX_LINEAGE_FACTS,
+    max_replicas: int = MAX_LINEAGE_REPLICAS,
+    max_work: int = MAX_REPLAY_WORK,
+) -> SnapshotLineage:
+    """Replay exact events, bounded by cumulative immutable-state work.
+
+    ``full`` boundaries must start with the exact current prefix; ``suffix``
+    contains only new boundaries. No event is sorted, ignored, or deduplicated.
+    Captures always start at the next sequence. To restore a pending candidate
+    boundary, supply its candidate only as ``pending_candidate`` (validated but
+    not consumed), not in ``snapshots``. The result then equals the crash head.
+
+    Every transition hashes its entire predecessor state: this format is NOT
+    linear in capture count. Charge retained replicas, fact entries, boundaries,
+    and incoming replicas before each transition, with a hard cumulative cap.
+    A rejected call returns no partial state. Resume in explicitly bounded
+    batches from independently anchored persisted heads, never skip captures.
+    """
+
+    if (
+        isinstance(max_work, bool)
+        or not isinstance(max_work, int)
+        or not 1 <= max_work <= MAX_REPLAY_WORK
+    ):
+        raise ValueError("snapshot_lineage_replay_work_invalid")
+    if boundary_mode not in ("full", "suffix"):
+        raise ValueError("snapshot_lineage_replay_mode_invalid")
+    # Bound event containers before copying or validating their contents.
+    if len(snapshots) + len(era_boundaries) > max_work:
+        _reject("snapshot_lineage_replay_work_exceeded")
+    work = 0
+
+    def charge(
+        state: SnapshotLineage,
+        candidate: ActiveAssignmentSnapshot | None = None,
+        *,
+        passes: int = 1,
+    ) -> None:
+        nonlocal work
+        size = (
+            1
+            + len(state.replicas)
+            + len(state.used_assignment_nonces)
+            + len(state.used_ticket_digests)
+            + len(state.used_receipt_digests)
+            + len(state.era_boundaries)
+        )
+        if candidate is not None:
+            size += (
+                1
+                + len(candidate.deployments)
+                + sum(len(item.replicas) for item in candidate.deployments)
+            )
+        work += passes * size
+        if work > max_work:
+            _reject("snapshot_lineage_replay_work_exceeded")
+
+    charge(lineage)
+    current = revalidate(lineage, SnapshotLineage)
+    recorded = [revalidate(item, LineageEraBoundary) for item in era_boundaries]
+    if boundary_mode == "full":
+        prefix = len(current.era_boundaries)
+        if recorded[:prefix] != current.era_boundaries:
+            _reject("snapshot_lineage_replay_mismatch")
+        recorded = recorded[prefix:]
+    if [item.era for item in recorded] != list(
+        range(current.era + 1, current.era + 1 + len(recorded))
+    ):
+        _reject("snapshot_lineage_replay_mismatch")
+    pending = deque(recorded)
+    upcoming = deque(snapshots)
+    used_pending_candidate = False
+    while pending or upcoming:
+        if (
+            pending
+            and current.accepted_snapshot_count > 0
+            and pending[0].opened_after_snapshot_sequence == current.last_snapshot_sequence
+        ):
+            event = pending.popleft()
+            candidate = upcoming[0] if upcoming else pending_candidate
+            retain: ActiveAssignmentSnapshot | None = None
+            if event.retained_for_snapshot_digest_sha256 is not None:
+                if (
+                    candidate is None
+                    or candidate.snapshot_digest_sha256 != event.retained_for_snapshot_digest_sha256
+                ):
+                    _reject("snapshot_lineage_replay_mismatch")
+                retain = candidate
+                used_pending_candidate = not upcoming
+            charge(current, retain, passes=3 if retain is not None else 1)
+            current = begin_snapshot_lineage_era(
+                current, retain_for=retain, max_facts=max_facts, max_replicas=max_replicas
+            )
+            if current.era_boundaries[-1] != event:
+                _reject("snapshot_lineage_replay_mismatch")
+            continue
+        if pending and pending[0].opened_after_snapshot_sequence < (
+            current.last_snapshot_sequence or 0
+        ):
+            _reject("snapshot_lineage_replay_mismatch")
+        if not upcoming:
+            _reject("snapshot_lineage_replay_mismatch")
+        candidate = upcoming.popleft()
+        charge(current, candidate)
+        current = advance_snapshot_lineage(
+            current, candidate, max_facts=max_facts, max_replicas=max_replicas
+        )
+    if pending_candidate is not None and not used_pending_candidate:
+        # Also permit proving an already-persisted pending head, without
+        # consuming its candidate. Never silently ignore the supplied capture.
+        if _pending_candidate(current) != pending_candidate.snapshot_digest_sha256:
+            _reject("snapshot_lineage_replay_mismatch")
+        charge(current, pending_candidate)
+        advance_snapshot_lineage(
+            current, pending_candidate, max_facts=max_facts, max_replicas=max_replicas
+        )
+    return current
+
+
+def verify_snapshot_succession(
+    previous: ActiveAssignmentSnapshot,
+    current: ActiveAssignmentSnapshot,
+) -> None:
+    """Enforce the transactional and incarnation rules between two adjacent captures.
+
+    Exactly :func:`advance_snapshot_lineage` applied to a fresh lineage over
+    ``previous`` and then ``current`` (so ``current`` must be the very next
+    capture); a publisher that persists its lineage gets the same rules across
+    every capture it ever accepted, which this two-capture form cannot see (an
+    incarnation dropped by one capture and rewritten by a later one, or a fact
+    retired two replacements ago).
+    """
+
+    previous = revalidate(previous, ActiveAssignmentSnapshot)
+    current = revalidate(current, ActiveAssignmentSnapshot)
+    if (
+        previous.central_authority_fingerprint_sha256
+        != current.central_authority_fingerprint_sha256
+    ):
+        _reject("snapshot_authority_mismatch")
+    if previous.network != current.network or previous.netuid != current.netuid:
+        _reject("snapshot_network_mismatch")
+    lineage = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=previous.central_authority_fingerprint_sha256,
+        first_snapshot_sequence=previous.snapshot_sequence,
+    )
+    advance_snapshot_lineage(advance_snapshot_lineage(lineage, previous), current)
 
 
 def verify_manifest_derived_from_snapshot(
@@ -526,4 +1395,14 @@ def parse_active_assignment_snapshot(rendered: bytes) -> ActiveAssignmentSnapsho
         ActiveAssignmentSnapshot,
         active_assignment_snapshot_bytes,
         maximum_bytes=MAX_SNAPSHOT_BYTES,
+    )
+
+
+def snapshot_lineage_bytes(value: SnapshotLineage) -> bytes:
+    return model_bytes(value, SnapshotLineage)
+
+
+def parse_snapshot_lineage(rendered: bytes) -> SnapshotLineage:
+    return parse_model(
+        rendered, SnapshotLineage, snapshot_lineage_bytes, maximum_bytes=MAX_LINEAGE_BYTES
     )

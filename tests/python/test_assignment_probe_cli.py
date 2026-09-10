@@ -5,6 +5,7 @@ import ast
 import hashlib
 import ipaddress
 import json
+import socket
 import ssl
 import threading
 import time
@@ -15,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import httpcore
+import httpx
 import pytest
 from assignment_probe_context import (
     BASE_EPOCH,
@@ -37,6 +40,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 import misscomputer_subnet.assignment_probe_cli as probe_cli
+import misscomputer_subnet.probe_transport as probe_transport
 from misscomputer_subnet.assignment_probe import (
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
@@ -45,8 +49,10 @@ from misscomputer_subnet.assignment_probe import (
     active_assignment_manifest_bytes,
     assignment_manifest_signature_envelope_bytes,
     assignment_manifest_trust_policy_bytes,
+    evaluate_probe_response,
     parse_assignment_manifest_chain_state,
     parse_validator_probe_report,
+    verify_observation_policy_binding,
 )
 from misscomputer_subnet.assignment_probe_cli import (
     EXIT_DEGRADED,
@@ -912,6 +918,528 @@ def test_probe_transport_classifies_failures_without_raising(tmp_path: Path) -> 
     assert result.code == "connection_failed"
     assert json.dumps(result.code)
     del tmp_path
+
+
+class _FixedClock:
+    """Monotonic clock that reads ``0`` at the request start and ``elapsed`` ever after."""
+
+    def __init__(self, elapsed_seconds: float) -> None:
+        self._elapsed = elapsed_seconds
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return 0.0 if self.calls == 1 else self._elapsed
+
+
+def _mock_transport(
+    responder: Callable[[httpx.Request], httpx.Response],
+) -> probe_cli.TransportBuilder:
+    return lambda _context, _remaining: httpx.MockTransport(responder)
+
+
+def _fetch(
+    responder: Callable[[httpx.Request], httpx.Response],
+    *,
+    elapsed_seconds: float,
+    budget_seconds: float = 0.1,
+    max_bytes: int = 4_096,
+) -> probe_cli.ProbeResponse | probe_cli.ProbeTransportFailure:
+    transport = probe_cli.HttpsProbeTransport(
+        ssl.create_default_context(),
+        clock=_FixedClock(elapsed_seconds),
+        transport_factory=_mock_transport(responder),
+    )
+    return transport.fetch(
+        url="https://fixture-alpha.mock.local/__challenge/000000000000000000000000",
+        server_name="fixture-alpha.mock.local",
+        headers={"host": "fixture-alpha.mock.local"},
+        timeout_seconds=budget_seconds,
+        max_bytes=max_bytes,
+    )
+
+
+def _response_scenarios(
+    deployment: ActiveDeploymentAssignment, probe_nonce: str
+) -> dict[str, Callable[[httpx.Request], httpx.Response]]:
+    """One responder per response-derived outcome ``evaluate_probe_response`` can reach."""
+
+    replica = deployment.replicas[0]
+    body = challenge_value(deployment.deployment_id).encode("ascii")
+    good = {"X-Build-ID": deployment.build_id}
+    attestation = attestation_header(sign_attestation(deployment, replica, probe_nonce=probe_nonce))
+
+    def respond(
+        status: int = 200,
+        *,
+        content: bytes = body,
+        headers: list[tuple[str, str]] | None = None,
+    ) -> Callable[[httpx.Request], httpx.Response]:
+        # A streamed body keeps the response readable through ``iter_raw`` and
+        # lets the declared ``Content-Length`` be judged before the body.
+        return lambda _request: httpx.Response(
+            status,
+            stream=httpx.ByteStream(content),
+            headers=[("Content-Length", str(len(content))), *(headers or [])],
+        )
+
+    return {
+        "serving": respond(headers=[*good.items(), ("X-Miss-Probe-Attestation", attestation)]),
+        "tls_pin_mismatch": respond(
+            headers=[*good.items(), ("X-Miss-Probe-Attestation", attestation)]
+        ),
+        "redirect_rejected": respond(302, content=b"", headers=[("Location", "https://x/")]),
+        "unexpected_status": respond(500, content=b"no"),
+        "response_oversized": respond(content=b"x" * 6_000, headers=list(good.items())),
+        "body_digest_mismatch": respond(content=b"tampered", headers=list(good.items())),
+        "build_id_header_mismatch": respond(headers=[("X-Build-ID", "0" * 24)]),
+        "attestation_missing": respond(headers=list(good.items())),
+        "attestation_invalid": respond(
+            headers=[
+                *good.items(),
+                ("X-Miss-Probe-Attestation", attestation),
+                ("X-Miss-Probe-Attestation", attestation),
+            ]
+        ),
+    }
+
+
+def test_transport_enforces_one_whole_request_budget_at_the_exact_boundary() -> None:
+    """Every response-derived outcome fits the budget or becomes a timeout, at ms precision.
+
+    With a 100ms budget, a request completing at exactly 100ms yields the
+    response-derived outcome with ``latency_millis == 100``; at 101ms every
+    one of them (serving and all eight response-derived failure codes,
+    including a late oversized ``Content-Length``) is reported as
+    ``ProbeTransportFailure("timeout")`` with the measured latency. Both are
+    admissible under :func:`verify_observation_policy_binding` for the policy
+    that set the budget, so the transport never emits an observation the
+    report builder, the decision, or the parser would refuse.
+    """
+
+    context = make_context()
+    deployment = context.deployments[0]
+    probe_nonce = label_digest("budget-nonce")
+    unpinned = build_policy(context.keys, probe_timeout_millis=100, max_response_bytes=4_096)
+    pinned = build_policy(
+        context.keys,
+        probe_timeout_millis=100,
+        max_response_bytes=4_096,
+        pinned_edge_leaf_certificate_sha256=(label_digest("edge-leaf"),),
+    )
+    scenarios = _response_scenarios(deployment, probe_nonce)
+    for code, responder in scenarios.items():
+        policy = pinned if code == "tls_pin_mismatch" else unpinned
+        at_budget = _fetch(responder, elapsed_seconds=0.1)
+        assert at_budget.latency_millis == 100, code
+        if code == "response_oversized":
+            # Declared Content-Length above the ceiling is judged before the body.
+            assert isinstance(at_budget, probe_cli.ProbeTransportFailure)
+            assert at_budget.code == "response_oversized" and at_budget.response_status == 200
+        else:
+            assert isinstance(at_budget, probe_cli.ProbeResponse), code
+        observation = evaluate_probe_response(
+            deployment, policy, probe_nonce=probe_nonce, result=at_budget
+        )
+        assert (observation.outcome, observation.failure_code) == (
+            ("serving", None) if code == "serving" else ("failed", code)
+        )
+        assert observation.latency_millis == 100
+        verify_observation_policy_binding(observation, policy)
+
+        over_budget = _fetch(responder, elapsed_seconds=0.101)
+        assert isinstance(over_budget, probe_cli.ProbeTransportFailure), code
+        assert over_budget.code == "timeout" and over_budget.latency_millis == 101
+        assert over_budget.response_status == (
+            302 if code == "redirect_rejected" else (500 if code == "unexpected_status" else 200)
+        )
+        late = evaluate_probe_response(
+            deployment, policy, probe_nonce=probe_nonce, result=over_budget
+        )
+        assert (late.outcome, late.failure_code, late.latency_millis) == ("failed", "timeout", 101)
+        verify_observation_policy_binding(late, policy)
+
+    # A body that exceeds the ceiling only while streaming is response-derived too.
+    def chunked(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, stream=httpx.ByteStream(b"y" * 5_000), headers={"X-Build-ID": deployment.build_id}
+        )
+
+    streamed = _fetch(chunked, elapsed_seconds=0.1, max_bytes=64)
+    assert isinstance(streamed, probe_cli.ProbeTransportFailure)
+    assert (streamed.code, streamed.latency_millis) == ("response_oversized", 100)
+    late_stream = _fetch(chunked, elapsed_seconds=0.101, max_bytes=64)
+    assert isinstance(late_stream, probe_cli.ProbeTransportFailure)
+    assert (late_stream.code, late_stream.latency_millis) == ("timeout", 101)
+
+    # Only whole-request expiry is timeout; early operation timeouts are transport faults.
+    def slow(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow origin", request=request)
+
+    for elapsed, latency in ((0.05, 50), (0.1, 100), (0.25, 250)):
+        result = _fetch(slow, elapsed_seconds=elapsed)
+        assert isinstance(result, probe_cli.ProbeTransportFailure)
+        assert (result.code, result.latency_millis) == (
+            "timeout" if latency > 100 else "transport_error",
+            latency,
+        )
+        verify_observation_policy_binding(
+            evaluate_probe_response(deployment, unpinned, probe_nonce=probe_nonce, result=result),
+            unpinned,
+        )
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    result = _fetch(refused, elapsed_seconds=0.25)
+    assert isinstance(result, probe_cli.ProbeTransportFailure)
+    assert (result.code, result.latency_millis) == ("timeout", 250)
+
+    # The budget is the policy's millisecond value, rounded once from seconds.
+    budget = probe_cli.RequestBudget(0.1, clock=_FixedClock(0.0))
+    assert budget.budget_millis == 100
+    assert not budget.exhausted(100) and budget.exhausted(101)
+    assert probe_cli.RequestBudget(5.0, clock=_FixedClock(0.0)).budget_millis == 5_000
+
+
+class TrickleHandler(BaseHTTPRequestHandler):
+    """Origin that stays inside every per-operation timeout while exceeding the budget."""
+
+    def log_message(self, *_: object) -> None:
+        return
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server API
+        try:
+            if self.path.startswith("/trickle-headers"):
+                for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n":
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.03)
+                self.wfile.write(b"ok")
+            elif self.path.startswith("/trickle-body"):
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 60\r\n\r\n")
+                self.wfile.flush()
+                for _ in range(60):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.03)
+            else:
+                self.wfile.write(b"HTTP/1.1 999 Odd\r\nContent-Length: 0\r\n\r\n")
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def trickle_server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
+    root = tmp_path / "trickle"
+    root.mkdir(mode=0o700)
+    ca_path, leaf_path, key_path, _ = write_certificate_chain(root)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), TrickleHandler)
+    server.daemon_threads = True
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(leaf_path), str(key_path))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"https://127.0.0.1:{server.server_address[1]}", ca_path
+    server.shutdown()
+
+
+def test_slow_trickle_origins_are_cut_off_at_the_whole_request_deadline(
+    trickle_server: tuple[str, Path],
+) -> None:
+    """Header and body trickles inside every per-read timeout still end near the budget.
+
+    A peer emitting one byte every 30ms never trips a 200ms per-read timeout,
+    so only the cancellable wall-clock deadline bounds the request: both
+    trickles must be reported as ``timeout`` within a small margin of 200ms
+    instead of running for the seconds the trickle would take.
+    """
+
+    origin, ca_path = trickle_server
+    transport = probe_cli.HttpsProbeTransport(ssl.create_default_context(cafile=str(ca_path)))
+    for path in ("/trickle-headers", "/trickle-body"):
+        started = time.monotonic()
+        result = transport.fetch(
+            url=f"{origin}{path}",
+            server_name="fixture-alpha.mock.local",
+            headers={"host": "fixture-alpha.mock.local"},
+            timeout_seconds=0.2,
+            max_bytes=4_096,
+        )
+        wall = time.monotonic() - started
+        assert isinstance(result, probe_cli.ProbeTransportFailure), path
+        assert result.code == "timeout", path
+        assert 200 <= result.latency_millis, path
+        assert wall < 0.75, (path, wall)  # trickles alone would take > 1.2s
+    # A live origin answering with a wire status outside the contract is a
+    # transport fault with no recorded status, not a crash and not a response.
+    result = transport.fetch(
+        url=f"{origin}/status-999",
+        server_name="fixture-alpha.mock.local",
+        headers={"host": "fixture-alpha.mock.local"},
+        timeout_seconds=5.0,
+        max_bytes=4_096,
+    )
+    assert isinstance(result, probe_cli.ProbeTransportFailure)
+    assert (result.code, result.response_status) == ("transport_error", None)
+
+
+def test_out_of_contract_wire_status_is_a_transport_fault_under_and_over_budget() -> None:
+    """httpx accepts 600..999 on the wire; the contract does not, so it is never an observation."""
+
+    context = make_context()
+    deployment = context.deployments[0]
+    policy = build_policy(context.keys, probe_timeout_millis=100)
+
+    def odd(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(999, stream=httpx.ByteStream(b""), headers=[("Content-Length", "0")])
+
+    within = _fetch(odd, elapsed_seconds=0.1)
+    assert isinstance(within, probe_cli.ProbeTransportFailure)
+    assert (within.code, within.response_status, within.latency_millis) == (
+        "transport_error",
+        None,
+        100,
+    )
+    observation = evaluate_probe_response(
+        deployment, policy, probe_nonce=label_digest("odd"), result=within
+    )
+    assert (observation.failure_code, observation.response_status) == ("transport_error", None)
+    verify_observation_policy_binding(observation, policy)
+    over = _fetch(odd, elapsed_seconds=0.101)
+    assert isinstance(over, probe_cli.ProbeTransportFailure)
+    assert (over.code, over.latency_millis) == ("timeout", 101)
+    # The contract layer defends itself too, for transports that let it through.
+    leaked = probe_cli.ProbeResponse(
+        status=600, headers=(), body=b"", latency_millis=5, tls_leaf_certificate_sha256=None
+    )
+    observation = evaluate_probe_response(
+        deployment, policy, probe_nonce=label_digest("odd"), result=leaked
+    )
+    assert (observation.outcome, observation.failure_code, observation.response_status) == (
+        "failed",
+        "transport_error",
+        None,
+    )
+
+
+def _budget(seconds: float) -> Callable[[], float]:
+    started = time.monotonic()
+    return lambda: max(0.0, seconds - (time.monotonic() - started))
+
+
+def test_name_resolution_and_every_address_dial_are_bounded_by_the_budget() -> None:
+    """DNS that overruns and multi-address blackholes cost at most one budget.
+
+    ``getaddrinfo`` cannot be cancelled, so the backend waits on it for exactly
+    the remaining budget and abandons it; each resolved address is dialled with
+    the time remaining at that instant, so three unreachable addresses do not
+    receive three full timeouts.
+    """
+
+    def slow_resolver(host: str, port: int) -> list[probe_transport.ResolvedAddress]:
+        time.sleep(0.35)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", port))]
+
+    started = time.monotonic()
+    backend = probe_transport.DeadlineNetworkBackend(_budget(0.1), resolver=slow_resolver)
+    with pytest.raises(httpcore.ConnectTimeout):
+        backend.connect_tcp("slow.invalid", 1, timeout=0.1)
+    assert time.monotonic() - started < 0.25
+
+    def three(host: str, port: int) -> list[probe_transport.ResolvedAddress]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, (f"10.255.255.{index}", port))
+            for index in (1, 2, 3)
+        ]
+
+    dial_timeouts: list[float] = []
+
+    def blackhole(
+        address: probe_transport.ResolvedAddress, timeout: float, local_address: str | None
+    ) -> socket.socket:
+        dial_timeouts.append(timeout)
+        time.sleep(timeout)
+        raise TimeoutError("blackhole")
+
+    started = time.monotonic()
+    backend = probe_transport.DeadlineNetworkBackend(_budget(0.1), resolver=three, dialer=blackhole)
+    with pytest.raises(httpcore.ConnectTimeout):
+        backend.connect_tcp("blackhole.invalid", 9, timeout=0.1)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2, elapsed
+    assert dial_timeouts and dial_timeouts[0] <= 0.1
+    assert all(
+        later <= earlier for earlier, later in zip(dial_timeouts, dial_timeouts[1:], strict=False)
+    )
+
+    # A refused first address falls through to a reachable second one, still
+    # inside the budget, and the resulting stream is a real socket stream.
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def two(host: str, _port: int) -> list[probe_transport.ResolvedAddress]:
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", 1)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", port)),
+        ]
+
+    backend = probe_transport.DeadlineNetworkBackend(_budget(1.0), resolver=two)
+    stream = backend.connect_tcp("two.invalid", port, timeout=1.0)
+    assert isinstance(stream.get_extra_info("socket"), socket.socket)
+    stream.close()
+    listener.close()
+    # Exhausted before resolving: refused without touching the resolver.
+    backend = probe_transport.DeadlineNetworkBackend(lambda: 0.0, resolver=three)
+    with pytest.raises(httpcore.ConnectTimeout):
+        backend.connect_tcp("late.invalid", 9, timeout=0.1)
+
+
+def test_partial_sends_recompute_the_remaining_budget_before_every_send() -> None:
+    """A peer draining the socket just inside each send timeout cannot outlast the budget.
+
+    httpcore loops ``send`` with one fixed timeout per call; the deadline stream
+    re-derives the remaining budget before every ``send`` instead.
+    """
+
+    sender, receiver = socket.socketpair()
+    sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4_096)
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4_096)
+    stop = threading.Event()
+
+    def drain_slowly() -> None:
+        # Frees a little buffer every 60ms: below a 100ms per-send timeout,
+        # so httpcore's own loop would keep sending for the whole 4 MiB.
+        while not stop.is_set():
+            time.sleep(0.06)
+            try:
+                if not receiver.recv(4_096):
+                    return
+            except OSError:
+                return
+
+    drainer = threading.Thread(target=drain_slowly, daemon=True)
+    drainer.start()
+    try:
+        started = time.monotonic()
+        stream = probe_transport.DeadlineNetworkStream(
+            probe_transport._SocketStream(sender), _budget(0.1)
+        )
+        with pytest.raises(httpcore.WriteTimeout):
+            stream.write(b"x" * (4 << 20), timeout=0.1)
+        assert time.monotonic() - started < 0.3
+    finally:
+        stop.set()
+        sender.close()
+        receiver.close()
+
+
+def test_probe_transport_module_is_bounded_network_plumbing_only() -> None:
+    """The socket-level module may open TCP/TLS under the caller's context and nothing more."""
+
+    source = (ROOT / "src" / "misscomputer_subnet" / "probe_transport.py").read_text()
+    tree = ast.parse(source)
+    imported: set[str] = set()
+    identifiers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".", maxsplit=1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.add(node.module.split(".", maxsplit=1)[0])
+        elif isinstance(node, ast.Name):
+            identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr)
+    assert imported <= {
+        "__future__",
+        "collections",
+        "contextlib",
+        "httpcore",
+        "httpx",
+        "os",  # only register_at_fork: reset inherited resolver permits
+        "select",
+        "signal",  # SIGINT masking only during lease accounting
+        "socket",
+        "ssl",
+        "threading",
+        "time",
+    }
+    assert not identifiers & {
+        "Ed25519PrivateKey",
+        "Popen",
+        "Wallet",
+        "environ",
+        "open",
+        "set_weights",
+        "sign",
+        "subprocess",
+        "system",
+        "urlopen",
+        "wallet",
+    }
+    assert {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    } == {"register_at_fork"}
+    assert "https://" not in source
+    # The CLI itself stays free of raw sockets; it only composes this module.
+    cli_source = (ROOT / "src" / "misscomputer_subnet" / "assignment_probe_cli.py").read_text()
+    assert "import socket" not in cli_source and "import httpcore" not in cli_source
+
+
+def test_blocked_name_resolutions_cannot_exceed_the_process_wide_slot_cap() -> None:
+    """Permanently blocked lookups hold at most the slot cap in threads; the rest fail fast.
+
+    ``getaddrinfo`` cannot be cancelled, so each overrun is abandoned on its
+    helper thread; the slots bound how many such threads can exist at once,
+    there is no queue, and a lookup that finds no free slot fails immediately
+    with a connection error rather than a full budget wait.
+    """
+
+    release = threading.Event()
+
+    def blocked(host: str, port: int) -> list[probe_transport.ResolvedAddress]:
+        release.wait()
+        return []
+
+    slots = threading.BoundedSemaphore(4)
+    prefix = "misscomputer-probe-resolve"
+    before = sum(1 for thread in threading.enumerate() if thread.name.startswith(prefix))
+    outcomes: list[tuple[str, float]] = []
+    try:
+        for _ in range(40):
+            backend = probe_transport.DeadlineNetworkBackend(
+                lambda: 0.02, resolver=blocked, resolution_slots=slots
+            )
+            started = time.monotonic()
+            try:
+                backend.connect_tcp("blocked.invalid", 1, timeout=0.02)
+            except httpcore.ConnectTimeout:
+                outcomes.append(("timeout", time.monotonic() - started))
+            except httpcore.ConnectError:
+                outcomes.append(("capacity", time.monotonic() - started))
+        live = sum(1 for thread in threading.enumerate() if thread.name.startswith(prefix)) - before
+        assert live <= 4, live
+        assert [kind for kind, _ in outcomes[:4]] == ["timeout"] * 4
+        assert {kind for kind, _ in outcomes[4:]} == {"capacity"}
+        assert all(elapsed < 0.01 for kind, elapsed in outcomes if kind == "capacity")
+        assert probe_transport.MAX_OUTSTANDING_RESOLUTIONS == 16
+    finally:
+        release.set()
+    time.sleep(0.05)
+    # Released lookups return their slots: new lookups get threads again.
+    done = probe_transport.DeadlineNetworkBackend(
+        lambda: 1.0,
+        resolver=lambda host, port: [(socket.AF_INET, socket.SOCK_STREAM, 6, ("127.0.0.1", 1))],
+        resolution_slots=slots,
+    )
+    with pytest.raises(httpcore.ConnectError, match="refused|Connection"):
+        done.connect_tcp("released.invalid", 1, timeout=1.0)
 
 
 def test_probe_requires_the_finalized_height_and_refuses_expired_leases(

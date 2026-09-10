@@ -44,21 +44,29 @@ from pydantic import BaseModel
 from misscomputer_subnet.assignment_probe import (
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
+    AssignedReplica,
     AssignmentManifestChainState,
     AssignmentManifestTrustPolicy,
     ProbeTransportFailure,
+    ValidatorProbeReport,
     build_initial_manifest_chain_state,
     build_validator_probe_report,
     evaluate_probe_response,
+    validator_probe_report_bytes,
     verify_active_assignment_manifest,
 )
 from misscomputer_subnet.assignment_snapshot import (
+    TICKET_MAX_FUTURE_SKEW_SECONDS,
     ActiveAssignmentSnapshot,
     SnapshotDeployment,
+    SnapshotLineage,
     active_assignment_snapshot_bytes,
+    advance_snapshot_lineage,
     build_active_assignment_snapshot,
+    build_initial_snapshot_lineage,
     build_snapshot_deployment,
     build_snapshot_replica,
+    snapshot_lineage_bytes,
 )
 from misscomputer_subnet.contract_codec import canonical_json
 from misscomputer_subnet.contract_codec import digest as canonical_digest
@@ -167,24 +175,50 @@ def snapshot_deployment_from(
     deployment: ActiveDeploymentAssignment,
     *,
     route_activated_at_epoch: int = ROUTE_ACTIVATED_AT,
+    reissued_ticket_at_epoch: int | None = None,
 ) -> SnapshotDeployment:
-    """Lift a manifest deployment back into its snapshot form with activation timing."""
+    """Lift a manifest deployment back into its snapshot form with activation timing.
+
+    ``reissued_ticket_at_epoch`` models the scheduler re-assigning every replica
+    under a fresh signed ticket stamped at that instant on the signer's clock.
+    A ticket binds its own issuance, so a different issuance is a different
+    ticket and a different assignment: the incarnation advances one generation
+    with a fresh nonce, endpoint, ticket digest, and ready-receipt digest, all
+    derived deterministically from the new facts. The golden incarnation's
+    facts are never rewritten in place.
+    """
+
+    def reissued(replica: AssignedReplica) -> dict[str, object]:
+        if reissued_ticket_at_epoch is None:
+            return {
+                "generation": replica.generation,
+                "assignment_nonce": replica.assignment_nonce,
+                "ticket_digest_sha256": replica.ticket_digest_sha256,
+                "receipt_digest_sha256": replica.receipt_digest_sha256,
+                "ticket_issued_at_epoch": replica.ticket_issued_at_epoch,
+            }
+        generation = replica.generation + 1
+        stamp = f"{deployment.deployment_id}-{replica.miner_hotkey}-g{generation}"
+        stamp = f"{stamp}-issued-{reissued_ticket_at_epoch}"
+        return {
+            "generation": generation,
+            "assignment_nonce": label_digest(f"nonce-{stamp}")[:32],
+            "ticket_digest_sha256": label_digest(f"ticket-{stamp}"),
+            "receipt_digest_sha256": label_digest(f"receipt-{stamp}"),
+            "ticket_issued_at_epoch": reissued_ticket_at_epoch,
+        }
 
     replicas = [
         build_snapshot_replica(
             miner_uid=replica.miner_uid,
             miner_hotkey=replica.miner_hotkey,
             miner_service_public_key=replica.miner_service_public_key,
-            generation=replica.generation,
-            assignment_nonce=replica.assignment_nonce,
             deployment_id=deployment.deployment_id,
-            ticket_digest_sha256=replica.ticket_digest_sha256,
-            receipt_digest_sha256=replica.receipt_digest_sha256,
             chain_block=replica.chain_block,
             expires_at_block=replica.expires_at_block,
-            ticket_issued_at_epoch=replica.ticket_issued_at_epoch,
             ticket_expires_at_epoch=replica.ticket_expires_at_epoch,
             route_activated_at_epoch=route_activated_at_epoch,
+            **reissued(replica),  # type: ignore[arg-type]
         )
         for replica in deployment.replicas
     ]
@@ -211,8 +245,16 @@ def build_snapshot(
     finalized_block_hash: str = FINALIZED_BLOCK_HASH,
     finalized_epoch: int = 42,
     central_authority: str | None = None,
+    snapshot_deployments: Sequence[SnapshotDeployment] | None = None,
 ) -> ActiveAssignmentSnapshot:
+    """Seal a capture; ``snapshot_deployments`` supplies pre-lifted deployments verbatim."""
+
     policy = build_policy(signer_keys())
+    if snapshot_deployments is None:
+        snapshot_deployments = [
+            snapshot_deployment_from(item)
+            for item in (fixture_deployments() if deployments is None else deployments)
+        ]
     return build_active_assignment_snapshot(
         central_authority_fingerprint_sha256=(
             central_authority or policy.central_authority_fingerprint_sha256
@@ -225,10 +267,50 @@ def build_snapshot(
         finalized_epoch=finalized_epoch,
         route_host_suffix=ROUTE_SUFFIX,
         probe_port=PROBE_PORT,
-        deployments=[
-            snapshot_deployment_from(item)
-            for item in (fixture_deployments() if deployments is None else deployments)
+        deployments=list(snapshot_deployments),
+    )
+
+
+def build_signer_skew_snapshot() -> ActiveAssignmentSnapshot:
+    """The golden capture's successor with the signer's clock leading the runtime's.
+
+    Every replica has been re-assigned under a fresh signed ticket (generation
+    2, fresh nonce, endpoint, ticket and receipt digests) and every route was
+    activated exactly at the capture instant (the runtime clock), while the
+    signer stamped alpha's tickets ``TICKET_MAX_FUTURE_SKEW_SECONDS`` after it
+    and beta's one second after it: the full and the minimal cross-domain
+    tolerance, at both bounds of the activation-ordering rule. It is the shared
+    Go/Python parity fixture for the clock-domain rule and a valid successor of
+    the golden capture because no golden incarnation is rewritten; one more
+    second on alpha is ``replica_activation_order_invalid``.
+    """
+
+    alpha, beta = fixture_deployments()
+    return build_snapshot(
+        snapshot_sequence=SNAPSHOT_SEQUENCE + 1,
+        state_revision=STATE_REVISION + 1,
+        snapshot_deployments=[
+            snapshot_deployment_from(
+                alpha,
+                route_activated_at_epoch=BASE_EPOCH,
+                reissued_ticket_at_epoch=BASE_EPOCH + TICKET_MAX_FUTURE_SKEW_SECONDS,
+            ),
+            snapshot_deployment_from(
+                beta, route_activated_at_epoch=BASE_EPOCH, reissued_ticket_at_epoch=BASE_EPOCH + 1
+            ),
         ],
+    )
+
+
+def build_snapshot_lineage() -> SnapshotLineage:
+    """The publisher's lineage after accepting the golden capture and its signer-skew successor."""
+
+    golden = build_snapshot()
+    lineage = build_initial_snapshot_lineage(
+        central_authority_fingerprint_sha256=golden.central_authority_fingerprint_sha256
+    )
+    return advance_snapshot_lineage(
+        advance_snapshot_lineage(lineage, golden), build_signer_skew_snapshot()
     )
 
 
@@ -289,7 +371,9 @@ def build_round(
         probe_nonce = nonce_for(f"{label}-{deployment.deployment_id}")
         responder = responders.get(deployment.deployment_id)
         if responder is None:
-            result: object = ProbeTransportFailure(code="timeout", latency_millis=latency_millis)
+            result: object = ProbeTransportFailure(
+                code="timeout", latency_millis=policy.probe_timeout_millis + 1
+            )
         else:
             replica = next(item for item in deployment.replicas if item.miner_hotkey == responder)
             attestation = sign_attestation(deployment, replica, probe_nonce=probe_nonce)
@@ -377,14 +461,19 @@ def make_window_context(
     - manifest 1 (sequence 1, issued at window start): alpha(A,B,C), beta(B,C,D);
       probed 24 times, every replica answers in turn;
     - manifest 2 (sequence 2, issued +1500s): adds gamma(E); probed 12 times,
-      E answers, so E is a newly activated miner that earned weight;
+      E answers, so E is a newly activated miner that earned weight; its first
+      probe is evaluated ``max_future_skew_seconds`` *before* the manifest's
+      issuance, exactly as a validator whose clock trails the publisher's by
+      the trust policy's tolerance would record it;
     - manifest 3 (sequence 3, issued +3000s): adds delta(F); probed 9 times,
       delta never answers, so F is unverified but inside activation grace;
     - G is registered and never assigned; the terminal fetch at window close
       re-verifies manifest 3.
 
     The golden record is a first window: it carries no prior baseline and
-    seals manifest 3's assigned set as the baseline for its successor.
+    seals manifest 3's assigned set as the baseline for its successor. It
+    seals the one trust policy every manifest and report of the window was
+    verified under, which bounds the skewed round.
     """
 
     keys = signer_keys()
@@ -462,7 +551,11 @@ def make_window_context(
                     "fixture-gamma": "MinerE",
                 },
                 label=f"window-two-{index}",
-                evaluation_epoch=BASE_EPOCH + 1_560 + 60 * index,
+                evaluation_epoch=(
+                    BASE_EPOCH + 1_500 - policy.max_future_skew_seconds
+                    if index == 0
+                    else BASE_EPOCH + 1_560 + 60 * index
+                ),
                 latency_millis=57,
             )
         )
@@ -491,6 +584,7 @@ def make_window_context(
         rounds,
         terminal=terminal,
         registered=registered,
+        trust_policies=[policy],
         window_start_epoch=WINDOW_START,
         window_end_epoch=WINDOW_END,
         decision_policy=decision_policy,
@@ -508,13 +602,88 @@ def make_window_context(
     )
 
 
+def build_future_terminal(
+    context: WindowContext,
+    *,
+    lead_seconds: int,
+    policy: AssignmentManifestTrustPolicy | None = None,
+) -> tuple[ActiveAssignmentManifest, AssignmentManifestChainState]:
+    """Manifest 4: manifest 3's assignments republished ``lead_seconds`` after window close.
+
+    It keeps manifest 3's finalized chain view, so the golden registered set
+    stays bound to it and the only thing that changes is the issue instant.
+    Returned with the chain state a validator holds after accepting manifest 3,
+    so a test can verify manifest 4 live at any evaluation epoch.
+    """
+
+    manifest_three = context.manifests[2]
+    state_three = verify_active_assignment_manifest(
+        manifest_three,
+        sign_manifest(manifest_three, context.keys),
+        context.policy,
+        context.states[2],
+        evaluation_epoch=manifest_three.issued_at_epoch,
+        current_finalized_height=FINALIZED_HEIGHT,
+    ).next_chain_state
+    manifest_four = build_manifest(
+        context.policy if policy is None else policy,
+        [
+            ActiveDeploymentAssignment.model_validate(item.model_dump(mode="json", by_alias=True))
+            for item in manifest_three.deployments
+        ],
+        sequence=4,
+        previous=manifest_three.manifest_digest_sha256,
+        issued_at=WINDOW_END + lead_seconds,
+        expires_at=WINDOW_END + lead_seconds + 3_600,
+        finalized_height=manifest_three.finalized_height,
+        finalized_block_hash=manifest_three.finalized_block_hash,
+    )
+    return manifest_four, state_three
+
+
+def future_terminal_decision(
+    lead_seconds: int,
+    *,
+    evaluated_at_epoch: int,
+    successor_policy: AssignmentManifestTrustPolicy | None = None,
+) -> ValidatorWeightDecision:
+    """The golden window closed by a terminal manifest issued after the close instant.
+
+    With ``successor_policy`` the terminal is published under that policy (a
+    rotation at the close) and both policies are supplied to the decision.
+    """
+
+    context = make_window_context()
+    manifest_four, _ = build_future_terminal(
+        context, lead_seconds=lead_seconds, policy=successor_policy
+    )
+    return decide_weight_submission(
+        context.rounds,
+        terminal=TerminalManifestObservation(
+            status="verified", evaluated_at_epoch=evaluated_at_epoch, manifest=manifest_four
+        ),
+        registered=context.registered,
+        trust_policies=[context.policy] + ([] if successor_policy is None else [successor_policy]),
+        window_start_epoch=WINDOW_START,
+        window_end_epoch=WINDOW_END,
+    )
+
+
+def successor_policy_valid_from(valid_from_epoch: int) -> AssignmentManifestTrustPolicy:
+    """The golden trust policy re-issued with a later validity start (a rotation)."""
+
+    return build_policy(signer_keys(), max_age=3_600, valid_from=valid_from_epoch)
+
+
 def build_pointer() -> AssignmentManifestLatestPointer:
     context = make_context()
     return build_manifest_latest_pointer(context.manifest, context.signatures)
 
 
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
+    "validator-probe-report": ValidatorProbeReport,
     "active-assignment-snapshot": ActiveAssignmentSnapshot,
+    "active-assignment-snapshot-lineage": SnapshotLineage,
     "assignment-manifest-latest-pointer": AssignmentManifestLatestPointer,
     "validator-weight-decision": ValidatorWeightDecision,
 }
@@ -522,7 +691,12 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
 
 def fixture_documents() -> dict[str, bytes]:
     return {
+        "validator-probe-report": validator_probe_report_bytes(make_context().report),
         "active-assignment-snapshot": active_assignment_snapshot_bytes(build_snapshot()),
+        "active-assignment-snapshot-signer-skew": active_assignment_snapshot_bytes(
+            build_signer_skew_snapshot()
+        ),
+        "active-assignment-snapshot-lineage": snapshot_lineage_bytes(build_snapshot_lineage()),
         "assignment-manifest-latest-pointer": assignment_manifest_latest_pointer_bytes(
             build_pointer()
         ),
@@ -595,6 +769,84 @@ def forged_decision(rendered: bytes, **changes: Any) -> dict[str, Any]:
     return reseal_decision(_mutate(rendered, **changes))
 
 
+def reseal_report(document: dict[str, Any]) -> dict[str, Any]:
+    """Recompute a mutated report's self digest; reports are unsigned, so this is cheap."""
+
+    resealed = dict(document)
+    unsigned = {key: value for key, value in resealed.items() if key != "report_digest_sha256"}
+    resealed["report_digest_sha256"] = canonical_digest(unsigned)
+    return resealed
+
+
+def reseal_observation(document: dict[str, Any]) -> dict[str, Any]:
+    """Recompute a mutated observation's self digest."""
+
+    resealed = dict(document)
+    unsigned = {k: v for k, v in resealed.items() if k != "observation_digest_sha256"}
+    resealed["observation_digest_sha256"] = canonical_digest(unsigned)
+    return resealed
+
+
+def reseal_report_observations(
+    report: dict[str, Any], observations: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Replace a report's observations (resealing each) and re-derive its digests."""
+
+    resealed = [reseal_observation(item) for item in observations]
+    serving = sum(item["outcome"] == "serving" for item in resealed)
+    return reseal_report(
+        {
+            **report,
+            "observations": resealed,
+            "observation_vector_digest_sha256": canonical_digest(resealed),
+            "serving_count": serving,
+            "failed_count": len(resealed) - serving,
+            "status": "serving" if serving == len(resealed) else "degraded",
+        }
+    )
+
+
+def forged_decision_with_report(
+    rendered: bytes,
+    *,
+    report_digest_sha256: str,
+    observation_changes: dict[str, Any] | None = None,
+    **report_changes: Any,
+) -> dict[str, Any]:
+    """Rewrite one sealed report in place and re-derive every digest that depends on it.
+
+    The report is resealed, its manifest's evidence list is re-sorted, the
+    scoring window's sorted report digests and digest are recomputed, and the
+    record is resealed, so only the derived semantics can reject the result.
+    """
+
+    document: dict[str, Any] = json.loads(rendered)
+    replaced = False
+    for evidence in document["assignment_manifest_evidence"]:
+        reports = evidence["scoring_reports"]
+        for index, report in enumerate(reports):
+            if report["report_digest_sha256"] == report_digest_sha256:
+                rewritten = {**report, **report_changes}
+                if observation_changes:
+                    rewritten = reseal_report_observations(
+                        rewritten,
+                        [{**item, **observation_changes} for item in report["observations"]],
+                    )
+                reports[index] = reseal_report(rewritten)
+                replaced = True
+        reports.sort(key=lambda item: item["report_digest_sha256"])
+    if not replaced:
+        raise AssertionError("report not sealed in the record")
+    window = document["scoring_window"]
+    window["report_digests"] = sorted(
+        report["report_digest_sha256"]
+        for evidence in document["assignment_manifest_evidence"]
+        for report in evidence["scoring_reports"]
+    )
+    document["scoring_window_digest_sha256"] = canonical_digest(window)
+    return reseal_decision(document)
+
+
 def negative_documents() -> dict[str, bytes]:
     documents = fixture_documents()
     snapshot = documents["active-assignment-snapshot"]
@@ -604,6 +856,18 @@ def negative_documents() -> dict[str, bytes]:
 
     def add(contract: str, case: str, expect: str, code: str, document: dict[str, Any]) -> None:
         cases[f"{contract}.v1/{case}"] = negative_document(contract, case, expect, code, document)
+
+    report_doc = json.loads(documents["validator-probe-report"])
+    observation = report_doc["observations"][0]
+    observation["trust_policy_digest_sha256"] = "0" * 64
+    report_doc = reseal_report_observations(report_doc, report_doc["observations"])
+    add(
+        "validator-probe-report",
+        "observation-under-foreign-policy",
+        "model",
+        "observation_policy_violation",
+        report_doc,
+    )
 
     snapshot_doc = json.loads(snapshot)
     add(
@@ -641,6 +905,33 @@ def negative_documents() -> dict[str, bytes]:
         "replica-activated-after-capture",
         "model",
         "snapshot_replica_activated_after_capture",
+        mutated,
+    )
+    mutated = json.loads(snapshot)
+    mutated["deployments"][0]["replicas"][0]["ticket_issued_at_epoch"] = (
+        BASE_EPOCH + TICKET_MAX_FUTURE_SKEW_SECONDS + 1
+    )
+    mutated["deployments"][0]["replicas"][0]["route_activated_at_epoch"] = (
+        BASE_EPOCH + TICKET_MAX_FUTURE_SKEW_SECONDS + 1
+    )
+    add(
+        "active-assignment-snapshot",
+        "replica-ticket-issued-beyond-capture-skew",
+        "model",
+        "snapshot_replica_ticket_issued_after_capture",
+        mutated,
+    )
+    mutated = json.loads(snapshot)
+    mutated["deployments"][0]["replicas"][0]["route_activated_at_epoch"] = (
+        mutated["deployments"][0]["replicas"][0]["ticket_issued_at_epoch"]
+        - TICKET_MAX_FUTURE_SKEW_SECONDS
+        - 1
+    )
+    add(
+        "active-assignment-snapshot",
+        "replica-activated-before-ticket-skew",
+        "model",
+        "replica_activation_order_invalid",
         mutated,
     )
     mutated = json.loads(snapshot)
@@ -817,6 +1108,251 @@ def negative_documents() -> dict[str, bytes]:
                 else row
                 for row in decision_doc["rows"]
             ],
+        ),
+    )
+    # The sealed record admits its skewed round only within the bound of the
+    # sealed trust policy that verified it; a digest-valid rewrite that pushes
+    # that report one more second before its manifest's issuance is refused.
+    skewed_report = next(
+        report
+        for evidence in decision_doc["assignment_manifest_evidence"]
+        for report in evidence["scoring_reports"]
+        if report["evaluation_epoch"] < report["manifest_issued_at_epoch"]
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-report-preceding-manifest-beyond-skew",
+        "model",
+        "scoring_window_evidence_inconsistent",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=skewed_report["report_digest_sha256"],
+            evaluation_epoch=skewed_report["evaluation_epoch"] - 1,
+        ),
+    )
+    # A terminal manifest issued further ahead of the close evaluation instant
+    # than its own trust policy's skew could never have verified live; the
+    # record was legitimately produced at close+1 and its evaluation instant
+    # rewritten back to the close.
+    future_terminal = validator_weight_decision_bytes(
+        future_terminal_decision(6, evaluated_at_epoch=WINDOW_END + 1)
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-terminal-issued-beyond-skew",
+        "model",
+        "terminal_manifest_future",
+        forged_decision(future_terminal, terminal_evaluated_at_epoch=WINDOW_END),
+    )
+    # Every sealed report and manifest must be bound by a sealed trust policy.
+    add(
+        "validator-weight-decision",
+        "submit-without-verifying-trust-policy",
+        "model",
+        "trust_policies_not_derived",
+        forged_decision(decision, trust_policies=[]),
+    )
+    # A terminal published under a successor policy that only becomes valid at
+    # the close+5 instant it was issued: legitimately produced at close+5, its
+    # evaluation instant rewritten to the close, where that policy could not
+    # yet have admitted anything.
+    successor = successor_policy_valid_from(WINDOW_END + 5)
+    rotated_terminal = validator_weight_decision_bytes(
+        future_terminal_decision(5, evaluated_at_epoch=WINDOW_END + 5, successor_policy=successor)
+    )
+    add(
+        "validator-weight-decision",
+        "submit-with-terminal-before-policy-validity",
+        "model",
+        "terminal_policy_rejected",
+        forged_decision(rotated_terminal, terminal_evaluated_at_epoch=WINDOW_END),
+    )
+    # A report's probe bounds are its policy's own scalars.
+    first_report = decision_doc["assignment_manifest_evidence"][0]["scoring_reports"][0]
+    add(
+        "validator-weight-decision",
+        "submit-with-report-probe-bounds-not-policy",
+        "model",
+        "scoring_window_evidence_inconsistent",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            max_response_bytes=first_report["max_response_bytes"] + 1,
+        ),
+    )
+    # A serving observation larger than the policy's response ceiling could
+    # only have been judged under a looser policy.
+    add(
+        "validator-weight-decision",
+        "submit-with-observation-oversized-for-policy",
+        "model",
+        "observation_policy_violation",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={"response_bytes": first_report["max_response_bytes"] + 1},
+        ),
+    )
+    # A response-derived observation slower than the policy's whole-request
+    # budget could only have been judged under a looser policy: the transport
+    # would have reported a timeout, never a response.
+    add(
+        "validator-weight-decision",
+        "submit-with-observation-slower-than-policy-timeout",
+        "model",
+        "observation_policy_violation",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={"latency_millis": first_report["probe_timeout_millis"] + 1},
+        ),
+    )
+    # A pin mismatch can only be judged by a policy that pins, against a leaf
+    # outside its pins; the golden policy pins nothing.
+    add(
+        "validator-weight-decision",
+        "submit-with-pin-mismatch-under-unpinned-policy",
+        "model",
+        "report_policy_rejected",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={
+                "outcome": "failed",
+                "failure_code": "tls_pin_mismatch",
+                "build_id_header_verified": False,
+                "attestation_status": "not_presented",
+                "attestation": None,
+            },
+        ),
+    )
+    # An observation names the policy that judged it; a report may only carry
+    # observations judged by the policy it names.
+    add(
+        "validator-weight-decision",
+        "submit-with-observation-under-foreign-policy",
+        "model",
+        "observation_policy_violation",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={"trust_policy_digest_sha256": "1" * 64},
+        ),
+    )
+    # An oversized verdict needs size evidence above the policy's ceiling.
+    add(
+        "validator-weight-decision",
+        "submit-with-oversized-below-policy-ceiling",
+        "model",
+        "observation_policy_violation",
+        forged_decision_with_report(
+            decision,
+            report_digest_sha256=first_report["report_digest_sha256"],
+            observation_changes={
+                "outcome": "failed",
+                "failure_code": "response_oversized",
+                "response_bytes": first_report["max_response_bytes"],
+                "build_id_header_verified": False,
+                "attestation_status": "not_presented",
+                "attestation": None,
+            },
+        ),
+    )
+    lineage = documents["active-assignment-snapshot-lineage"]
+    lineage_doc = json.loads(lineage)
+    add(
+        "active-assignment-snapshot-lineage",
+        "unknown-field",
+        "schema",
+        "extra_forbidden",
+        _mutate(lineage, ticket_json="not-allowed"),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "self-digest-mismatch",
+        "model",
+        "lineage_digest_sha256_mismatch",
+        _mutate(lineage, lineage_digest_sha256="0" * 64),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "replicas-not-canonical",
+        "model",
+        "lineage_replicas_not_canonical",
+        _mutate(lineage, replicas=list(reversed(lineage_doc["replicas"]))),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "genesis-with-history",
+        "model",
+        "lineage_genesis_invalid",
+        _mutate(lineage, accepted_snapshot_count=0),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "used-facts-not-canonical",
+        "model",
+        "lineage_used_facts_not_canonical",
+        _mutate(
+            lineage, used_assignment_nonces=list(reversed(lineage_doc["used_assignment_nonces"]))
+        ),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "retired-facts-forgotten",
+        "model",
+        "lineage_used_facts_not_derived",
+        _mutate(lineage, used_receipt_digests=lineage_doc["used_receipt_digests"][:1]),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "era-without-boundary",
+        "model",
+        "lineage_era_invalid",
+        _mutate(lineage, era=2),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "chain-link-missing",
+        "model",
+        "lineage_chain_link_missing",
+        _mutate(lineage, previous_lineage_digest_sha256=None),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "history-not-contiguous",
+        "model",
+        "lineage_history_not_contiguous",
+        _mutate(lineage, history_start_snapshot_sequence=2),
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "history-overclaimed",
+        "model",
+        "lineage_history_not_contiguous",
+        _mutate(lineage, last_snapshot_sequence=lineage_doc["last_snapshot_sequence"] + 5),
+    )
+    duplicated = json.loads(lineage)
+    duplicated["replicas"][1]["receipt_digest_sha256"] = duplicated["replicas"][0][
+        "receipt_digest_sha256"
+    ]
+    add(
+        "active-assignment-snapshot-lineage",
+        "replica-facts-duplicate",
+        "model",
+        "lineage_replica_facts_duplicate",
+        duplicated,
+    )
+    add(
+        "active-assignment-snapshot-lineage",
+        "used-facts-overlap",
+        "model",
+        "lineage_used_facts_overlap",
+        _mutate(
+            lineage,
+            used_receipt_digests=sorted(
+                {*lineage_doc["used_receipt_digests"], lineage_doc["used_ticket_digests"][0]}
+            ),
         ),
     )
     add(
