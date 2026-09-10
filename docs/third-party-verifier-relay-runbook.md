@@ -83,19 +83,50 @@ result = verify_public_relay_path(
     evaluation_epoch=trusted_epoch,
     current_finalized_height=metagraph.block,
     decision=sealed_decision,
+    retained_probe_reports=tuple(archived_probe_reports),
     finalized_metagraph=metagraph,        # complete, finalized, independently read
     finalized_block_hash=finalized_hash,
 )
-# Persist result.manifest_verification.next_chain_state before using weight_plan.
+# Persist catch-up (if any) through the locked handoff below before probing.
 # result.weight_plan is prepared data, never a submission.
 ```
+
+The retained report tuple is mandatory: its canonical report digests must equal
+the complete sealed decision evidence exactly. The verifier then rechecks every
+credited miner attestation signature and its deployment, replica, endpoint,
+challenge, body, and probe-nonce binding. It rejects reuse of a probe nonce or
+signed attestation even when unsigned report timestamps, latency, or other
+envelope metadata and all enclosing digests have been relabelled. The trusted
+evaluation epoch must be within five seconds (inclusive) of both window close
+and terminal evaluation; one second outside either boundary is rejected.
 
 For an online serving check, use `misscomputer-assignment-probe` as documented
 in `public-validator-live-probe-runbook.md`. Its locked `state.json` and
 out-of-band state anchor provide the restart-safe implementation of the
-manifest state transition. The historical catch-up objects must be verified
-through the SDK before the live probe when the latest-pointer verdict requires
-history; historical manifests are never probed.
+manifest state transition. When SDK verification returns a caught-up state,
+compare-bind and persist it under that same lock before invoking the probe CLI:
+
+```python
+from misscomputer_subnet.assignment_probe_cli import persist_assignment_manifest_catch_up
+
+persisted = persist_assignment_manifest_catch_up(
+    state_root=state_root,
+    trust_policy=assignment_policy,
+    history=history_entries,
+    evaluation_epoch=trusted_epoch,
+    expected_anchor_sha256=durable_state.state_digest_sha256,
+    expected_next_state_sha256=result.manifest_verification.next_chain_state.state_digest_sha256,
+)
+assert persisted.state_digest_sha256 == result.manifest_verification.next_chain_state.state_digest_sha256
+```
+
+Only then run `misscomputer-assignment-probe` for the head with
+`--trusted-state-anchor` equal to the persisted digest. The handoff replays and
+authenticates every history object again while holding `probe.lock`, compares
+the durable starting anchor and expected SDK result, atomically replaces
+`state.json`, fsyncs file and directory, safely recovers a regular owner-only
+`.state.install` left before rename, and makes concurrent probe/catch-up runs
+fail `probe_busy`. Historical manifests are never probed.
 
 ## Score-checkpoint cross-check
 
