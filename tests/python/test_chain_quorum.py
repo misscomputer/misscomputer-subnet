@@ -277,14 +277,17 @@ async def test_bittensor_adapter_pins_explicit_rpc_without_sdk_rotation(
     calls: list[tuple[str, dict[str, object]]] = []
 
     class Client:
+        async def connect(self) -> None:
+            return None
+
         async def close(self) -> None:
             return None
 
-    async def make_client(endpoint: str, **kwargs: object) -> Client:
+    def make_client(endpoint: str, **kwargs: object) -> Client:
         calls.append((endpoint, kwargs))
         return Client()
 
-    monkeypatch.setattr(chain_module.bt, "Subtensor", make_client)
+    monkeypatch.setattr(chain_module.bt, "Client", make_client)
     chain = BittensorChain(
         network="finney",
         netuid=24,
@@ -294,12 +297,11 @@ async def test_bittensor_adapter_pins_explicit_rpc_without_sdk_rotation(
     await chain.open()
     await chain.close()
 
-    assert calls == [
-        (
-            "wss://rpc.example.invalid",
-            {"archive_endpoints": [], "fallback_endpoints": []},
-        )
-    ]
+    assert len(calls) == 1
+    assert calls[0][0] == "wss://rpc.example.invalid"
+    substrate = calls[0][1]["substrate"]
+    assert substrate.endpoint == "wss://rpc.example.invalid"
+    assert substrate.archive_endpoints == substrate.fallback_endpoints == []
 
 
 @pytest.mark.asyncio
@@ -309,20 +311,38 @@ async def test_bittensor_adapter_preserves_legacy_named_network_behavior(
     calls: list[tuple[str, dict[str, Any]]] = []
 
     class Client:
+        async def connect(self) -> None:
+            return None
+
         async def close(self) -> None:
             return None
 
-    async def make_client(network: str, **kwargs: Any) -> Client:
+    def make_client(network: str, **kwargs: Any) -> Client:
         calls.append((network, kwargs))
         return Client()
 
-    monkeypatch.setattr(chain_module.bt, "Subtensor", make_client)
+    monkeypatch.setattr(chain_module.bt, "Client", make_client)
     chain = BittensorChain(network="finney", netuid=24)
 
     await chain.open()
     await chain.close()
 
-    assert calls == [("finney", {})]
+    from bittensor.settings import (
+        default_archive_endpoints,
+        default_fallback_endpoints,
+        resolve_endpoint,
+    )
+
+    assert len(calls) == 1 and calls[0][0] == "finney"
+    substrate = calls[0][1]["substrate"]
+    _, endpoint = resolve_endpoint("finney")
+    assert substrate.endpoint == endpoint
+    assert substrate.archive_endpoints == [
+        url for url in default_archive_endpoints("finney") if url != endpoint
+    ]
+    assert substrate.fallback_endpoints == [
+        url for url in default_fallback_endpoints("finney") if url != endpoint
+    ]
 
 
 class FakeWeightNamespace:

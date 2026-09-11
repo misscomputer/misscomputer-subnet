@@ -14,7 +14,6 @@ import re
 import secrets
 import sys
 from collections.abc import Callable, Mapping
-from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -31,6 +30,7 @@ from .weight_plan import (
     WeightPlanError,
     WeightPlanTargetError,
     _canonical_json,
+    _cleanup_temporary_plan,
     _pin_directory_chain,
     _prepare_temporary_plan,
     _read_existing,
@@ -62,11 +62,25 @@ _REFERENCE_RE = re.compile(r"^[!-~]{1,256}$")
 
 
 class WeightExecutionError(RuntimeError):
-    """A fail-closed executor rejection with a safe operator-facing code."""
+    """A safe operational error, independent of submission effect certainty."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+        self.status = "ambiguous" if code == "submission_ambiguous" else "rejected"
+        self.audit_error_code: str | None = None
+        self.cleanup_error_codes: tuple[str, ...] = ()
+        self.extrinsic_ref: str | None = None
+
+    def redacted_document(self) -> dict[str, object]:
+        document: dict[str, object] = {"error_code": self.code, "status": self.status}
+        if self.audit_error_code is not None:
+            document["audit_error_code"] = self.audit_error_code
+        if self.cleanup_error_codes:
+            document["cleanup_error_codes"] = list(self.cleanup_error_codes)
+        if self.extrinsic_ref is not None:
+            document["extrinsic_ref"] = self.extrinsic_ref
+        return document
 
 
 class AuditStateError(WeightExecutionError):
@@ -730,8 +744,11 @@ class AuditStateStore:
         try:
             self._open_lock()
             self._load()
-        except Exception:
-            self.close()
+        except BaseException as primary:
+            try:
+                self.close()
+            except BaseException:
+                primary.add_note("audit_cleanup_failed")
             raise
 
     def _open_lock(self) -> None:
@@ -803,6 +820,7 @@ class AuditStateStore:
         if len(rendered) > MAX_WEIGHT_PLAN_BYTES:
             raise AuditStateError("audit_state_full", "audit state exceeds its size limit")
         temporary = None
+        primary: BaseException | None = None
         try:
             _revalidate_pinned_chain(self._chain)
             if not _same_target(
@@ -854,24 +872,28 @@ class AuditStateStore:
             )
             self._target = installed
             self.state = state
-        except AuditStateError:
+        except AuditStateError as exc:
+            primary = exc
             raise
         except (OSError, WeightPlanTargetError) as exc:
-            raise AuditStateError("audit_state_unsafe", "audit state update failed") from exc
+            primary = AuditStateError("audit_state_unsafe", "audit state update failed")
+            raise primary from exc
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
-            if temporary is not None and temporary.name is not None:
-                try:
-                    named = os.stat(
-                        temporary.name,
-                        dir_fd=self._chain.parent_fd,
-                        follow_symlinks=False,
-                    )
-                    if (named.st_dev, named.st_ino) == temporary.identity:
-                        os.unlink(temporary.name, dir_fd=self._chain.parent_fd)
-                except FileNotFoundError:
-                    pass
-            if temporary is not None:
-                os.close(temporary.descriptor)
+            try:
+                if temporary is not None:
+                    _cleanup_temporary_plan(temporary, self._chain.parent_fd)
+            except BaseException as exc:
+                if primary is not None:
+                    primary.add_note("audit_temporary_cleanup_failed")
+                elif isinstance(exc, Exception):
+                    raise AuditStateError(
+                        "audit_state_unsafe", "audit temporary cleanup failed"
+                    ) from exc
+                else:
+                    raise
 
     def blocking_attempt(self, plan_digest_sha256: str) -> AuditAttempt | None:
         for attempt in reversed(self.state.attempts):
@@ -999,15 +1021,17 @@ class AuditStateStore:
 
     def close(self) -> None:
         descriptor = getattr(self, "_lock_descriptor", -1)
-        if descriptor >= 0:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
-            self._lock_descriptor = -1
-        chain = getattr(self, "_chain", None)
-        if chain is not None:
-            chain.close()
+        self._lock_descriptor = -1
+        try:
+            if descriptor >= 0:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+        finally:
+            chain = getattr(self, "_chain", None)
+            if chain is not None:
+                chain.close()
 
     def __enter__(self) -> AuditStateStore:
         return self
@@ -1067,9 +1091,10 @@ class ExecutionSummary:
     omitted_count: int
     attempt_id: str | None = None
     extrinsic_ref: str | None = None
+    cleanup_error_codes: tuple[str, ...] = ()
 
     def redacted_document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "attempt_id": self.attempt_id,
             "current_block": self.current_block,
             "execution_digest_sha256": self.execution_digest_sha256,
@@ -1083,6 +1108,9 @@ class ExecutionSummary:
             "status": self.status,
             "target_count": self.target_count,
         }
+        if self.cleanup_error_codes:
+            document["cleanup_error_codes"] = list(self.cleanup_error_codes)
+        return document
 
 
 def _validate_execution_gates(
@@ -1144,8 +1172,134 @@ def _pre_send_failure(
     )
 
 
+@dataclass(slots=True)
+class _ExecutionResources:
+    """Own resources before awaiting initialization; retire without losing the result."""
+
+    chain: ExecutionChain
+    submitter: WeightSubmitter | None = None
+    store: AuditStateStore | None = None
+    receipt: AuditReceipt | None = None
+    audit_error_code: str | None = None
+    cleanup_error_codes: list[str] = field(default_factory=list)
+
+    def finish_submission(
+        self,
+        attempt_id: str,
+        *,
+        status: Literal["confirmed", "failed", "ambiguous"],
+        outcome: ReceiptOutcome,
+        extrinsic_ref: str | None,
+        error_code: str | None,
+        clock: Callable[[], str],
+    ) -> None:
+        # Capture effect certainty before any fallible result persistence/cleanup.
+        self.receipt = AuditReceipt(outcome, extrinsic_ref, error_code)
+        assert self.store is not None
+        try:
+            self.store.finish_attempt(
+                attempt_id,
+                status=status,
+                outcome=outcome,
+                extrinsic_ref=extrinsic_ref,
+                error_code=error_code,
+                timestamp=clock(),
+            )
+        except BaseException:
+            # Never retry writes against a possibly replaced inode. The durably
+            # installed submission_started marker remains a non-retryable barrier.
+            # Cancellation/process-level errors during final persistence cannot
+            # replace a receipt we already hold (or turn uncertainty into rejection).
+            self.audit_error_code = "audit_persistence_failed"
+
+    async def close(self) -> None:
+        try:
+            if self.submitter is not None:
+                try:
+                    await self.submitter.close()
+                except BaseException:
+                    self.cleanup_error_codes.append("submitter_cleanup_failed")
+        finally:
+            try:
+                if self.store is not None:
+                    try:
+                        self.store.close()
+                    except BaseException:
+                        self.cleanup_error_codes.append("audit_cleanup_failed")
+            finally:
+                try:
+                    await self.chain.close()
+                except BaseException:
+                    self.cleanup_error_codes.append("chain_cleanup_failed")
+
+    async def drain(self) -> bool:
+        # Shield is not enough by itself: own and drain the task across *every*
+        # cancellation, including cancellation while already unwinding a failure.
+        task = asyncio.create_task(self.close(), name="weight-executor-cleanup")
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        return cancelled
+
+
 async def run_weight_executor(
     config: ExecutorConfig,
+    *,
+    chain: ExecutionChain,
+    submitter_factory: Callable[[], WeightSubmitter] | None = None,
+    environ: Mapping[str, str] | None = None,
+    clock: Callable[[], str] | None = None,
+    attempt_nonce_factory: Callable[[], str] | None = None,
+) -> ExecutionSummary:
+    """Execute once; report effect certainty separately from audit/cleanup failures."""
+
+    resources = _ExecutionResources(chain)
+    primary: BaseException | None = None
+    summary: ExecutionSummary | None = None
+    try:
+        summary = await _execute_weight_plan(
+            config,
+            resources,
+            chain=chain,
+            submitter_factory=submitter_factory,
+            environ=environ,
+            clock=clock,
+            attempt_nonce_factory=attempt_nonce_factory,
+        )
+    except BaseException as exc:
+        primary = exc
+    finally:
+        cancelled = await resources.drain()
+    if primary is None and resources.audit_error_code is not None:
+        # A confirmed SDK receipt is still confirmed when its audit write fails.
+        assert resources.receipt is not None and resources.receipt.outcome == "confirmed"
+        primary = WeightExecutionError(
+            "submission_confirmed_audit_failed",
+            "submission confirmed; audit requires reconciliation",
+        )
+        primary.status = "confirmed"
+        primary.extrinsic_ref = resources.receipt.extrinsic_ref
+    if primary is not None:
+        if isinstance(primary, WeightExecutionError):
+            primary.audit_error_code = resources.audit_error_code
+            primary.cleanup_error_codes = tuple(resources.cleanup_error_codes)
+        else:
+            for code in resources.cleanup_error_codes:
+                primary.add_note(code)
+        raise primary
+    assert summary is not None
+    if cancelled and summary.mode == "dry-run":
+        raise asyncio.CancelledError
+    return replace(summary, cleanup_error_codes=tuple(resources.cleanup_error_codes))
+
+
+async def _execute_weight_plan(
+    config: ExecutorConfig,
+    resources: _ExecutionResources,
     *,
     chain: ExecutionChain,
     submitter_factory: Callable[[], WeightSubmitter] | None = None,
@@ -1173,245 +1327,228 @@ async def run_weight_executor(
     environment = os.environ if environ is None else environ
     _validate_execution_gates(config, plan, environment)
 
-    opened = False
     try:
-        try:
-            await chain.open()
-            opened = True
-            snapshot = await chain.sync()
-        except Exception as exc:
+        await chain.open()
+        snapshot = await chain.sync()
+    except Exception as exc:
+        raise WeightExecutionError(
+            "chain_preflight_failed", "current finalized chain state is unavailable"
+        ) from exc
+    vector = derive_execution_vector(
+        plan,
+        snapshot,
+        network=config.network,
+        netuid=config.netuid,
+        validator_hotkey=config.validator_hotkey,
+    )
+    if (
+        config.confirm_execution_digest is not None
+        and vector.digest_sha256 != config.confirm_execution_digest
+    ):
+        raise WeightExecutionError(
+            "execution_digest_confirmation_required",
+            "execution requires the exact adjusted execution digest",
+        )
+    if not config.execute:
+        return ExecutionSummary(
+            mode="dry-run",
+            status="validated",
+            network=config.network,
+            netuid=config.netuid,
+            current_block=snapshot.block,
+            plan_digest_sha256=plan.digest_sha256,
+            execution_digest_sha256=vector.digest_sha256,
+            target_count=len(vector.weights),
+            moved_count=vector.moved_count,
+            omitted_count=len(vector.omitted),
+        )
+
+    try:
+        commit_reveal_enabled = await chain.commit_reveal_enabled(snapshot.block)
+    except Exception as exc:
+        raise WeightExecutionError(
+            "chain_preflight_failed", "weight submission mode is unavailable"
+        ) from exc
+    if commit_reveal_enabled:
+        raise WeightExecutionError(
+            "commit_reveal_unsupported",
+            "commit-reveal weights are unsupported by this executor",
+        )
+
+    assert config.audit_state_path is not None
+    if submitter_factory is None:
+        raise WeightExecutionError(
+            "submitter_unavailable", "execution signing capability is unavailable"
+        )
+    try:
+        store_context = AuditStateStore(config.audit_state_path)
+    except AuditStateError:
+        raise
+    except Exception as exc:
+        raise AuditStateError("audit_state_unsafe", "audit state is unavailable") from exc
+    store = resources.store = store_context
+    blocking = store.blocking_attempt(plan.digest_sha256)
+    if blocking is not None:
+        raise AuditStateError(
+            "idempotency_blocked",
+            "this plan has a prior non-retryable or unresolved attempt",
+        )
+    attempt = store.start_attempt(
+        vector,
+        preflight_block=snapshot.block,
+        timestamp=effective_clock(),
+        attempt_nonce=(None if attempt_nonce_factory is None else attempt_nonce_factory()),
+    )
+    try:
+        submitter = resources.submitter = submitter_factory()
+        if submitter.hotkey != config.validator_hotkey:
             raise WeightExecutionError(
-                "chain_preflight_failed", "current finalized chain state is unavailable"
-            ) from exc
-        vector = derive_execution_vector(
+                "signer_hotkey_mismatch",
+                "signing wallet does not match the configured validator",
+            )
+        await submitter.open()
+    except WeightExecutionError as exc:
+        _pre_send_failure(store, attempt, code=exc.code, clock=effective_clock)
+        raise
+    except Exception as exc:
+        _pre_send_failure(
+            store,
+            attempt,
+            code="signer_unavailable",
+            clock=effective_clock,
+        )
+        raise WeightExecutionError(
+            "signer_unavailable", "signing capability could not be loaded"
+        ) from exc
+
+    try:
+        send_snapshot = await chain.sync()
+        if send_snapshot.block < snapshot.block:
+            raise WeightExecutionError(
+                "pre_send_state_changed", "chain state rolled back before submission"
+            )
+        if send_snapshot.block == snapshot.block and snapshot_identity_fingerprint(
+            send_snapshot
+        ) != snapshot_identity_fingerprint(snapshot):
+            raise WeightExecutionError(
+                "pre_send_state_changed",
+                "same-height chain identity changed before submission",
+            )
+        send_vector = derive_execution_vector(
             plan,
-            snapshot,
+            send_snapshot,
             network=config.network,
             netuid=config.netuid,
             validator_hotkey=config.validator_hotkey,
         )
-        if (
-            config.confirm_execution_digest is not None
-            and vector.digest_sha256 != config.confirm_execution_digest
-        ):
-            raise WeightExecutionError(
-                "execution_digest_confirmation_required",
-                "execution requires the exact adjusted execution digest",
-            )
-        if not config.execute:
-            return ExecutionSummary(
-                mode="dry-run",
-                status="validated",
-                network=config.network,
-                netuid=config.netuid,
-                current_block=snapshot.block,
-                plan_digest_sha256=plan.digest_sha256,
-                execution_digest_sha256=vector.digest_sha256,
-                target_count=len(vector.weights),
-                moved_count=vector.moved_count,
-                omitted_count=len(vector.omitted),
-            )
-
-        try:
-            commit_reveal_enabled = await chain.commit_reveal_enabled(snapshot.block)
-        except Exception as exc:
-            raise WeightExecutionError(
-                "chain_preflight_failed", "weight submission mode is unavailable"
-            ) from exc
-        if commit_reveal_enabled:
+        if await chain.commit_reveal_enabled(send_snapshot.block):
             raise WeightExecutionError(
                 "commit_reveal_unsupported",
                 "commit-reveal weights are unsupported by this executor",
             )
-
-        assert config.audit_state_path is not None
-        if submitter_factory is None:
+        if send_vector.digest_sha256 != vector.digest_sha256:
             raise WeightExecutionError(
-                "submitter_unavailable", "execution signing capability is unavailable"
+                "pre_send_state_changed",
+                "the adjusted execution vector changed before submission",
             )
-        try:
-            store_context = AuditStateStore(config.audit_state_path)
-        except AuditStateError:
-            raise
-        except Exception as exc:
-            raise AuditStateError("audit_state_unsafe", "audit state is unavailable") from exc
-        with store_context as store:
-            blocking = store.blocking_attempt(plan.digest_sha256)
-            if blocking is not None:
-                raise AuditStateError(
-                    "idempotency_blocked",
-                    "this plan has a prior non-retryable or unresolved attempt",
-                )
-            attempt = store.start_attempt(
-                vector,
-                preflight_block=snapshot.block,
-                timestamp=effective_clock(),
-                attempt_nonce=(None if attempt_nonce_factory is None else attempt_nonce_factory()),
+    except WeightExecutionError as exc:
+        _pre_send_failure(store, attempt, code=exc.code, clock=effective_clock)
+        raise
+    except Exception as exc:
+        _pre_send_failure(
+            store,
+            attempt,
+            code="pre_send_state_unavailable",
+            clock=effective_clock,
+        )
+        raise WeightExecutionError(
+            "pre_send_state_unavailable",
+            "final send-check chain state is unavailable",
+        ) from exc
+
+    attempt = store.mark_submission_started(
+        attempt.attempt_id,
+        send_check_block=send_snapshot.block,
+        timestamp=effective_clock(),
+    )
+    try:
+        result = await asyncio.wait_for(
+            submitter.submit(send_vector),
+            timeout=float(config.submission_timeout_seconds),
+        )
+        if not isinstance(result, SubmissionResult):
+            raise TypeError("submitter returned an unsupported result")
+    except TimeoutError as exc:
+        resources.finish_submission(
+            attempt.attempt_id,
+            status="ambiguous",
+            outcome="ambiguous",
+            extrinsic_ref=None,
+            error_code="submission_timeout",
+            clock=effective_clock,
+        )
+        raise WeightExecutionError(
+            "submission_ambiguous",
+            "submission timed out and must be reconciled before retry",
+        ) from exc
+    except Exception as exc:
+        resources.finish_submission(
+            attempt.attempt_id,
+            status="ambiguous",
+            outcome="ambiguous",
+            extrinsic_ref=None,
+            error_code="submission_exception",
+            clock=effective_clock,
+        )
+        raise WeightExecutionError(
+            "submission_ambiguous",
+            "submission response was lost and must be reconciled before retry",
+        ) from exc
+    if result.success:
+        if result.extrinsic_ref is None:
+            resources.finish_submission(
+                attempt.attempt_id,
+                status="ambiguous",
+                outcome="ambiguous",
+                extrinsic_ref=None,
+                error_code="missing_extrinsic_reference",
+                clock=effective_clock,
             )
-            submitter: WeightSubmitter | None = None
-            submitter_opened = False
-            try:
-                try:
-                    submitter = submitter_factory()
-                    if submitter.hotkey != config.validator_hotkey:
-                        raise WeightExecutionError(
-                            "signer_hotkey_mismatch",
-                            "signing wallet does not match the configured validator",
-                        )
-                    await submitter.open()
-                    submitter_opened = True
-                except WeightExecutionError as exc:
-                    _pre_send_failure(store, attempt, code=exc.code, clock=effective_clock)
-                    raise
-                except Exception as exc:
-                    _pre_send_failure(
-                        store,
-                        attempt,
-                        code="signer_unavailable",
-                        clock=effective_clock,
-                    )
-                    raise WeightExecutionError(
-                        "signer_unavailable", "signing capability could not be loaded"
-                    ) from exc
-
-                try:
-                    send_snapshot = await chain.sync()
-                    if send_snapshot.block < snapshot.block:
-                        raise WeightExecutionError(
-                            "pre_send_state_changed", "chain state rolled back before submission"
-                        )
-                    if send_snapshot.block == snapshot.block and snapshot_identity_fingerprint(
-                        send_snapshot
-                    ) != snapshot_identity_fingerprint(snapshot):
-                        raise WeightExecutionError(
-                            "pre_send_state_changed",
-                            "same-height chain identity changed before submission",
-                        )
-                    send_vector = derive_execution_vector(
-                        plan,
-                        send_snapshot,
-                        network=config.network,
-                        netuid=config.netuid,
-                        validator_hotkey=config.validator_hotkey,
-                    )
-                    if await chain.commit_reveal_enabled(send_snapshot.block):
-                        raise WeightExecutionError(
-                            "commit_reveal_unsupported",
-                            "commit-reveal weights are unsupported by this executor",
-                        )
-                    if send_vector.digest_sha256 != vector.digest_sha256:
-                        raise WeightExecutionError(
-                            "pre_send_state_changed",
-                            "the adjusted execution vector changed before submission",
-                        )
-                except WeightExecutionError as exc:
-                    _pre_send_failure(store, attempt, code=exc.code, clock=effective_clock)
-                    raise
-                except Exception as exc:
-                    _pre_send_failure(
-                        store,
-                        attempt,
-                        code="pre_send_state_unavailable",
-                        clock=effective_clock,
-                    )
-                    raise WeightExecutionError(
-                        "pre_send_state_unavailable",
-                        "final send-check chain state is unavailable",
-                    ) from exc
-
-                attempt = store.mark_submission_started(
-                    attempt.attempt_id,
-                    send_check_block=send_snapshot.block,
-                    timestamp=effective_clock(),
-                )
-                try:
-                    result = await asyncio.wait_for(
-                        submitter.submit(send_vector),
-                        timeout=float(config.submission_timeout_seconds),
-                    )
-                    if not isinstance(result, SubmissionResult):
-                        raise TypeError("submitter returned an unsupported result")
-                except TimeoutError as exc:
-                    store.finish_attempt(
-                        attempt.attempt_id,
-                        status="ambiguous",
-                        outcome="ambiguous",
-                        extrinsic_ref=None,
-                        error_code="submission_timeout",
-                        timestamp=effective_clock(),
-                    )
-                    raise WeightExecutionError(
-                        "submission_ambiguous",
-                        "submission timed out and must be reconciled before retry",
-                    ) from exc
-                except Exception as exc:
-                    store.finish_attempt(
-                        attempt.attempt_id,
-                        status="ambiguous",
-                        outcome="ambiguous",
-                        extrinsic_ref=None,
-                        error_code="submission_exception",
-                        timestamp=effective_clock(),
-                    )
-                    raise WeightExecutionError(
-                        "submission_ambiguous",
-                        "submission response was lost and must be reconciled before retry",
-                    ) from exc
-                if result.success:
-                    if result.extrinsic_ref is None:
-                        store.finish_attempt(
-                            attempt.attempt_id,
-                            status="ambiguous",
-                            outcome="ambiguous",
-                            extrinsic_ref=None,
-                            error_code="missing_extrinsic_reference",
-                            timestamp=effective_clock(),
-                        )
-                        raise WeightExecutionError(
-                            "submission_ambiguous",
-                            "success lacked a durable extrinsic reference",
-                        )
-                    store.finish_attempt(
-                        attempt.attempt_id,
-                        status="confirmed",
-                        outcome="confirmed",
-                        extrinsic_ref=result.extrinsic_ref,
-                        error_code=None,
-                        timestamp=effective_clock(),
-                    )
-                    return ExecutionSummary(
-                        mode="execute",
-                        status="confirmed",
-                        network=config.network,
-                        netuid=config.netuid,
-                        current_block=send_snapshot.block,
-                        plan_digest_sha256=plan.digest_sha256,
-                        execution_digest_sha256=vector.digest_sha256,
-                        target_count=len(vector.weights),
-                        moved_count=vector.moved_count,
-                        omitted_count=len(vector.omitted),
-                        attempt_id=attempt.attempt_id,
-                        extrinsic_ref=result.extrinsic_ref,
-                    )
-                store.finish_attempt(
-                    attempt.attempt_id,
-                    status="failed",
-                    outcome="definite_failure",
-                    extrinsic_ref=result.extrinsic_ref,
-                    error_code=result.error_code or "chain_rejected",
-                    timestamp=effective_clock(),
-                )
-                raise WeightExecutionError(
-                    "submission_failed", "chain submission was definitively rejected"
-                )
-            finally:
-                if submitter is not None and submitter_opened:
-                    with suppress(Exception):
-                        await submitter.close()
-    finally:
-        if opened:
-            with suppress(Exception):
-                await chain.close()
+            raise WeightExecutionError(
+                "submission_ambiguous",
+                "success lacked a durable extrinsic reference",
+            )
+        resources.finish_submission(
+            attempt.attempt_id,
+            status="confirmed",
+            outcome="confirmed",
+            extrinsic_ref=result.extrinsic_ref,
+            error_code=None,
+            clock=effective_clock,
+        )
+        return ExecutionSummary(
+            mode="execute",
+            status="confirmed",
+            network=config.network,
+            netuid=config.netuid,
+            current_block=send_snapshot.block,
+            plan_digest_sha256=plan.digest_sha256,
+            execution_digest_sha256=vector.digest_sha256,
+            target_count=len(vector.weights),
+            moved_count=vector.moved_count,
+            omitted_count=len(vector.omitted),
+            attempt_id=attempt.attempt_id,
+            extrinsic_ref=result.extrinsic_ref,
+        )
+    resources.finish_submission(
+        attempt.attempt_id,
+        status="failed",
+        outcome="definite_failure",
+        extrinsic_ref=result.extrinsic_ref,
+        error_code=result.error_code or "chain_rejected",
+        clock=effective_clock,
+    )
+    raise WeightExecutionError("submission_failed", "chain submission was definitively rejected")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1515,7 +1652,7 @@ def main() -> None:
     except WeightExecutionError as exc:
         print(
             json.dumps(
-                {"error_code": exc.code, "status": "rejected"},
+                exc.redacted_document(),
                 sort_keys=True,
                 separators=(",", ":"),
             ),

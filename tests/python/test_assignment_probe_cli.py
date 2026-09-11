@@ -65,7 +65,12 @@ from misscomputer_subnet.assignment_probe_cli import (
     ManifestSource,
     SignatureSource,
     execute_assignment_probe,
+    persist_assignment_manifest_catch_up,
     run_cli,
+)
+from misscomputer_subnet.manifest_publication import (
+    ManifestHistoryEntry,
+    build_manifest_latest_pointer,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -698,6 +703,144 @@ def test_replay_rollback_and_equivocation_are_rejected_by_local_state(
     )
     assert not (tmp_path / "output" / "rollback.json").exists()
     assert not (tmp_path / "output" / "divergent.json").exists()
+
+
+def test_locked_authenticated_catch_up_persists_across_restart(
+    tmp_path: Path, tls_server: TLSFixture
+) -> None:
+    context = make_context()
+    first_publication = write_publication(tmp_path / "publication-one", context)
+    configure_routes(tls_server, context.manifest)
+    first = execute_assignment_probe(probe_config(first_publication, tls_server, tmp_path))
+    manifest_two = build_manifest(
+        context.policy,
+        context.deployments,
+        sequence=2,
+        previous=context.manifest.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 100,
+        expires_at=BASE_EPOCH + 3_700,
+        finalized_height=FINALIZED_HEIGHT + 5,
+        finalized_block_hash=label_digest("catch-up-two"),
+    )
+    signatures_two = tuple(sign_manifest(manifest_two, context.keys))
+    from misscomputer_subnet.manifest_publication import replay_manifest_history
+
+    history = (
+        ManifestHistoryEntry(
+            pointer=build_manifest_latest_pointer(manifest_two, signatures_two),
+            manifest=manifest_two,
+            signatures=signatures_two,
+        ),
+    )
+    expected = replay_manifest_history(
+        first.next_chain_state,
+        history,
+        context.policy,
+        evaluation_epoch=BASE_EPOCH + 200,
+    )
+    persisted = persist_assignment_manifest_catch_up(
+        state_root=str(tmp_path / "state"),
+        trust_policy=context.policy,
+        history=history,
+        evaluation_epoch=BASE_EPOCH + 200,
+        expected_anchor_sha256=first.next_chain_state.state_digest_sha256,
+        expected_next_state_sha256=expected.state_digest_sha256,
+    )
+    assert persisted == expected
+
+    manifest_three = build_manifest(
+        context.policy,
+        context.deployments,
+        sequence=3,
+        previous=manifest_two.manifest_digest_sha256,
+        issued_at=BASE_EPOCH + 200,
+        expires_at=BASE_EPOCH + 3_800,
+        finalized_height=FINALIZED_HEIGHT + 10,
+        finalized_block_hash=label_digest("catch-up-three"),
+    )
+    publication_three = write_publication(
+        tmp_path / "publication-three",
+        context,
+        manifest=manifest_three,
+        signatures=sign_manifest(manifest_three, context.keys),
+    )
+    configure_routes(tls_server, manifest_three)
+    restarted = execute_assignment_probe(
+        probe_config(
+            publication_three,
+            tls_server,
+            tmp_path,
+            name="restarted",
+            anchor=expected.state_digest_sha256,
+            evaluation_epoch=BASE_EPOCH + 200,
+            current_finalized_height=FINALIZED_HEIGHT,
+        )
+    )
+    assert restarted.next_chain_state.last_sequence == 3
+
+
+def test_catch_up_expected_anchor_crash_recovery_and_locking(
+    tmp_path: Path, tls_server: TLSFixture
+) -> None:
+    context = make_context()
+    publication = write_publication(tmp_path / "publication", context)
+    configure_routes(tls_server, context.manifest)
+    first = execute_assignment_probe(probe_config(publication, tls_server, tmp_path))
+
+    residue = tmp_path / "state" / probe_cli.STATE_INSTALL_NAME
+    residue.write_bytes(b"partial")
+    residue.chmod(0o600)
+    original_state = (tmp_path / "state" / probe_cli.STATE_NAME).read_bytes()
+    assert_cli_rejected(
+        "catch_up_state_mismatch",
+        lambda: persist_assignment_manifest_catch_up(
+            state_root=str(tmp_path / "state"),
+            trust_policy=context.policy,
+            history=(),
+            evaluation_epoch=EVALUATION_EPOCH,
+            expected_anchor_sha256=first.next_chain_state.state_digest_sha256,
+            expected_next_state_sha256="f" * 64,
+        ),
+    )
+    assert (tmp_path / "state" / probe_cli.STATE_NAME).read_bytes() == original_state
+    # A compare failure performs no installation; the next valid install safely
+    # removes the interrupted temp before replacing the durable state.
+    assert residue.read_bytes() == b"partial"
+
+    persisted = persist_assignment_manifest_catch_up(
+        state_root=str(tmp_path / "state"),
+        trust_policy=context.policy,
+        history=(),
+        evaluation_epoch=EVALUATION_EPOCH,
+        expected_anchor_sha256=first.next_chain_state.state_digest_sha256,
+        expected_next_state_sha256=first.next_chain_state.state_digest_sha256,
+    )
+    assert persisted == first.next_chain_state
+    assert not residue.exists()
+
+    assert_cli_rejected(
+        "state_anchor_stale",
+        lambda: persist_assignment_manifest_catch_up(
+            state_root=str(tmp_path / "state"),
+            trust_policy=context.policy,
+            history=(),
+            evaluation_epoch=EVALUATION_EPOCH,
+            expected_anchor_sha256="0" * 64,
+            expected_next_state_sha256=first.next_chain_state.state_digest_sha256,
+        ),
+    )
+    with probe_cli._StateRoot(str(tmp_path / "state")):
+        assert_cli_rejected(
+            "probe_busy",
+            lambda: persist_assignment_manifest_catch_up(
+                state_root=str(tmp_path / "state"),
+                trust_policy=context.policy,
+                history=(),
+                evaluation_epoch=EVALUATION_EPOCH,
+                expected_anchor_sha256=first.next_chain_state.state_digest_sha256,
+                expected_next_state_sha256=first.next_chain_state.state_digest_sha256,
+            ),
+        )
 
 
 def test_state_anchor_and_output_protections(tmp_path: Path, tls_server: TLSFixture) -> None:

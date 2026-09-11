@@ -59,6 +59,7 @@ from .assignment_probe import (
     validator_probe_report_bytes,
     verify_active_assignment_manifest,
 )
+from .manifest_publication import ManifestHistoryEntry, replay_manifest_history
 from .probe_transport import (
     RequestBudget,
     TransportBuilder,
@@ -728,7 +729,31 @@ class _StateRoot:
         except (TypeError, ValueError, ValidationError, RecursionError) as exc:
             raise AssignmentProbeCLIError("state_file_invalid") from exc
 
+    def _remove_install_residue(self) -> None:
+        """Remove only a safe temp file left by an interrupted locked install."""
+
+        try:
+            metadata = os.stat(STATE_INSTALL_NAME, dir_fd=self._directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_install_residue") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != _effective_uid()
+            or stat.S_IMODE(metadata.st_mode) != STATE_FILE_MODE
+            or metadata.st_nlink != 1
+            or metadata.st_size > MAX_STATE_BYTES
+        ):
+            _fail("state_install_residue")
+        try:
+            os.unlink(STATE_INSTALL_NAME, dir_fd=self._directory_fd)
+            os.fsync(self._directory_fd)
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_install_residue") from exc
+
     def replace_state(self, rendered: bytes) -> None:
+        self._remove_install_residue()
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
             descriptor = os.open(
@@ -780,6 +805,74 @@ class _StateRoot:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+def persist_assignment_manifest_catch_up(
+    *,
+    state_root: str,
+    trust_policy: AssignmentManifestTrustPolicy,
+    history: Sequence[ManifestHistoryEntry],
+    evaluation_epoch: int,
+    expected_anchor_sha256: str,
+    expected_next_state_sha256: str,
+    head_manifest: ActiveAssignmentManifest | None = None,
+    head_signatures: Sequence[AssignmentManifestSignatureEnvelope] | None = None,
+    current_finalized_height: int | None = None,
+) -> AssignmentManifestChainState:
+    """Authenticate and atomically persist SDK catch-up under the probe CLI lock.
+
+    ``expected_anchor_sha256`` is the independently retained durable state
+    anchor read by the SDK. ``expected_next_state_sha256`` compare-binds this
+    independently replayed history to the SDK result before installation.
+    For a public-verifier result, supply all three live-head arguments: the
+    history excludes that head, which must be verified live under this lock
+    before comparing its exact next-state digest. Omitting all three retains
+    the history-only handoff for callers that have not yet verified a head.
+    Holding the same lock as :func:`execute_assignment_probe` makes concurrent
+    catch-up/probe attempts fail busy rather than overwrite each other.
+    """
+
+    if (
+        _DIGEST.fullmatch(expected_anchor_sha256) is None
+        or _DIGEST.fullmatch(expected_next_state_sha256) is None
+    ):
+        _fail("state_anchor_invalid")
+    policy = AssignmentManifestTrustPolicy.model_validate(
+        trust_policy.model_dump(mode="json", by_alias=True)
+    )
+    with _StateRoot(state_root) as root:
+        prior = _resolve_prior_state(root, policy, expected_anchor_sha256)
+        try:
+            caught_up = replay_manifest_history(
+                prior,
+                tuple(history),
+                policy,
+                evaluation_epoch=evaluation_epoch,
+            )
+            if any(
+                item is not None
+                for item in (head_manifest, head_signatures, current_finalized_height)
+            ):
+                if (
+                    head_manifest is None
+                    or head_signatures is None
+                    or current_finalized_height is None
+                ):
+                    _fail("catch_up_invalid")
+                caught_up = verify_active_assignment_manifest(
+                    head_manifest,
+                    tuple(head_signatures),
+                    policy,
+                    caught_up,
+                    evaluation_epoch=evaluation_epoch,
+                    current_finalized_height=current_finalized_height,
+                ).next_chain_state
+        except (TypeError, ValueError, ValidationError, RecursionError) as exc:
+            raise AssignmentProbeCLIError("catch_up_invalid") from exc
+        if caught_up.state_digest_sha256 != expected_next_state_sha256:
+            _fail("catch_up_state_mismatch")
+        root.replace_state(assignment_manifest_chain_state_bytes(caught_up))
+        return caught_up
 
 
 def _resolve_prior_state(

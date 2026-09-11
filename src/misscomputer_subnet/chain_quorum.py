@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 from urllib.parse import urlsplit
 
+from .async_lifecycle import drain_cleanup
 from .chain import BittensorChain, MetagraphSnapshot
 
 
@@ -82,6 +83,7 @@ class FinalizedRpcQuorum:
         self._max_finalized_lag = max_finalized_lag
         self._alert_sink = alert_sink
         self._opened = False
+        self._owns_chains = False
         self._last_agreed_block: int | None = None
 
     def _fail(
@@ -105,17 +107,47 @@ class FinalizedRpcQuorum:
         return RpcAgreementError(code, message)
 
     async def open(self) -> None:
-        results = await asyncio.gather(
-            *(chain.open() for chain in self._chains), return_exceptions=True
-        )
-        if any(isinstance(result, BaseException) for result in results):
-            await asyncio.gather(*(chain.close() for chain in self._chains), return_exceptions=True)
-            raise self._fail("rpc_open_failed", "open", "redundant RPC set is unavailable")
-        self._opened = True
+        if self._owns_chains:
+            raise self._fail("rpc_open_failed", "open", "redundant RPC set is already open")
+        self._owns_chains = True
+        tasks = [asyncio.create_task(chain.open()) for chain in self._chains]
+
+        async def collect() -> list[None | BaseException]:
+            return list(await asyncio.gather(*tasks, return_exceptions=True))
+
+        collector = asyncio.create_task(collect(), name="rpc-quorum-initialization")
+        try:
+            results = await asyncio.shield(collector)
+            if any(isinstance(result, BaseException) for result in results):
+                raise self._fail("rpc_open_failed", "open", "redundant RPC set is unavailable")
+            self._opened = True
+        except BaseException as primary:
+            # Cancel each open once, then drain it before closing children.
+            # Repeated outer cancellation must not interrupt child unwinding or
+            # let a late successful initialization race past quorum cleanup.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            async def retire() -> None:
+                try:
+                    await collector
+                finally:
+                    await self.close()
+
+            try:
+                await drain_cleanup(retire(), name="rpc-quorum-open-cleanup")
+            except BaseException:
+                primary.add_note("rpc_initialization_cleanup_failed")
+            raise
 
     async def close(self) -> None:
-        if not self._opened:
+        await drain_cleanup(self._close_chains(), name="rpc-quorum-cleanup")
+
+    async def _close_chains(self) -> None:
+        if not self._owns_chains:
             return
+        self._owns_chains = False
         self._opened = False
         results = await asyncio.gather(
             *(chain.close() for chain in self._chains), return_exceptions=True

@@ -21,7 +21,9 @@ checkpoint verification, weight execution, the online
 `misscomputer-assignment-probe` public-validator liveness check of signed
 active-assignment manifests (see `docs/public-validator-live-probe.md`), and
 the one-shot `misscomputer-python-boundary` /
-`misscomputer-checkpoint-boundary` commands.
+`misscomputer-checkpoint-boundary` commands. The complete generic third-party
+catch-up, live-head, sealed-decision, and dry-run WeightPlan route is documented
+in [`docs/third-party-verifier-relay-runbook.md`](docs/third-party-verifier-relay-runbook.md).
 
 Protocol and Go API compatibility changes are recorded in
 [`docs/api-migrations.md`](docs/api-migrations.md). The frozen

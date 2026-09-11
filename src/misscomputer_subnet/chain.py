@@ -13,7 +13,9 @@ from typing import Any, Protocol
 
 import bittensor as bt
 
+from .async_lifecycle import drain_cleanup
 from .auth import HotkeySigningFacade
+from .chain_transport import _OwnedRpcSubstrate
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,25 +94,37 @@ class BittensorChain:
         self.__client: Any = None
 
     async def open(self) -> None:
-        if self.rpc_endpoint is None:
-            self.__client = await bt.Subtensor(self.network)
-            return
-        self.__client = await bt.Subtensor(
-            self.rpc_endpoint,
-            fallback_endpoints=[],
-            archive_endpoints=[],
+        if self.__client is not None:
+            raise RuntimeError("chain is already open")
+        network = self.rpc_endpoint if self.rpc_endpoint is not None else self.network
+        # Both Client and the raw transport backend are owned before connect()
+        # can acquire a socket. Subtensor's awaitable wrapper publishes too late.
+        self.__client = bt.Client(
+            network,
+            substrate=_OwnedRpcSubstrate(network, pinned=self.rpc_endpoint is not None),
         )
+        try:
+            await self.__client.connect()
+        except BaseException as primary:
+            try:
+                await self.close()
+            except BaseException:
+                primary.add_note("chain_initialization_cleanup_failed")
+            raise
 
     async def close(self) -> None:
+        await drain_cleanup(self._close_client(), name="bittensor-chain-cleanup")
+
+    async def _close_client(self) -> None:
         client = self.__client
         if client is None:
             return
+        self.__client = None
         close = getattr(client, "close", None) or getattr(client, "aclose", None)
         if close is not None:
             result = close()
             if hasattr(result, "__await__"):
                 await result
-        self.__client = None
 
     async def sync(self) -> MetagraphSnapshot:
         client = self.__client

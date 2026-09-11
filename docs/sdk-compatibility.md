@@ -41,6 +41,10 @@ maintaining compatibility with runtimes that are not deployed.
 - `bt.resolve_signer(..., role="hotkey")` inside the facade for
   Wallet/Keypair-compatible btauth and service-binding signatures
 - `bt.sp_core` keypairs for deterministic mock identities and signature verification
+- `public_verifier.verify_public_relay_path` composes only frozen pure contract
+  verification and `build_weight_plan_from_decision`; it accepts a structural,
+  caller-supplied finalized metagraph view and never imports the SDK chain
+  adapter, wallet, signer, executor, or submission API
 - only behind the external weight-signer protocol, `bt.SetWeights(netuid=..., uids=...,
   weights=..., version_key=2)` and async
   `client.execute(intent, wallet, retries=0, wait_for_inclusion=True,
