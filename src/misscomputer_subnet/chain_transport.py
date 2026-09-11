@@ -57,16 +57,11 @@ class _OwnedRpcSubstrate(RpcSubstrate):
         async def connect_owned(url: str) -> Any:
             # Closed transports no longer need fallback ownership; retain any
             # ambiguous entry so a failed SDK reconnect close is never lost.
-            retained: list[tuple[Any, Any]] = []
-            for owned_websocket, transport in websockets:
-                is_closing = getattr(transport, "is_closing", None)
-                try:
-                    retired = callable(is_closing) and is_closing()
-                except BaseException:
-                    retired = False
-                if not retired:
-                    retained.append((owned_websocket, transport))
-            websockets[:] = retained
+            websockets[:] = [
+                (owned_websocket, transport)
+                for owned_websocket, transport in websockets
+                if not self._connection_retired(owned_websocket, transport)
+            ]
             websocket = await connect(url)
             # No await is allowed between acquisition and retention: the SDK
             # may immediately initiate cleanup when later initialization fails.
@@ -78,6 +73,25 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             _RpcInterfaceOwnership(raw=raw, session=session, websockets=websockets)
         )
         return raw
+
+    @staticmethod
+    def _connection_retired(websocket: Any, transport: Any) -> bool:
+        """Return true only after the lower-layer connection is actually gone."""
+
+        connection_lost = getattr(websocket, "connection_lost_waiter", None)
+        done = getattr(connection_lost, "done", None)
+        if callable(done):
+            with suppress(BaseException):
+                if done():
+                    return True
+        get_extra_info = getattr(transport, "get_extra_info", None)
+        if callable(get_extra_info):
+            with suppress(BaseException):
+                sock = get_extra_info("socket")
+                fileno = getattr(sock, "fileno", None)
+                if callable(fileno) and fileno() < 0:
+                    return True
+        return False
 
     async def connect(self) -> None:
         try:

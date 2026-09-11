@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -692,6 +693,90 @@ async def test_close_quiesces_supervisors_before_another_transport_can_reconnect
         assert not replacement_was_published, "the primary supervisor mutated ownership"
         assert len(primary_clients) == 1
         assert primary_supervisor.done()
+
+
+@pytest.mark.parametrize("buffered_shutdown", [False, True])
+async def test_reconnect_retains_closing_socket_until_descriptor_is_retired(
+    monkeypatch: pytest.MonkeyPatch,
+    buffered_shutdown: bool,
+) -> None:
+    server_connections: list[Any] = []
+    replacement_connected = asyncio.Event()
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        if len(server_connections) == 1:
+            await websocket.recv()
+            if buffered_shutdown:
+                websocket.transport.pause_reading()
+            await websocket.send('{"jsonrpc":"2.0","id":999999,"result":null}')
+        else:
+            replacement_connected.set()
+        await websocket.wait_closed()
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    async with serve(handle, "127.0.0.1", 0) as server:
+        endpoint = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+        await chain.open()
+        substrate = chain._BittensorChain__client._substrate
+        owned = substrate._owned_interfaces[0]
+        session = owned.session
+        first_client = session._ws
+        first_transport = first_client.transport
+        first_socket = first_transport.get_extra_info("socket")
+        real_close = ClientConnection.close
+
+        session._response_timeout = 0.02
+        pending = asyncio.create_task(session.request("review-unanswered-rpc"))
+
+        async def close_fault(websocket: ClientConnection, *args: Any, **kwargs: Any) -> None:
+            if websocket is first_client:
+                if buffered_shutdown and not websocket.transport.is_closing():
+                    first_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                    websocket.transport.write(b"x" * (2 * 1024 * 1024))
+                    assert websocket.transport.get_write_buffer_size() > 0
+                    websocket.transport.close()
+                raise OSError("old-websocket-close-failed")
+            await real_close(websocket, *args, **kwargs)
+
+        monkeypatch.setattr(ClientConnection, "close", close_fault)
+        await asyncio.wait_for(replacement_connected.wait(), 2)
+        for _ in range(30):
+            if session._ws is not None and session._ws is not first_client:
+                break
+            await asyncio.sleep(0)
+        assert session._ws is not None and session._ws is not first_client
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        session._response_timeout = 60
+        first_was_retained = any(websocket is first_client for websocket, _ in owned.websockets)
+        assert first_socket.fileno() >= 0, "test requires a live stale socket"
+        assert first_transport.is_closing() is buffered_shutdown
+
+        close_failure: OSError | None = None
+        try:
+            await chain.close()
+        except OSError as exc:
+            close_failure = exc
+        await chain.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        leaked_fd = first_socket.fileno()
+
+        # Reclaim an adversarial test-owned socket after measuring application cleanup.
+        first_transport.abort()
+        for websocket in server_connections:
+            websocket.transport.abort()
+        await asyncio.gather(*(websocket.wait_closed() for websocket in server_connections))
+        assert leaked_fd == -1, "old live descriptor survived repeated chain.close"
+        assert (close_failure is not None) is first_was_retained
+        assert first_was_retained, "live closing transport was pruned before replacement dial"
 
 
 @pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
