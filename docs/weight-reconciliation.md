@@ -63,6 +63,33 @@ the path of either ledger. Preserve both ledgers, the report bytes/digest,
 supervisor logs, provider alerts, and any public extrinsic reference for the
 incident review.
 
+## Executor result versus audit/cleanup health
+
+Executor exit 2 is an operational failure, **not** proof that no submission
+occurred. Read the JSON `status` and `error_code` together:
+
+- `submission_ambiguous` has `status: "ambiguous"`, including when recording
+  that result failed. Reconcile before any further action.
+- `submission_confirmed_audit_failed` has `status: "confirmed"`, the public
+  `extrinsic_ref`, and `audit_error_code: "audit_persistence_failed"`. The
+  signer confirmed the submission, but the executor cannot claim a durable
+  final audit receipt. Preserve the reference and reconcile the ledgers.
+- A definite chain rejection remains `submission_failed` / `rejected`, even
+  when audit persistence separately fails. It still blocks automatic replay.
+
+`audit_error_code` and optional `cleanup_error_codes` describe storage/resource
+health independently of effect certainty. Cleanup diagnostics are
+`submitter_cleanup_failed`, `audit_cleanup_failed`, and `chain_cleanup_failed`;
+they never convert a confirmed/ambiguous result into definite rejection.
+An otherwise confirmed execution may return exit 0 with cleanup diagnostics.
+
+If the final write failed, the previous durable `in_progress` attempt with
+`submission_started: true` may remain. This is intentionally replay-blocking;
+do not clear it or infer that submission did not occur. A failed unlink may
+also leave an owner-only temporary file. Preserve incident evidence and repair
+the storage problem separately; the executor does not weaken inode checks or
+retry writes after a potentially successful replacement.
+
 ## Alert policy
 
 Page immediately on `rpc_finalized_rollback`, `rpc_snapshot_disagreement`,

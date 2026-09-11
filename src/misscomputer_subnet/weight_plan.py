@@ -636,9 +636,16 @@ class _PinnedDirectoryChain:
         return self.descriptors[-1]
 
     def close(self) -> None:
-        for descriptor in reversed(self.descriptors):
-            os.close(descriptor)
-        self.descriptors.clear()
+        descriptors, self.descriptors = self.descriptors, []
+        primary: BaseException | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+        if primary is not None:
+            raise primary
 
 
 @dataclass(slots=True)
@@ -843,16 +850,30 @@ def _allocate_visible_temporary(directory_fd: int) -> tuple[int, str]:
     raise WeightPlanTargetError("could not allocate a private temporary plan file")
 
 
+def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> None:
+    try:
+        if temporary.name is not None:
+            try:
+                named = os.stat(temporary.name, dir_fd=directory_fd, follow_symlinks=False)
+                if (named.st_dev, named.st_ino) == temporary.identity:
+                    os.unlink(temporary.name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(temporary.descriptor)
+
+
 def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPlan:
     descriptor = _open_unnamed_temporary(directory_fd)
     if descriptor is not None:
-        value = os.fstat(descriptor)
         temporary = _TemporaryPlan(
             descriptor=descriptor,
-            identity=(value.st_dev, value.st_ino),
+            identity=(-1, -1),
             name=None,
         )
         try:
+            value = os.fstat(descriptor)
+            temporary.identity = (value.st_dev, value.st_ino)
             os.fchmod(descriptor, WEIGHT_PLAN_FILE_MODE)
             _write_all(descriptor, rendered)
             os.fsync(descriptor)
@@ -889,30 +910,23 @@ def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPla
                     expected_size=len(rendered),
                 )
                 return temporary
-        except Exception:
-            if temporary.name is not None:
-                try:
-                    named = os.stat(
-                        temporary.name,
-                        dir_fd=directory_fd,
-                        follow_symlinks=False,
-                    )
-                    if (named.st_dev, named.st_ino) == temporary.identity:
-                        os.unlink(temporary.name, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    pass
-            os.close(descriptor)
+        except BaseException as primary:
+            try:
+                _cleanup_temporary_plan(temporary, directory_fd)
+            except BaseException:
+                primary.add_note("temporary_cleanup_failed")
             raise
         os.close(descriptor)
 
     descriptor, name = _allocate_visible_temporary(directory_fd)
-    value = os.fstat(descriptor)
     temporary = _TemporaryPlan(
         descriptor=descriptor,
-        identity=(value.st_dev, value.st_ino),
+        identity=(-1, -1),
         name=name,
     )
     try:
+        value = os.fstat(descriptor)
+        temporary.identity = (value.st_dev, value.st_ino)
         os.fchmod(descriptor, WEIGHT_PLAN_FILE_MODE)
         _write_all(descriptor, rendered)
         os.fsync(descriptor)
@@ -923,14 +937,11 @@ def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPla
         )
         _validate_temporary_name(temporary, directory_fd, expected_size=len(rendered))
         return temporary
-    except Exception:
-        os.close(descriptor)
+    except BaseException as primary:
         try:
-            named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if (named.st_dev, named.st_ino) == temporary.identity:
-                os.unlink(name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
+            _cleanup_temporary_plan(temporary, directory_fd)
+        except BaseException:
+            primary.add_note("temporary_cleanup_failed")
         raise
 
 
