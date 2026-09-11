@@ -490,6 +490,210 @@ async def test_sdk_close_fault_cannot_discard_a_live_websocket(
         assert all(raw._session._ws is None for raw in connections)
 
 
+@pytest.mark.parametrize("initialization", ["primary", "archive"])
+async def test_sdk_initialization_cleanup_cannot_discard_a_live_websocket(
+    monkeypatch: pytest.MonkeyPatch,
+    initialization: str,
+) -> None:
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    faulted_clients: list[ClientConnection] = []
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def fail_codec(*args: Any, **kwargs: Any) -> None:
+        raise OSError("post-connect-initialization-failed")
+
+    async def close_before_shutdown(websocket: ClientConnection, *args: Any, **kwargs: Any) -> None:
+        if not any(candidate is websocket for candidate in faulted_clients):
+            faulted_clients.append(websocket)
+        raise OSError("sdk-initialization-close-failed")
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    endpoint_count = 2 if initialization == "archive" else 1
+    async with AsyncExitStack() as stack:
+        servers = [
+            await stack.enter_async_context(serve(handle, "127.0.0.1", 0))
+            for _ in range(endpoint_count)
+        ]
+        endpoints = [f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}" for server in servers]
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoints[0])
+        if initialization == "archive":
+            monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+            await chain.open()
+            substrate = chain._BittensorChain__client._substrate
+            substrate.archive_endpoints = [endpoints[1]]
+        monkeypatch.setattr(RuntimeManager, "codec_at", fail_codec)
+        monkeypatch.setattr(ClientConnection, "close", close_before_shutdown)
+
+        with pytest.raises(bittensor.result.RpcConnectionError):
+            if initialization == "primary":
+                await chain.open()
+            else:
+                await substrate._archive()
+        await chain.close()
+        await chain.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        transports = [websocket.transport for websocket in faulted_clients]
+        client_sockets = [transport.get_extra_info("socket") for transport in transports]
+        leaked = [
+            (transport, sock)
+            for transport, sock in zip(transports, client_sockets, strict=True)
+            if not transport.is_closing() or sock is None or sock.fileno() >= 0
+        ]
+        peer_open = [
+            websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+        ]
+
+        for transport, _ in leaked:
+            transport.abort()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert len(connections) == endpoint_count
+        assert len(faulted_clients) == endpoint_count
+        assert not leaked, "SDK initialization cleanup discarded a live client descriptor"
+        assert not peer_open, "SDK initialization cleanup left the localhost peer open"
+
+
+@pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
+async def test_close_quiesces_supervisors_before_another_transport_can_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    fault_type: type[BaseException],
+) -> None:
+    connections: list[SubstrateConnection] = []
+    client_websockets: dict[str, list[ClientConnection]] = {}
+    server_connections: list[Any] = []
+    primary_server_connections: list[Any] = []
+    primary_drop = asyncio.Event()
+    primary_reconnected = asyncio.Event()
+    archive_close_started = asyncio.Event()
+    release_archive_close = asyncio.Event()
+    real_interface = RpcSubstrate._interface
+    real_close = ClientConnection.close
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        connect = raw._session._connect
+
+        async def capture(endpoint: str) -> Any:
+            websocket = await connect(endpoint)
+            client_websockets.setdefault(endpoint, []).append(websocket)
+            return websocket
+
+        raw._session._connect = capture
+        return raw
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def primary_handler(websocket: Any) -> None:
+        server_connections.append(websocket)
+        primary_server_connections.append(websocket)
+        if len(primary_server_connections) == 1:
+            await primary_drop.wait()
+            websocket.transport.abort()
+        else:
+            primary_reconnected.set()
+        await websocket.wait_closed()
+
+    async def archive_handler(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    async with (
+        serve(primary_handler, "127.0.0.1", 0) as primary,
+        serve(archive_handler, "127.0.0.1", 0) as archive,
+    ):
+        primary_endpoint = f"ws://127.0.0.1:{primary.sockets[0].getsockname()[1]}"
+        archive_endpoint = f"ws://127.0.0.1:{archive.sockets[0].getsockname()[1]}"
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=primary_endpoint)
+        await chain.open()
+        substrate = chain._BittensorChain__client._substrate
+        substrate.archive_endpoints = [archive_endpoint]
+        await substrate._archive()
+        primary_supervisor = connections[0]._session._supervisor
+        assert primary_supervisor is not None
+        primary_first = client_websockets[primary_endpoint][0]
+        archive_first = client_websockets[archive_endpoint][0]
+
+        async def close_with_race(websocket: ClientConnection, *args: Any, **kwargs: Any) -> None:
+            if websocket is archive_first:
+                archive_close_started.set()
+                await release_archive_close.wait()
+            if websocket is not primary_first and any(
+                websocket is candidate
+                for candidate in client_websockets.get(primary_endpoint, [])[1:]
+            ):
+                raise fault_type("replacement-websocket-close-failed")
+            await real_close(websocket, *args, **kwargs)
+
+        monkeypatch.setattr(ClientConnection, "close", close_with_race)
+        closing = asyncio.create_task(chain.close())
+        await asyncio.wait_for(archive_close_started.wait(), 2)
+        primary_drop.set()
+        reconnect_waiter = asyncio.create_task(primary_reconnected.wait())
+        done, _ = await asyncio.wait(
+            {reconnect_waiter, primary_supervisor},
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert done, "primary supervisor neither stopped nor reconnected"
+        replacement_was_published = primary_reconnected.is_set()
+        reconnect_waiter.cancel()
+        await asyncio.gather(reconnect_waiter, return_exceptions=True)
+        release_archive_close.set()
+        close_failure: BaseException | None = None
+        try:
+            await asyncio.wait_for(closing, 2)
+        except BaseException as exc:
+            close_failure = exc
+        if close_failure is not None and fault_type is not OSError:
+            assert isinstance(close_failure, fault_type)
+        await chain.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        primary_clients = client_websockets[primary_endpoint]
+        transports = [websocket.transport for websocket in primary_clients]
+        client_sockets = [transport.get_extra_info("socket") for transport in transports]
+        leaked = [
+            (transport, sock)
+            for transport, sock in zip(transports, client_sockets, strict=True)
+            if not transport.is_closing() or sock is None or sock.fileno() >= 0
+        ]
+        peer_open = [
+            websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+        ]
+
+        for transport, _ in leaked:
+            transport.abort()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert not leaked, "a replacement websocket escaped the all-transports snapshot"
+        assert not peer_open, "a replacement websocket left its localhost peer open"
+        assert not replacement_was_published, "the primary supervisor mutated ownership"
+        assert len(primary_clients) == 1
+        assert primary_supervisor.done()
+
+
 @pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
 @pytest.mark.parametrize("repeated_cancel", [False, True])
 async def test_unix_connect_baseexception_retires_real_writer(

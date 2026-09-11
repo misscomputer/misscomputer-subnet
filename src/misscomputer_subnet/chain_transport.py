@@ -11,6 +11,7 @@ another transport. No SDK files are patched and no write/signing API is added.
 from __future__ import annotations
 
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 from bittensor._substrate import RpcSubstrate
@@ -22,6 +23,13 @@ from bittensor.settings import (
 )
 
 from .async_lifecycle import drain_cleanup
+
+
+@dataclass(slots=True)
+class _RpcInterfaceOwnership:
+    raw: SubstrateConnection
+    session: Any
+    websockets: list[tuple[Any, Any]]
 
 
 class _OwnedRpcSubstrate(RpcSubstrate):
@@ -38,11 +46,37 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             ),
             archive_endpoints=[] if pinned else default_archive_endpoints(resolved_network),
         )
-        self._owned_interfaces: list[SubstrateConnection] = []
+        self._owned_interfaces: list[_RpcInterfaceOwnership] = []
 
     def _interface(self, endpoint: str, fallbacks: list[str]) -> SubstrateConnection:
         raw = super()._interface(endpoint, fallbacks)
-        self._owned_interfaces.append(raw)
+        session = raw._session
+        connect = session._connect
+        websockets: list[tuple[Any, Any]] = []
+
+        async def connect_owned(url: str) -> Any:
+            # Closed transports no longer need fallback ownership; retain any
+            # ambiguous entry so a failed SDK reconnect close is never lost.
+            retained: list[tuple[Any, Any]] = []
+            for owned_websocket, transport in websockets:
+                is_closing = getattr(transport, "is_closing", None)
+                try:
+                    retired = callable(is_closing) and is_closing()
+                except BaseException:
+                    retired = False
+                if not retired:
+                    retained.append((owned_websocket, transport))
+            websockets[:] = retained
+            websocket = await connect(url)
+            # No await is allowed between acquisition and retention: the SDK
+            # may immediately initiate cleanup when later initialization fails.
+            websockets.append((websocket, getattr(websocket, "transport", None)))
+            return websocket
+
+        session._connect = connect_owned
+        self._owned_interfaces.append(
+            _RpcInterfaceOwnership(raw=raw, session=session, websockets=websockets)
+        )
         return raw
 
     async def connect(self) -> None:
@@ -66,22 +100,39 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             raise
 
     async def _close_owned(self) -> None:
-        # RpcSession.close() clears its websocket slot after suppressing an
-        # ordinary websocket.close() failure. Capture every lower ownership
-        # layer before asking the SDK to close or clearing our published slots.
-        retirements = [self._capture_retirement(raw) for raw in self._owned_interfaces]
+        owned = self._owned_interfaces
         self._owned_interfaces = []
+
+        # Freeze every session before the first await. Otherwise a supervisor
+        # later in the list can reconnect while an earlier interface is being
+        # closed and replace the websocket captured for its own retirement.
+        supervisors: list[Any] = []
+        for ownership in owned:
+            ownership.session._closing = True
+            supervisor = ownership.session._supervisor
+            supervisors.append(supervisor)
+            if supervisor is not None:
+                with suppress(BaseException):
+                    supervisor.cancel()
+
+        # RpcSession.close() clears its websocket slot after suppressing an
+        # ordinary websocket.close() failure. Retain all connections captured
+        # at the dial seam, including ones an earlier SDK cleanup forgot.
+        retirements = [
+            self._capture_retirement(ownership, supervisor)
+            for ownership, supervisor in zip(owned, supervisors, strict=True)
+        ]
         self._substrate = None
         self._archive_substrate = None
         primary: BaseException | None = None
-        for raw, session, websocket, transport, supervisor in reversed(retirements):
+        for raw, session, websockets, supervisor in reversed(retirements):
             failure: BaseException | None = None
             try:
                 await raw.close()
             except BaseException as exc:
                 failure = exc
             try:
-                await self._retire_session(session, websocket, transport, supervisor)
+                await self._retire_session(session, websockets, supervisor)
             except BaseException as exc:
                 if failure is None:
                     failure = exc
@@ -96,16 +147,19 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             raise primary
 
     @staticmethod
-    def _capture_retirement(raw: SubstrateConnection) -> tuple[Any, ...]:
-        session = raw._session
-        websocket = session._ws
-        return raw, session, websocket, getattr(websocket, "transport", None), session._supervisor
+    def _capture_retirement(
+        ownership: _RpcInterfaceOwnership, supervisor: Any
+    ) -> tuple[SubstrateConnection, Any, tuple[tuple[Any, Any], ...], Any]:
+        current = ownership.session._ws
+        websockets = list(ownership.websockets)
+        if current is not None and not any(websocket is current for websocket, _ in websockets):
+            websockets.append((current, getattr(current, "transport", None)))
+        return ownership.raw, ownership.session, tuple(websockets), supervisor
 
     @staticmethod
     async def _retire_session(
         session: Any,
-        websocket: Any,
-        transport: Any,
+        websockets: tuple[tuple[Any, Any], ...],
         supervisor: Any,
     ) -> None:
         """Drain the captured SDK layers without trusting mutable SDK slots."""
@@ -125,26 +179,26 @@ class _OwnedRpcSubstrate(RpcSubstrate):
                 supervisor.cancel()
             with suppress(BaseException):
                 await supervisor
-        if websocket is not None:
+        for websocket, transport in reversed(websockets):
             try:
                 await websocket.close()
             except BaseException as exc:
                 failed(exc)
-        abort = getattr(transport, "abort", None)
-        if callable(abort):
-            try:
-                abort()
-            except BaseException as exc:
-                failed(exc)
-        wait_closed = getattr(websocket, "wait_closed", None)
-        if callable(wait_closed):
-            try:
-                await wait_closed()
-            except BaseException as exc:
-                failed(exc)
+            abort = getattr(transport, "abort", None)
+            if callable(abort):
+                try:
+                    abort()
+                except BaseException as exc:
+                    failed(exc)
+            wait_closed = getattr(websocket, "wait_closed", None)
+            if callable(wait_closed):
+                try:
+                    await wait_closed()
+                except BaseException as exc:
+                    failed(exc)
         if session._supervisor is supervisor:
             session._supervisor = None
-        if session._ws is websocket:
+        if any(session._ws is websocket for websocket, _ in websockets):
             session._ws = None
         try:
             # Finish the SDK's pending-request and subscription shutdown after
