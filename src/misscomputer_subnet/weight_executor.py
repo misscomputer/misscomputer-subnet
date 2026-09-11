@@ -1205,9 +1205,11 @@ class _ExecutionResources:
                 error_code=error_code,
                 timestamp=clock(),
             )
-        except Exception:
+        except BaseException:
             # Never retry writes against a possibly replaced inode. The durably
             # installed submission_started marker remains a non-retryable barrier.
+            # Cancellation/process-level errors during final persistence cannot
+            # replace a receipt we already hold (or turn uncertainty into rejection).
             self.audit_error_code = "audit_persistence_failed"
 
     async def close(self) -> None:

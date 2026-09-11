@@ -1,5 +1,10 @@
 # Executor post-send lifecycle repair evidence
 
+The original sections below record the first bounded repair. The subsequent
+exact-head review found additional uncovered cases; the **Second bounded
+repair** section supersedes its finding-closure claims and SDK test limitation.
+Historical evidence is retained rather than relabelled as second-round coverage.
+
 ## Immutable scope
 
 Public PR: https://github.com/misscomputer/misscomputer-subnet/pull/10.
@@ -102,3 +107,107 @@ preserve the primary result after cleanup has been drained.
 
 This is a local writer handoff, not an independent review or hosted exact-head
 CI claim. The controller owns subsequent review, publication, and merge gates.
+
+## Second bounded repair
+
+Input head: `9b9c7d5a52a11aab86a53a2385b629693e1ba9aa`; unchanged base:
+`a5eb398317353e40d59d8357c11d9871fbb5b265`. The non-author repair lane
+attested OpenAI `gpt-6-astra`, `xhigh`, from resolved runtime turn metadata.
+Local HEAD/upstream/pull ref, live branch/PR head, base, and merge-base matched
+before changes and immediately before the local-only commit.
+
+### Executed failing-before evidence
+
+With production source still at the input head, the expanded standalone matrix
+produced **104 failed, 68 passed** (7.98 seconds):
+
+- 80 final-persistence failures across `SimulatedCrash(BaseException)` and
+  `CancelledError`, five submission outcomes, and eight fault sites: clock,
+  write, file fsync, replace, directory fsync, verification, temp close, unlink.
+  The old CLI leaked raw exceptions instead of safe outcome JSON, while the
+  already durable replay barrier still prevented a second submit.
+- Seven descriptor-cleanup failures: target close skipped reopened directory
+  descriptors; plan unlink skipped temporary/directory closes; root/child
+  acquisition failures leaked already-acquired descriptors.
+- Ten real Bittensor 11.1.0 primary/archive initialization leaks, a quorum
+  cancellation with child close counts `0, 0`, and two real Unix signer
+  post-connect `BaseException` leaks.
+- A mutated retained report with an unchanged digest was accepted despite its
+  canonical parser rejecting `report_counts_invalid`.
+- Three live-head persistence regressions initially failed because the old
+  API lacked live-head arguments. The exact old documented composition was
+  also executed separately and failed with `catch_up_state_mismatch`:
+
+```sh
+.venv/bin/python scripts/reproduce-pr10-history-handoff.py \
+  --source-revision 9b9c7d5a52a11aab86a53a2385b629693e1ba9aa
+```
+
+That command reads the exact old handoff module from local git without editing
+the checkout. Without `--source-revision`, the repaired composition succeeds
+and persists the verifier's exact live-head state at sequence 3.
+
+### Repairs and stable outcomes
+
+- **PR13-SOL-002:** final persistence now contains `BaseException` after
+  capturing effect certainty. Confirmed results retain
+  `submission_confirmed_audit_failed`, definite rejection retains
+  `submission_failed`, and unknown outcomes retain `submission_ambiguous`;
+  each persistence fault reports `audit_persistence_failed`. All regression
+  cases execute real `main()`, assert sanitized JSON, one submission, closed
+  descriptors, and a blocked retry. Nested cleanup and acquisition unwinding
+  attempt every owned directory/temp descriptor even when another close or
+  unlink fails. The older confirmed-crash test now asserts the truthful
+  confirmed result while preserving all of its replay-barrier assertions.
+- **PR13-SOL-003:** `BittensorChain` owns the cold SDK `Client` before connect;
+  a narrow backend adapter for pinned 11.1.0 independently owns each raw
+  interface before primary or lazy archive initialization. SDK files are not
+  modified. Quorum ownership is independent of successful-open state and its
+  canceled initialization tasks are drained before child cleanup. The Unix
+  signer publishes its connected writer before peer/inode validation.
+  Cleanup tasks remain owned and drained across repeated cancellation.
+- **PR13-SOL-004:** the locked handoff optionally takes the live manifest,
+  signatures, and finalized height as an all-or-none group. It authenticates
+  history, verifies the head live, compare-binds the exact next-state digest,
+  and only then atomically persists it. Catch-up, direct-head, and reprobe
+  compositions succeed; invalid signatures, expired head, incomplete input,
+  or wrong expected state do not write. Existing history-only callers remain
+  supported. The runbook uses the complete live-head handoff.
+- **PR13-SOL-005:** independently retained reports are canonically reparsed
+  and revalidated before their digests participate in equality checks.
+  Mutated/stale-digest content rejects as `decision_probe_records_invalid`.
+
+### Final validation
+
+- `scripts/reproduce-pr10-terminal-review.sh`: **182 passed**, three consecutive
+  runs (9.32, 9.67, 9.55 seconds).
+- Complete Python suite: **971 passed**, 174.88 seconds. An initial full run
+  exposed the older confirmed-crash expectation and an incorrect new test
+  assumption that an expired assignment lease must invalidate the entire
+  manifest state. The former was updated to the required effect semantics;
+  the latter tests expired-head freshness instead. No validity rule was relaxed.
+- The real SDK lifecycle file has 20 passing cases, including cancellation
+  during websocket handshake and every metadata RPC await, malformed metadata,
+  lazy archive acquisition, both transport-close failure orders, quorum cleanup,
+  and real Unix peer EOF with repeated cancellation.
+- Ruff check/format and strict mypy pass (35 source files); `pip check` passes.
+- Go vet, uncached `go test -race -count=1 ./...`, gofmt, and module verification
+  pass. Both contract generators run twice; all 194 tracked contract files
+  remain byte-identical. Dependency/schema versions are unchanged.
+- Release/SBOM, public-boundary, staged secret, attribution, and diff checks pass.
+
+### Remaining operational limits
+
+All network tests use localhost, with real pinned SDK/websocket/Unix transport
+lifecycle. Successful primary/archive setup in archive/close-order tests stubs
+codec warming and display-token metadata only; malformed metadata and canceled
+RPC initialization use the real SDK path. This is not a live chain submission,
+production-service validation, external SIGINT/SIGKILL test, or proof of
+power-loss durability. A close operation that never returns can still delay
+shutdown; no owned cleanup task is abandoned. A refused unlink can leave an
+owner-only recoverable temporary artifact, and ambiguous descriptor closes are
+not retried against potentially reused descriptor numbers.
+
+No push, merge, PR metadata change, private snapshot/vendor change, or live
+infrastructure effect was performed. Independent exact-SHA review and any
+publication/merge remain the controller's next gates.

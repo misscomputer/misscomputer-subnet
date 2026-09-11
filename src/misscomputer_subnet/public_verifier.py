@@ -21,6 +21,8 @@ from .assignment_probe import (
     ValidatorProbeReport,
     assignment_manifest_chain_state_bytes,
     parse_assignment_manifest_chain_state,
+    parse_validator_probe_report,
+    validator_probe_report_bytes,
     verify_active_assignment_manifest,
     verify_miner_probe_attestation,
 )
@@ -153,7 +155,16 @@ def _verify_decision_probe_evidence(
 ) -> None:
     """Bind retained reports, reauthenticate credits, and reject probe replay."""
 
-    retained_digests = [item.report_digest_sha256 for item in retained_probe_reports]
+    # Frozen Pydantic models still contain mutable observations. A caller's
+    # cached digest alone is not evidence of the retained archive's contents.
+    try:
+        retained = tuple(
+            parse_validator_probe_report(validator_probe_report_bytes(item))
+            for item in retained_probe_reports
+        )
+    except (AttributeError, TypeError, ValueError, RecursionError):
+        _reject("decision_probe_records_invalid")
+    retained_digests = [item.report_digest_sha256 for item in retained]
     sealed_digests = [
         report.report_digest_sha256
         for evidence in decision.assignment_manifest_evidence

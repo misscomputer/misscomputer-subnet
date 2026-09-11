@@ -30,13 +30,27 @@ import misscomputer_subnet.weight_signer_protocol as signer
 
 
 @pytest.mark.parametrize("outcome", ["lost", "timeout", "missing", "confirmed", "rejected"])
-@pytest.mark.parametrize("fault", ["replace", "unlink", "directory_fsync", "temp_close", "clock"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "replace",
+        "unlink",
+        "directory_fsync",
+        "temp_close",
+        "clock",
+        "write",
+        "file_fsync",
+        "verify",
+    ],
+)
+@pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
 def test_cli_post_send_persistence_failure_keeps_certainty_and_closes_fd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     outcome: str,
     fault: str,
+    fault_type: type[BaseException],
 ) -> None:
     plan, path = persist_plan(tmp_path)
     audit = tmp_path / "audit.json"
@@ -49,6 +63,8 @@ def test_cli_post_send_persistence_failure_keeps_certainty_and_closes_fd(
         os.fsync,
         os.close,
     )
+    real_write = os.write
+    real_verify = executor._verify_configured_target
 
     class Submitter(FakeSubmitter):
         async def submit(self, vector: executor.ExecutionVector) -> executor.SubmissionResult:
@@ -73,29 +89,41 @@ def test_cli_post_send_persistence_failure_keeps_certainty_and_closes_fd(
 
     def replace(*args: Any, **kwargs: Any) -> None:
         if submitted and fault in {"replace", "unlink"}:
-            raise OSError("private-replace-sentinel")
+            raise fault_type("private-replace-sentinel")
         real_replace(*args, **kwargs)
 
     def unlink(*args: Any, **kwargs: Any) -> None:
         if submitted and fault == "unlink":
-            raise OSError("private-unlink-sentinel")
+            raise fault_type("private-unlink-sentinel")
         real_unlink(*args, **kwargs)
 
     def fsync(descriptor: int) -> None:
         if submitted and fault == "directory_fsync" and descriptor not in descriptors:
             # A prepared temp has been returned only once the file fsync succeeded.
             if descriptors:
-                raise OSError("private-fsync-sentinel")
+                raise fault_type("private-fsync-sentinel")
+        if submitted and fault == "file_fsync":
+            raise fault_type("private-file-fsync-sentinel")
         real_fsync(descriptor)
 
     def close(descriptor: int) -> None:
         real_close(descriptor)
         if submitted and fault == "temp_close" and descriptor in descriptors:
-            raise OSError("private-close-sentinel")
+            raise fault_type("private-close-sentinel")
+
+    def write(descriptor: int, data: Any) -> int:
+        if submitted and fault == "write":
+            raise fault_type("private-write-sentinel")
+        return real_write(descriptor, data)
+
+    def verify(*args: Any, **kwargs: Any) -> None:
+        if submitted and fault == "verify":
+            raise fault_type("private-verify-sentinel")
+        real_verify(*args, **kwargs)
 
     def clock() -> str:
         if submitted and fault == "clock":
-            raise OSError("private-clock-sentinel")
+            raise fault_type("private-clock-sentinel")
         return "2026-09-11T18:00:00.000000Z"
 
     argv = [
@@ -130,6 +158,8 @@ def test_cli_post_send_persistence_failure_keeps_certainty_and_closes_fd(
         patch.setattr(os, "unlink", unlink)
         patch.setattr(os, "fsync", fsync)
         patch.setattr(os, "close", close)
+        patch.setattr(os, "write", write)
+        patch.setattr(executor, "_verify_configured_target", verify)
         patch.setattr(executor, "_utc_now", clock)
         patch.setattr(executor.sys, "argv", argv)
         patch.setattr(

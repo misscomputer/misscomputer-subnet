@@ -913,7 +913,7 @@ async def test_crash_after_sdk_success_before_receipt_persistence_blocks_retry(
 
     monkeypatch.setattr(AuditStateStore, "finish_attempt", crash_on_confirm)
     submitter = FakeSubmitter(result=SubmissionResult(True, "103-2"))
-    with pytest.raises(SimulatedCrash):
+    with pytest.raises(WeightExecutionError) as persistence_error:
         await run_weight_executor(
             execute_config(plan, path, audit),
             chain=SequenceChain(metagraph(block=102), metagraph(block=103)),
@@ -921,6 +921,12 @@ async def test_crash_after_sdk_success_before_receipt_persistence_blocks_retry(
             environ=acknowledged(),
             clock=lambda: FIXED_TIME,
         )
+    assert persistence_error.value.redacted_document() == {
+        "error_code": "submission_confirmed_audit_failed",
+        "status": "confirmed",
+        "audit_error_code": "audit_persistence_failed",
+        "extrinsic_ref": "103-2",
+    }
     attempt = parse_audit_state(audit.read_bytes()).attempts[0]
     assert attempt.status == "in_progress"
     assert attempt.submission_started is True

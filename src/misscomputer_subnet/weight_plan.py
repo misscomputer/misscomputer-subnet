@@ -716,9 +716,12 @@ def _pin_directory_chain(absolute_parent: str) -> _PinnedDirectoryChain:
             descriptors=descriptors,
             identities=tuple(identities),
         )
-    except Exception:
+    except BaseException as primary:
         for descriptor in reversed(descriptors):
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except BaseException:
+                primary.add_note("directory_cleanup_failed")
         raise
 
 
@@ -974,9 +977,11 @@ def _verify_configured_target(
     except OSError as exc:
         raise WeightPlanTargetError("configured weight plan target is unavailable") from exc
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        reopened.close()
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            reopened.close()
 
 
 def _exact_object(
@@ -1171,17 +1176,8 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         )
         return True
     finally:
-        if temporary is not None and temporary.name is not None:
-            try:
-                named = os.stat(
-                    temporary.name,
-                    dir_fd=chain.parent_fd,
-                    follow_symlinks=False,
-                )
-                if (named.st_dev, named.st_ino) == temporary.identity:
-                    os.unlink(temporary.name, dir_fd=chain.parent_fd)
-            except FileNotFoundError:
-                pass
-        if temporary is not None:
-            os.close(temporary.descriptor)
-        chain.close()
+        try:
+            if temporary is not None:
+                _cleanup_temporary_plan(temporary, chain.parent_fd)
+        finally:
+            chain.close()

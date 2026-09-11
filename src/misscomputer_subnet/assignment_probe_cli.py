@@ -815,12 +815,19 @@ def persist_assignment_manifest_catch_up(
     evaluation_epoch: int,
     expected_anchor_sha256: str,
     expected_next_state_sha256: str,
+    head_manifest: ActiveAssignmentManifest | None = None,
+    head_signatures: Sequence[AssignmentManifestSignatureEnvelope] | None = None,
+    current_finalized_height: int | None = None,
 ) -> AssignmentManifestChainState:
     """Authenticate and atomically persist SDK catch-up under the probe CLI lock.
 
     ``expected_anchor_sha256`` is the independently retained durable state
     anchor read by the SDK. ``expected_next_state_sha256`` compare-binds this
     independently replayed history to the SDK result before installation.
+    For a public-verifier result, supply all three live-head arguments: the
+    history excludes that head, which must be verified live under this lock
+    before comparing its exact next-state digest. Omitting all three retains
+    the history-only handoff for callers that have not yet verified a head.
     Holding the same lock as :func:`execute_assignment_probe` makes concurrent
     catch-up/probe attempts fail busy rather than overwrite each other.
     """
@@ -842,6 +849,24 @@ def persist_assignment_manifest_catch_up(
                 policy,
                 evaluation_epoch=evaluation_epoch,
             )
+            if any(
+                item is not None
+                for item in (head_manifest, head_signatures, current_finalized_height)
+            ):
+                if (
+                    head_manifest is None
+                    or head_signatures is None
+                    or current_finalized_height is None
+                ):
+                    _fail("catch_up_invalid")
+                caught_up = verify_active_assignment_manifest(
+                    head_manifest,
+                    tuple(head_signatures),
+                    policy,
+                    caught_up,
+                    evaluation_epoch=evaluation_epoch,
+                    current_finalized_height=current_finalized_height,
+                ).next_chain_state
         except (TypeError, ValueError, ValidationError, RecursionError) as exc:
             raise AssignmentProbeCLIError("catch_up_invalid") from exc
         if caught_up.state_digest_sha256 != expected_next_state_sha256:

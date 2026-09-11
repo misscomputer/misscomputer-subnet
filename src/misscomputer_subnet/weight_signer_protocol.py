@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from .async_lifecycle import drain_cleanup
 from .weight_executor import (
     ExecutionVector,
     ExecutionWeight,
@@ -409,6 +410,8 @@ class UnixWeightSignerClient:
                     ) from exc
                 await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0.0)))
                 continue
+            self._reader = reader
+            self._writer = writer
             try:
                 raw_socket = writer.get_extra_info("socket")
                 if raw_socket is None or unix_peer_uid(raw_socket) != self.signer_uid:
@@ -420,21 +423,26 @@ class UnixWeightSignerClient:
                     raise SignerProtocolError(
                         "signer_socket_unsafe", "signer socket changed during connection"
                     )
-            except Exception:
-                writer.close()
-                await writer.wait_closed()
+            except BaseException as primary:
+                try:
+                    await self.close()
+                except BaseException:
+                    primary.add_note("signer_initialization_cleanup_failed")
                 raise
-            self._reader = reader
-            self._writer = writer
             return
 
     async def close(self) -> None:
+        await drain_cleanup(self._close_writer(), name="weight-signer-cleanup")
+
+    async def _close_writer(self) -> None:
         writer = self._writer
         self._reader = None
         self._writer = None
         if writer is not None:
-            writer.close()
-            await writer.wait_closed()
+            try:
+                writer.close()
+            finally:
+                await writer.wait_closed()
 
     async def submit(self, vector: ExecutionVector) -> SubmissionResult:
         reader = self._reader

@@ -91,7 +91,9 @@ result = verify_public_relay_path(
 # result.weight_plan is prepared data, never a submission.
 ```
 
-The retained report tuple is mandatory: its canonical report digests must equal
+The retained report tuple is mandatory: every report is canonically reparsed
+and revalidated before its digest is trusted (`decision_probe_records_invalid`
+on malformed or stale-digest content). Its canonical report digests must equal
 the complete sealed decision evidence exactly. The verifier then rechecks every
 credited miner attestation signature and its deployment, replica, endpoint,
 challenge, body, and probe-nonce binding. It rejects reuse of a probe nonce or
@@ -113,6 +115,9 @@ persisted = persist_assignment_manifest_catch_up(
     state_root=state_root,
     trust_policy=assignment_policy,
     history=history_entries,
+    head_manifest=head_manifest,
+    head_signatures=head_signatures,
+    current_finalized_height=metagraph.block,
     evaluation_epoch=trusted_epoch,
     expected_anchor_sha256=durable_state.state_digest_sha256,
     expected_next_state_sha256=result.manifest_verification.next_chain_state.state_digest_sha256,
@@ -120,9 +125,15 @@ persisted = persist_assignment_manifest_catch_up(
 assert persisted.state_digest_sha256 == result.manifest_verification.next_chain_state.state_digest_sha256
 ```
 
+This persists the **live-head** state, not just the state after historical
+replay. Supply all three live-head arguments for this composition, including
+direct-head and reprobe cases with empty history. History-only SDK callers may
+omit all three and compare against their history-only replay result instead.
+
 Only then run `misscomputer-assignment-probe` for the head with
 `--trusted-state-anchor` equal to the persisted digest. The handoff replays and
-authenticates every history object again while holding `probe.lock`, compares
+authenticates every history object and verifies the head's signatures,
+freshness, and finalized-height leases again while holding `probe.lock`, compares
 the durable starting anchor and expected SDK result, atomically replaces
 `state.json`, fsyncs file and directory, safely recovers a regular owner-only
 `.state.install` left before rename, and makes concurrent probe/catch-up runs
