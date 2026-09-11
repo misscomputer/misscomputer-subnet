@@ -11,6 +11,7 @@ another transport. No SDK files are patched and no write/signing API is added.
 from __future__ import annotations
 
 from contextlib import suppress
+from typing import Any
 
 from bittensor._substrate import RpcSubstrate
 from bittensor._transport.interface import SubstrateConnection
@@ -65,40 +66,95 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             raise
 
     async def _close_owned(self) -> None:
-        owned, self._owned_interfaces = self._owned_interfaces, []
+        # RpcSession.close() clears its websocket slot after suppressing an
+        # ordinary websocket.close() failure. Capture every lower ownership
+        # layer before asking the SDK to close or clearing our published slots.
+        retirements = [self._capture_retirement(raw) for raw in self._owned_interfaces]
+        self._owned_interfaces = []
         self._substrate = None
         self._archive_substrate = None
         primary: BaseException | None = None
-        for raw in reversed(owned):
+        for raw, session, websocket, transport, supervisor in reversed(retirements):
+            failure: BaseException | None = None
             try:
                 await raw.close()
             except BaseException as exc:
-                # RpcSession.close() awaits its supervisor before closing the
-                # websocket. Malformed inbound RPC data can kill that task
-                # with an unexpected exception, which close() re-raises at
-                # that await and therefore never performs socket shutdown.
-                # Retire the pinned SDK session directly before forgetting
-                # this application-owned interface.
-                await self._retire_failed_session(raw, exc)
+                failure = exc
+            try:
+                await self._retire_session(session, websocket, transport, supervisor)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+                else:
+                    failure.add_note("rpc_transport_fallback_cleanup_failed")
+            if failure is not None:
                 if primary is None:
-                    primary = exc
+                    primary = failure
+                else:
+                    primary.add_note("rpc_additional_transport_cleanup_failed")
         if primary is not None:
             raise primary
 
     @staticmethod
-    async def _retire_failed_session(raw: SubstrateConnection, primary: BaseException) -> None:
+    def _capture_retirement(raw: SubstrateConnection) -> tuple[Any, ...]:
         session = raw._session
-        supervisor = session._supervisor
+        websocket = session._ws
+        return raw, session, websocket, getattr(websocket, "transport", None), session._supervisor
+
+    @staticmethod
+    async def _retire_session(
+        session: Any,
+        websocket: Any,
+        transport: Any,
+        supervisor: Any,
+    ) -> None:
+        """Drain the captured SDK layers without trusting mutable SDK slots."""
+
+        primary: BaseException | None = None
+
+        def failed(exc: BaseException) -> None:
+            nonlocal primary
+            if primary is None:
+                primary = exc
+            else:
+                primary.add_note("rpc_transport_fallback_cleanup_failed")
+
         session._closing = True
         if supervisor is not None:
-            supervisor.cancel()
+            with suppress(BaseException):
+                supervisor.cancel()
             with suppress(BaseException):
                 await supervisor
+        if websocket is not None:
+            try:
+                await websocket.close()
+            except BaseException as exc:
+                failed(exc)
+        abort = getattr(transport, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except BaseException as exc:
+                failed(exc)
+        wait_closed = getattr(websocket, "wait_closed", None)
+        if callable(wait_closed):
+            try:
+                await wait_closed()
+            except BaseException as exc:
+                failed(exc)
+        if session._supervisor is supervisor:
             session._supervisor = None
+        if session._ws is websocket:
+            session._ws = None
         try:
+            # Finish the SDK's pending-request and subscription shutdown after
+            # lower-layer retirement, including when its first close stopped
+            # before those logical resources were drained.
             await session.close()
-        except BaseException:
-            primary.add_note("rpc_transport_fallback_cleanup_failed")
+        except BaseException as exc:
+            failed(exc)
+        if primary is not None:
+            raise primary
 
     async def close(self) -> None:
         await drain_cleanup(self._close_owned(), name="bittensor-transport-cleanup")
