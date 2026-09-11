@@ -280,6 +280,113 @@ async def test_real_sdk_close_failure_still_attempts_both_transports(
         assert not leaked, "one failed SDK close prevented another transport cleanup"
 
 
+async def test_real_sdk_close_failure_before_shutdown_still_retires_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    malformed_sent = asyncio.Event()
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.recv()
+        # A JSON scalar reaches the pinned SDK supervisor's mapping dispatch
+        # and terminates it before the caller waiting on metadata can unwind.
+        await websocket.send("7")
+        malformed_sent.set()
+        await websocket.wait_closed()
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    async with serve(handle, "127.0.0.1", 0) as server:
+        endpoint = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+        opening = asyncio.create_task(chain.open())
+        await asyncio.wait_for(malformed_sent.wait(), 2)
+        supervisor = connections[0]._session._supervisor
+        assert supervisor is not None
+        with pytest.raises(TypeError):
+            await asyncio.wait_for(asyncio.shield(supervisor), 2)
+
+        with pytest.raises(TypeError):
+            await chain.close()
+
+        if not opening.done():
+            opening.cancel()
+        with pytest.raises(bittensor.result.RpcConnectionError):
+            await opening
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        leaked = [raw for raw in connections if raw._session._ws is not None]
+        live_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "rpc-session" and not task.done()
+        ]
+        # Cleanup test-owned leaked SDK transports after recording the
+        # failing-old evidence. The production close has already forgotten it.
+        for raw in connections:
+            raw._session._supervisor = None
+            await raw.close()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert connections
+        assert not leaked, "failed SDK supervisor prevented websocket shutdown"
+        assert not live_tasks, "failed SDK supervisor survived chain.close"
+
+
+async def test_close_raising_before_sdk_shutdown_has_fallback_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def close_before_shutdown(raw: SubstrateConnection) -> None:
+        assert raw._session._ws is not None
+        raise SimulatedCrash("pre-shutdown-close")
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    async with serve(handle, "127.0.0.1", 0) as server:
+        endpoint = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+        await chain.open()
+        monkeypatch.setattr(SubstrateConnection, "close", close_before_shutdown)
+        with pytest.raises(SimulatedCrash, match="pre-shutdown-close"):
+            await chain.close()
+        await chain.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert connections
+        assert all(raw._session._ws is None for raw in connections)
+        assert all(
+            raw._session._supervisor is None or raw._session._supervisor.done()
+            for raw in connections
+        )
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+
+
 @pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
 @pytest.mark.parametrize("repeated_cancel", [False, True])
 async def test_unix_connect_baseexception_retires_real_writer(
