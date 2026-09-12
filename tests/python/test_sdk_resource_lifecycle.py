@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ from bittensor._transport.interface import SubstrateConnection
 from bittensor._transport.runtime import RuntimeManager
 from test_chain_quorum import FakeFinalizedChain
 from test_weight_executor import SimulatedCrash
+from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.server import serve
 
 import misscomputer_subnet.weight_signer_protocol as signer
@@ -385,6 +388,505 @@ async def test_close_raising_before_sdk_shutdown_has_fallback_and_is_idempotent(
         )
         for websocket in server_connections:
             await asyncio.wait_for(websocket.wait_closed(), 2)
+
+
+@pytest.mark.parametrize("topology", ["primary", "archive", "quorum"])
+@pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
+async def test_sdk_close_fault_cannot_discard_a_live_websocket(
+    monkeypatch: pytest.MonkeyPatch,
+    topology: str,
+    fault_type: type[BaseException],
+) -> None:
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    async def close_before_shutdown(websocket: ClientConnection, *args: Any, **kwargs: Any) -> None:
+        assert not websocket.transport.is_closing()
+        raise fault_type("sdk-websocket-close-failed")
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    endpoint_count = 2 if topology in {"archive", "quorum"} else 1
+    async with AsyncExitStack() as stack:
+        servers = [
+            await stack.enter_async_context(serve(handle, "127.0.0.1", 0))
+            for _ in range(endpoint_count)
+        ]
+        endpoints = [f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}" for server in servers]
+        if topology == "quorum":
+            owner: BittensorChain | FinalizedRpcQuorum = FinalizedRpcQuorum(
+                tuple(
+                    BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+                    for endpoint in endpoints
+                )
+            )
+            await owner.open()
+        else:
+            owner = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoints[0])
+            await owner.open()
+            if topology == "archive":
+                substrate = owner._BittensorChain__client._substrate
+                substrate.archive_endpoints = [endpoints[1]]
+                await substrate._archive()
+
+        expected_connections = 2 if topology in {"archive", "quorum"} else 1
+        assert len(connections) == expected_connections
+        websockets = [raw._session._ws for raw in connections]
+        assert all(isinstance(websocket, ClientConnection) for websocket in websockets)
+        transports = [websocket.transport for websocket in websockets if websocket is not None]
+        client_sockets = [transport.get_extra_info("socket") for transport in transports]
+        supervisors = [raw._session._supervisor for raw in connections]
+        assert all(sock is not None and sock.fileno() >= 0 for sock in client_sockets)
+        assert all(supervisor is not None and not supervisor.done() for supervisor in supervisors)
+
+        monkeypatch.setattr(ClientConnection, "close", close_before_shutdown)
+        first_close: BaseException | None = None
+        try:
+            await owner.close()
+        except BaseException as exc:
+            first_close = exc
+        if first_close is not None:
+            if topology == "quorum":
+                assert first_close.__class__.__name__ == "RpcAgreementError"
+            else:
+                assert isinstance(first_close, fault_type)
+        elif fault_type is not OSError:
+            pytest.fail("SDK close discarded a BaseException")
+        await owner.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        leaked = [
+            (transport, sock)
+            for transport, sock in zip(transports, client_sockets, strict=True)
+            if not transport.is_closing() or sock.fileno() >= 0
+        ]
+        peer_open = [
+            websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+        ]
+
+        # Keep failing-old evidence leak-free after recording whether application
+        # cleanup retired both the client descriptors and their localhost peers.
+        for transport, _ in leaked:
+            transport.abort()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert not leaked, "SDK close discarded ownership of a live client descriptor"
+        assert not peer_open, "SDK close left the localhost peer open"
+        assert all(supervisor is not None and supervisor.done() for supervisor in supervisors)
+        assert all(raw._session._ws is None for raw in connections)
+
+
+@pytest.mark.parametrize("initialization", ["primary", "archive"])
+async def test_sdk_initialization_cleanup_cannot_discard_a_live_websocket(
+    monkeypatch: pytest.MonkeyPatch,
+    initialization: str,
+) -> None:
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    faulted_clients: list[ClientConnection] = []
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def fail_codec(*args: Any, **kwargs: Any) -> None:
+        raise OSError("post-connect-initialization-failed")
+
+    async def close_before_shutdown(websocket: ClientConnection, *args: Any, **kwargs: Any) -> None:
+        if not any(candidate is websocket for candidate in faulted_clients):
+            faulted_clients.append(websocket)
+        raise OSError("sdk-initialization-close-failed")
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    endpoint_count = 2 if initialization == "archive" else 1
+    async with AsyncExitStack() as stack:
+        servers = [
+            await stack.enter_async_context(serve(handle, "127.0.0.1", 0))
+            for _ in range(endpoint_count)
+        ]
+        endpoints = [f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}" for server in servers]
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoints[0])
+        if initialization == "archive":
+            monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+            await chain.open()
+            substrate = chain._BittensorChain__client._substrate
+            substrate.archive_endpoints = [endpoints[1]]
+        monkeypatch.setattr(RuntimeManager, "codec_at", fail_codec)
+        monkeypatch.setattr(ClientConnection, "close", close_before_shutdown)
+
+        with pytest.raises(bittensor.result.RpcConnectionError):
+            if initialization == "primary":
+                await chain.open()
+            else:
+                await substrate._archive()
+        await chain.close()
+        await chain.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        transports = [websocket.transport for websocket in faulted_clients]
+        client_sockets = [transport.get_extra_info("socket") for transport in transports]
+        leaked = [
+            (transport, sock)
+            for transport, sock in zip(transports, client_sockets, strict=True)
+            if not transport.is_closing() or sock is None or sock.fileno() >= 0
+        ]
+        peer_open = [
+            websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+        ]
+
+        for transport, _ in leaked:
+            transport.abort()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert len(connections) == endpoint_count
+        assert len(faulted_clients) == endpoint_count
+        assert not leaked, "SDK initialization cleanup discarded a live client descriptor"
+        assert not peer_open, "SDK initialization cleanup left the localhost peer open"
+
+
+@pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
+async def test_close_quiesces_supervisors_before_another_transport_can_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    fault_type: type[BaseException],
+) -> None:
+    connections: list[SubstrateConnection] = []
+    client_websockets: dict[str, list[ClientConnection]] = {}
+    server_connections: list[Any] = []
+    primary_server_connections: list[Any] = []
+    primary_drop = asyncio.Event()
+    primary_reconnected = asyncio.Event()
+    archive_close_started = asyncio.Event()
+    release_archive_close = asyncio.Event()
+    real_interface = RpcSubstrate._interface
+    real_close = ClientConnection.close
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        connect = raw._session._connect
+
+        async def capture(endpoint: str) -> Any:
+            websocket = await connect(endpoint)
+            client_websockets.setdefault(endpoint, []).append(websocket)
+            return websocket
+
+        raw._session._connect = capture
+        return raw
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def primary_handler(websocket: Any) -> None:
+        server_connections.append(websocket)
+        primary_server_connections.append(websocket)
+        if len(primary_server_connections) == 1:
+            await primary_drop.wait()
+            websocket.transport.abort()
+        else:
+            primary_reconnected.set()
+        await websocket.wait_closed()
+
+    async def archive_handler(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    async with (
+        serve(primary_handler, "127.0.0.1", 0) as primary,
+        serve(archive_handler, "127.0.0.1", 0) as archive,
+    ):
+        primary_endpoint = f"ws://127.0.0.1:{primary.sockets[0].getsockname()[1]}"
+        archive_endpoint = f"ws://127.0.0.1:{archive.sockets[0].getsockname()[1]}"
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=primary_endpoint)
+        await chain.open()
+        substrate = chain._BittensorChain__client._substrate
+        substrate.archive_endpoints = [archive_endpoint]
+        await substrate._archive()
+        primary_supervisor = connections[0]._session._supervisor
+        assert primary_supervisor is not None
+        primary_first = client_websockets[primary_endpoint][0]
+        archive_first = client_websockets[archive_endpoint][0]
+
+        async def close_with_race(websocket: ClientConnection, *args: Any, **kwargs: Any) -> None:
+            if websocket is archive_first:
+                archive_close_started.set()
+                await release_archive_close.wait()
+            if websocket is not primary_first and any(
+                websocket is candidate
+                for candidate in client_websockets.get(primary_endpoint, [])[1:]
+            ):
+                raise fault_type("replacement-websocket-close-failed")
+            await real_close(websocket, *args, **kwargs)
+
+        monkeypatch.setattr(ClientConnection, "close", close_with_race)
+        closing = asyncio.create_task(chain.close())
+        await asyncio.wait_for(archive_close_started.wait(), 2)
+        primary_drop.set()
+        reconnect_waiter = asyncio.create_task(primary_reconnected.wait())
+        done, _ = await asyncio.wait(
+            {reconnect_waiter, primary_supervisor},
+            timeout=2,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert done, "primary supervisor neither stopped nor reconnected"
+        replacement_was_published = primary_reconnected.is_set()
+        reconnect_waiter.cancel()
+        await asyncio.gather(reconnect_waiter, return_exceptions=True)
+        release_archive_close.set()
+        close_failure: BaseException | None = None
+        try:
+            await asyncio.wait_for(closing, 2)
+        except BaseException as exc:
+            close_failure = exc
+        if close_failure is not None and fault_type is not OSError:
+            assert isinstance(close_failure, fault_type)
+        await chain.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        primary_clients = client_websockets[primary_endpoint]
+        transports = [websocket.transport for websocket in primary_clients]
+        client_sockets = [transport.get_extra_info("socket") for transport in transports]
+        leaked = [
+            (transport, sock)
+            for transport, sock in zip(transports, client_sockets, strict=True)
+            if not transport.is_closing() or sock is None or sock.fileno() >= 0
+        ]
+        peer_open = [
+            websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+        ]
+
+        for transport, _ in leaked:
+            transport.abort()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert not leaked, "a replacement websocket escaped the all-transports snapshot"
+        assert not peer_open, "a replacement websocket left its localhost peer open"
+        assert not replacement_was_published, "the primary supervisor mutated ownership"
+        assert len(primary_clients) == 1
+        assert primary_supervisor.done()
+
+
+@pytest.mark.parametrize("topology", ["primary", "archive", "quorum"])
+async def test_close_rejects_read_reconnect_after_ownership_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    topology: str,
+) -> None:
+    """An already-running read cannot publish a connection after close returns."""
+
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    read_started: list[asyncio.Event] = []
+    release_reads = asyncio.Event()
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        async for rendered in websocket:
+            request = json.loads(rendered)
+            await websocket.send(
+                json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": None})
+            )
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    endpoint_count = 2 if topology in {"archive", "quorum"} else 1
+    async with AsyncExitStack() as stack:
+        servers = [
+            await stack.enter_async_context(serve(handle, "127.0.0.1", 0))
+            for _ in range(endpoint_count)
+        ]
+        endpoints = [f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}" for server in servers]
+        if topology == "quorum":
+            owner: BittensorChain | FinalizedRpcQuorum = FinalizedRpcQuorum(
+                tuple(
+                    BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+                    for endpoint in endpoints
+                )
+            )
+            await owner.open()
+            targets = connections
+        else:
+            owner = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoints[0])
+            await owner.open()
+            substrate = owner._BittensorChain__client._substrate
+            if topology == "archive":
+                substrate.archive_endpoints = [endpoints[1]]
+                archive = await substrate._archive()
+                assert archive is not None
+                targets = [archive]
+            else:
+                targets = [substrate.raw]
+
+        # Leave each descriptor owned by the application wrapper but make the
+        # next read take RpcSession's lazy reconnect path. The read tasks enter
+        # connect() before application shutdown takes its immutable snapshot.
+        for raw in targets:
+            await raw._session.close()
+            started = asyncio.Event()
+            read_started.append(started)
+            real_connect = raw._session.connect
+
+            async def delayed_connect(
+                *, entered: asyncio.Event = started, connect: Any = real_connect
+            ) -> None:
+                entered.set()
+                await release_reads.wait()
+                await connect()
+
+            raw._session.connect = delayed_connect
+
+        reads = [
+            asyncio.create_task(raw._session.request("review-shutdown-race")) for raw in targets
+        ]
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in read_started)), 2)
+        await owner.close()
+        release_reads.set()
+        await asyncio.wait_for(asyncio.gather(*reads, return_exceptions=True), 2)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        escaped = [raw for raw in targets if raw._session._ws is not None]
+        live_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "rpc-session" and not task.done()
+        ]
+        peer_open = [
+            websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+        ]
+
+        # Reclaim test-owned resources after recording whether close reached a
+        # fixed point, including on the intentionally failing old revision.
+        for raw in targets:
+            await raw._session.close()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert not escaped, "an underway read published a connection after ownership retirement"
+        assert not live_tasks, "an underway read published a supervisor after close returned"
+        assert not peer_open, "an underway read left its localhost peer open"
+
+
+@pytest.mark.parametrize("buffered_shutdown", [False, True])
+async def test_reconnect_retains_closing_socket_until_descriptor_is_retired(
+    monkeypatch: pytest.MonkeyPatch,
+    buffered_shutdown: bool,
+) -> None:
+    server_connections: list[Any] = []
+    replacement_connected = asyncio.Event()
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        if len(server_connections) == 1:
+            await websocket.recv()
+            if buffered_shutdown:
+                websocket.transport.pause_reading()
+            await websocket.send('{"jsonrpc":"2.0","id":999999,"result":null}')
+        else:
+            replacement_connected.set()
+        await websocket.wait_closed()
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    async with serve(handle, "127.0.0.1", 0) as server:
+        endpoint = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        chain = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+        await chain.open()
+        substrate = chain._BittensorChain__client._substrate
+        owned = substrate._owned_interfaces[0]
+        session = owned.session
+        first_client = session._ws
+        first_transport = first_client.transport
+        first_socket = first_transport.get_extra_info("socket")
+        real_close = ClientConnection.close
+
+        session._response_timeout = 0.02
+        pending = asyncio.create_task(session.request("review-unanswered-rpc"))
+
+        async def close_fault(websocket: ClientConnection, *args: Any, **kwargs: Any) -> None:
+            if websocket is first_client:
+                if buffered_shutdown and not websocket.transport.is_closing():
+                    first_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                    websocket.transport.write(b"x" * (2 * 1024 * 1024))
+                    assert websocket.transport.get_write_buffer_size() > 0
+                    websocket.transport.close()
+                raise OSError("old-websocket-close-failed")
+            await real_close(websocket, *args, **kwargs)
+
+        monkeypatch.setattr(ClientConnection, "close", close_fault)
+        await asyncio.wait_for(replacement_connected.wait(), 2)
+        for _ in range(30):
+            if session._ws is not None and session._ws is not first_client:
+                break
+            await asyncio.sleep(0)
+        assert session._ws is not None and session._ws is not first_client
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        session._response_timeout = 60
+        first_was_retained = any(websocket is first_client for websocket, _ in owned.websockets)
+        assert first_socket.fileno() >= 0, "test requires a live stale socket"
+        assert first_transport.is_closing() is buffered_shutdown
+
+        close_failure: OSError | None = None
+        try:
+            await chain.close()
+        except OSError as exc:
+            close_failure = exc
+        await chain.close()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        leaked_fd = first_socket.fileno()
+
+        # Reclaim an adversarial test-owned socket after measuring application cleanup.
+        first_transport.abort()
+        for websocket in server_connections:
+            websocket.transport.abort()
+        await asyncio.gather(*(websocket.wait_closed() for websocket in server_connections))
+        assert leaked_fd == -1, "old live descriptor survived repeated chain.close"
+        assert (close_failure is not None) is first_was_retained
+        assert first_was_retained, "live closing transport was pruned before replacement dial"
 
 
 @pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash, asyncio.CancelledError])
