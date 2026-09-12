@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from typing import Any
 
@@ -201,6 +202,150 @@ async def test_quorum_sanitizes_endpoint_failure_and_closes_opened_set() -> None
     assert error.value.code == "rpc_open_failed"
     assert sensitive_value not in str(error.value)
     assert sensitive_value not in str(alerts[0].document())
+    assert first.close_count == second.close_count == 1
+
+
+class QuorumLifecycleCrash(BaseException):
+    pass
+
+
+async def test_quorum_open_baseexception_closes_every_admitted_child() -> None:
+    first = FakeFinalizedChain()
+    second = FakeFinalizedChain(open_error=QuorumLifecycleCrash("unpublished-open-crash"))
+    quorum = FinalizedRpcQuorum((first, second))
+
+    with pytest.raises(RpcAgreementError) as error:
+        await quorum.open()
+
+    assert error.value.code == "rpc_open_failed"
+    assert first.close_count == second.close_count == 1
+    assert not quorum._opened
+    assert not quorum._owns_chains
+
+
+async def test_quorum_concurrent_close_joins_cancellation_resistant_open_once() -> None:
+    started = [asyncio.Event(), asyncio.Event()]
+    release = asyncio.Event()
+
+    class Chain(FakeFinalizedChain):
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
+            self.cancel_count = 0
+
+        async def open(self) -> None:
+            self.open_count += 1
+            started[self.index].set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    self.cancel_count += 1
+
+    chains = (Chain(0), Chain(1))
+    quorum = FinalizedRpcQuorum(chains)
+    opening = asyncio.create_task(quorum.open())
+    await asyncio.gather(*(event.wait() for event in started))
+    closings = [asyncio.create_task(quorum.close()) for _ in range(3)]
+    await asyncio.sleep(0)
+    for _ in range(3):
+        closings[0].cancel()
+        await asyncio.sleep(0)
+    assert not any(closing.done() for closing in closings)
+
+    release.set()
+    results = await asyncio.wait_for(
+        asyncio.gather(opening, *closings, return_exceptions=True),
+        2,
+    )
+
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert isinstance(results[1], asyncio.CancelledError)
+    assert results[2:] == [None, None]
+    assert [chain.cancel_count for chain in chains] == [1, 1]
+    assert [chain.close_count for chain in chains] == [1, 1]
+    assert not quorum._opened
+    assert not quorum._owns_chains
+    await quorum.close()
+    assert [chain.close_count for chain in chains] == [1, 1]
+
+    await quorum.open()
+    assert quorum._opened
+    await quorum.close()
+    assert [chain.open_count for chain in chains] == [2, 2]
+    assert [chain.close_count for chain in chains] == [2, 2]
+
+
+async def test_external_close_joining_failed_open_waits_for_open_wrapper() -> None:
+    started = [asyncio.Event(), asyncio.Event()]
+    cancelled = [asyncio.Event(), asyncio.Event()]
+    release_open = asyncio.Event()
+    close_started, release_close = asyncio.Event(), asyncio.Event()
+
+    class Chain(FakeFinalizedChain):
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
+
+        async def open(self) -> None:
+            self.open_count += 1
+            started[self.index].set()
+            try:
+                await release_open.wait()
+            except asyncio.CancelledError:
+                cancelled[self.index].set()
+                await release_open.wait()
+
+        async def close(self) -> None:
+            self.close_count += 1
+            close_started.set()
+            await release_close.wait()
+
+    chains = (Chain(0), Chain(1))
+    quorum = FinalizedRpcQuorum(chains)
+    opening = asyncio.create_task(quorum.open())
+    await asyncio.gather(*(event.wait() for event in started))
+    opening.cancel()
+    await asyncio.gather(*(event.wait() for event in cancelled))
+    release_open.set()
+    await asyncio.wait_for(close_started.wait(), 2)
+
+    external_close = asyncio.create_task(quorum.close())
+    release_close.set()
+    await asyncio.wait_for(external_close, 2)
+
+    assert opening.done()
+    result = (await asyncio.gather(opening, return_exceptions=True))[0]
+    assert isinstance(result, asyncio.CancelledError)
+    assert [chain.close_count for chain in chains] == [1, 1]
+    assert not quorum._opened
+    assert not quorum._owns_chains
+
+
+async def test_quorum_close_baseexception_attempts_all_children_and_reaches_fixed_point() -> None:
+    class Chain(FakeFinalizedChain):
+        def __init__(self, close_error: BaseException | None = None) -> None:
+            super().__init__()
+            self.close_error = close_error
+
+        async def close(self) -> None:
+            self.close_count += 1
+            if self.close_error is not None:
+                raise self.close_error
+
+    first = Chain(QuorumLifecycleCrash("first-close-crash"))
+    second = Chain(asyncio.CancelledError("second-close-cancel"))
+    quorum = FinalizedRpcQuorum((first, second))
+    await quorum.open()
+
+    with pytest.raises(RpcAgreementError) as error:
+        await quorum.close()
+
+    assert error.value.code == "rpc_close_failed"
+    assert first.close_count == second.close_count == 1
+    assert not quorum._opened
+    assert not quorum._owns_chains
+    await quorum.close()
     assert first.close_count == second.close_count == 1
 
 
