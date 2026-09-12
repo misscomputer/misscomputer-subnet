@@ -695,6 +695,116 @@ async def test_close_quiesces_supervisors_before_another_transport_can_reconnect
         assert primary_supervisor.done()
 
 
+@pytest.mark.parametrize("topology", ["primary", "archive", "quorum"])
+async def test_close_rejects_read_reconnect_after_ownership_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    topology: str,
+) -> None:
+    """An already-running read cannot publish a connection after close returns."""
+
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    read_started: list[asyncio.Event] = []
+    release_reads = asyncio.Event()
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def warm_codec(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        async for rendered in websocket:
+            request = json.loads(rendered)
+            await websocket.send(
+                json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": None})
+            )
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", warm_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    endpoint_count = 2 if topology in {"archive", "quorum"} else 1
+    async with AsyncExitStack() as stack:
+        servers = [
+            await stack.enter_async_context(serve(handle, "127.0.0.1", 0))
+            for _ in range(endpoint_count)
+        ]
+        endpoints = [f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}" for server in servers]
+        if topology == "quorum":
+            owner: BittensorChain | FinalizedRpcQuorum = FinalizedRpcQuorum(
+                tuple(
+                    BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+                    for endpoint in endpoints
+                )
+            )
+            await owner.open()
+            targets = connections
+        else:
+            owner = BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoints[0])
+            await owner.open()
+            substrate = owner._BittensorChain__client._substrate
+            if topology == "archive":
+                substrate.archive_endpoints = [endpoints[1]]
+                archive = await substrate._archive()
+                assert archive is not None
+                targets = [archive]
+            else:
+                targets = [substrate.raw]
+
+        # Leave each descriptor owned by the application wrapper but make the
+        # next read take RpcSession's lazy reconnect path. The read tasks enter
+        # connect() before application shutdown takes its immutable snapshot.
+        for raw in targets:
+            await raw._session.close()
+            started = asyncio.Event()
+            read_started.append(started)
+            real_connect = raw._session.connect
+
+            async def delayed_connect(
+                *, entered: asyncio.Event = started, connect: Any = real_connect
+            ) -> None:
+                entered.set()
+                await release_reads.wait()
+                await connect()
+
+            raw._session.connect = delayed_connect
+
+        reads = [
+            asyncio.create_task(raw._session.request("review-shutdown-race")) for raw in targets
+        ]
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in read_started)), 2)
+        await owner.close()
+        release_reads.set()
+        await asyncio.wait_for(asyncio.gather(*reads, return_exceptions=True), 2)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        escaped = [raw for raw in targets if raw._session._ws is not None]
+        live_tasks = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "rpc-session" and not task.done()
+        ]
+        peer_open = [
+            websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+        ]
+
+        # Reclaim test-owned resources after recording whether close reached a
+        # fixed point, including on the intentionally failing old revision.
+        for raw in targets:
+            await raw._session.close()
+        for websocket in server_connections:
+            await asyncio.wait_for(websocket.wait_closed(), 2)
+        assert not escaped, "an underway read published a connection after ownership retirement"
+        assert not live_tasks, "an underway read published a supervisor after close returned"
+        assert not peer_open, "an underway read left its localhost peer open"
+
+
 @pytest.mark.parametrize("buffered_shutdown", [False, True])
 async def test_reconnect_retains_closing_socket_until_descriptor_is_retired(
     monkeypatch: pytest.MonkeyPatch,

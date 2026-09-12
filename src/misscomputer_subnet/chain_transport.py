@@ -30,6 +30,7 @@ class _RpcInterfaceOwnership:
     raw: SubstrateConnection
     session: Any
     websockets: list[tuple[Any, Any]]
+    retiring: bool = False
 
 
 class _OwnedRpcSubstrate(RpcSubstrate):
@@ -47,14 +48,20 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             archive_endpoints=[] if pinned else default_archive_endpoints(resolved_network),
         )
         self._owned_interfaces: list[_RpcInterfaceOwnership] = []
+        self._retiring = False
 
     def _interface(self, endpoint: str, fallbacks: list[str]) -> SubstrateConnection:
+        if self._retiring:
+            raise ConnectionError("RPC transport is closing")
         raw = super()._interface(endpoint, fallbacks)
         session = raw._session
         connect = session._connect
         websockets: list[tuple[Any, Any]] = []
+        ownership = _RpcInterfaceOwnership(raw=raw, session=session, websockets=websockets)
 
         async def connect_owned(url: str) -> Any:
+            if self._ownership_retiring(ownership):
+                raise ConnectionError("RPC transport is closing")
             # Closed transports no longer need fallback ownership; retain any
             # ambiguous entry so a failed SDK reconnect close is never lost.
             websockets[:] = [
@@ -63,16 +70,41 @@ class _OwnedRpcSubstrate(RpcSubstrate):
                 if not self._connection_retired(owned_websocket, transport)
             ]
             websocket = await connect(url)
+            if self._ownership_retiring(ownership):
+                # Shutdown may have taken its immutable connection snapshot
+                # while this dial was awaiting. Retire the late acquisition at
+                # the publication seam instead of returning it to RpcSession.
+                await self._retire_late_connection(websocket, getattr(websocket, "transport", None))
+                raise ConnectionError("RPC transport is closing")
             # No await is allowed between acquisition and retention: the SDK
             # may immediately initiate cleanup when later initialization fails.
             websockets.append((websocket, getattr(websocket, "transport", None)))
             return websocket
 
         session._connect = connect_owned
-        self._owned_interfaces.append(
-            _RpcInterfaceOwnership(raw=raw, session=session, websockets=websockets)
-        )
+        self._owned_interfaces.append(ownership)
         return raw
+
+    @staticmethod
+    def _ownership_retiring(ownership: _RpcInterfaceOwnership) -> bool:
+        # Read through a call so type analysis does not treat the value as
+        # immutable across the connection await above.
+        return ownership.retiring
+
+    @staticmethod
+    async def _retire_late_connection(websocket: Any, transport: Any) -> None:
+        """Best-effort fixed-point cleanup for a dial completed during close."""
+
+        with suppress(BaseException):
+            await websocket.close()
+        abort = getattr(transport, "abort", None)
+        if callable(abort):
+            with suppress(BaseException):
+                abort()
+        wait_closed = getattr(websocket, "wait_closed", None)
+        if callable(wait_closed):
+            with suppress(BaseException):
+                await wait_closed()
 
     @staticmethod
     def _connection_retired(websocket: Any, transport: Any) -> bool:
@@ -114,6 +146,7 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             raise
 
     async def _close_owned(self) -> None:
+        self._retiring = True
         owned = self._owned_interfaces
         self._owned_interfaces = []
 
@@ -122,6 +155,7 @@ class _OwnedRpcSubstrate(RpcSubstrate):
         # closed and replace the websocket captured for its own retirement.
         supervisors: list[Any] = []
         for ownership in owned:
+            ownership.retiring = True
             ownership.session._closing = True
             supervisor = ownership.session._supervisor
             supervisors.append(supervisor)
