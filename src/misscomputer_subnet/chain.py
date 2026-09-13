@@ -82,7 +82,9 @@ class BittensorChain:
     __slots__ = (
         "__client",
         "__close_task",
+        "__generation",
         "__lifecycle_lock",
+        "__open_task",
         "__retiring",
         "network",
         "netuid",
@@ -101,7 +103,9 @@ class BittensorChain:
         self.rpc_endpoint = rpc_endpoint
         self.__client: Any = None
         self.__close_task: asyncio.Task[None] | None = None
+        self.__generation = 0
         self.__lifecycle_lock = asyncio.Lock()
+        self.__open_task: asyncio.Task[None] | None = None
         self.__retiring = False
 
     async def open(self) -> None:
@@ -117,15 +121,44 @@ class BittensorChain:
                 network,
                 substrate=_OwnedRpcSubstrate(network, pinned=self.rpc_endpoint is not None),
             )
+            self.__generation += 1
+            generation = self.__generation
             self.__client = client
+            opening = asyncio.create_task(
+                self._finish_open(client, generation),
+                name="bittensor-chain-open",
+            )
+            self.__open_task = opening
+        await opening
+
+    async def _finish_open(self, client: Any, generation: int) -> None:
+        current = asyncio.current_task()
+        succeeded = False
         try:
             await client.connect()
+            async with self.__lifecycle_lock:
+                if (
+                    self.__generation != generation
+                    or self.__client is not client
+                    or self.__retiring
+                ):
+                    raise RuntimeError("chain open was superseded by close")
+            succeeded = True
         except BaseException as primary:
             try:
-                await self.close()
+                await drain_cleanup(
+                    self._close_client(client),
+                    name="bittensor-chain-initialization-cleanup",
+                )
             except BaseException:
                 primary.add_note("chain_initialization_cleanup_failed")
             raise
+        finally:
+            async with self.__lifecycle_lock:
+                if self.__open_task is current:
+                    self.__open_task = None
+                if not succeeded and self.__generation == generation and self.__client is client:
+                    self.__client = None
 
     async def close(self) -> None:
         await drain_cleanup(self._request_close(), name="bittensor-chain-cleanup")
@@ -135,14 +168,18 @@ class BittensorChain:
             closing = self.__close_task
             if closing is None:
                 client = self.__client
-                if client is None:
+                opening = self.__open_task
+                if client is None and opening is None:
                     return
+                if client is None:
+                    raise RuntimeError("chain opening operation lost its client")
                 # Close admission before publishing the asynchronous retirement.
-                # The task remains shared until every SDK layer is at a fixed point.
+                # The task remains shared until both the admitted opener and every
+                # SDK layer are at a fixed point.
                 self.__retiring = True
                 self.__client = None
                 closing = asyncio.create_task(
-                    self._finish_close(client),
+                    self._finish_close(client, opening, self.__generation),
                     name="bittensor-chain-close",
                 )
                 self.__close_task = closing
@@ -153,16 +190,38 @@ class BittensorChain:
                 if self.__close_task is closing and closing.done():
                     self.__close_task = None
 
-    async def _finish_close(self, client: Any) -> None:
-        close = getattr(client, "close", None) or getattr(client, "aclose", None)
+    async def _finish_close(
+        self,
+        client: Any,
+        opening: asyncio.Task[None] | None,
+        generation: int,
+    ) -> None:
+        primary: BaseException | None = None
         try:
-            if close is not None:
-                result = close()
-                if hasattr(result, "__await__"):
-                    await result
+            try:
+                await self._close_client(client)
+            except BaseException as exc:
+                primary = exc
+            # Begin transport retirement before waiting for the opener. Closing the
+            # SDK resolves ordinary pending RPC initialization, while a codec that
+            # intentionally resists shutdown remains an owned operation and keeps
+            # the retirement/reopen gate closed until it unwinds.
+            if opening is not None:
+                await asyncio.gather(opening, return_exceptions=True)
+            if primary is not None:
+                raise primary
         finally:
             async with self.__lifecycle_lock:
-                self.__retiring = False
+                if self.__generation == generation:
+                    self.__retiring = False
+
+    @staticmethod
+    async def _close_client(client: Any) -> None:
+        close = getattr(client, "close", None) or getattr(client, "aclose", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
 
     async def sync(self) -> MetagraphSnapshot:
         client = self.__client

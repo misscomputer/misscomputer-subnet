@@ -70,6 +70,9 @@
         {
           "maxLength": 256,
           "minLength": 1,
+          "not": {
+            "pattern": "[^!-~]"
+          },
           "pattern": "^[!-~]+$",
           "type": "string"
         }

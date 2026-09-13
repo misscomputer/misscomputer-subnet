@@ -116,11 +116,15 @@ different scheduling identity fingerprint at the same block, is rejected. The
 Go bridge independently applies the same block floor and same-height chain-state
 conflict check before committing its staged chain/miner snapshot.
 
-`BittensorChain.close()` retains one shared SDK retirement task until the real
-client close completes. Concurrent close callers join that task; cancellation
-cannot detach it, and an SDK close error remains the result for every joiner.
-The adapter refuses `open()` while retirement is active and clears the gate only
-after captured WebSocket descriptors and RPC supervisors reach their closed
+`BittensorChain` retains both the admitted `open()` operation and its client
+generation. `close()` closes admission, starts SDK retirement, and drains that
+exact opener before releasing the gate. Initialization cleanup is bound to its
+original client, so an obsolete opener cannot close a later generation.
+Concurrent close callers join one chain retirement; repeated caller
+cancellation cannot detach it. At the substrate layer, initialization/archive
+cleanup and external owner close also join one shared retirement operation.
+The adapter refuses reopening until the admitted opener, captured WebSocket
+descriptors, RPC supervisors, and transport cleanup tasks reach their closed
 fixed point.
 
 The one-shot executor is stricter than the daemon fallback: every execution
