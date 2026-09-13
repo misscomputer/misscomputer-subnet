@@ -836,7 +836,7 @@ def _link_unnamed_temporary(descriptor: int, directory_fd: int, name: str) -> No
         raise OSError(error, os.strerror(error), name)
 
 
-def _allocate_visible_temporary(directory_fd: int) -> tuple[int, str]:
+def _allocate_visible_temporary(directory_fd: int) -> _TemporaryPlan:
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     for _ in range(32):
         candidate = f".weight-plan.tmp-{secrets.token_hex(16)}"
@@ -849,21 +849,57 @@ def _allocate_visible_temporary(directory_fd: int) -> tuple[int, str]:
             )
         except FileExistsError:
             continue
-        return descriptor, candidate
+        temporary = _TemporaryPlan(
+            descriptor=descriptor,
+            identity=(-1, -1),
+            name=candidate,
+        )
+        try:
+            value = os.fstat(descriptor)
+            temporary.identity = (value.st_dev, value.st_ino)
+            return temporary
+        except BaseException as primary:
+            try:
+                _cleanup_temporary_plan(temporary, directory_fd)
+            except BaseException:
+                primary.add_note("temporary_acquisition_cleanup_failed")
+            raise
     raise WeightPlanTargetError("could not allocate a private temporary plan file")
 
 
 def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> None:
+    primary: BaseException | None = None
+
+    def failed(exc: BaseException) -> None:
+        nonlocal primary
+        if primary is None:
+            primary = exc
+        else:
+            primary.add_note("temporary_additional_cleanup_failed")
+
+    identity = temporary.identity
+    if identity == (-1, -1):
+        try:
+            descriptor_stat = os.fstat(temporary.descriptor)
+            identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            temporary.identity = identity
+        except BaseException as exc:
+            failed(exc)
     try:
-        if temporary.name is not None:
-            try:
-                named = os.stat(temporary.name, dir_fd=directory_fd, follow_symlinks=False)
-                if (named.st_dev, named.st_ino) == temporary.identity:
-                    os.unlink(temporary.name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-    finally:
+        if temporary.name is not None and identity != (-1, -1):
+            named = os.stat(temporary.name, dir_fd=directory_fd, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) == identity:
+                os.unlink(temporary.name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+    except BaseException as exc:
+        failed(exc)
+    try:
         os.close(temporary.descriptor)
+    except BaseException as exc:
+        failed(exc)
+    if primary is not None:
+        raise primary
 
 
 def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPlan:
@@ -921,18 +957,11 @@ def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPla
             raise
         os.close(descriptor)
 
-    descriptor, name = _allocate_visible_temporary(directory_fd)
-    temporary = _TemporaryPlan(
-        descriptor=descriptor,
-        identity=(-1, -1),
-        name=name,
-    )
+    temporary = _allocate_visible_temporary(directory_fd)
     try:
-        value = os.fstat(descriptor)
-        temporary.identity = (value.st_dev, value.st_ino)
-        os.fchmod(descriptor, WEIGHT_PLAN_FILE_MODE)
-        _write_all(descriptor, rendered)
-        os.fsync(descriptor)
+        os.fchmod(temporary.descriptor, WEIGHT_PLAN_FILE_MODE)
+        _write_all(temporary.descriptor, rendered)
+        os.fsync(temporary.descriptor)
         _validate_temporary_descriptor(
             temporary,
             expected_size=len(rendered),
