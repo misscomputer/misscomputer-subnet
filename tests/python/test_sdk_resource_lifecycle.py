@@ -22,8 +22,9 @@ from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.server import serve
 
 import misscomputer_subnet.weight_signer_protocol as signer
+from misscomputer_subnet import chain_quorum as chain_quorum_module
 from misscomputer_subnet.chain import BittensorChain
-from misscomputer_subnet.chain_quorum import FinalizedRpcQuorum
+from misscomputer_subnet.chain_quorum import FinalizedRpcQuorum, RpcAgreementError
 
 
 async def test_real_sdk_cancellation_during_websocket_handshake_drains_waiters() -> None:
@@ -238,6 +239,289 @@ async def test_quorum_outer_cancel_drains_open_children_before_return() -> None:
         await asyncio.wait_for(task, 2)
     await quorum.close()
     assert [chain.close_count for chain in chains] == [1, 1]
+
+
+async def test_quorum_close_joins_delayed_real_sdk_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR13-ASTRA-016: close cannot return before an admitted open retires."""
+
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    codec_calls = 0
+    codec_cancellations = 0
+    codecs_started, release_codecs = asyncio.Event(), asyncio.Event()
+    real_interface = RpcSubstrate._interface
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def delayed_codec(*args: Any, **kwargs: Any) -> None:
+        nonlocal codec_calls, codec_cancellations
+        codec_calls += 1
+        if codec_calls == 2:
+            codecs_started.set()
+        while not release_codecs.is_set():
+            try:
+                await release_codecs.wait()
+            except asyncio.CancelledError:
+                codec_cancellations += 1
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", delayed_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    async with (
+        serve(handle, "127.0.0.1", 0) as first_server,
+        serve(handle, "127.0.0.1", 0) as second_server,
+    ):
+        endpoints = tuple(
+            f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+            for server in (first_server, second_server)
+        )
+        chains = tuple(
+            BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+            for endpoint in endpoints
+        )
+        quorum = FinalizedRpcQuorum(chains)
+        opening = asyncio.create_task(quorum.open(), name="review-quorum-open")
+        closing: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(codecs_started.wait(), 2)
+            assert len(connections) == 2
+            websockets = [raw._session._ws for raw in connections]
+            assert all(isinstance(websocket, ClientConnection) for websocket in websockets)
+            sockets = [websocket.transport.get_extra_info("socket") for websocket in websockets]
+            supervisors = [raw._session._supervisor for raw in connections]
+            assert all(sock is not None and sock.fileno() >= 0 for sock in sockets)
+            assert all(
+                supervisor is not None and not supervisor.done() for supervisor in supervisors
+            )
+
+            closing = asyncio.create_task(quorum.close(), name="review-quorum-close")
+            completed_before_release, _ = await asyncio.wait({closing}, timeout=0.1)
+            with pytest.raises(RpcAgreementError) as admission_error:
+                await quorum.open()
+            assert admission_error.value.code == "rpc_open_failed"
+
+            release_codecs.set()
+            await asyncio.wait_for(closing, 2)
+            assert opening.done(), "quorum.close returned before the public open waiter unwound"
+            result = (await asyncio.gather(opening, return_exceptions=True))[0]
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            live_quorum_tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if (
+                    task.get_name()
+                    in {"review-quorum-open", "rpc-quorum-initialization", "rpc-quorum-open"}
+                    or task.get_name().startswith("rpc-quorum-child-initialization-")
+                )
+                and not task.done()
+            ]
+            peer_open = [
+                websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+            ]
+            assert not completed_before_release, (
+                "quorum.close returned while two SDK initializers and the quorum open were alive"
+            )
+            assert isinstance(result, BaseException)
+            assert codec_cancellations >= 2
+            assert not quorum._opened
+            assert not quorum._owns_chains
+            assert all(chain._BittensorChain__client is None for chain in chains)
+            assert all(raw._session._ws is None for raw in connections)
+            assert all(
+                raw._session._supervisor is None or raw._session._supervisor.done()
+                for raw in connections
+            )
+            assert all(sock is not None and sock.fileno() < 0 for sock in sockets)
+            assert not peer_open
+            assert not live_quorum_tasks
+        finally:
+            release_codecs.set()
+            if closing is not None:
+                await asyncio.gather(closing, return_exceptions=True)
+            await asyncio.gather(opening, return_exceptions=True)
+            await asyncio.gather(quorum.close(), return_exceptions=True)
+            for raw in connections:
+                await asyncio.gather(raw.close(), return_exceptions=True)
+            for websocket in server_connections:
+                websocket.transport.abort()
+            await asyncio.gather(
+                *(websocket.wait_closed() for websocket in server_connections),
+                return_exceptions=True,
+            )
+
+
+@pytest.mark.parametrize("repeated_cancel", [False, True], ids=["ordinary", "cancelled"])
+async def test_quorum_close_failure_waits_for_public_open_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    repeated_cancel: bool,
+) -> None:
+    """PR12-ASTRA-001: a close error cannot bypass the public open barrier."""
+
+    assert bittensor.__version__ == "11.1.0"
+    connections: list[SubstrateConnection] = []
+    server_connections: list[Any] = []
+    codec_calls = 0
+    codec_cancellations = 0
+    codecs_started, release_codecs = asyncio.Event(), asyncio.Event()
+    codecs_cancelled = asyncio.Event()
+    public_cleanup_reached = asyncio.Event()
+    release_public_cleanup = asyncio.Event()
+    real_interface = RpcSubstrate._interface
+    real_drain_cleanup = chain_quorum_module.drain_cleanup
+
+    def interface(self: Any, *args: Any) -> SubstrateConnection:
+        raw = real_interface(self, *args)
+        connections.append(raw)
+        return raw
+
+    async def delayed_codec(*args: Any, **kwargs: Any) -> None:
+        nonlocal codec_calls, codec_cancellations
+        codec_calls += 1
+        if codec_calls == 2:
+            codecs_started.set()
+        while not release_codecs.is_set():
+            try:
+                await release_codecs.wait()
+            except asyncio.CancelledError:
+                codec_cancellations += 1
+                if codec_cancellations == 2:
+                    codecs_cancelled.set()
+
+    async def hold_public_cleanup[T](operation: Any, *, name: str) -> T:
+        try:
+            return await real_drain_cleanup(operation, name=name)
+        except BaseException:
+            if name == "rpc-quorum-open-cleanup":
+                public_cleanup_reached.set()
+                await release_public_cleanup.wait()
+            raise
+
+    async def handle(websocket: Any) -> None:
+        server_connections.append(websocket)
+        await websocket.wait_closed()
+
+    class FaultingCloseChain:
+        def __init__(self, chain: BittensorChain, *, fail_close: bool) -> None:
+            self.chain = chain
+            self.fail_close = fail_close
+            self.close_count = 0
+
+        async def open(self) -> None:
+            await self.chain.open()
+
+        async def close(self) -> None:
+            self.close_count += 1
+            await self.chain.close()
+            if self.fail_close:
+                raise SimulatedCrash("private-child-close-failure")
+
+    monkeypatch.setattr(RpcSubstrate, "_interface", interface)
+    monkeypatch.setattr(RuntimeManager, "codec_at", delayed_codec)
+    monkeypatch.setattr(bittensor.config, "token_symbols_fresh", lambda _: True)
+    monkeypatch.setattr(bittensor.config, "load_token_symbols", lambda _: {})
+    monkeypatch.setattr(chain_quorum_module, "drain_cleanup", hold_public_cleanup)
+    async with (
+        serve(handle, "127.0.0.1", 0) as first_server,
+        serve(handle, "127.0.0.1", 0) as second_server,
+    ):
+        endpoints = tuple(
+            f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+            for server in (first_server, second_server)
+        )
+        raw_chains = tuple(
+            BittensorChain(network="finney", netuid=24, rpc_endpoint=endpoint)
+            for endpoint in endpoints
+        )
+        chains = tuple(
+            FaultingCloseChain(chain, fail_close=index == 0)
+            for index, chain in enumerate(raw_chains)
+        )
+        quorum = FinalizedRpcQuorum(chains)  # type: ignore[arg-type]
+        opening = asyncio.create_task(quorum.open(), name="review-public-quorum-open")
+        closing: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(codecs_started.wait(), 2)
+            assert len(connections) == 2
+            websockets = [raw._session._ws for raw in connections]
+            assert all(isinstance(websocket, ClientConnection) for websocket in websockets)
+            sockets = [websocket.transport.get_extra_info("socket") for websocket in websockets]
+            supervisors = [raw._session._supervisor for raw in connections]
+
+            closing = asyncio.create_task(quorum.close(), name="review-public-quorum-close")
+            await asyncio.sleep(0)
+            if repeated_cancel:
+                for _ in range(3):
+                    closing.cancel()
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(codecs_cancelled.wait(), 2)
+            assert not closing.done()
+
+            release_codecs.set()
+            await asyncio.wait_for(public_cleanup_reached.wait(), 2)
+            completed_before_public_open, _ = await asyncio.wait({closing}, timeout=0.1)
+            assert not completed_before_public_open, (
+                "quorum.close propagated its child-close failure before public open completed"
+            )
+
+            release_public_cleanup.set()
+            results = await asyncio.wait_for(
+                asyncio.gather(opening, closing, return_exceptions=True),
+                2,
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            peer_open = [
+                websocket for websocket in server_connections if websocket.state.name != "CLOSED"
+            ]
+            live_quorum_tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name().startswith(("review-public-quorum-", "rpc-quorum-"))
+                and not task.done()
+            ]
+
+            assert isinstance(results[0], asyncio.CancelledError)
+            assert isinstance(results[1], RpcAgreementError)
+            assert results[1].code == "rpc_close_failed"
+            assert codec_cancellations >= 2
+            assert [chain.close_count for chain in chains] == [1, 1]
+            assert not quorum._opened
+            assert not quorum._owns_chains
+            assert all(chain._BittensorChain__client is None for chain in raw_chains)
+            assert all(raw._session._ws is None for raw in connections)
+            assert all(supervisor is None or supervisor.done() for supervisor in supervisors)
+            assert all(sock is not None and sock.fileno() < 0 for sock in sockets)
+            assert not peer_open
+            assert not live_quorum_tasks
+            await quorum.close()
+            assert [chain.close_count for chain in chains] == [1, 1]
+        finally:
+            release_codecs.set()
+            release_public_cleanup.set()
+            if closing is not None:
+                await asyncio.gather(closing, return_exceptions=True)
+            await asyncio.gather(opening, return_exceptions=True)
+            await asyncio.gather(quorum.close(), return_exceptions=True)
+            for raw in connections:
+                await asyncio.gather(raw.close(), return_exceptions=True)
+            for websocket in server_connections:
+                websocket.transport.abort()
+            await asyncio.gather(
+                *(websocket.wait_closed() for websocket in server_connections),
+                return_exceptions=True,
+            )
 
 
 @pytest.mark.parametrize("failing_index", [0, 1])

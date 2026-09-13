@@ -85,6 +85,12 @@ class FinalizedRpcQuorum:
         self._opened = False
         self._owns_chains = False
         self._last_agreed_block: int | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._generation = 0
+        self._retiring = False
+        self._open_task: asyncio.Task[None] | None = None
+        self._open_waiter_done: asyncio.Event | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     def _fail(
         self,
@@ -107,10 +113,55 @@ class FinalizedRpcQuorum:
         return RpcAgreementError(code, message)
 
     async def open(self) -> None:
-        if self._owns_chains:
-            raise self._fail("rpc_open_failed", "open", "redundant RPC set is already open")
-        self._owns_chains = True
-        tasks = [asyncio.create_task(chain.open()) for chain in self._chains]
+        waiter_done = asyncio.Event()
+        async with self._lifecycle_lock:
+            if (
+                self._retiring
+                or self._close_task is not None
+                or self._owns_chains
+                or self._open_task is not None
+                or (self._open_waiter_done is not None and not self._open_waiter_done.is_set())
+            ):
+                raise self._fail("rpc_open_failed", "open", "redundant RPC set is already open")
+            self._generation += 1
+            generation = self._generation
+            self._owns_chains = True
+            opening = asyncio.create_task(
+                self._open_chains(generation),
+                name="rpc-quorum-open",
+            )
+            self._open_task = opening
+            self._open_waiter_done = waiter_done
+
+        try:
+            await asyncio.shield(opening)
+        except BaseException as primary:
+            if not opening.done():
+                opening.cancel()
+
+            async def retire() -> None:
+                with suppress(BaseException):
+                    await opening
+                # This wrapper cannot wait for its own completion event. Any
+                # external close sharing the cleanup waits for it separately.
+                await self._request_close(wait_for_open=False)
+
+            try:
+                await drain_cleanup(retire(), name="rpc-quorum-open-cleanup")
+            except BaseException:
+                primary.add_note("rpc_initialization_cleanup_failed")
+            raise
+        finally:
+            waiter_done.set()
+
+    async def _open_chains(self, generation: int) -> None:
+        tasks = [
+            asyncio.create_task(
+                chain.open(),
+                name=f"rpc-quorum-child-initialization-{index}",
+            )
+            for index, chain in enumerate(self._chains)
+        ]
 
         async def collect() -> list[None | BaseException]:
             return list(await asyncio.gather(*tasks, return_exceptions=True))
@@ -120,7 +171,20 @@ class FinalizedRpcQuorum:
             results = await asyncio.shield(collector)
             if any(isinstance(result, BaseException) for result in results):
                 raise self._fail("rpc_open_failed", "open", "redundant RPC set is unavailable")
-            self._opened = True
+            current = asyncio.current_task()
+            async with self._lifecycle_lock:
+                if (
+                    self._retiring
+                    or generation != self._generation
+                    or not self._owns_chains
+                    or self._open_task is not current
+                ):
+                    raise self._fail(
+                        "rpc_open_failed",
+                        "open",
+                        "redundant RPC initialization was retired",
+                    )
+                self._opened = True
         except BaseException as primary:
             # Cancel each open once, then drain it before closing children.
             # Repeated outer cancellation must not interrupt child unwinding or
@@ -130,29 +194,69 @@ class FinalizedRpcQuorum:
                     task.cancel()
 
             async def retire() -> None:
-                try:
-                    await collector
-                finally:
-                    await self.close()
+                await collector
 
             try:
-                await drain_cleanup(retire(), name="rpc-quorum-open-cleanup")
+                await drain_cleanup(retire(), name="rpc-quorum-initialization-cleanup")
             except BaseException:
                 primary.add_note("rpc_initialization_cleanup_failed")
             raise
 
     async def close(self) -> None:
-        await drain_cleanup(self._close_chains(), name="rpc-quorum-cleanup")
+        await drain_cleanup(self._request_close(), name="rpc-quorum-cleanup")
 
-    async def _close_chains(self) -> None:
-        if not self._owns_chains:
-            return
-        self._owns_chains = False
-        self._opened = False
-        results = await asyncio.gather(
-            *(chain.close() for chain in self._chains), return_exceptions=True
-        )
-        if any(isinstance(result, BaseException) for result in results):
+    async def _request_close(self, *, wait_for_open: bool = True) -> None:
+        async with self._lifecycle_lock:
+            closing = self._close_task
+            waiter_done = self._open_waiter_done
+            if closing is None:
+                owns_chains = self._owns_chains
+                opening = self._open_task
+                self._retiring = True
+                self._generation += 1
+                self._owns_chains = False
+                self._opened = False
+                closing = asyncio.create_task(
+                    self._finish_close(owns_chains, opening),
+                    name="rpc-quorum-close",
+                )
+                self._close_task = closing
+        try:
+            try:
+                await closing
+            finally:
+                if wait_for_open and waiter_done is not None:
+                    await waiter_done.wait()
+        finally:
+            async with self._lifecycle_lock:
+                if self._close_task is closing and closing.done():
+                    self._close_task = None
+
+    async def _finish_close(
+        self,
+        owns_chains: bool,
+        opening: asyncio.Task[None] | None,
+    ) -> None:
+        close_failed = False
+        try:
+            if opening is not None:
+                if not opening.done():
+                    opening.cancel()
+                with suppress(BaseException):
+                    await opening
+            if owns_chains:
+                results = await asyncio.gather(
+                    *(chain.close() for chain in self._chains), return_exceptions=True
+                )
+                close_failed = any(isinstance(result, BaseException) for result in results)
+        finally:
+            async with self._lifecycle_lock:
+                self._opened = False
+                self._owns_chains = False
+                self._retiring = False
+                if self._open_task is opening:
+                    self._open_task = None
+        if close_failed:
             raise self._fail("rpc_close_failed", "close", "redundant RPC close failed")
 
     async def sync(self) -> MetagraphSnapshot:
