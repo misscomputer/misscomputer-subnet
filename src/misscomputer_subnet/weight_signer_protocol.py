@@ -256,9 +256,14 @@ class SignerResponse:
                 raise SignerProtocolError(
                     "signer_protocol_invalid", "confirmed signer response is incomplete"
                 )
-        elif self.error_code is None or self.extrinsic_ref is not None:
+        elif self.status == "rejected":
+            if self.error_code is None or self.extrinsic_ref is not None:
+                raise SignerProtocolError(
+                    "signer_protocol_invalid", "rejected signer response is incomplete"
+                )
+        elif self.error_code is None:
             raise SignerProtocolError(
-                "signer_protocol_invalid", "rejected signer response is incomplete"
+                "signer_protocol_invalid", "ambiguous signer response is incomplete"
             )
 
     def document(self) -> dict[str, object]:
@@ -474,10 +479,15 @@ class UnixWeightSignerClient:
                 "signer_protocol_invalid", "signer response request ID does not match"
             )
         if response.status == "ambiguous":
-            raise SignerProtocolError(
+            error = SignerProtocolError(
                 "submission_ambiguous",
                 "signer reported an ambiguous submission that requires reconciliation",
             )
+            # The response was canonical, request-bound, and received from the
+            # pinned signer UID. Preserve its safe signed-extrinsic reference
+            # while retaining ambiguous effect certainty.
+            error.extrinsic_ref = response.extrinsic_ref
+            raise error
         return SubmissionResult(
             success=response.status == "confirmed",
             extrinsic_ref=response.extrinsic_ref,

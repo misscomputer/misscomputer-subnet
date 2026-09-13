@@ -35,7 +35,14 @@
           "type": "string"
         },
         "extrinsic_ref": {
-          "type": "null"
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string"
+            }
+          ]
         },
         "status": {
           "const": "ambiguous"

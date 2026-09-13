@@ -79,7 +79,15 @@ class ChainQuery(Protocol):
 class BittensorChain:
     """Narrow metagraph query adapter with no public wallet or raw client."""
 
-    __slots__ = ("__client", "network", "netuid", "rpc_endpoint")
+    __slots__ = (
+        "__client",
+        "__close_task",
+        "__lifecycle_lock",
+        "__retiring",
+        "network",
+        "netuid",
+        "rpc_endpoint",
+    )
 
     def __init__(
         self,
@@ -92,19 +100,26 @@ class BittensorChain:
         self.netuid = netuid
         self.rpc_endpoint = rpc_endpoint
         self.__client: Any = None
+        self.__close_task: asyncio.Task[None] | None = None
+        self.__lifecycle_lock = asyncio.Lock()
+        self.__retiring = False
 
     async def open(self) -> None:
-        if self.__client is not None:
-            raise RuntimeError("chain is already open")
-        network = self.rpc_endpoint if self.rpc_endpoint is not None else self.network
-        # Both Client and the raw transport backend are owned before connect()
-        # can acquire a socket. Subtensor's awaitable wrapper publishes too late.
-        self.__client = bt.Client(
-            network,
-            substrate=_OwnedRpcSubstrate(network, pinned=self.rpc_endpoint is not None),
-        )
+        async with self.__lifecycle_lock:
+            if self.__retiring or self.__close_task is not None:
+                raise RuntimeError("chain is retiring")
+            if self.__client is not None:
+                raise RuntimeError("chain is already open")
+            network = self.rpc_endpoint if self.rpc_endpoint is not None else self.network
+            # Both Client and the raw transport backend are owned before connect()
+            # can acquire a socket. Subtensor's awaitable wrapper publishes too late.
+            client = bt.Client(
+                network,
+                substrate=_OwnedRpcSubstrate(network, pinned=self.rpc_endpoint is not None),
+            )
+            self.__client = client
         try:
-            await self.__client.connect()
+            await client.connect()
         except BaseException as primary:
             try:
                 await self.close()
@@ -113,18 +128,41 @@ class BittensorChain:
             raise
 
     async def close(self) -> None:
-        await drain_cleanup(self._close_client(), name="bittensor-chain-cleanup")
+        await drain_cleanup(self._request_close(), name="bittensor-chain-cleanup")
 
-    async def _close_client(self) -> None:
-        client = self.__client
-        if client is None:
-            return
-        self.__client = None
+    async def _request_close(self) -> None:
+        async with self.__lifecycle_lock:
+            closing = self.__close_task
+            if closing is None:
+                client = self.__client
+                if client is None:
+                    return
+                # Close admission before publishing the asynchronous retirement.
+                # The task remains shared until every SDK layer is at a fixed point.
+                self.__retiring = True
+                self.__client = None
+                closing = asyncio.create_task(
+                    self._finish_close(client),
+                    name="bittensor-chain-close",
+                )
+                self.__close_task = closing
+        try:
+            await closing
+        finally:
+            async with self.__lifecycle_lock:
+                if self.__close_task is closing and closing.done():
+                    self.__close_task = None
+
+    async def _finish_close(self, client: Any) -> None:
         close = getattr(client, "close", None) or getattr(client, "aclose", None)
-        if close is not None:
-            result = close()
-            if hasattr(result, "__await__"):
-                await result
+        try:
+            if close is not None:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+        finally:
+            async with self.__lifecycle_lock:
+                self.__retiring = False
 
     async def sync(self) -> MetagraphSnapshot:
         client = self.__client

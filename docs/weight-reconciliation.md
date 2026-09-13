@@ -69,7 +69,10 @@ Executor exit 2 is an operational failure, **not** proof that no submission
 occurred. Read the JSON `status` and `error_code` together:
 
 - `submission_ambiguous` has `status: "ambiguous"`, including when recording
-  that result failed. Reconcile before any further action.
+  that result failed. It also carries `extrinsic_ref` when the authenticated v2
+  signer returned a canonical reference after signing and possible submission but could not
+  prove confirmation. The reference narrows reconciliation; it does not make
+  the result confirmed or retryable. Reconcile before any further action.
 - `submission_confirmed_audit_failed` has `status: "confirmed"`, the public
   `extrinsic_ref`, and `audit_error_code: "audit_persistence_failed"`. The
   signer confirmed the submission, but the executor cannot claim a durable
