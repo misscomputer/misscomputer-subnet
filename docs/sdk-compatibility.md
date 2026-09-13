@@ -117,9 +117,14 @@ Go bridge independently applies the same block floor and same-height chain-state
 conflict check before committing its staged chain/miner snapshot.
 
 `BittensorChain` retains both the admitted `open()` operation and its client
-generation. `close()` closes admission, starts SDK retirement, and drains that
-exact opener before releasing the gate. Initialization cleanup is bound to its
-original client, so an obsolete opener cannot close a later generation.
+generation. The public opener remains responsible across both cancellation
+handoffs: before its child first executes and after a successful SDK connect
+but before the child's result is delivered. Any failure starts or joins
+retirement for exactly the captured generation, drains the child and client,
+and only then propagates the original failure. `close()` closes admission,
+clears the captured opener independently of the child's `finally` block,
+starts SDK retirement, and drains that exact opener before releasing the gate.
+An obsolete opener therefore cannot close a later generation.
 Concurrent close callers join one chain retirement; repeated caller
 cancellation cannot detach it. At the substrate layer, initialization/archive
 cleanup and external owner close also join one shared retirement operation.

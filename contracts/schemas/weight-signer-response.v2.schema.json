@@ -57,7 +57,12 @@
           "type": "null"
         },
         {
-          "pattern": "^[a-z0-9_]{1,64}$",
+          "maxLength": 64,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^a-z0-9_]"
+          },
+          "pattern": "^[a-z0-9_]+$",
           "type": "string"
         }
       ]
@@ -79,7 +84,12 @@
       ]
     },
     "request_id": {
-      "pattern": "^[0-9a-f]{64}$",
+      "maxLength": 64,
+      "minLength": 64,
+      "not": {
+        "pattern": "[^0-9a-f]"
+      },
+      "pattern": "^[0-9a-f]+$",
       "type": "string"
     },
     "schema": {

@@ -129,11 +129,20 @@ class BittensorChain:
                 name="bittensor-chain-open",
             )
             self.__open_task = opening
-        await opening
+        try:
+            await opening
+        except BaseException as primary:
+            try:
+                await drain_cleanup(
+                    self._retire_open(client, opening, generation),
+                    name="bittensor-chain-open-cleanup",
+                )
+            except BaseException:
+                primary.add_note("chain_open_cleanup_failed")
+            raise
 
     async def _finish_open(self, client: Any, generation: int) -> None:
         current = asyncio.current_task()
-        succeeded = False
         try:
             await client.connect()
             async with self.__lifecycle_lock:
@@ -143,22 +152,41 @@ class BittensorChain:
                     or self.__retiring
                 ):
                     raise RuntimeError("chain open was superseded by close")
-            succeeded = True
-        except BaseException as primary:
-            try:
-                await drain_cleanup(
-                    self._close_client(client),
-                    name="bittensor-chain-initialization-cleanup",
-                )
-            except BaseException:
-                primary.add_note("chain_initialization_cleanup_failed")
-            raise
         finally:
             async with self.__lifecycle_lock:
                 if self.__open_task is current:
                     self.__open_task = None
-                if not succeeded and self.__generation == generation and self.__client is client:
-                    self.__client = None
+
+    async def _retire_open(
+        self,
+        client: Any,
+        opening: asyncio.Task[None],
+        generation: int,
+    ) -> None:
+        """Retire one failed public-open generation before exposing its failure."""
+
+        # Cancellation normally propagates from open() to its child, but the
+        # child may already have completed successfully at the result handoff.
+        # Mark it cancelled synchronously so close can drain either schedule.
+        opening.cancel()
+        async with self.__lifecycle_lock:
+            closing: asyncio.Task[None] | None = None
+            if self.__generation == generation:
+                closing = self.__close_task
+                if closing is None and self.__client is client:
+                    closing = self._begin_close(client, opening, generation)
+                elif self.__open_task is opening:
+                    # A concurrent retirement may already have detached the
+                    # client. Never depend on the child's finally block to
+                    # release the stale opener slot.
+                    self.__open_task = None
+        if closing is None:
+            # A newer generation can exist only after the captured generation
+            # reached its close fixed point. Retrieve the old child's result
+            # without acting on the replacement.
+            await asyncio.gather(opening, return_exceptions=True)
+            return
+        await self._join_close(closing)
 
     async def close(self) -> None:
         await drain_cleanup(self._request_close(), name="bittensor-chain-cleanup")
@@ -176,13 +204,29 @@ class BittensorChain:
                 # Close admission before publishing the asynchronous retirement.
                 # The task remains shared until both the admitted opener and every
                 # SDK layer are at a fixed point.
-                self.__retiring = True
-                self.__client = None
-                closing = asyncio.create_task(
-                    self._finish_close(client, opening, self.__generation),
-                    name="bittensor-chain-close",
-                )
-                self.__close_task = closing
+                closing = self._begin_close(client, opening, self.__generation)
+        await self._join_close(closing)
+
+    def _begin_close(
+        self,
+        client: Any,
+        opening: asyncio.Task[None] | None,
+        generation: int,
+    ) -> asyncio.Task[None]:
+        """Publish one close task while the lifecycle lock is held."""
+
+        self.__retiring = True
+        self.__client = None
+        if self.__open_task is opening:
+            self.__open_task = None
+        closing = asyncio.create_task(
+            self._finish_close(client, opening, generation),
+            name="bittensor-chain-close",
+        )
+        self.__close_task = closing
+        return closing
+
+    async def _join_close(self, closing: asyncio.Task[None]) -> None:
         try:
             await closing
         finally:
