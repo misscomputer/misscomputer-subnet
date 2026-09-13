@@ -222,9 +222,11 @@ class FinalizedRpcQuorum:
                 )
                 self._close_task = closing
         try:
-            await closing
-            if wait_for_open and waiter_done is not None:
-                await waiter_done.wait()
+            try:
+                await closing
+            finally:
+                if wait_for_open and waiter_done is not None:
+                    await waiter_done.wait()
         finally:
             async with self._lifecycle_lock:
                 if self._close_task is closing and closing.done():
