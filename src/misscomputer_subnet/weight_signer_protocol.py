@@ -361,7 +361,12 @@ class UnixWeightSignerClient:
     """Wallet-free executor adapter pinned to one Unix signer UID."""
 
     __slots__ = (
+        "_close_task",
+        "_generation",
+        "_lifecycle_lock",
+        "_open_task",
         "_reader",
+        "_retiring",
         "_writer",
         "hotkey",
         "signer_uid",
@@ -387,37 +392,70 @@ class UnixWeightSignerClient:
         self.signer_uid = signer_uid
         self.hotkey = hotkey
         self.timeout_seconds = float(timeout_seconds)
+        self._close_task: asyncio.Task[None] | None = None
+        self._generation = 0
+        self._lifecycle_lock = asyncio.Lock()
+        self._open_task: asyncio.Task[None] | None = None
         self._reader: asyncio.StreamReader | None = None
+        self._retiring = False
         self._writer: asyncio.StreamWriter | None = None
 
     async def open(self) -> None:
-        if self._writer is not None:
-            raise SignerProtocolError("signer_protocol_invalid", "signer client is already open")
+        async with self._lifecycle_lock:
+            if self._retiring or self._close_task is not None:
+                raise SignerProtocolError("signer_protocol_invalid", "signer client is retiring")
+            if self._writer is not None or self._open_task is not None:
+                raise SignerProtocolError(
+                    "signer_protocol_invalid", "signer client is already open"
+                )
+            self._generation += 1
+            generation = self._generation
+            opening = asyncio.create_task(
+                self._finish_open(generation),
+                name="weight-signer-open",
+            )
+            self._open_task = opening
+        try:
+            await opening
+        except BaseException as primary:
+            try:
+                await drain_cleanup(
+                    self._retire_open(opening, generation),
+                    name="weight-signer-open-cleanup",
+                )
+            except BaseException:
+                primary.add_note("signer_initialization_cleanup_failed")
+            raise
+
+    async def _finish_open(self, generation: int) -> None:
+        current = asyncio.current_task()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout_seconds
-        while True:
-            try:
-                before = validate_socket_inode(self.socket_path, owner_uid=self.signer_uid)
-                reader, writer = await asyncio.open_unix_connection(self.socket_path)
-            except SignerProtocolError as exc:
-                if socket_path_exists(self.socket_path):
-                    raise
-                if loop.time() >= deadline:
-                    raise SignerProtocolError(
-                        "signer_unavailable", "signer socket did not become available"
-                    ) from exc
-                await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0.0)))
-                continue
-            except OSError as exc:
-                if loop.time() >= deadline:
-                    raise SignerProtocolError(
-                        "signer_unavailable", "signer is unavailable"
-                    ) from exc
-                await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0.0)))
-                continue
-            self._reader = reader
-            self._writer = writer
-            try:
+        try:
+            while True:
+                try:
+                    before = validate_socket_inode(self.socket_path, owner_uid=self.signer_uid)
+                    reader, writer = await asyncio.open_unix_connection(self.socket_path)
+                except SignerProtocolError as exc:
+                    if socket_path_exists(self.socket_path):
+                        raise
+                    if loop.time() >= deadline:
+                        raise SignerProtocolError(
+                            "signer_unavailable", "signer socket did not become available"
+                        ) from exc
+                    await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0.0)))
+                    continue
+                except OSError as exc:
+                    if loop.time() >= deadline:
+                        raise SignerProtocolError(
+                            "signer_unavailable", "signer is unavailable"
+                        ) from exc
+                    await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0.0)))
+                    continue
+                # Retain the acquired writer before another task can begin
+                # retirement at the next await boundary.
+                self._reader = reader
+                self._writer = writer
                 raw_socket = writer.get_extra_info("socket")
                 if raw_socket is None or unix_peer_uid(raw_socket) != self.signer_uid:
                     raise SignerProtocolError(
@@ -428,26 +466,138 @@ class UnixWeightSignerClient:
                     raise SignerProtocolError(
                         "signer_socket_unsafe", "signer socket changed during connection"
                     )
-            except BaseException as primary:
-                try:
-                    await self.close()
-                except BaseException:
-                    primary.add_note("signer_initialization_cleanup_failed")
-                raise
+                async with self._lifecycle_lock:
+                    if self._generation != generation or self._retiring:
+                        raise SignerProtocolError(
+                            "signer_protocol_invalid", "signer open was superseded by close"
+                        )
+                return
+        finally:
+            async with self._lifecycle_lock:
+                if self._open_task is current:
+                    self._open_task = None
+
+    async def _retire_open(
+        self,
+        opening: asyncio.Task[None],
+        generation: int,
+    ) -> None:
+        opening.cancel()
+        async with self._lifecycle_lock:
+            closing: asyncio.Task[None] | None = None
+            if self._generation == generation:
+                closing = self._close_task
+                if closing is None and (self._writer is not None or self._open_task is opening):
+                    closing = self._begin_close(self._writer, opening, generation)
+                elif self._open_task is opening:
+                    self._open_task = None
+        if closing is None:
+            await asyncio.gather(opening, return_exceptions=True)
             return
+        await self._join_close(closing)
 
     async def close(self) -> None:
-        await drain_cleanup(self._close_writer(), name="weight-signer-cleanup")
+        await drain_cleanup(self._request_close(), name="weight-signer-cleanup")
 
-    async def _close_writer(self) -> None:
-        writer = self._writer
+    async def _request_close(self) -> None:
+        async with self._lifecycle_lock:
+            closing = self._close_task
+            if closing is None:
+                writer = self._writer
+                opening = self._open_task
+                if writer is None and opening is None:
+                    return
+                closing = self._begin_close(writer, opening, self._generation)
+        await self._join_close(closing)
+
+    def _begin_close(
+        self,
+        writer: asyncio.StreamWriter | None,
+        opening: asyncio.Task[None] | None,
+        generation: int,
+    ) -> asyncio.Task[None]:
+        """Publish one generation-bound retirement while holding the lock."""
+
+        self._retiring = True
+        if opening is not None:
+            opening.cancel()
+        transport = writer.transport if writer is not None else None
         self._reader = None
         self._writer = None
-        if writer is not None:
+        if self._open_task is opening:
+            self._open_task = None
+        closing = asyncio.create_task(
+            self._finish_close(writer, transport, opening, generation),
+            name="weight-signer-retirement",
+        )
+        self._close_task = closing
+        return closing
+
+    async def _join_close(self, closing: asyncio.Task[None]) -> None:
+        try:
+            await closing
+        finally:
+            async with self._lifecycle_lock:
+                if self._close_task is closing and closing.done():
+                    self._close_task = None
+
+    async def _finish_close(
+        self,
+        writer: asyncio.StreamWriter | None,
+        transport: asyncio.BaseTransport | None,
+        opening: asyncio.Task[None] | None,
+        generation: int,
+    ) -> None:
+        primary: BaseException | None = None
+        try:
             try:
-                writer.close()
-            finally:
+                await self._retire_writer(writer, transport)
+            except BaseException as exc:
+                primary = exc
+            if opening is not None:
+                await asyncio.gather(opening, return_exceptions=True)
+            if primary is not None:
+                raise primary
+        finally:
+            async with self._lifecycle_lock:
+                if self._generation == generation:
+                    self._retiring = False
+
+    async def _retire_writer(
+        self,
+        writer: asyncio.StreamWriter | None,
+        transport: asyncio.BaseTransport | None,
+    ) -> None:
+        """Independently close, abort, and boundedly drain one writer."""
+
+        if writer is None:
+            return
+        primary: BaseException | None = None
+
+        def failed(exc: BaseException, note: str) -> None:
+            nonlocal primary
+            if primary is None:
+                primary = exc
+            else:
+                primary.add_note(note)
+
+        try:
+            writer.close()
+        except BaseException as exc:
+            failed(exc, "signer_writer_close_failed")
+        abort = getattr(transport, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except BaseException as exc:
+                failed(exc, "signer_transport_abort_failed")
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
                 await writer.wait_closed()
+        except BaseException as exc:
+            failed(exc, "signer_writer_retirement_failed")
+        if primary is not None:
+            raise primary
 
     async def submit(self, vector: ExecutionVector) -> SubmissionResult:
         reader = self._reader
