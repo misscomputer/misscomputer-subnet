@@ -883,8 +883,13 @@ def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> Non
             descriptor_stat = os.fstat(temporary.descriptor)
             identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
             temporary.identity = identity
-        except BaseException as exc:
-            failed(exc)
+        except BaseException as fstat_error:
+            try:
+                descriptor_stat = os.stat(temporary.descriptor)
+                identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                temporary.identity = identity
+            except BaseException:
+                failed(fstat_error)
     try:
         if temporary.name is not None and identity != (-1, -1):
             named = os.stat(temporary.name, dir_fd=directory_fd, follow_symlinks=False)
