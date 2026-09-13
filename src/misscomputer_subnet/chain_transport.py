@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from bittensor._substrate import RpcSubstrate
+from bittensor._transport.errors import SubstrateRequestException
 from bittensor._transport.interface import SubstrateConnection
 from bittensor.settings import (
     default_archive_endpoints,
@@ -63,6 +64,7 @@ class _OwnedRpcSubstrate(RpcSubstrate):
         self._lifecycle_lock = asyncio.Lock()
         self._operations: dict[asyncio.Task[Any], _RpcOperationOwnership] = {}
         self._owned_interfaces: list[_RpcInterfaceOwnership] = []
+        self._ownership_changed = asyncio.Event()
         self._retiring = False
 
     def _interface(self, endpoint: str, fallbacks: list[str]) -> SubstrateConnection:
@@ -109,6 +111,7 @@ class _OwnedRpcSubstrate(RpcSubstrate):
 
         session._connect = connect_owned
         self._owned_interfaces.append(ownership)
+        self._ownership_changed.set()
         return raw
 
     def _current_operation_admitted(self) -> bool:
@@ -137,21 +140,31 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             self._operations[current] = ownership
             return ownership
 
-    async def _release_operation(self, ownership: _RpcOperationOwnership) -> None:
-        async with self._lifecycle_lock:
-            current = self._operations.get(ownership.task)
-            if current is not ownership:
-                return
-            ownership.depth -= 1
-            if ownership.depth == 0:
-                del self._operations[ownership.task]
-                if not ownership.completion.done():
-                    ownership.completion.set_result(None)
+    def _release_operation(self, ownership: _RpcOperationOwnership) -> None:
+        current = self._operations.get(ownership.task)
+        if current is not ownership:
+            return
+        ownership.depth -= 1
+        if ownership.depth == 0:
+            del self._operations[ownership.task]
+            if not ownership.completion.done():
+                ownership.completion.set_result(None)
 
     async def _drain_operations(self, caller: asyncio.Task[Any] | None) -> None:
-        """Wait to a fixed point for every admitted operation except our caller."""
+        """Settle failed sessions and drain every admitted operation to a fixed point."""
 
         while True:
+            # No task can interleave between clearing this edge-trigger and the
+            # ownership snapshot below. A nested archive factory that publishes
+            # after we await sets it and forces another fixed-point pass.
+            self._ownership_changed.clear()
+            supervisors: set[asyncio.Task[Any]] = set()
+            for interface in self._owned_interfaces:
+                supervisor = interface.session._supervisor
+                if supervisor is not None and supervisor.done():
+                    self._settle_failed_session(interface.session)
+                elif supervisor is not None:
+                    supervisors.add(supervisor)
             async with self._lifecycle_lock:
                 pending = tuple(
                     ownership.completion
@@ -160,10 +173,30 @@ class _OwnedRpcSubstrate(RpcSubstrate):
                 )
             if not pending:
                 return
-            await asyncio.gather(
-                *(asyncio.shield(completion) for completion in pending),
-                return_exceptions=True,
-            )
+            ownership_changed = asyncio.create_task(self._ownership_changed.wait())
+            try:
+                # A supervisor may fail or a nested archive may be published
+                # after the snapshot without resolving the pinned SDK's request
+                # futures. Wake on either edge so the next pass can settle it.
+                await asyncio.wait(
+                    (*pending, *supervisors, ownership_changed),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                ownership_changed.cancel()
+                await asyncio.gather(ownership_changed, return_exceptions=True)
+
+    @staticmethod
+    def _settle_failed_session(session: Any) -> None:
+        """Wake requests a terminated SDK supervisor can no longer resolve."""
+
+        if not session._pending and not session._subscriptions:
+            return
+        shutdown = SubstrateRequestException("RPC session closed during shutdown")
+        session._closing = True
+        session._fatal_error = shutdown
+        session._fail_all(shutdown)
+        session._connected.set()
 
     @staticmethod
     def _ownership_retiring(ownership: _RpcInterfaceOwnership) -> bool:
@@ -226,7 +259,7 @@ class _OwnedRpcSubstrate(RpcSubstrate):
         try:
             return await super()._read(op)
         finally:
-            await self._release_operation(ownership)
+            self._release_operation(ownership)
 
     async def _archive(self) -> SubstrateConnection | None:
         ownership = await self._admit_operation()
@@ -240,7 +273,7 @@ class _OwnedRpcSubstrate(RpcSubstrate):
                     primary.add_note("rpc_archive_cleanup_failed")
                 raise
         finally:
-            await self._release_operation(ownership)
+            self._release_operation(ownership)
 
     async def _close_owned(self, caller: asyncio.Task[Any] | None) -> None:
         self._retiring = True

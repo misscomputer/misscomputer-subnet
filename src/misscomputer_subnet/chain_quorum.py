@@ -7,14 +7,16 @@ import asyncio
 import ipaddress
 import json
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Any, Protocol, TypeVar, cast
 from urllib.parse import urlsplit
 
 from .async_lifecycle import drain_cleanup
 from .chain import BittensorChain, MetagraphSnapshot
+
+T = TypeVar("T")
 
 
 class FinalizedChainQuery(Protocol):
@@ -58,6 +60,13 @@ class RpcAgreementError(RuntimeError):
         self.code = code
 
 
+@dataclass(slots=True)
+class _QuorumReadOperation:
+    task: asyncio.Task[Any]
+    completion: asyncio.Future[None]
+    depth: int = 1
+
+
 AlertSink = Callable[[RpcAgreementAlert], None]
 
 
@@ -91,6 +100,7 @@ class FinalizedRpcQuorum:
         self._open_task: asyncio.Task[None] | None = None
         self._open_waiter_done: asyncio.Event | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._operations: dict[asyncio.Task[Any], _QuorumReadOperation] = {}
 
     def _fail(
         self,
@@ -203,9 +213,15 @@ class FinalizedRpcQuorum:
             raise
 
     async def close(self) -> None:
-        await drain_cleanup(self._request_close(), name="rpc-quorum-cleanup")
+        caller = asyncio.current_task()
+        await drain_cleanup(self._request_close(caller=caller), name="rpc-quorum-cleanup")
 
-    async def _request_close(self, *, wait_for_open: bool = True) -> None:
+    async def _request_close(
+        self,
+        *,
+        wait_for_open: bool = True,
+        caller: asyncio.Task[Any] | None = None,
+    ) -> None:
         async with self._lifecycle_lock:
             closing = self._close_task
             waiter_done = self._open_waiter_done
@@ -217,7 +233,7 @@ class FinalizedRpcQuorum:
                 self._owns_chains = False
                 self._opened = False
                 closing = asyncio.create_task(
-                    self._finish_close(owns_chains, opening),
+                    self._finish_close(owns_chains, opening, caller),
                     name="rpc-quorum-close",
                 )
                 self._close_task = closing
@@ -236,9 +252,11 @@ class FinalizedRpcQuorum:
         self,
         owns_chains: bool,
         opening: asyncio.Task[None] | None,
+        caller: asyncio.Task[Any] | None,
     ) -> None:
         close_failed = False
         try:
+            self._cancel_read_operations(caller)
             if opening is not None:
                 if not opening.done():
                     opening.cancel()
@@ -249,6 +267,7 @@ class FinalizedRpcQuorum:
                     *(chain.close() for chain in self._chains), return_exceptions=True
                 )
                 close_failed = any(isinstance(result, BaseException) for result in results)
+            await self._drain_read_operations(caller)
         finally:
             async with self._lifecycle_lock:
                 self._opened = False
@@ -259,7 +278,65 @@ class FinalizedRpcQuorum:
         if close_failed:
             raise self._fail("rpc_close_failed", "close", "redundant RPC close failed")
 
+    async def _admit_read(self) -> _QuorumReadOperation:
+        current = asyncio.current_task()
+        if current is None:
+            raise self._fail("rpc_read_failed", "read", "RPC read has no owning task")
+        async with self._lifecycle_lock:
+            if self._retiring or self._close_task is not None:
+                raise self._fail("rpc_read_failed", "read", "redundant RPC set is retiring")
+            ownership = self._operations.get(current)
+            if ownership is None:
+                ownership = _QuorumReadOperation(
+                    task=current,
+                    completion=asyncio.get_running_loop().create_future(),
+                )
+                self._operations[current] = ownership
+            else:
+                ownership.depth += 1
+            return ownership
+
+    def _release_read(self, ownership: _QuorumReadOperation) -> None:
+        current = self._operations.get(ownership.task)
+        if current is not ownership:
+            return
+        ownership.depth -= 1
+        if ownership.depth == 0:
+            del self._operations[ownership.task]
+            if not ownership.completion.done():
+                ownership.completion.set_result(None)
+
+    async def _run_read(self, read: Callable[[], Awaitable[T]]) -> T:
+        ownership = await self._admit_read()
+        try:
+            return await read()
+        finally:
+            self._release_read(ownership)
+
+    def _cancel_read_operations(self, caller: asyncio.Task[Any] | None) -> None:
+        for ownership in tuple(self._operations.values()):
+            if ownership.task is not caller and not ownership.completion.done():
+                ownership.task.cancel()
+
+    async def _drain_read_operations(self, caller: asyncio.Task[Any] | None) -> None:
+        while True:
+            async with self._lifecycle_lock:
+                pending = tuple(
+                    ownership.completion
+                    for ownership in self._operations.values()
+                    if ownership.task is not caller and not ownership.completion.done()
+                )
+            if not pending:
+                return
+            await asyncio.gather(
+                *(asyncio.shield(completion) for completion in pending),
+                return_exceptions=True,
+            )
+
     async def sync(self) -> MetagraphSnapshot:
+        return await self._run_read(self._sync)
+
+    async def _sync(self) -> MetagraphSnapshot:
         heights_raw = await asyncio.gather(
             *(chain.latest_finalized_block() for chain in self._chains),
             return_exceptions=True,
@@ -337,6 +414,9 @@ class FinalizedRpcQuorum:
         return snapshots[0]
 
     async def commit_reveal_enabled(self, block: int) -> bool:
+        return await self._run_read(lambda: self._commit_reveal_enabled(block))
+
+    async def _commit_reveal_enabled(self, block: int) -> bool:
         values_raw = await asyncio.gather(
             *(chain.commit_reveal_enabled(block) for chain in self._chains),
             return_exceptions=True,
@@ -366,6 +446,9 @@ class FinalizedRpcQuorum:
         return values[0]
 
     async def validator_weights(self, block: int, validator_uid: int) -> dict[int, float]:
+        return await self._run_read(lambda: self._validator_weights(block, validator_uid))
+
+    async def _validator_weights(self, block: int, validator_uid: int) -> dict[int, float]:
         rows_raw = await asyncio.gather(
             *(chain.validator_weights(block, validator_uid) for chain in self._chains),
             return_exceptions=True,

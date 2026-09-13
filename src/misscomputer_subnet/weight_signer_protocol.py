@@ -556,6 +556,27 @@ class UnixWeightSignerClient:
                 primary = exc
             if opening is not None:
                 await asyncio.gather(opening, return_exceptions=True)
+            # A cancellation-resistant dial can acquire and publish after
+            # _begin_close captured an empty writer slot. The generation gate
+            # remains closed while the completed opener is drained, so repeat
+            # ownership discovery until that generation has no writer left.
+            while True:
+                async with self._lifecycle_lock:
+                    if self._generation != generation:
+                        late_writer = None
+                    else:
+                        late_writer = self._writer
+                        self._reader = None
+                        self._writer = None
+                if late_writer is None:
+                    break
+                try:
+                    await self._retire_writer(late_writer, late_writer.transport)
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+                    else:
+                        primary.add_note("signer_late_writer_retirement_failed")
             if primary is not None:
                 raise primary
         finally:

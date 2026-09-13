@@ -7,15 +7,18 @@ import asyncio
 import json
 import math
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 import bittensor as bt
 
 from .async_lifecycle import drain_cleanup
 from .auth import HotkeySigningFacade
 from .chain_transport import _OwnedRpcSubstrate
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +69,13 @@ class MetagraphSnapshot:
         return (self.network, self.netuid, self.block, self.tempo, neurons)
 
 
+@dataclass(slots=True)
+class _ChainReadOperation:
+    task: asyncio.Task[Any]
+    completion: asyncio.Future[None]
+    depth: int = 1
+
+
 class ChainQuery(Protocol):
     """Read-only metagraph lifecycle exposed to neuron application code."""
 
@@ -85,6 +95,7 @@ class BittensorChain:
         "__generation",
         "__lifecycle_lock",
         "__open_task",
+        "__operations",
         "__retiring",
         "network",
         "netuid",
@@ -106,6 +117,7 @@ class BittensorChain:
         self.__generation = 0
         self.__lifecycle_lock = asyncio.Lock()
         self.__open_task: asyncio.Task[None] | None = None
+        self.__operations: dict[asyncio.Task[Any], _ChainReadOperation] = {}
         self.__retiring = False
 
     async def open(self) -> None:
@@ -189,9 +201,10 @@ class BittensorChain:
         await self._join_close(closing)
 
     async def close(self) -> None:
-        await drain_cleanup(self._request_close(), name="bittensor-chain-cleanup")
+        caller = asyncio.current_task()
+        await drain_cleanup(self._request_close(caller), name="bittensor-chain-cleanup")
 
-    async def _request_close(self) -> None:
+    async def _request_close(self, caller: asyncio.Task[Any] | None) -> None:
         async with self.__lifecycle_lock:
             closing = self.__close_task
             if closing is None:
@@ -204,7 +217,7 @@ class BittensorChain:
                 # Close admission before publishing the asynchronous retirement.
                 # The task remains shared until both the admitted opener and every
                 # SDK layer are at a fixed point.
-                closing = self._begin_close(client, opening, self.__generation)
+                closing = self._begin_close(client, opening, self.__generation, caller)
         await self._join_close(closing)
 
     def _begin_close(
@@ -212,6 +225,7 @@ class BittensorChain:
         client: Any,
         opening: asyncio.Task[None] | None,
         generation: int,
+        caller: asyncio.Task[Any] | None = None,
     ) -> asyncio.Task[None]:
         """Publish one close task while the lifecycle lock is held."""
 
@@ -220,7 +234,7 @@ class BittensorChain:
         if self.__open_task is opening:
             self.__open_task = None
         closing = asyncio.create_task(
-            self._finish_close(client, opening, generation),
+            self._finish_close(client, opening, generation, caller),
             name="bittensor-chain-close",
         )
         self.__close_task = closing
@@ -239,9 +253,11 @@ class BittensorChain:
         client: Any,
         opening: asyncio.Task[None] | None,
         generation: int,
+        caller: asyncio.Task[Any] | None,
     ) -> None:
         primary: BaseException | None = None
         try:
+            self._cancel_read_operations(caller)
             try:
                 await self._close_client(client)
             except BaseException as exc:
@@ -252,12 +268,72 @@ class BittensorChain:
             # the retirement/reopen gate closed until it unwinds.
             if opening is not None:
                 await asyncio.gather(opening, return_exceptions=True)
+            await self._drain_read_operations(caller)
             if primary is not None:
                 raise primary
         finally:
             async with self.__lifecycle_lock:
                 if self.__generation == generation:
                     self.__retiring = False
+
+    async def _admit_read(self) -> tuple[_ChainReadOperation, Any]:
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("chain read has no owning task")
+        async with self.__lifecycle_lock:
+            if self.__retiring or self.__close_task is not None:
+                raise RuntimeError("chain is retiring")
+            client = self.__client
+            if client is None:
+                raise RuntimeError("chain is not open")
+            ownership = self.__operations.get(current)
+            if ownership is None:
+                ownership = _ChainReadOperation(
+                    task=current,
+                    completion=asyncio.get_running_loop().create_future(),
+                )
+                self.__operations[current] = ownership
+            else:
+                ownership.depth += 1
+            return ownership, client
+
+    def _release_read(self, ownership: _ChainReadOperation) -> None:
+        current = self.__operations.get(ownership.task)
+        if current is not ownership:
+            return
+        ownership.depth -= 1
+        if ownership.depth == 0:
+            del self.__operations[ownership.task]
+            if not ownership.completion.done():
+                ownership.completion.set_result(None)
+
+    async def _run_read(self, read: Callable[[Any], Awaitable[T]]) -> T:
+        ownership, client = await self._admit_read()
+        try:
+            return await read(client)
+        finally:
+            # No await: repeated cancellation cannot strand the completion.
+            self._release_read(ownership)
+
+    def _cancel_read_operations(self, caller: asyncio.Task[Any] | None) -> None:
+        for ownership in tuple(self.__operations.values()):
+            if ownership.task is not caller and not ownership.completion.done():
+                ownership.task.cancel()
+
+    async def _drain_read_operations(self, caller: asyncio.Task[Any] | None) -> None:
+        while True:
+            async with self.__lifecycle_lock:
+                pending = tuple(
+                    ownership.completion
+                    for ownership in self.__operations.values()
+                    if ownership.task is not caller and not ownership.completion.done()
+                )
+            if not pending:
+                return
+            await asyncio.gather(
+                *(asyncio.shield(completion) for completion in pending),
+                return_exceptions=True,
+            )
 
     @staticmethod
     async def _close_client(client: Any) -> None:
@@ -268,31 +344,31 @@ class BittensorChain:
                 await result
 
     async def sync(self) -> MetagraphSnapshot:
-        client = self.__client
-        if client is None:
-            raise RuntimeError("chain is not open")
-        finalized_block = await self._finalized_block()
-        return await self._read_metagraph(finalized_block)
+        async def read(client: Any) -> MetagraphSnapshot:
+            finalized_block = await self._finalized_block(client)
+            return await self._read_metagraph(client, finalized_block)
+
+        return await self._run_read(read)
 
     async def latest_finalized_block(self) -> int:
         """Return an exact finalized height or fail when the RPC lacks support."""
 
-        finalized_block = await self._finalized_block()
-        if finalized_block is None:
-            raise RuntimeError("RPC does not expose finalized-head reads")
-        return finalized_block
+        async def read(client: Any) -> int:
+            finalized_block = await self._finalized_block(client)
+            if finalized_block is None:
+                raise RuntimeError("RPC does not expose finalized-head reads")
+            return finalized_block
+
+        return await self._run_read(read)
 
     async def sync_at_finalized(self, block: int) -> MetagraphSnapshot:
         """Read one caller-proven finalized height from this RPC."""
 
         if block < 0:
             raise RuntimeError("finalized block is invalid")
-        return await self._read_metagraph(block)
+        return await self._run_read(lambda client: self._read_metagraph(client, block))
 
-    async def _read_metagraph(self, block: int | None) -> MetagraphSnapshot:
-        client = self.__client
-        if client is None:
-            raise RuntimeError("chain is not open")
+    async def _read_metagraph(self, client: Any, block: int | None) -> MetagraphSnapshot:
         if block is None:
             graph = await client.subnets.metagraph(netuid=self.netuid, commitments=False)
         else:
@@ -332,19 +408,26 @@ class BittensorChain:
     async def commit_reveal_enabled(self, block: int) -> bool:
         """Read the subnet's weight mode at one exact finalized block."""
 
-        client = self.__client
-        if client is None:
-            raise RuntimeError("chain is not open")
-        return bool(await client.subnets.commit_reveal_enabled(self.netuid, block=block))
+        async def read(client: Any) -> bool:
+            return bool(await client.subnets.commit_reveal_enabled(self.netuid, block=block))
+
+        return await self._run_read(read)
 
     async def validator_weights(self, block: int, validator_uid: int) -> dict[int, float]:
         """Read one validator's normalized weight row at an exact block."""
 
-        client = self.__client
-        if client is None:
-            raise RuntimeError("chain is not open")
         if block < 0 or not 0 <= validator_uid <= 65_535:
             raise RuntimeError("weight-row identity is invalid")
+        return await self._run_read(
+            lambda client: self._read_validator_weights(client, block, validator_uid)
+        )
+
+    async def _read_validator_weights(
+        self,
+        client: Any,
+        block: int,
+        validator_uid: int,
+    ) -> dict[int, float]:
         rows = await client.weights.weights(self.netuid, block=block)
         if not isinstance(rows, dict):
             raise RuntimeError("weight row response is invalid")
@@ -371,7 +454,7 @@ class BittensorChain:
             raise RuntimeError("validator weight row is not normalized")
         return dict(sorted(row.items()))
 
-    async def _finalized_block(self) -> int | None:
+    async def _finalized_block(self, client: Any) -> int | None:
         """Return the finalized height exposed by the pinned Bittensor v11 SDK.
 
         ``Client`` does not publish a one-shot finalized-height method, but its
@@ -381,7 +464,7 @@ class BittensorChain:
         monotonic/same-height-conflict checks instead of silently accepting a
         rollback.
         """
-        substrate = getattr(self.__client, "_substrate", None)
+        substrate = getattr(client, "_substrate", None)
         raw = getattr(substrate, "raw", None)
         finalized_head = getattr(raw, "get_chain_finalised_head", None)
         block_number = getattr(raw, "get_block_number", None)
