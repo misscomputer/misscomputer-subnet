@@ -10,6 +10,7 @@ another transport. No SDK files are patched and no write/signing API is added.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -47,6 +48,8 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             ),
             archive_endpoints=[] if pinned else default_archive_endpoints(resolved_network),
         )
+        self._close_task: asyncio.Task[None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._owned_interfaces: list[_RpcInterfaceOwnership] = []
         self._retiring = False
 
@@ -126,8 +129,14 @@ class _OwnedRpcSubstrate(RpcSubstrate):
         return False
 
     async def connect(self) -> None:
+        async with self._lifecycle_lock:
+            if self._retiring or self._close_task is not None:
+                raise ConnectionError("RPC transport is closing")
         try:
             await super().connect()
+            async with self._lifecycle_lock:
+                if self._retiring or self._close_task is not None:
+                    raise ConnectionError("RPC transport is closing")
         except BaseException as primary:
             try:
                 await self.close()
@@ -136,8 +145,15 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             raise
 
     async def _archive(self) -> SubstrateConnection | None:
+        async with self._lifecycle_lock:
+            if self._retiring or self._close_task is not None:
+                raise ConnectionError("RPC transport is closing")
         try:
-            return await super()._archive()
+            archive = await super()._archive()
+            async with self._lifecycle_lock:
+                if self._retiring or self._close_task is not None:
+                    raise ConnectionError("RPC transport is closing")
+            return archive
         except BaseException as primary:
             try:
                 await self.close()
@@ -259,4 +275,23 @@ class _OwnedRpcSubstrate(RpcSubstrate):
             raise primary
 
     async def close(self) -> None:
-        await drain_cleanup(self._close_owned(), name="bittensor-transport-cleanup")
+        await drain_cleanup(self._request_close(), name="bittensor-transport-cleanup")
+
+    async def _request_close(self) -> None:
+        async with self._lifecycle_lock:
+            closing = self._close_task
+            if closing is None:
+                # Publish one immutable retirement before ownership is removed.
+                # Initialization, archive, and owner-close paths all join it.
+                self._retiring = True
+                closing = asyncio.create_task(
+                    self._close_owned(),
+                    name="bittensor-transport-retirement",
+                )
+                self._close_task = closing
+        try:
+            await closing
+        finally:
+            async with self._lifecycle_lock:
+                if self._close_task is closing and closing.done():
+                    self._close_task = None

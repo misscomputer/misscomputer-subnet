@@ -78,6 +78,17 @@ submission. Any timeout/exception after entering `execute` is also ambiguous,
 even when an SDK preflight may have failed before signing, because the wrapper
 cannot prove that boundary from an exception alone.
 
+Weight-signer protocol v2 has three exact response forms. `confirmed` requires
+a canonical extrinsic reference and no error code; `rejected` requires an error
+code and forbids a reference; `ambiguous` requires an error code and may carry
+the canonical reference of an extrinsic the signer already signed and may have
+submitted.
+That last reference is reconciliation evidence, not confirmation. The public
+peer-UID-pinned client accepts it only after canonical framing, exact v2 shape,
+request-ID binding, and status validation, then preserves it through the
+executor's ambiguous audit receipt and CLI diagnostic. Both the referenced and
+null-reference ambiguous forms remain replay-blocking.
+
 The neuron facade remains API/call-path isolation, but weight execution adds an
 independently privileged signer boundary: the executor process and OS account
 cannot read the wallet, cannot supply arbitrary weights, and can address only
@@ -104,6 +115,22 @@ documented conservative fallback: a block lower than the admitted floor, or a
 different scheduling identity fingerprint at the same block, is rejected. The
 Go bridge independently applies the same block floor and same-height chain-state
 conflict check before committing its staged chain/miner snapshot.
+
+`BittensorChain` retains both the admitted `open()` operation and its client
+generation. The public opener remains responsible across both cancellation
+handoffs: before its child first executes and after a successful SDK connect
+but before the child's result is delivered. Any failure starts or joins
+retirement for exactly the captured generation, drains the child and client,
+and only then propagates the original failure. `close()` closes admission,
+clears the captured opener independently of the child's `finally` block,
+starts SDK retirement, and drains that exact opener before releasing the gate.
+An obsolete opener therefore cannot close a later generation.
+Concurrent close callers join one chain retirement; repeated caller
+cancellation cannot detach it. At the substrate layer, initialization/archive
+cleanup and external owner close also join one shared retirement operation.
+The adapter refuses reopening until the admitted opener, captured WebSocket
+descriptors, RPC supervisors, and transport cleanup tasks reach their closed
+fixed point.
 
 The one-shot executor is stricter than the daemon fallback: every execution
 preflight requires `snapshot.finalized is True`. An SDK/transport without the

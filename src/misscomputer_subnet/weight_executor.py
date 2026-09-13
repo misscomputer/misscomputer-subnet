@@ -1492,18 +1492,29 @@ async def _execute_weight_plan(
             "submission timed out and must be reconciled before retry",
         ) from exc
     except Exception as exc:
+        # Only a canonical, request-bound signer response raises the public
+        # ambiguous error with a reference. Keep that reconciliation handle
+        # through the generic post-send exception boundary without changing
+        # the effect classification or making the attempt replayable.
+        extrinsic_ref = (
+            exc.extrinsic_ref
+            if isinstance(exc, WeightExecutionError) and exc.code == "submission_ambiguous"
+            else None
+        )
         resources.finish_submission(
             attempt.attempt_id,
             status="ambiguous",
             outcome="ambiguous",
-            extrinsic_ref=None,
+            extrinsic_ref=extrinsic_ref,
             error_code="submission_exception",
             clock=effective_clock,
         )
-        raise WeightExecutionError(
+        error = WeightExecutionError(
             "submission_ambiguous",
             "submission response was lost and must be reconciled before retry",
-        ) from exc
+        )
+        error.extrinsic_ref = extrinsic_ref
+        raise error from exc
     if result.success:
         if result.extrinsic_ref is None:
             resources.finish_submission(
