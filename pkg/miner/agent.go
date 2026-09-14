@@ -351,6 +351,11 @@ func (a *Agent) Deactivate(ctx context.Context, endpointID string) error {
 				if err := a.State.PutCleanupEndpoint(ctx, endpoint); err != nil {
 					return err
 				}
+			} else if !endpoint.Active {
+				// A completed exact deactivation is idempotent. Reassert its durable
+				// owner fence, but never reopen the inactive incarnation merely to
+				// upgrade optional backend cleanup metadata.
+				return a.State.FenceEndpointDeactivation(ctx, endpointID, deploymentID, a.MinerID, validatorHotkey)
 			} else if endpoint.RuntimeCleanupPath == "" || endpoint.RuntimeCleanupRoot == "" {
 				cleanupPlan := deployruntime.CleanupPlan{
 					InstanceID: endpoint.RuntimeID, LayerPath: endpoint.RuntimeCleanupPath,

@@ -257,6 +257,9 @@ func TestDurableReadyAssignmentReplayReportsIdempotency(t *testing.T) {
 	if err := agent.Deactivate(context.Background(), first.EndpointID); err != nil {
 		t.Fatal(err)
 	}
+	if err := agent.Deactivate(context.Background(), first.EndpointID); err != nil {
+		t.Fatalf("repeat deactivation: %v", err)
+	}
 }
 
 func TestCancelledHealthWaitCleansRuntimeWithFreshContext(t *testing.T) {

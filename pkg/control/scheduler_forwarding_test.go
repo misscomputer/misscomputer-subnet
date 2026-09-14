@@ -148,7 +148,12 @@ func TestSchedulerCancellationAcrossForwardingBoundaryCannotStrandMinerRuntime(t
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
-	defer forwarder.Close()
+	forwarderClosed := false
+	defer func() {
+		if !forwarderClosed {
+			forwarder.Close()
+		}
+	}()
 	assigner := &remote.Assigner{
 		MinerHotkey: "forwarded-miner", ServiceKey: minerPublic, BridgeURL: forwarder.URL,
 		Secret: []byte("forwarding-boundary-secret-32-bytes"), Client: forwarder.Client(), Retries: 0,
@@ -180,9 +185,22 @@ func TestSchedulerCancellationAcrossForwardingBoundaryCannotStrandMinerRuntime(t
 	close(runtime.release)
 	select {
 	case <-forwardingDone:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("detached forwarding task did not finish")
 	}
+	// The completed /deploy handler hands its late result back to the
+	// scheduler-owned assignment worker. That worker can then issue a second
+	// /deactivate after forwardingDone closes. Drain the scheduler ownership
+	// graph first, then close the forwarding server to join every admitted HTTP
+	// handler before tearing down the state they use.
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := scheduler.Drain(drainCtx); err != nil {
+		cancelDrain()
+		t.Fatal(err)
+	}
+	cancelDrain()
+	forwarder.Close()
+	forwarderClosed = true
 	runtime.mu.Lock()
 	active, stops := runtime.active, runtime.stops
 	runtime.mu.Unlock()

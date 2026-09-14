@@ -311,6 +311,15 @@ class SignerResponse:
         )
 
 
+@dataclass(slots=True)
+class _SignerSubmitOperation:
+    task: asyncio.Task[object]
+    completion: asyncio.Future[None]
+    generation: int
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+
+
 def unix_peer_uid(connection: socket.socket) -> int:
     if not hasattr(socket, "SO_PEERCRED"):
         raise SignerProtocolError(
@@ -365,6 +374,7 @@ class UnixWeightSignerClient:
         "_generation",
         "_lifecycle_lock",
         "_open_task",
+        "_operations",
         "_reader",
         "_retiring",
         "_writer",
@@ -396,6 +406,7 @@ class UnixWeightSignerClient:
         self._generation = 0
         self._lifecycle_lock = asyncio.Lock()
         self._open_task: asyncio.Task[None] | None = None
+        self._operations: dict[asyncio.Task[object], _SignerSubmitOperation] = {}
         self._reader: asyncio.StreamReader | None = None
         self._retiring = False
         self._writer: asyncio.StreamWriter | None = None
@@ -497,6 +508,11 @@ class UnixWeightSignerClient:
         await self._join_close(closing)
 
     async def close(self) -> None:
+        caller = asyncio.current_task()
+        if caller is not None and caller in self._operations:
+            raise SignerProtocolError(
+                "signer_protocol_invalid", "signer request cannot close its own client"
+            )
         await drain_cleanup(self._request_close(), name="weight-signer-cleanup")
 
     async def _request_close(self) -> None:
@@ -505,7 +521,7 @@ class UnixWeightSignerClient:
             if closing is None:
                 writer = self._writer
                 opening = self._open_task
-                if writer is None and opening is None:
+                if writer is None and opening is None and not self._operations:
                     return
                 closing = self._begin_close(writer, opening, self._generation)
         await self._join_close(closing)
@@ -521,13 +537,21 @@ class UnixWeightSignerClient:
         self._retiring = True
         if opening is not None:
             opening.cancel()
+        operations = tuple(
+            operation
+            for operation in self._operations.values()
+            if operation.generation == generation and (writer is None or operation.writer is writer)
+        )
+        for operation in operations:
+            if not operation.completion.done():
+                operation.task.cancel()
         transport = writer.transport if writer is not None else None
         self._reader = None
         self._writer = None
         if self._open_task is opening:
             self._open_task = None
         closing = asyncio.create_task(
-            self._finish_close(writer, transport, opening, generation),
+            self._finish_close(writer, transport, opening, operations, generation),
             name="weight-signer-retirement",
         )
         self._close_task = closing
@@ -546,6 +570,7 @@ class UnixWeightSignerClient:
         writer: asyncio.StreamWriter | None,
         transport: asyncio.BaseTransport | None,
         opening: asyncio.Task[None] | None,
+        operations: tuple[_SignerSubmitOperation, ...],
         generation: int,
     ) -> None:
         primary: BaseException | None = None
@@ -556,6 +581,7 @@ class UnixWeightSignerClient:
                 primary = exc
             if opening is not None:
                 await asyncio.gather(opening, return_exceptions=True)
+            await self._drain_submit_operations(operations)
             # A cancellation-resistant dial can acquire and publish after
             # _begin_close captured an empty writer slot. The generation gate
             # remains closed while the completed opener is drained, so repeat
@@ -620,47 +646,95 @@ class UnixWeightSignerClient:
         if primary is not None:
             raise primary
 
-    async def submit(self, vector: ExecutionVector) -> SubmissionResult:
+    def _admit_submit(self) -> _SignerSubmitOperation:
+        """Capture one complete request scope before its first await."""
+
+        current = asyncio.current_task()
+        if current is None:
+            raise SignerProtocolError(
+                "signer_protocol_invalid", "signer request has no owning task"
+            )
+        if self._retiring or self._close_task is not None:
+            raise SignerProtocolError("signer_protocol_invalid", "signer client is retiring")
         reader = self._reader
         writer = self._writer
         if reader is None or writer is None:
             raise SignerProtocolError("signer_unavailable", "signer client is not open")
-        request = SignerRequest(
-            request_id=secrets.token_hex(32),
-            network=vector.network,
-            netuid=vector.netuid,
-            validator_hotkey=vector.validator_hotkey,
-            plan_digest_sha256=vector.plan_digest_sha256,
-            execution_digest_sha256=vector.digest_sha256,
-            execution_vector=vector,
-        )
-        try:
-            async with asyncio.timeout(self.timeout_seconds):
-                writer.write(request.canonical_bytes())
-                await writer.drain()
-                response = SignerResponse.from_bytes(await read_message(reader))
-        except TimeoutError as exc:
-            raise SignerProtocolError("signer_timeout", "signer response timed out") from exc
-        except SignerProtocolError:
-            raise
-        except OSError as exc:
-            raise SignerProtocolError("signer_unavailable", "signer is unavailable") from exc
-        if response.request_id != request.request_id:
+        if current in self._operations:
             raise SignerProtocolError(
-                "signer_protocol_invalid", "signer response request ID does not match"
+                "signer_protocol_invalid", "signer task already owns a request"
             )
-        if response.status == "ambiguous":
-            error = SignerProtocolError(
-                "submission_ambiguous",
-                "signer reported an ambiguous submission that requires reconciliation",
-            )
-            # The response was canonical, request-bound, and received from the
-            # pinned signer UID. Preserve its safe signed-extrinsic reference
-            # while retaining ambiguous effect certainty.
-            error.extrinsic_ref = response.extrinsic_ref
-            raise error
-        return SubmissionResult(
-            success=response.status == "confirmed",
-            extrinsic_ref=response.extrinsic_ref,
-            error_code=response.error_code,
+        operation = _SignerSubmitOperation(
+            task=current,
+            completion=asyncio.get_running_loop().create_future(),
+            generation=self._generation,
+            reader=reader,
+            writer=writer,
         )
+        self._operations[current] = operation
+        return operation
+
+    def _release_submit(self, operation: _SignerSubmitOperation) -> None:
+        if self._operations.get(operation.task) is operation:
+            del self._operations[operation.task]
+        if not operation.completion.done():
+            operation.completion.set_result(None)
+
+    @staticmethod
+    async def _drain_submit_operations(
+        operations: tuple[_SignerSubmitOperation, ...],
+    ) -> None:
+        pending = tuple(
+            operation.completion for operation in operations if not operation.completion.done()
+        )
+        if pending:
+            await asyncio.gather(
+                *(asyncio.shield(completion) for completion in pending),
+                return_exceptions=True,
+            )
+
+    async def submit(self, vector: ExecutionVector) -> SubmissionResult:
+        operation = self._admit_submit()
+        try:
+            request = SignerRequest(
+                request_id=secrets.token_hex(32),
+                network=vector.network,
+                netuid=vector.netuid,
+                validator_hotkey=vector.validator_hotkey,
+                plan_digest_sha256=vector.plan_digest_sha256,
+                execution_digest_sha256=vector.digest_sha256,
+                execution_vector=vector,
+            )
+            try:
+                async with asyncio.timeout(self.timeout_seconds):
+                    operation.writer.write(request.canonical_bytes())
+                    await operation.writer.drain()
+                    response = SignerResponse.from_bytes(await read_message(operation.reader))
+            except TimeoutError as exc:
+                raise SignerProtocolError("signer_timeout", "signer response timed out") from exc
+            except SignerProtocolError:
+                raise
+            except OSError as exc:
+                raise SignerProtocolError("signer_unavailable", "signer is unavailable") from exc
+            if response.request_id != request.request_id:
+                raise SignerProtocolError(
+                    "signer_protocol_invalid", "signer response request ID does not match"
+                )
+            if response.status == "ambiguous":
+                error = SignerProtocolError(
+                    "submission_ambiguous",
+                    "signer reported an ambiguous submission that requires reconciliation",
+                )
+                # The response was canonical, request-bound, and received from the
+                # pinned signer UID. Preserve its safe signed-extrinsic reference
+                # while retaining ambiguous effect certainty.
+                error.extrinsic_ref = response.extrinsic_ref
+                raise error
+            return SubmissionResult(
+                success=response.status == "confirmed",
+                extrinsic_ref=response.extrinsic_ref,
+                error_code=response.error_code,
+            )
+        finally:
+            # No await: repeated cancellation cannot strand this completion.
+            self._release_submit(operation)
