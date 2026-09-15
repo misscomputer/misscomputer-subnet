@@ -11,7 +11,6 @@ import math
 import os
 import secrets
 import stat
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
@@ -45,6 +44,26 @@ class WeightPlanError(ValueError):
 
 class WeightPlanTargetError(WeightPlanError):
     """The requested durable plan target is unsafe."""
+
+
+def _add_note_safely(primary: BaseException, note: str) -> None:
+    """Retain cleanup context without allowing a broken hook to replace ``primary``."""
+
+    try:
+        BaseException.add_note(primary, note)
+    except BaseException:
+        # Exception identity and resource retirement take precedence over an
+        # optional diagnostic annotation, including for hostile subclasses.
+        return
+
+
+def _close_preserving(descriptor: int, primary: BaseException, note: str) -> None:
+    """Close one descriptor without replacing an already-selected failure."""
+
+    try:
+        os.close(descriptor)
+    except BaseException:
+        _add_note_safely(primary, note)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -560,6 +579,15 @@ def _target_stat(directory_fd: int, name: str) -> os.stat_result | None:
     return target
 
 
+def _unvalidated_target_stat(directory_fd: int, name: str) -> os.stat_result | None:
+    """Observe one entry for rollback without accepting it as application data."""
+
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
 def _same_target(first: os.stat_result | None, second: os.stat_result | None) -> bool:
     if first is None or second is None:
         return first is second
@@ -587,6 +615,7 @@ def _same_target(first: os.stat_result | None, second: os.stat_result | None) ->
 def _read_existing(directory_fd: int, name: str, expected: os.stat_result) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(name, flags, dir_fd=directory_fd)
+    primary: BaseException | None = None
     try:
         opened = os.fstat(descriptor)
         _validate_existing_target(opened)
@@ -603,8 +632,17 @@ def _read_existing(directory_fd: int, name: str, expected: os.stat_result) -> by
         if remaining == 0 and os.read(descriptor, 1):
             raise WeightPlanTargetError("existing weight plan target is unexpectedly large")
         return b"".join(chunks)
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except BaseException:
+            if primary is not None:
+                _add_note_safely(primary, "target_cleanup_failed")
+            else:
+                raise
 
 
 def _secure_file_location(path: str | os.PathLike[str]) -> tuple[str, str]:
@@ -645,6 +683,8 @@ class _PinnedDirectoryChain:
             except BaseException as exc:
                 if primary is None:
                     primary = exc
+                else:
+                    _add_note_safely(primary, "directory_additional_cleanup_failed")
         if primary is not None:
             raise primary
 
@@ -722,7 +762,7 @@ def _pin_directory_chain(absolute_parent: str) -> _PinnedDirectoryChain:
             try:
                 os.close(descriptor)
             except BaseException:
-                primary.add_note("directory_cleanup_failed")
+                _add_note_safely(primary, "directory_cleanup_failed")
         raise
 
 
@@ -733,11 +773,21 @@ def _revalidate_pinned_chain(chain: _PinnedDirectoryChain) -> None:
         if (current.st_dev, current.st_ino) != chain.identities[index]:
             raise WeightPlanTargetError("pinned weight plan directory changed identity")
     reopened = _pin_directory_chain(chain.absolute_parent)
+    primary: BaseException | None = None
     try:
         if reopened.identities != chain.identities:
             raise WeightPlanTargetError("configured weight plan directory changed during install")
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        reopened.close()
+        try:
+            reopened.close()
+        except BaseException:
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
+            else:
+                raise
 
 
 def _read_descriptor(descriptor: int) -> bytes:
@@ -863,7 +913,7 @@ def _allocate_visible_temporary(directory_fd: int) -> _TemporaryPlan:
             try:
                 _cleanup_temporary_plan(temporary, directory_fd)
             except BaseException:
-                primary.add_note("temporary_acquisition_cleanup_failed")
+                _add_note_safely(primary, "temporary_acquisition_cleanup_failed")
             raise
     raise WeightPlanTargetError("could not allocate a private temporary plan file")
 
@@ -887,6 +937,25 @@ def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
         raise OSError(error, os.strerror(error), source)
 
 
+def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
+    """Atomically exchange two directory entries without discarding either inode."""
+
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), first)
+    result = renameat2(
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(first)),
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(second)),
+        2,  # RENAME_EXCHANGE
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), first)
+
+
 def _scanned_target_stat(directory_fd: int, name: str) -> os.stat_result | None:
     with os.scandir(directory_fd) as entries:
         for entry in entries:
@@ -908,17 +977,6 @@ def _temporary_name_matches(
     return (first.st_dev, first.st_ino) == expected and (second.st_dev, second.st_ino) == expected
 
 
-def _restore_quarantined_name(
-    temporary: _TemporaryPlan,
-    directory_fd: int,
-    *,
-    source: str,
-    quarantine: str,
-) -> None:
-    _rename_noreplace(directory_fd, quarantine, source)
-    temporary.name = source
-
-
 def _quarantine_and_unlink_temporary(
     temporary: _TemporaryPlan,
     directory_fd: int,
@@ -926,11 +984,10 @@ def _quarantine_and_unlink_temporary(
 ) -> None:
     """Detach and revalidate an owned name before unlinking it.
 
-    The original pathname is never passed to unlink.  A no-replace rename
-    first moves whichever inode currently occupies it to an unpredictable
-    quarantine name.  If that atomic move captured a replacement, descriptor
-    link state and independent namespace observations fail the ownership fence
-    and the entry is restored instead of unlinked.
+    An exact descriptor-derived hard link is the exchange anchor.  Atomic
+    exchanges cannot collide during restoration and never discard whichever
+    inode raced into either name.  Only names still mapped to the descriptor's
+    exact identity are eligible for unlink.
     """
 
     source = temporary.name
@@ -940,16 +997,27 @@ def _quarantine_and_unlink_temporary(
     for _ in range(32):
         candidate = f".weight-plan.cleanup-{secrets.token_hex(16)}"
         try:
-            _rename_noreplace(directory_fd, source, candidate)
-        except FileExistsError:
-            continue
-        quarantine = candidate
-        temporary.name = candidate
-        break
+            _link_unnamed_temporary(temporary.descriptor, directory_fd, candidate)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                continue
+            # A raced unlink can retire the last name before linkat observes
+            # the still-open descriptor.  In that case the foreign source is
+            # already independent of the owned inode and must be left alone.
+            if exc.errno == errno.ENOENT:
+                return
+            raise
+        else:
+            quarantine = candidate
+            break
     if quarantine is None:
-        raise WeightPlanTargetError("could not quarantine a temporary plan file")
+        raise WeightPlanTargetError("could not anchor a temporary plan file")
 
+    temporary.name = quarantine
+    exchanged = False
     try:
+        _rename_exchange(directory_fd, source, quarantine)
+        exchanged = True
         descriptor_stat = os.fstat(temporary.descriptor)
         descriptor_owned = (
             stat.S_ISREG(descriptor_stat.st_mode)
@@ -958,28 +1026,44 @@ def _quarantine_and_unlink_temporary(
             and stat.S_IMODE(descriptor_stat.st_mode) == WEIGHT_PLAN_FILE_MODE
             and descriptor_stat.st_nlink > 0
         )
-        name_owned = _temporary_name_matches(directory_fd, quarantine, identity)
+        source_owned = _temporary_name_matches(directory_fd, source, identity)
+        quarantine_owned = _temporary_name_matches(directory_fd, quarantine, identity)
+        if descriptor_owned and source_owned and quarantine_owned:
+            # A second exchange closes the validation-to-delete gap exercised
+            # by a replacement at the quarantine name.  A replacement is
+            # moved, not unlinked, and the mismatch below restores it.
+            _rename_exchange(directory_fd, source, quarantine)
+            source_owned = _temporary_name_matches(directory_fd, source, identity)
+            quarantine_owned = _temporary_name_matches(directory_fd, quarantine, identity)
+        if not descriptor_owned or not source_owned or not quarantine_owned:
+            _rename_exchange(directory_fd, source, quarantine)
+            exchanged = False
+            source_owned = _temporary_name_matches(directory_fd, source, identity)
+            quarantine_owned = _temporary_name_matches(directory_fd, quarantine, identity)
+            owned_name = source if source_owned else quarantine if quarantine_owned else None
+            if owned_name is not None:
+                os.unlink(owned_name, dir_fd=directory_fd)
+            temporary.name = None
+            return
+        os.unlink(source, dir_fd=directory_fd)
+        temporary.name = quarantine
+        os.unlink(quarantine, dir_fd=directory_fd)
+        temporary.name = None
     except BaseException as primary:
+        if exchanged:
+            try:
+                _rename_exchange(directory_fd, source, quarantine)
+                temporary.name = source
+            except BaseException:
+                _add_note_safely(primary, "temporary_quarantine_restore_failed")
         try:
-            _restore_quarantined_name(
-                temporary,
-                directory_fd,
-                source=source,
-                quarantine=quarantine,
-            )
+            if _temporary_name_matches(directory_fd, quarantine, identity):
+                os.unlink(quarantine, dir_fd=directory_fd)
+                if _temporary_name_matches(directory_fd, source, identity):
+                    temporary.name = source
         except BaseException:
-            primary.add_note("temporary_quarantine_restore_failed")
+            _add_note_safely(primary, "temporary_quarantine_retirement_failed")
         raise
-    if not descriptor_owned or not name_owned:
-        _restore_quarantined_name(
-            temporary,
-            directory_fd,
-            source=source,
-            quarantine=quarantine,
-        )
-        return
-    os.unlink(quarantine, dir_fd=directory_fd)
-    temporary.name = None
 
 
 def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> None:
@@ -990,7 +1074,7 @@ def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> Non
         if primary is None:
             primary = exc
         else:
-            primary.add_note("temporary_additional_cleanup_failed")
+            _add_note_safely(primary, "temporary_additional_cleanup_failed")
 
     identity = temporary.identity
     if identity == (-1, -1):
@@ -1071,7 +1155,7 @@ def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPla
             try:
                 _cleanup_temporary_plan(temporary, directory_fd)
             except BaseException:
-                primary.add_note("temporary_cleanup_failed")
+                _add_note_safely(primary, "temporary_cleanup_failed")
             raise
         os.close(descriptor)
 
@@ -1091,7 +1175,7 @@ def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPla
         try:
             _cleanup_temporary_plan(temporary, directory_fd)
         except BaseException:
-            primary.add_note("temporary_cleanup_failed")
+            _add_note_safely(primary, "temporary_cleanup_failed")
         raise
 
 
@@ -1105,6 +1189,8 @@ def _verify_configured_target(
     _revalidate_pinned_chain(chain)
     reopened = _pin_directory_chain(chain.absolute_parent)
     descriptor = -1
+    primary: BaseException | None = None
+    body_failed = False
     try:
         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         descriptor = os.open(name, flags, dir_fd=reopened.parent_fd)
@@ -1122,13 +1208,31 @@ def _verify_configured_target(
         if named is None or not _same_target(after, named):
             raise WeightPlanTargetError("configured weight plan target changed after verification")
     except OSError as exc:
-        raise WeightPlanTargetError("configured weight plan target is unavailable") from exc
+        body_failed = True
+        primary = WeightPlanTargetError("configured weight plan target is unavailable")
+        raise primary from exc
+    except BaseException as exc:
+        body_failed = True
+        primary = exc
+        raise
     finally:
         try:
             if descriptor >= 0:
                 os.close(descriptor)
-        finally:
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "target_cleanup_failed")
+            else:
+                primary = exc
+        try:
             reopened.close()
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
+            else:
+                primary = exc
+        if not body_failed and primary is not None:
+            raise primary
 
 
 def _exact_object(
@@ -1234,6 +1338,7 @@ def load_weight_plan(path: str | os.PathLike[str]) -> WeightPlan:
 
     parent, name = _secure_file_location(path)
     chain = _pin_directory_chain(parent)
+    primary: BaseException | None = None
     try:
         _revalidate_pinned_chain(chain)
         target = _target_stat(chain.parent_fd, name)
@@ -1249,8 +1354,121 @@ def load_weight_plan(path: str | os.PathLike[str]) -> WeightPlan:
             rendered=rendered,
         )
         return _parse_weight_plan(rendered)
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        chain.close()
+        try:
+            chain.close()
+        except BaseException:
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
+            else:
+                raise
+
+
+def _install_temporary_plan(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    existing: os.stat_result | None,
+) -> None:
+    """Install ``temporary`` without destroying an unvalidated destination.
+
+    Creation uses ``RENAME_NOREPLACE``. Replacement uses ``RENAME_EXCHANGE``
+    so a destination that raced validation is retained under the temporary
+    name, checked through an open descriptor, and atomically restored before
+    the operation is rejected.
+    """
+
+    source = temporary.name
+    if source is None:
+        raise WeightPlanTargetError("temporary weight plan has no install name")
+    if existing is None:
+        try:
+            _rename_noreplace(directory_fd, source, name)
+        except FileExistsError as exc:
+            raise WeightPlanTargetError(
+                "weight plan target changed before atomic installation"
+            ) from exc
+        temporary.name = None
+        return
+
+    displaced_descriptor = -1
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        displaced_descriptor = os.open(name, flags, dir_fd=directory_fd)
+        expected_stat = os.fstat(displaced_descriptor)
+        _validate_existing_target(expected_stat)
+        if not _same_target(existing, expected_stat):
+            raise WeightPlanTargetError("weight plan target changed before atomic replacement")
+    except OSError as exc:
+        primary = WeightPlanTargetError("weight plan target changed before atomic replacement")
+        if displaced_descriptor >= 0:
+            _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
+        raise primary from exc
+    except BaseException as primary:
+        if displaced_descriptor >= 0:
+            _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
+        raise
+
+    try:
+        _rename_exchange(directory_fd, source, name)
+    except BaseException as primary:
+        _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
+        raise
+    temporary.name = None
+    failure: BaseException | None = None
+    displaced_stat: os.stat_result | None = None
+    try:
+        displaced_stat = os.fstat(displaced_descriptor)
+        _validate_existing_target(displaced_stat)
+        mapped = _target_stat(directory_fd, source)
+        installed = _target_stat(directory_fd, name)
+        if (
+            (displaced_stat.st_dev, displaced_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
+            or mapped is None
+            or not _same_target(displaced_stat, mapped)
+            or installed is None
+            or (installed.st_dev, installed.st_ino) != temporary.identity
+        ):
+            raise WeightPlanTargetError("weight plan target changed during atomic replacement")
+    except OSError as exc:
+        failure = WeightPlanTargetError("weight plan target changed during atomic replacement")
+        failure.__cause__ = exc
+    except BaseException as exc:
+        failure = exc
+
+    if failure is not None:
+        if displaced_descriptor >= 0:
+            try:
+                os.close(displaced_descriptor)
+            except BaseException:
+                _add_note_safely(failure, "displaced_target_cleanup_failed")
+        try:
+            source_stat = _unvalidated_target_stat(directory_fd, source)
+            installed_stat = _unvalidated_target_stat(directory_fd, name)
+            if (
+                source_stat is None
+                or installed_stat is None
+                or (installed_stat.st_dev, installed_stat.st_ino) != temporary.identity
+            ):
+                raise WeightPlanTargetError("atomic replacement rollback lost ownership")
+            _rename_exchange(directory_fd, source, name)
+            temporary.name = source
+        except BaseException:
+            _add_note_safely(failure, "atomic_replacement_rollback_failed")
+        raise failure
+
+    assert displaced_descriptor >= 0
+    assert displaced_stat is not None
+    displaced = _TemporaryPlan(
+        descriptor=displaced_descriptor,
+        identity=(displaced_stat.st_dev, displaced_stat.st_ino),
+        name=source,
+    )
+    _cleanup_temporary_plan(displaced, directory_fd)
 
 
 def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> bool:
@@ -1263,6 +1481,7 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
     parent, name = _secure_file_location(path)
     chain = _pin_directory_chain(parent)
     temporary: _TemporaryPlan | None = None
+    primary: BaseException | None = None
     try:
         directory_fd = chain.parent_fd
         rendered = plan.canonical_bytes()
@@ -1294,13 +1513,7 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         )
         _validate_temporary_name(temporary, directory_fd, expected_size=len(rendered))
         assert temporary.name is not None
-        os.replace(
-            temporary.name,
-            name,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        temporary.name = None
+        _install_temporary_plan(temporary, directory_fd, name, existing)
         _validate_temporary_descriptor(
             temporary,
             expected_size=len(rendered),
@@ -1322,25 +1535,27 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
             rendered=rendered,
         )
         return True
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        active = sys.exception()
         cleanup_primary: BaseException | None = None
         try:
             if temporary is not None:
                 _cleanup_temporary_plan(temporary, chain.parent_fd)
         except BaseException as exc:
-            if active is not None:
-                active.add_note("temporary_cleanup_failed")
+            if primary is not None:
+                _add_note_safely(primary, "temporary_cleanup_failed")
             else:
                 cleanup_primary = exc
         try:
             chain.close()
         except BaseException as exc:
-            if active is not None:
-                active.add_note("directory_cleanup_failed")
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
             elif cleanup_primary is not None:
-                cleanup_primary.add_note("directory_cleanup_failed")
+                _add_note_safely(cleanup_primary, "directory_cleanup_failed")
             else:
                 cleanup_primary = exc
-        if cleanup_primary is not None:
+        if primary is None and cleanup_primary is not None:
             raise cleanup_primary

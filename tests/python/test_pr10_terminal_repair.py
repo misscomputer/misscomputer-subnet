@@ -104,7 +104,7 @@ def test_atomic_plan_unlink_failure_attempts_temporary_and_directory_cleanup(
     with monkeypatch.context() as patch:
         patch.setattr(plan_module, "_pin_directory_chain", pin)
         patch.setattr(plan_module, "_prepare_temporary_plan", prepare)
-        patch.setattr(os, "replace", replace)
+        patch.setattr(plan_module, "_rename_noreplace", replace)
         patch.setattr(os, "unlink", unlink)
         with pytest.raises(fault_type):
             plan_module.write_weight_plan_atomic(plan, tmp_path / "second.json")

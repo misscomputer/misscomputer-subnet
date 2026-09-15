@@ -207,7 +207,7 @@ def test_repeated_cleanup_faults_keep_first_failure_and_owned_residue(
     primary = PersistenceAbort("post-quarantine fstat aborted")
     restore_failure = OSError(errno.EIO, "quarantine restore failed")
     real_fstat = os.fstat
-    real_rename = weight_plan._rename_noreplace
+    real_rename = weight_plan._rename_exchange
     rename_calls = 0
 
     def fstat(descriptor_value: int) -> os.stat_result:
@@ -225,7 +225,7 @@ def test_repeated_cleanup_faults_keep_first_failure_and_owned_residue(
     try:
         with monkeypatch.context() as patch:
             patch.setattr(os, "fstat", fstat)
-            patch.setattr(weight_plan, "_rename_noreplace", rename)
+            patch.setattr(weight_plan, "_rename_exchange", rename)
             with pytest.raises(PersistenceAbort) as caught:
                 weight_plan._cleanup_temporary_plan(temporary, directory_fd)
 
@@ -282,7 +282,7 @@ def test_primary_persistence_abort_survives_cleanup_unlink_failure(
     try:
         with monkeypatch.context() as patch:
             patch.setattr(weight_plan, "_open_unnamed_temporary", lambda _: None)
-            patch.setattr(os, "replace", abort_replace)
+            patch.setattr(weight_plan, "_rename_noreplace", abort_replace)
             patch.setattr(os, "unlink", fail_temporary_unlink)
             with pytest.raises(type(primary)) as caught:
                 weight_plan.write_weight_plan_atomic(plan(), target)
@@ -315,7 +315,7 @@ def test_primary_persistence_error_survives_directory_close_failure(
 
     with monkeypatch.context() as patch:
         patch.setattr(weight_plan, "_open_unnamed_temporary", lambda _: None)
-        patch.setattr(os, "replace", abort_replace)
+        patch.setattr(weight_plan, "_rename_noreplace", abort_replace)
         with pytest.raises(weight_plan.WeightPlanTargetError) as caught:
             weight_plan.write_weight_plan_atomic(plan(), target)
 

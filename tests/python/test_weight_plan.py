@@ -431,32 +431,27 @@ def test_parent_rename_race_fails_if_configured_path_does_not_receive_plan(
     target.chmod(0o600)
     moved_parent = tmp_path / "plans-original"
     candidate = plan(block=102)
-    real_replace = os.replace
+    real_exchange = weight_plan_module._rename_exchange
     raced = False
 
     def rename_parent_before_install(
+        directory_fd: int,
         source: str,
         destination: str,
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal raced
-        assert raced is False
+        if raced:
+            real_exchange(directory_fd, source, destination)
+            return
         raced = True
         parent.rename(moved_parent)
         parent.mkdir(mode=0o700)
         replacement = parent / "weight-plan.json"
         replacement.write_bytes(b"qualifying replacement")
         replacement.chmod(0o600)
-        real_replace(
-            source,
-            destination,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
+        real_exchange(directory_fd, source, destination)
 
-    monkeypatch.setattr(os, "replace", rename_parent_before_install)
+    monkeypatch.setattr(weight_plan_module, "_rename_exchange", rename_parent_before_install)
     with pytest.raises(WeightPlanTargetError, match="configured weight plan directory changed"):
         write_weight_plan_atomic(candidate, target)
 
