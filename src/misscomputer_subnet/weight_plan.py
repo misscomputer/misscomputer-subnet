@@ -11,6 +11,7 @@ import math
 import os
 import secrets
 import stat
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
@@ -867,6 +868,120 @@ def _allocate_visible_temporary(directory_fd: int) -> _TemporaryPlan:
     raise WeightPlanTargetError("could not allocate a private temporary plan file")
 
 
+def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
+    """Move one directory entry without ever replacing the destination."""
+
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), source)
+    result = renameat2(
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(source)),
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(destination)),
+        1,  # RENAME_NOREPLACE
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), source)
+
+
+def _scanned_target_stat(directory_fd: int, name: str) -> os.stat_result | None:
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if entry.name == name:
+                return entry.stat(follow_symlinks=False)
+    return None
+
+
+def _temporary_name_matches(
+    directory_fd: int,
+    name: str,
+    identity: tuple[int, int],
+) -> bool:
+    first = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    second = _scanned_target_stat(directory_fd, name)
+    if second is None:
+        return False
+    expected = identity
+    return (first.st_dev, first.st_ino) == expected and (second.st_dev, second.st_ino) == expected
+
+
+def _restore_quarantined_name(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    *,
+    source: str,
+    quarantine: str,
+) -> None:
+    _rename_noreplace(directory_fd, quarantine, source)
+    temporary.name = source
+
+
+def _quarantine_and_unlink_temporary(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    identity: tuple[int, int],
+) -> None:
+    """Detach and revalidate an owned name before unlinking it.
+
+    The original pathname is never passed to unlink.  A no-replace rename
+    first moves whichever inode currently occupies it to an unpredictable
+    quarantine name.  If that atomic move captured a replacement, descriptor
+    link state and independent namespace observations fail the ownership fence
+    and the entry is restored instead of unlinked.
+    """
+
+    source = temporary.name
+    if source is None or not _temporary_name_matches(directory_fd, source, identity):
+        return
+    quarantine: str | None = None
+    for _ in range(32):
+        candidate = f".weight-plan.cleanup-{secrets.token_hex(16)}"
+        try:
+            _rename_noreplace(directory_fd, source, candidate)
+        except FileExistsError:
+            continue
+        quarantine = candidate
+        temporary.name = candidate
+        break
+    if quarantine is None:
+        raise WeightPlanTargetError("could not quarantine a temporary plan file")
+
+    try:
+        descriptor_stat = os.fstat(temporary.descriptor)
+        descriptor_owned = (
+            stat.S_ISREG(descriptor_stat.st_mode)
+            and (descriptor_stat.st_dev, descriptor_stat.st_ino) == identity
+            and descriptor_stat.st_uid == _effective_uid()
+            and stat.S_IMODE(descriptor_stat.st_mode) == WEIGHT_PLAN_FILE_MODE
+            and descriptor_stat.st_nlink > 0
+        )
+        name_owned = _temporary_name_matches(directory_fd, quarantine, identity)
+    except BaseException as primary:
+        try:
+            _restore_quarantined_name(
+                temporary,
+                directory_fd,
+                source=source,
+                quarantine=quarantine,
+            )
+        except BaseException:
+            primary.add_note("temporary_quarantine_restore_failed")
+        raise
+    if not descriptor_owned or not name_owned:
+        _restore_quarantined_name(
+            temporary,
+            directory_fd,
+            source=source,
+            quarantine=quarantine,
+        )
+        return
+    os.unlink(quarantine, dir_fd=directory_fd)
+    temporary.name = None
+
+
 def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> None:
     primary: BaseException | None = None
 
@@ -892,9 +1007,7 @@ def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> Non
                 failed(fstat_error)
     try:
         if temporary.name is not None and identity != (-1, -1):
-            named = os.stat(temporary.name, dir_fd=directory_fd, follow_symlinks=False)
-            if (named.st_dev, named.st_ino) == identity:
-                os.unlink(temporary.name, dir_fd=directory_fd)
+            _quarantine_and_unlink_temporary(temporary, directory_fd, identity)
     except FileNotFoundError:
         pass
     except BaseException as exc:
@@ -1210,8 +1323,24 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         )
         return True
     finally:
+        active = sys.exception()
+        cleanup_primary: BaseException | None = None
         try:
             if temporary is not None:
                 _cleanup_temporary_plan(temporary, chain.parent_fd)
-        finally:
+        except BaseException as exc:
+            if active is not None:
+                active.add_note("temporary_cleanup_failed")
+            else:
+                cleanup_primary = exc
+        try:
             chain.close()
+        except BaseException as exc:
+            if active is not None:
+                active.add_note("directory_cleanup_failed")
+            elif cleanup_primary is not None:
+                cleanup_primary.add_note("directory_cleanup_failed")
+            else:
+                cleanup_primary = exc
+        if cleanup_primary is not None:
+            raise cleanup_primary
