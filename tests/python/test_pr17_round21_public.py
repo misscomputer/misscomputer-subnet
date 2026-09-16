@@ -49,28 +49,32 @@ def test_cleanup_does_not_unlink_replacement_after_quarantine_validation(
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     temporary = _owned_temporary(directory_fd, ".weight-plan.tmp-owned")
     descriptor = temporary.descriptor
-    real_matches = weight_plan._temporary_name_matches
-    real_unlink = os.unlink
-    raced_name: str | None = None
+    real_move = weight_plan._rename_noreplace_between
+    raced = False
 
-    def replace_after_match(fd: int, name: str, identity: tuple[int, int]) -> bool:
-        nonlocal raced_name
-        matched = real_matches(fd, name, identity)
-        if matched and name.startswith(".weight-plan.cleanup-") and raced_name is None:
-            raced_name = name
-            real_unlink(name, dir_fd=directory_fd)
+    def replace_after_move(
+        source_fd: int,
+        name: str,
+        destination_fd: int,
+        destination: str,
+    ) -> None:
+        nonlocal raced
+        real_move(source_fd, name, destination_fd, destination)
+        if source_fd == directory_fd and name == ".weight-plan.tmp-owned" and not raced:
+            raced = True
             replacement = tmp_path / name
             replacement.write_bytes(b"foreign quarantine replacement\n")
             replacement.chmod(weight_plan.WEIGHT_PLAN_FILE_MODE)
-        return matched
 
     try:
         with monkeypatch.context() as patch:
-            patch.setattr(weight_plan, "_temporary_name_matches", replace_after_match)
+            patch.setattr(weight_plan, "_rename_noreplace_between", replace_after_move)
             weight_plan._cleanup_temporary_plan(temporary, directory_fd)
 
-        assert raced_name is not None
-        assert (tmp_path / raced_name).read_bytes() == b"foreign quarantine replacement\n"
+        assert raced is True
+        assert (tmp_path / ".weight-plan.tmp-owned").read_bytes() == (
+            b"foreign quarantine replacement\n"
+        )
     finally:
         for residue in tmp_path.iterdir():
             residue.unlink(missing_ok=True)

@@ -33,6 +33,7 @@ WEIGHT_PLAN_SCHEMA_VERSION = 1
 WEIGHT_PLAN_PROTOCOL_VERSION_KEY: Final = 2
 SNAPSHOT_IDENTITY_SCHEMA = "miss.computer/misscomputer-subnet/metagraph-identity/v1"
 WEIGHT_PLAN_FILE_MODE = 0o600
+WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE = 0o700
 MAX_WEIGHT_PLAN_NEURONS = 65_536
 MAX_WEIGHT_PLAN_BYTES = 16 << 20
 MAX_BLOCK = (1 << 63) - 1
@@ -701,6 +702,13 @@ class _TemporaryPlan:
 
 
 @dataclass(slots=True)
+class _PrivateCleanupDirectory:
+    descriptor: int
+    identity: tuple[int, int]
+    name: str
+
+
+@dataclass(slots=True)
 class _WeightPlanWriteLock:
     descriptor: int
 
@@ -1023,23 +1031,34 @@ def _allocate_visible_temporary(directory_fd: int) -> _TemporaryPlan:
     raise WeightPlanTargetError("could not allocate a private temporary plan file")
 
 
-def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
-    """Move one directory entry without ever replacing the destination."""
+def _rename_noreplace_between(
+    source_directory_fd: int,
+    source: str,
+    destination_directory_fd: int,
+    destination: str,
+) -> None:
+    """Move one directory entry between pinned directories without replacement."""
 
     libc: Any = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
         raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), source)
     result = renameat2(
-        directory_fd,
+        source_directory_fd,
         ctypes.c_char_p(os.fsencode(source)),
-        directory_fd,
+        destination_directory_fd,
         ctypes.c_char_p(os.fsencode(destination)),
         1,  # RENAME_NOREPLACE
     )
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), source)
+
+
+def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
+    """Move one directory entry without ever replacing the destination."""
+
+    _rename_noreplace_between(directory_fd, source, directory_fd, destination)
 
 
 def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
@@ -1059,6 +1078,84 @@ def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), first)
+
+
+def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirectory:
+    """Create and pin an unpredictable owner-only directory for destructive cleanup."""
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    for _ in range(32):
+        name = f".weight-plan.cleanup-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        descriptor = -1
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+            opened = os.fstat(descriptor)
+            mapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != _effective_uid()
+                or stat.S_IMODE(opened.st_mode) != WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE
+                or (opened.st_dev, opened.st_ino) != (mapped.st_dev, mapped.st_ino)
+            ):
+                raise WeightPlanTargetError("private cleanup directory changed identity")
+            return _PrivateCleanupDirectory(
+                descriptor=descriptor,
+                identity=(opened.st_dev, opened.st_ino),
+                name=name,
+            )
+        except BaseException as primary:
+            if descriptor >= 0:
+                _close_preserving(descriptor, primary, "private_cleanup_descriptor_close_failed")
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except BaseException:
+                _add_note_safely(primary, "private_cleanup_directory_retirement_failed")
+            raise
+    raise WeightPlanTargetError("could not allocate a private cleanup directory")
+
+
+def _close_private_cleanup_directory(
+    cleanup: _PrivateCleanupDirectory,
+    directory_fd: int,
+    primary: BaseException | None,
+) -> None:
+    """Close and, when empty and still owned, retire one cleanup directory."""
+
+    cleanup_error: BaseException | None = None
+    try:
+        opened = os.fstat(cleanup.descriptor)
+        mapped = os.stat(cleanup.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != cleanup.identity or (
+            mapped.st_dev,
+            mapped.st_ino,
+        ) != cleanup.identity:
+            raise WeightPlanTargetError("private cleanup directory changed identity")
+    except BaseException as exc:
+        cleanup_error = exc
+    try:
+        os.close(cleanup.descriptor)
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+        else:
+            _add_note_safely(cleanup_error, "private_cleanup_descriptor_close_failed")
+    if cleanup_error is None:
+        try:
+            os.rmdir(cleanup.name, dir_fd=directory_fd)
+        except OSError as exc:
+            # A non-empty directory contains an entry whose ownership could not
+            # be proved.  Preserve it rather than turning cleanup into deletion.
+            if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                cleanup_error = exc
+    if cleanup_error is not None:
+        if primary is not None:
+            _add_note_safely(primary, "private_cleanup_directory_retirement_failed")
+        else:
+            raise cleanup_error
 
 
 def _scanned_target_stat(directory_fd: int, name: str) -> os.stat_result | None:
@@ -1087,56 +1184,39 @@ def _quarantine_and_unlink_temporary(
     directory_fd: int,
     identity: tuple[int, int],
 ) -> None:
-    """Detach and revalidate an owned name before unlinking it.
+    """Move a name into an owner-only directory before destructive cleanup.
 
-    An exact descriptor-derived hard link is the exchange anchor.  Atomic
-    exchanges cannot collide during restoration and never discard whichever
-    inode raced into either name.  Only names still mapped to the descriptor's
-    exact identity are eligible for unlink.
+    The cross-directory no-replace rename is the ownership boundary.  A late
+    replacement is either left at ``source`` or moved intact into the private
+    directory, identified there, and restored without replacement.  Only the
+    descriptor-bound inode is ever passed to unlink, and only after it is no
+    longer reachable through the shared parent directory.
     """
 
     source = temporary.name
     if source is None or not _temporary_name_matches(directory_fd, source, identity):
         return
-    quarantine: str | None = None
-    for _ in range(32):
-        candidate = f".weight-plan.cleanup-{secrets.token_hex(16)}"
-        try:
-            _link_unnamed_temporary(temporary.descriptor, directory_fd, candidate)
-        except OSError as exc:
-            if exc.errno == errno.EEXIST:
-                continue
-            if exc.errno == errno.ENOENT:
-                # Linux before 6.10 also reports ENOENT when AT_EMPTY_PATH is
-                # denied to an unprivileged caller.  A zero link count proves
-                # actual retirement; otherwise retry the documented procfs
-                # form and surface failure rather than abandoning a live name.
-                if os.fstat(temporary.descriptor).st_nlink == 0:
-                    return
-                try:
-                    _link_temporary_through_proc(
-                        temporary.descriptor,
-                        directory_fd,
-                        candidate,
-                    )
-                except OSError as fallback_error:
-                    if fallback_error.errno == errno.EEXIST:
-                        continue
-                    raise
-                quarantine = candidate
-                break
-            raise
-        else:
-            quarantine = candidate
-            break
-    if quarantine is None:
-        raise WeightPlanTargetError("could not anchor a temporary plan file")
-
-    temporary.name = quarantine
-    exchanged = False
+    cleanup = _open_private_cleanup_directory(directory_fd)
+    quarantine = ".weight-plan.cleanup-retired"
+    moved = False
+    primary: BaseException | None = None
     try:
-        _rename_exchange(directory_fd, source, quarantine)
-        exchanged = True
+        try:
+            _rename_noreplace_between(
+                directory_fd,
+                source,
+                cleanup.descriptor,
+                quarantine,
+            )
+        except FileNotFoundError:
+            # A missing source is retirement only when the descriptor proves
+            # that the owned inode has no other name.  Do not repeat the former
+            # blanket ENOENT suppression that stranded moved-aside plans.
+            if os.fstat(temporary.descriptor).st_nlink == 0:
+                return
+            raise
+        moved = True
+        temporary.name = None
         descriptor_stat = os.fstat(temporary.descriptor)
         descriptor_owned = (
             stat.S_ISREG(descriptor_stat.st_mode)
@@ -1145,44 +1225,40 @@ def _quarantine_and_unlink_temporary(
             and stat.S_IMODE(descriptor_stat.st_mode) == WEIGHT_PLAN_FILE_MODE
             and descriptor_stat.st_nlink > 0
         )
-        source_owned = _temporary_name_matches(directory_fd, source, identity)
-        quarantine_owned = _temporary_name_matches(directory_fd, quarantine, identity)
-        if descriptor_owned and source_owned and quarantine_owned:
-            # A second exchange closes the validation-to-delete gap exercised
-            # by a replacement at the quarantine name.  A replacement is
-            # moved, not unlinked, and the mismatch below restores it.
-            _rename_exchange(directory_fd, source, quarantine)
-            source_owned = _temporary_name_matches(directory_fd, source, identity)
-            quarantine_owned = _temporary_name_matches(directory_fd, quarantine, identity)
-        if not descriptor_owned or not source_owned or not quarantine_owned:
-            _rename_exchange(directory_fd, source, quarantine)
-            exchanged = False
-            source_owned = _temporary_name_matches(directory_fd, source, identity)
-            quarantine_owned = _temporary_name_matches(directory_fd, quarantine, identity)
-            owned_name = source if source_owned else quarantine if quarantine_owned else None
-            if owned_name is not None:
-                os.unlink(owned_name, dir_fd=directory_fd)
-            temporary.name = None
-            return
-        os.unlink(source, dir_fd=directory_fd)
-        temporary.name = quarantine
-        os.unlink(quarantine, dir_fd=directory_fd)
-        temporary.name = None
-    except BaseException as primary:
-        if exchanged:
-            try:
-                _rename_exchange(directory_fd, source, quarantine)
+        captured = os.stat(quarantine, dir_fd=cleanup.descriptor, follow_symlinks=False)
+        captured_owned = (captured.st_dev, captured.st_ino) == identity
+        if not descriptor_owned or not captured_owned:
+            _rename_noreplace_between(
+                cleanup.descriptor,
+                quarantine,
+                directory_fd,
+                source,
+            )
+            moved = False
+            if captured_owned:
                 temporary.name = source
+            return
+        os.unlink(quarantine, dir_fd=cleanup.descriptor)
+        moved = False
+        temporary.name = None
+    except BaseException as exc:
+        primary = exc
+        if moved:
+            try:
+                _rename_noreplace_between(
+                    cleanup.descriptor,
+                    quarantine,
+                    directory_fd,
+                    source,
+                )
+                restored = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
+                if (restored.st_dev, restored.st_ino) == identity:
+                    temporary.name = source
             except BaseException:
                 _add_note_safely(primary, "temporary_quarantine_restore_failed")
-        try:
-            if _temporary_name_matches(directory_fd, quarantine, identity):
-                os.unlink(quarantine, dir_fd=directory_fd)
-                if _temporary_name_matches(directory_fd, source, identity):
-                    temporary.name = source
-        except BaseException:
-            _add_note_safely(primary, "temporary_quarantine_retirement_failed")
         raise
+    finally:
+        _close_private_cleanup_directory(cleanup, directory_fd, primary)
 
 
 def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> None:
@@ -1211,8 +1287,6 @@ def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> Non
     try:
         if temporary.name is not None and identity != (-1, -1):
             _quarantine_and_unlink_temporary(temporary, directory_fd, identity)
-    except FileNotFoundError:
-        pass
     except BaseException as exc:
         failed(exc)
     try:
@@ -1491,6 +1565,7 @@ def _install_temporary_plan(
     directory_fd: int,
     name: str,
     existing: os.stat_result | None,
+    existing_bytes: bytes | None,
 ) -> None:
     """Install ``temporary`` without destroying an unvalidated destination.
 
@@ -1510,8 +1585,70 @@ def _install_temporary_plan(
             raise WeightPlanTargetError(
                 "weight plan target changed before atomic installation"
             ) from exc
+        installed = _unvalidated_target_stat(directory_fd, name)
+        descriptor_stat = os.fstat(temporary.descriptor)
+        if (
+            installed is None
+            or (installed.st_dev, installed.st_ino) != temporary.identity
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino) != temporary.identity
+            or descriptor_stat.st_nlink != 1
+        ):
+            failure = WeightPlanTargetError("weight plan source changed during atomic installation")
+            try:
+                _rename_noreplace(directory_fd, name, source)
+                restored = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
+                if (restored.st_dev, restored.st_ino) == temporary.identity:
+                    temporary.name = source
+                else:
+                    temporary.name = None
+            except BaseException:
+                _add_note_safely(failure, "atomic_creation_rollback_failed")
+            raise failure
         temporary.name = None
         return
+
+    if existing_bytes is None:
+        raise WeightPlanTargetError("existing weight plan bytes are unavailable")
+
+    # An exchanged destination remains writable through descriptors held by a
+    # same-user process.  Keep a separately fsynced byte-for-byte rollback copy:
+    # restoring the displaced inode itself could otherwise publish bytes that
+    # were overwritten after the exchange.
+    backup = _prepare_temporary_plan(directory_fd, existing_bytes)
+    backup_primary: BaseException | None = None
+    try:
+        _install_replacement_plan(
+            temporary,
+            backup,
+            directory_fd,
+            name,
+            source,
+            existing,
+            existing_bytes,
+        )
+    except BaseException as exc:
+        backup_primary = exc
+        raise
+    finally:
+        try:
+            _cleanup_temporary_plan(backup, directory_fd)
+        except BaseException:
+            if backup_primary is not None:
+                _add_note_safely(backup_primary, "rollback_copy_cleanup_failed")
+            else:
+                raise
+
+
+def _install_replacement_plan(
+    temporary: _TemporaryPlan,
+    backup: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    source: str,
+    existing: os.stat_result,
+    existing_bytes: bytes,
+) -> None:
+    """Exchange one replacement while retaining an independent rollback copy."""
 
     displaced_descriptor = -1
     try:
@@ -1519,7 +1656,11 @@ def _install_temporary_plan(
         displaced_descriptor = os.open(name, flags, dir_fd=directory_fd)
         expected_stat = os.fstat(displaced_descriptor)
         _validate_existing_target(expected_stat)
-        if not _same_target(existing, expected_stat):
+        if (
+            not _same_target(existing, expected_stat)
+            or _read_descriptor(displaced_descriptor) != existing_bytes
+            or not _same_target(expected_stat, os.fstat(displaced_descriptor))
+        ):
             raise WeightPlanTargetError("weight plan target changed before atomic replacement")
     except OSError as exc:
         primary = WeightPlanTargetError("weight plan target changed before atomic replacement")
@@ -1542,11 +1683,15 @@ def _install_temporary_plan(
     try:
         displaced_stat = os.fstat(displaced_descriptor)
         _validate_existing_target(displaced_stat)
+        displaced_bytes = _read_descriptor(displaced_descriptor)
+        displaced_after = os.fstat(displaced_descriptor)
         mapped = _target_stat(directory_fd, source)
         installed = _target_stat(directory_fd, name)
         if (
             (displaced_stat.st_dev, displaced_stat.st_ino)
             != (expected_stat.st_dev, expected_stat.st_ino)
+            or displaced_bytes != existing_bytes
+            or not _same_target(displaced_stat, displaced_after)
             or mapped is None
             or not _same_target(displaced_stat, mapped)
             or installed is None
@@ -1563,6 +1708,15 @@ def _install_temporary_plan(
         try:
             source_stat = _unvalidated_target_stat(directory_fd, source)
             installed_stat = _unvalidated_target_stat(directory_fd, name)
+            displaced_now = os.fstat(displaced_descriptor)
+            displaced_bytes = _read_descriptor(displaced_descriptor)
+            displaced_after = os.fstat(displaced_descriptor)
+            displaced_intact = (
+                (displaced_now.st_dev, displaced_now.st_ino)
+                == (expected_stat.st_dev, expected_stat.st_ino)
+                and displaced_bytes == existing_bytes
+                and _same_target(displaced_now, displaced_after)
+            )
             installed_is_temporary = (
                 installed_stat is not None
                 and (
@@ -1575,31 +1729,55 @@ def _install_temporary_plan(
                 source_stat.st_dev,
                 source_stat.st_ino,
             ) == (expected_stat.st_dev, expected_stat.st_ino)
-            if installed_is_temporary:
-                # The exchanged source remained descriptor-bound.  Put the
-                # current source entry back at the configured destination;
-                # this also preserves a destination replacement that arrived
-                # immediately before the exchange.
+            temporary_nlink = os.fstat(temporary.descriptor).st_nlink
+            if (
+                displaced_intact
+                and source_is_displaced
+                and (installed_is_temporary or temporary_nlink == 0)
+            ):
+                # Either the ordinary exchange completed, or a foreign source
+                # was exchanged after unlinking the prepared inode.  The exact
+                # original is still at ``source`` and can be restored without
+                # publishing unverified bytes.
+                _rename_exchange(directory_fd, source, name)
+                temporary.name = source if installed_is_temporary else None
+            elif installed_is_temporary and displaced_now.st_nlink == 0:
+                # The destination was replaced immediately before exchange.
+                # Its replacement is now at ``source``; restore that exact
+                # foreign entry rather than overwriting it with stale state.
                 _rename_exchange(directory_fd, source, name)
                 temporary.name = source
-            elif source_is_displaced:
-                # The source name was substituted before the exchange.  The
-                # pinned original destination is still recoverable at source,
-                # while the prepared inode has no remaining name.  Restore the
-                # original and leave the foreign source at the source path.
-                displaced_now = os.fstat(displaced_descriptor)
-                _validate_existing_target(displaced_now)
-                if (
-                    (displaced_now.st_dev, displaced_now.st_ino)
-                    != (expected_stat.st_dev, expected_stat.st_ino)
-                    or not _same_target(displaced_now, source_stat)
-                    or os.fstat(temporary.descriptor).st_nlink != 0
-                ):
-                    raise WeightPlanTargetError("atomic replacement rollback lost ownership")
-                _rename_exchange(directory_fd, source, name)
-                temporary.name = None
             else:
-                raise WeightPlanTargetError("atomic replacement rollback lost ownership")
+                # A moved-aside or content-mutated displaced inode is unsafe to
+                # publish.  Exchange the independent rollback copy into place;
+                # whatever occupied the target is preserved under the copy's
+                # former name and is retired only when it is our prepared inode.
+                backup_source = backup.name
+                if backup_source is None:
+                    raise WeightPlanTargetError("atomic replacement rollback copy is unnamed")
+                _validate_temporary_name(
+                    backup,
+                    directory_fd,
+                    expected_size=len(existing_bytes),
+                )
+                _rename_exchange(directory_fd, backup_source, name)
+                restored = _unvalidated_target_stat(directory_fd, name)
+                backup_after = os.fstat(backup.descriptor)
+                backup_bytes = _read_descriptor(backup.descriptor)
+                backup_final = os.fstat(backup.descriptor)
+                if (
+                    restored is None
+                    or (restored.st_dev, restored.st_ino) != backup.identity
+                    or (backup_after.st_dev, backup_after.st_ino) != backup.identity
+                    or backup_after.st_nlink != 1
+                    or backup_bytes != existing_bytes
+                    or not _same_target(backup_after, backup_final)
+                ):
+                    raise WeightPlanTargetError("atomic replacement rollback copy was substituted")
+                backup.name = None
+                moved = _unvalidated_target_stat(directory_fd, backup_source)
+                if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
+                    temporary.name = backup_source
         except BaseException:
             _add_note_safely(failure, "atomic_replacement_rollback_failed")
         _close_preserving(displaced_descriptor, failure, "displaced_target_cleanup_failed")
@@ -1635,6 +1813,7 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         write_lock = _acquire_write_lock(directory_fd, name)
         _revalidate_pinned_chain(chain)
         existing = _target_stat(directory_fd, name)
+        existing_bytes: bytes | None = None
         if existing is not None:
             existing_bytes = _read_existing(directory_fd, name, existing)
             if not _same_target(existing, _target_stat(directory_fd, name)):
@@ -1659,7 +1838,13 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         )
         _validate_temporary_name(temporary, directory_fd, expected_size=len(rendered))
         assert temporary.name is not None
-        _install_temporary_plan(temporary, directory_fd, name, existing)
+        _install_temporary_plan(
+            temporary,
+            directory_fd,
+            name,
+            existing,
+            existing_bytes,
+        )
         _validate_temporary_descriptor(
             temporary,
             expected_size=len(rendered),

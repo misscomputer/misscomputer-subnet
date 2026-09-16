@@ -284,7 +284,9 @@ def test_atomic_plan_write_is_private_idempotent_and_replaces_new_snapshot(
     assert target.read_bytes() == replacement.canonical_bytes()
     assert target.stat().st_ino != first_inode
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert fsync_kinds == ["file", "directory"]
+    # Replacement retains a separately fsynced rollback copy until the
+    # exchanged destination has been byte- and identity-verified.
+    assert fsync_kinds == ["file", "file", "directory"]
 
 
 def test_unnamed_temporary_materialization_enoent_uses_visible_fallback(

@@ -107,7 +107,7 @@ def test_late_cleanup_replacement_waits_for_writer_ownership(
         matched = real_matches(directory_fd, name, identity)
         if name.startswith(".weight-plan.tmp-"):
             source_observations[name] += 1
-            if matched and source_observations[name] == 3:
+            if matched and source_observations[name] == 1 and not replacement_start.is_set():
                 state["source"] = name
                 replacement_start.set()
                 assert lock_decided.wait(timeout=5)
@@ -308,7 +308,6 @@ def test_capability_limited_cleanup_retires_displaced_plan(
     original = plan(block=101)
     replacement = plan(block=102)
     assert weight_plan.write_weight_plan_atomic(original, target) is True
-    real_proc_link = weight_plan._link_temporary_through_proc
     proc_links: list[str] = []
 
     def capability_limited_link(
@@ -320,13 +319,12 @@ def test_capability_limited_cleanup_retires_displaced_plan(
 
     def record_proc_link(descriptor: int, directory_fd: int, name: str) -> None:
         proc_links.append(name)
-        real_proc_link(descriptor, directory_fd, name)
 
     monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", capability_limited_link)
     monkeypatch.setattr(weight_plan, "_link_temporary_through_proc", record_proc_link)
 
     assert weight_plan.write_weight_plan_atomic(replacement, target) is True
-    assert len(proc_links) == 1
+    assert not proc_links
     assert target.read_bytes() == replacement.canonical_bytes()
     assert stat.S_IMODE(target.stat().st_mode) == weight_plan.WEIGHT_PLAN_FILE_MODE
     assert target.stat().st_nlink == 1
@@ -334,7 +332,7 @@ def test_capability_limited_cleanup_retires_displaced_plan(
     assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
 
 
-def test_unavailable_cleanup_anchor_surfaces_unresolved_retirement(
+def test_unavailable_descriptor_linking_does_not_block_private_retirement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -344,7 +342,6 @@ def test_unavailable_cleanup_anchor_surfaces_unresolved_retirement(
     original = plan(block=101)
     replacement = plan(block=102)
     assert weight_plan.write_weight_plan_atomic(original, target) is True
-    unresolved = OSError(errno.EACCES, "procfs descriptor link denied")
 
     def capability_limited_link(
         _descriptor: int,
@@ -358,19 +355,12 @@ def test_unavailable_cleanup_anchor_surfaces_unresolved_retirement(
         _directory_fd: int,
         _name: str,
     ) -> None:
-        raise unresolved
+        raise OSError(errno.EACCES, "procfs descriptor link denied")
 
     monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", capability_limited_link)
     monkeypatch.setattr(weight_plan, "_link_temporary_through_proc", unavailable_fallback)
 
-    with pytest.raises(OSError) as caught:
-        weight_plan.write_weight_plan_atomic(replacement, target)
-
-    assert caught.value is unresolved
+    assert weight_plan.write_weight_plan_atomic(replacement, target) is True
     assert target.read_bytes() == replacement.canonical_bytes()
-    residues = list(tmp_path.glob(".weight-plan.tmp-*"))
-    assert len(residues) == 1
-    assert residues[0].read_bytes() == original.canonical_bytes()
-    assert stat.S_IMODE(residues[0].stat().st_mode) == weight_plan.WEIGHT_PLAN_FILE_MODE
-    assert residues[0].stat().st_nlink == 1
+    assert not list(tmp_path.glob(".weight-plan.tmp-*"))
     assert not list(tmp_path.glob(".weight-plan.cleanup-*"))

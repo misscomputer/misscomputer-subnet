@@ -185,7 +185,12 @@ def test_cleanup_metadata_faults_preserve_the_exact_owned_inode(
         assert closed.value.errno == errno.EBADF
     finally:
         for residue in tmp_path.iterdir():
-            residue.unlink(missing_ok=True)
+            if residue.is_dir():
+                for child in residue.iterdir():
+                    child.unlink(missing_ok=True)
+                residue.rmdir()
+            else:
+                residue.unlink(missing_ok=True)
         try:
             os.close(descriptor)
         except OSError as exc:
@@ -207,7 +212,7 @@ def test_repeated_cleanup_faults_keep_first_failure_and_owned_residue(
     primary = PersistenceAbort("post-quarantine fstat aborted")
     restore_failure = OSError(errno.EIO, "quarantine restore failed")
     real_fstat = os.fstat
-    real_rename = weight_plan._rename_exchange
+    real_rename = weight_plan._rename_noreplace_between
     rename_calls = 0
 
     def fstat(descriptor_value: int) -> os.stat_result:
@@ -215,23 +220,23 @@ def test_repeated_cleanup_faults_keep_first_failure_and_owned_residue(
             raise primary
         return real_fstat(descriptor_value)
 
-    def rename(fd: int, source: str, destination: str) -> None:
+    def rename(source_fd: int, source: str, destination_fd: int, destination: str) -> None:
         nonlocal rename_calls
         rename_calls += 1
         if rename_calls == 2:
             raise restore_failure
-        real_rename(fd, source, destination)
+        real_rename(source_fd, source, destination_fd, destination)
 
     try:
         with monkeypatch.context() as patch:
             patch.setattr(os, "fstat", fstat)
-            patch.setattr(weight_plan, "_rename_exchange", rename)
+            patch.setattr(weight_plan, "_rename_noreplace_between", rename)
             with pytest.raises(PersistenceAbort) as caught:
                 weight_plan._cleanup_temporary_plan(temporary, directory_fd)
 
         assert caught.value is primary
         assert "temporary_quarantine_restore_failed" in getattr(primary, "__notes__", ())
-        residue = list(tmp_path.iterdir())
+        residue = list(tmp_path.glob(".weight-plan.cleanup-*/.weight-plan.cleanup-retired"))
         assert len(residue) == 1
         value = residue[0].stat()
         assert (value.st_dev, value.st_ino) == expected_identity
@@ -240,7 +245,12 @@ def test_repeated_cleanup_faults_keep_first_failure_and_owned_residue(
         assert closed.value.errno == errno.EBADF
     finally:
         for residue in tmp_path.iterdir():
-            residue.unlink(missing_ok=True)
+            if residue.is_dir():
+                for child in residue.iterdir():
+                    child.unlink(missing_ok=True)
+                residue.rmdir()
+            else:
+                residue.unlink(missing_ok=True)
         try:
             os.close(descriptor)
         except OSError as exc:
