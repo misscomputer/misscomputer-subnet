@@ -1141,9 +1141,15 @@ def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
     _rename_noreplace_between(directory_fd, source, directory_fd, destination)
 
 
-def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
-    """Atomically exchange two directory entries without discarding either inode."""
+_last_exchange_publication: tuple[int, int] | None = None
 
+
+def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
+    """Atomically exchange two entries and record the inode the syscall published."""
+
+    global _last_exchange_publication
+    _last_exchange_publication = None
+    first_stat = _unvalidated_target_stat(directory_fd, first)
     libc: Any = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
@@ -1158,6 +1164,17 @@ def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), first)
+    published = _unvalidated_target_stat(directory_fd, second)
+    if (
+        first_stat is not None
+        and published is not None
+        and (
+            published.st_dev,
+            published.st_ino,
+        )
+        == (first_stat.st_dev, first_stat.st_ino)
+    ):
+        _last_exchange_publication = (published.st_dev, published.st_ino)
 
 
 def _open_private_cleanup_namespace_monitor(
@@ -2030,7 +2047,7 @@ def _record_rollback_publication(
     directory_fd: int,
     name: str,
 ) -> None:
-    """Authorize repair only for the entry this attempt just published."""
+    """Authorize repair only for the exact entry this attempt just published."""
 
     state.exchange_identity = None
     published = _unvalidated_target_stat(directory_fd, name)
@@ -2076,8 +2093,11 @@ def _exchange_rollback_copy(
         else:
             raise WeightPlanTargetError("atomic replacement rollback destination was recreated")
         rollback.name = None
-        _record_rollback_publication(destination_state, directory_fd, name)
+        # Durability must not depend on later bookkeeping or observation.  After
+        # the fsync, bind any recovery authority to the entry the mutation
+        # actually published, not to a stale pre-mutation source observation.
         _fsync_replacement_rollback(directory_fd, failure)
+        _record_rollback_publication(destination_state, directory_fd, name)
         if exchanged:
             moved = _unvalidated_target_stat(directory_fd, source)
             if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
@@ -2162,17 +2182,13 @@ def _rollback_replacement(
     source: str,
     name: str,
     failure: BaseException,
+    published_identity: tuple[int, int] | None,
 ) -> None:
     restored = False
-    destination_state = _RollbackDestinationState(exchange_identity=None)
+    destination_state = _RollbackDestinationState(exchange_identity=published_identity)
     try:
         source_stat = _unvalidated_target_stat(directory_fd, source)
         installed_stat = _unvalidated_target_stat(directory_fd, name)
-        if installed_stat is not None:
-            destination_state.exchange_identity = (
-                installed_stat.st_dev,
-                installed_stat.st_ino,
-            )
         displaced_now = os.fstat(displaced_descriptor)
         displaced_bytes = _read_descriptor(displaced_descriptor)
         displaced_after = os.fstat(displaced_descriptor)
@@ -2186,6 +2202,14 @@ def _rollback_replacement(
             installed_stat is not None
             and (installed_stat.st_dev, installed_stat.st_ino) == temporary.identity
         )
+        installed_is_our_publication = (
+            installed_stat is not None
+            and (
+                installed_stat.st_dev,
+                installed_stat.st_ino,
+            )
+            == destination_state.exchange_identity
+        )
         source_is_displaced = source_stat is not None and (
             source_stat.st_dev,
             source_stat.st_ino,
@@ -2194,7 +2218,7 @@ def _rollback_replacement(
         restore_original = (
             displaced_intact
             and source_is_displaced
-            and (installed_is_temporary or temporary_nlink == 0)
+            and (installed_is_our_publication or (installed_stat is None and temporary_nlink == 0))
         )
         restore_replaced_destination = installed_is_temporary and displaced_now.st_nlink == 0
         if restore_original or restore_replaced_destination:
@@ -2206,8 +2230,11 @@ def _rollback_replacement(
             else:
                 _rename_exchange(directory_fd, source, name)
                 temporary.name = source if installed_is_temporary else None
-            _record_rollback_publication(destination_state, directory_fd, name)
+            # A successful restoring mutation requires a directory durability
+            # attempt even if subsequent publication bookkeeping or validation
+            # fails.  The restored identity is known from the moved source.
             _fsync_replacement_rollback(directory_fd, failure)
+            _record_rollback_publication(destination_state, directory_fd, name)
             if restore_original:
                 _validate_restored_original(
                     displaced_descriptor,
@@ -2278,8 +2305,11 @@ def _install_replacement_plan(
             _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
         raise
 
+    global _last_exchange_publication
+    _last_exchange_publication = None
     try:
         _rename_exchange(directory_fd, source, name)
+        published_identity = _last_exchange_publication
     except BaseException as primary:
         _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
         raise
@@ -2345,6 +2375,7 @@ def _install_replacement_plan(
             source,
             name,
             failure,
+            published_identity,
         )
         _close_preserving(displaced_descriptor, failure, "displaced_target_cleanup_failed")
         raise failure
