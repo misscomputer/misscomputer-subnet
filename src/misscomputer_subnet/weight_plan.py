@@ -12,6 +12,7 @@ import math
 import os
 import secrets
 import stat
+import struct
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
@@ -42,6 +43,26 @@ MAX_VERSION_KEY = (1 << 64) - 1
 _AT_FDCWD: Final = -100
 _AT_SYMLINK_FOLLOW: Final = 0x400
 _AT_EMPTY_PATH: Final = 0x1000
+_IN_ATTRIB: Final = 0x00000004
+_IN_MOVED_FROM: Final = 0x00000040
+_IN_MOVED_TO: Final = 0x00000080
+_IN_CREATE: Final = 0x00000100
+_IN_DELETE: Final = 0x00000200
+_IN_DELETE_SELF: Final = 0x00000400
+_IN_MOVE_SELF: Final = 0x00000800
+_IN_Q_OVERFLOW: Final = 0x00004000
+_IN_IGNORED: Final = 0x00008000
+_IN_ISDIR: Final = 0x40000000
+_INOTIFY_EVENT = struct.Struct("iIII")
+_PRIVATE_CLEANUP_WATCH_MASK: Final = (
+    _IN_ATTRIB
+    | _IN_MOVED_FROM
+    | _IN_MOVED_TO
+    | _IN_CREATE
+    | _IN_DELETE
+    | _IN_DELETE_SELF
+    | _IN_MOVE_SELF
+)
 
 
 class WeightPlanError(ValueError):
@@ -703,10 +724,18 @@ class _TemporaryPlan:
 
 
 @dataclass(slots=True)
+class _PrivateCleanupNamespaceMonitor:
+    descriptor: int
+    parent_watch: int
+    private_watch: int = -1
+
+
+@dataclass(slots=True)
 class _PrivateCleanupDirectory:
     descriptor: int
     identity: tuple[int, int]
     name: str
+    monitor: _PrivateCleanupNamespaceMonitor
 
 
 @dataclass(slots=True)
@@ -1124,24 +1153,157 @@ def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
         raise OSError(error, os.strerror(error), first)
 
 
+def _open_private_cleanup_namespace_monitor(
+    directory_fd: int,
+) -> _PrivateCleanupNamespaceMonitor:
+    """Watch the parent namespace before creating cleanup authority within it."""
+
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    inotify_init1 = getattr(libc, "inotify_init1", None)
+    inotify_add_watch = getattr(libc, "inotify_add_watch", None)
+    if inotify_init1 is None or inotify_add_watch is None:
+        raise WeightPlanTargetError("private cleanup namespace monitoring is unavailable")
+    descriptor = inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    parent_watch = inotify_add_watch(
+        descriptor,
+        ctypes.c_char_p(os.fsencode(f"/proc/self/fd/{directory_fd}")),
+        _PRIVATE_CLEANUP_WATCH_MASK,
+    )
+    if parent_watch < 0:
+        error = ctypes.get_errno()
+        os.close(descriptor)
+        raise OSError(error, os.strerror(error))
+    return _PrivateCleanupNamespaceMonitor(
+        descriptor=descriptor,
+        parent_watch=parent_watch,
+    )
+
+
+def _add_private_cleanup_directory_watch(
+    monitor: _PrivateCleanupNamespaceMonitor,
+    descriptor: int,
+) -> None:
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    private_watch = libc.inotify_add_watch(
+        monitor.descriptor,
+        ctypes.c_char_p(os.fsencode(f"/proc/self/fd/{descriptor}")),
+        _PRIVATE_CLEANUP_WATCH_MASK,
+    )
+    if private_watch < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    monitor.private_watch = private_watch
+
+
+def _read_private_cleanup_namespace_events(
+    monitor: _PrivateCleanupNamespaceMonitor,
+) -> list[tuple[int, int, str]]:
+    events: list[tuple[int, int, str]] = []
+    while True:
+        try:
+            payload = os.read(monitor.descriptor, 64 << 10)
+        except BlockingIOError:
+            break
+        if not payload:
+            break
+        offset = 0
+        while offset < len(payload):
+            watch, mask, _cookie, name_length = _INOTIFY_EVENT.unpack_from(payload, offset)
+            offset += _INOTIFY_EVENT.size
+            raw_name = payload[offset : offset + name_length]
+            offset += name_length
+            name = os.fsdecode(raw_name.split(b"\0", 1)[0])
+            events.append((watch, mask, name))
+    return events
+
+
+def _private_cleanup_creation_is_owned(
+    monitor: _PrivateCleanupNamespaceMonitor,
+    name: str,
+) -> bool:
+    matching: list[int] = []
+    for watch, mask, event_name in _read_private_cleanup_namespace_events(monitor):
+        if mask & (_IN_Q_OVERFLOW | _IN_IGNORED):
+            return False
+        if watch == monitor.parent_watch and event_name == name:
+            matching.append(mask)
+    return len(matching) == 1 and bool(matching[0] & _IN_CREATE) and bool(matching[0] & _IN_ISDIR)
+
+
+def _private_cleanup_namespace_is_stable(
+    cleanup: _PrivateCleanupDirectory,
+    *,
+    allowed_private_name: str | None = None,
+    allowed_private_mask: int = 0,
+    require_allowed_private_event: bool = False,
+) -> tuple[bool, bool]:
+    """Consume the lease log and report parent-name and private-dir stability."""
+
+    parent_stable = True
+    private_stable = True
+    allowed_count = 0
+    for watch, mask, event_name in _read_private_cleanup_namespace_events(cleanup.monitor):
+        if mask & (_IN_Q_OVERFLOW | _IN_IGNORED):
+            parent_stable = False
+            private_stable = False
+            continue
+        if watch == cleanup.monitor.parent_watch and event_name == cleanup.name:
+            if mask & ~(_IN_ATTRIB | _IN_ISDIR):
+                parent_stable = False
+        elif watch == cleanup.monitor.private_watch:
+            if mask & _IN_ATTRIB:
+                continue
+            if (
+                allowed_private_name is not None
+                and event_name == allowed_private_name
+                and mask & allowed_private_mask
+                and not mask & ~(allowed_private_mask | _IN_ISDIR)
+            ):
+                allowed_count += 1
+            else:
+                private_stable = False
+    if require_allowed_private_event and allowed_count != 1:
+        private_stable = False
+    return parent_stable, private_stable
+
+
+def _close_private_cleanup_namespace_monitor(
+    monitor: _PrivateCleanupNamespaceMonitor,
+    primary: BaseException | None,
+) -> BaseException | None:
+    try:
+        os.close(monitor.descriptor)
+    except BaseException as exc:
+        if primary is None:
+            return exc
+        _add_note_safely(primary, "private_cleanup_monitor_close_failed")
+    return primary
+
+
 def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirectory:
     """Create and pin an unpredictable owner-only directory for destructive cleanup."""
 
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     for _ in range(32):
         name = f".weight-plan.cleanup-{secrets.token_hex(16)}"
+        monitor = _open_private_cleanup_namespace_monitor(directory_fd)
         try:
-            # The non-writable staging mode binds acquisition to the directory
-            # just created.  A final-mode directory substituted in mkdir/open's
-            # pathname gap is rejected and preserved, rather than accepted as
-            # cleanup-owned merely because it has the same UID.
             os.mkdir(
                 name,
                 _WEIGHT_PLAN_PRIVATE_DIRECTORY_ACQUISITION_MODE,
                 dir_fd=directory_fd,
             )
         except FileExistsError:
+            monitor_error = _close_private_cleanup_namespace_monitor(monitor, None)
+            if monitor_error is not None:
+                raise monitor_error from None
             continue
+        except BaseException as primary:
+            _close_private_cleanup_namespace_monitor(monitor, primary)
+            raise
         descriptor = -1
         try:
             descriptor = os.open(name, flags, dir_fd=directory_fd)
@@ -1157,6 +1319,13 @@ def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirecto
                 or (opened.st_dev, opened.st_ino) != (scanned.st_dev, scanned.st_ino)
             ):
                 raise WeightPlanTargetError("private cleanup directory changed identity")
+            # A successful mkdir is not an ownership capability: the name can
+            # be replaced by a same-UID, same-mode directory before open.  The
+            # parent watch was installed first, so exactly one creation event
+            # derives the opened directory's authority from this attempt.
+            if not _private_cleanup_creation_is_owned(monitor, name):
+                raise WeightPlanTargetError("private cleanup directory creation was replaced")
+            _add_private_cleanup_directory_watch(monitor, descriptor)
             os.fchmod(descriptor, WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE)
             opened = os.fstat(descriptor)
             mapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1170,14 +1339,20 @@ def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirecto
                 or (opened.st_dev, opened.st_ino) != (scanned.st_dev, scanned.st_ino)
             ):
                 raise WeightPlanTargetError("private cleanup directory changed identity")
-            return _PrivateCleanupDirectory(
+            cleanup = _PrivateCleanupDirectory(
                 descriptor=descriptor,
                 identity=(opened.st_dev, opened.st_ino),
                 name=name,
+                monitor=monitor,
             )
+            parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+            if not parent_stable or not private_stable:
+                raise WeightPlanTargetError("private cleanup directory changed identity")
+            return cleanup
         except BaseException as primary:
             if descriptor >= 0:
                 _close_preserving(descriptor, primary, "private_cleanup_descriptor_close_failed")
+            _close_private_cleanup_namespace_monitor(monitor, primary)
             # The pathname may already identify a same-UID replacement.  Once
             # acquisition has failed there is no proven mapping to retire, so
             # preserve the entry rather than applying rmdir to an unowned name.
@@ -1194,6 +1369,7 @@ def _close_private_cleanup_directory(
     """Close and, when empty and still owned, retire one cleanup directory."""
 
     cleanup_error: BaseException | None = None
+    private_stable = True
     try:
         opened = os.fstat(cleanup.descriptor)
         mapped = os.stat(cleanup.name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1213,9 +1389,12 @@ def _close_private_cleanup_directory(
             != cleanup.identity
         ):
             raise WeightPlanTargetError("private cleanup directory changed identity")
+        parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+        if not parent_stable:
+            raise WeightPlanTargetError("private cleanup directory changed identity")
     except BaseException as exc:
         cleanup_error = exc
-    if cleanup_error is None:
+    if cleanup_error is None and private_stable:
         try:
             # Keep the validated descriptor pinned until the rmdir has
             # completed.  Closing it first reopens a same-UID substitution
@@ -1236,6 +1415,7 @@ def _close_private_cleanup_directory(
             cleanup_error = exc
         else:
             _add_note_safely(cleanup_error, "private_cleanup_descriptor_close_failed")
+    cleanup_error = _close_private_cleanup_namespace_monitor(cleanup.monitor, cleanup_error)
     if cleanup_error is not None:
         if primary is not None:
             _add_note_safely(primary, "private_cleanup_directory_retirement_failed")
@@ -1287,6 +1467,9 @@ def _quarantine_and_unlink_temporary(
     primary: BaseException | None = None
     try:
         try:
+            parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+            if not parent_stable or not private_stable:
+                raise WeightPlanTargetError("private cleanup namespace changed identity")
             _rename_noreplace_between(
                 directory_fd,
                 source,
@@ -1302,6 +1485,14 @@ def _quarantine_and_unlink_temporary(
             raise
         moved = True
         temporary.name = None
+        parent_stable, private_stable = _private_cleanup_namespace_is_stable(
+            cleanup,
+            allowed_private_name=quarantine,
+            allowed_private_mask=_IN_MOVED_TO,
+            require_allowed_private_event=True,
+        )
+        if not parent_stable or not private_stable:
+            raise WeightPlanTargetError("private cleanup namespace changed identity")
         descriptor_stat = os.fstat(temporary.descriptor)
         descriptor_owned = (
             stat.S_ISREG(descriptor_stat.st_mode)
@@ -1328,7 +1519,9 @@ def _quarantine_and_unlink_temporary(
                 and (captured.st_dev, captured.st_ino) == identity
                 and (captured_opened.st_dev, captured_opened.st_ino) == identity
             )
-            if not descriptor_owned or not captured_owned:
+            parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+            namespace_owned = parent_stable and private_stable
+            if not descriptor_owned or not captured_owned or not namespace_owned:
                 _rename_noreplace_between(
                     cleanup.descriptor,
                     quarantine,
@@ -1336,10 +1529,24 @@ def _quarantine_and_unlink_temporary(
                     source,
                 )
                 moved = False
-                if captured_owned:
+                _private_cleanup_namespace_is_stable(
+                    cleanup,
+                    allowed_private_name=quarantine,
+                    allowed_private_mask=_IN_MOVED_FROM,
+                    require_allowed_private_event=True,
+                )
+                if captured_owned and namespace_owned:
                     temporary.name = source
                 return
             os.unlink(quarantine, dir_fd=cleanup.descriptor)
+            parent_stable, private_stable = _private_cleanup_namespace_is_stable(
+                cleanup,
+                allowed_private_name=quarantine,
+                allowed_private_mask=_IN_DELETE,
+                require_allowed_private_event=True,
+            )
+            if not parent_stable or not private_stable:
+                raise WeightPlanTargetError("private cleanup namespace changed identity")
             moved = False
             temporary.name = None
         except BaseException as exc:
@@ -1363,6 +1570,12 @@ def _quarantine_and_unlink_temporary(
                     quarantine,
                     directory_fd,
                     source,
+                )
+                _private_cleanup_namespace_is_stable(
+                    cleanup,
+                    allowed_private_name=quarantine,
+                    allowed_private_mask=_IN_MOVED_FROM,
+                    require_allowed_private_event=True,
                 )
                 restored = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
                 if (restored.st_dev, restored.st_ino) == identity:
