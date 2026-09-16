@@ -34,6 +34,7 @@ WEIGHT_PLAN_PROTOCOL_VERSION_KEY: Final = 2
 SNAPSHOT_IDENTITY_SCHEMA = "miss.computer/misscomputer-subnet/metagraph-identity/v1"
 WEIGHT_PLAN_FILE_MODE = 0o600
 WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE = 0o700
+_WEIGHT_PLAN_PRIVATE_DIRECTORY_ACQUISITION_MODE: Final = 0o500
 MAX_WEIGHT_PLAN_NEURONS = 65_536
 MAX_WEIGHT_PLAN_BYTES = 16 << 20
 MAX_BLOCK = (1 << 63) - 1
@@ -1130,12 +1131,33 @@ def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirecto
     for _ in range(32):
         name = f".weight-plan.cleanup-{secrets.token_hex(16)}"
         try:
-            os.mkdir(name, WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE, dir_fd=directory_fd)
+            # The non-writable staging mode binds acquisition to the directory
+            # just created.  A final-mode directory substituted in mkdir/open's
+            # pathname gap is rejected and preserved, rather than accepted as
+            # cleanup-owned merely because it has the same UID.
+            os.mkdir(
+                name,
+                _WEIGHT_PLAN_PRIVATE_DIRECTORY_ACQUISITION_MODE,
+                dir_fd=directory_fd,
+            )
         except FileExistsError:
             continue
         descriptor = -1
         try:
             descriptor = os.open(name, flags, dir_fd=directory_fd)
+            opened = os.fstat(descriptor)
+            mapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            scanned = _scanned_target_stat(directory_fd, name)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != _effective_uid()
+                or stat.S_IMODE(opened.st_mode) != _WEIGHT_PLAN_PRIVATE_DIRECTORY_ACQUISITION_MODE
+                or (opened.st_dev, opened.st_ino) != (mapped.st_dev, mapped.st_ino)
+                or scanned is None
+                or (opened.st_dev, opened.st_ino) != (scanned.st_dev, scanned.st_ino)
+            ):
+                raise WeightPlanTargetError("private cleanup directory changed identity")
+            os.fchmod(descriptor, WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE)
             opened = os.fstat(descriptor)
             mapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             scanned = _scanned_target_stat(directory_fd, name)
@@ -1193,15 +1215,11 @@ def _close_private_cleanup_directory(
             raise WeightPlanTargetError("private cleanup directory changed identity")
     except BaseException as exc:
         cleanup_error = exc
-    try:
-        os.close(cleanup.descriptor)
-    except BaseException as exc:
-        if cleanup_error is None:
-            cleanup_error = exc
-        else:
-            _add_note_safely(cleanup_error, "private_cleanup_descriptor_close_failed")
     if cleanup_error is None:
         try:
+            # Keep the validated descriptor pinned until the rmdir has
+            # completed.  Closing it first reopens a same-UID substitution
+            # window after the last identity observation.
             os.rmdir(cleanup.name, dir_fd=directory_fd)
         except BaseException as exc:
             # A non-empty directory contains an entry whose ownership could not
@@ -1211,6 +1229,13 @@ def _close_private_cleanup_directory(
                 errno.EEXIST,
             }:
                 cleanup_error = exc
+    try:
+        os.close(cleanup.descriptor)
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+        else:
+            _add_note_safely(cleanup_error, "private_cleanup_descriptor_close_failed")
     if cleanup_error is not None:
         if primary is not None:
             _add_note_safely(primary, "private_cleanup_directory_retirement_failed")
@@ -1286,33 +1311,49 @@ def _quarantine_and_unlink_temporary(
             and descriptor_stat.st_nlink > 0
         )
         captured = os.stat(quarantine, dir_fd=cleanup.descriptor, follow_symlinks=False)
+        if not hasattr(os, "O_PATH"):
+            raise WeightPlanTargetError("non-opening metadata descriptors are unavailable")
         captured_descriptor = os.open(
             quarantine,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW,
             dir_fd=cleanup.descriptor,
         )
+        captured_primary: BaseException | None = None
         try:
             captured_opened = os.fstat(captured_descriptor)
-        finally:
-            os.close(captured_descriptor)
-        captured_owned = (captured.st_dev, captured.st_ino) == identity and (
-            captured_opened.st_dev,
-            captured_opened.st_ino,
-        ) == identity
-        if not descriptor_owned or not captured_owned:
-            _rename_noreplace_between(
-                cleanup.descriptor,
-                quarantine,
-                directory_fd,
-                source,
+            captured_owned = (
+                stat.S_ISREG(captured_opened.st_mode)
+                and captured_opened.st_uid == _effective_uid()
+                and stat.S_IMODE(captured_opened.st_mode) == WEIGHT_PLAN_FILE_MODE
+                and (captured.st_dev, captured.st_ino) == identity
+                and (captured_opened.st_dev, captured_opened.st_ino) == identity
             )
+            if not descriptor_owned or not captured_owned:
+                _rename_noreplace_between(
+                    cleanup.descriptor,
+                    quarantine,
+                    directory_fd,
+                    source,
+                )
+                moved = False
+                if captured_owned:
+                    temporary.name = source
+                return
+            os.unlink(quarantine, dir_fd=cleanup.descriptor)
             moved = False
-            if captured_owned:
-                temporary.name = source
-            return
-        os.unlink(quarantine, dir_fd=cleanup.descriptor)
-        moved = False
-        temporary.name = None
+            temporary.name = None
+        except BaseException as exc:
+            captured_primary = exc
+            raise
+        finally:
+            if captured_primary is None:
+                os.close(captured_descriptor)
+            else:
+                _close_preserving(
+                    captured_descriptor,
+                    captured_primary,
+                    "captured_descriptor_close_failed",
+                )
     except BaseException as exc:
         primary = exc
         if moved:
