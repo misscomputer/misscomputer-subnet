@@ -284,7 +284,9 @@ def test_atomic_plan_write_is_private_idempotent_and_replaces_new_snapshot(
     assert target.read_bytes() == replacement.canonical_bytes()
     assert target.stat().st_ino != first_inode
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert fsync_kinds == ["file", "directory"]
+    # Replacement retains a separately fsynced rollback copy until the
+    # exchanged destination has been byte- and identity-verified.
+    assert fsync_kinds == ["file", "file", "directory"]
 
 
 def test_unnamed_temporary_materialization_enoent_uses_visible_fallback(
@@ -431,38 +433,33 @@ def test_parent_rename_race_fails_if_configured_path_does_not_receive_plan(
     target.chmod(0o600)
     moved_parent = tmp_path / "plans-original"
     candidate = plan(block=102)
-    real_replace = os.replace
+    real_exchange = weight_plan_module._rename_exchange
     raced = False
 
     def rename_parent_before_install(
+        directory_fd: int,
         source: str,
         destination: str,
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
     ) -> None:
         nonlocal raced
-        assert raced is False
+        if raced:
+            real_exchange(directory_fd, source, destination)
+            return
         raced = True
         parent.rename(moved_parent)
         parent.mkdir(mode=0o700)
         replacement = parent / "weight-plan.json"
         replacement.write_bytes(b"qualifying replacement")
         replacement.chmod(0o600)
-        real_replace(
-            source,
-            destination,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
+        real_exchange(directory_fd, source, destination)
 
-    monkeypatch.setattr(os, "replace", rename_parent_before_install)
+    monkeypatch.setattr(weight_plan_module, "_rename_exchange", rename_parent_before_install)
     with pytest.raises(WeightPlanTargetError, match="configured weight plan directory changed"):
         write_weight_plan_atomic(candidate, target)
 
     assert raced is True
     assert target.read_bytes() == b"qualifying replacement"
-    assert (moved_parent / "weight-plan.json").read_bytes() == candidate.canonical_bytes()
+    assert (moved_parent / "weight-plan.json").read_bytes() == b"original plan"
 
 
 def test_visible_temporary_hardlink_during_fsync_fails_closed(
@@ -494,4 +491,6 @@ def test_visible_temporary_hardlink_during_fsync_fails_closed(
     assert linked is True
     assert not target.exists()
     assert stolen.read_bytes() == candidate.canonical_bytes()
-    assert stolen.stat().st_nlink == 1
+    # Destructive pathname retirement is deferred: the owned inode remains
+    # linked from its owner-only cleanup directory as well as this stolen link.
+    assert stolen.stat().st_nlink == 2
