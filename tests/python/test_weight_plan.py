@@ -459,7 +459,7 @@ def test_parent_rename_race_fails_if_configured_path_does_not_receive_plan(
 
     assert raced is True
     assert target.read_bytes() == b"qualifying replacement"
-    assert (moved_parent / "weight-plan.json").read_bytes() == candidate.canonical_bytes()
+    assert (moved_parent / "weight-plan.json").read_bytes() == b"original plan"
 
 
 def test_visible_temporary_hardlink_during_fsync_fails_closed(

@@ -12,7 +12,7 @@ import math
 import os
 import secrets
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urlsplit
@@ -1680,6 +1680,7 @@ def _install_temporary_plan(
     rendered: bytes,
     existing: os.stat_result | None,
     existing_bytes: bytes | None,
+    final_validation: Callable[[], None],
 ) -> None:
     """Install ``temporary`` without destroying an unvalidated destination.
 
@@ -1721,6 +1722,7 @@ def _install_temporary_plan(
                 name,
                 expected=rendered,
             )
+            final_validation()
         except BaseException as failure:
             rollback_moved = False
             try:
@@ -1761,6 +1763,7 @@ def _install_temporary_plan(
             rendered,
             existing,
             existing_bytes,
+            final_validation,
         )
     except BaseException as exc:
         backup_primary = exc
@@ -1812,6 +1815,8 @@ def _exchange_rollback_copy(
     name: str,
     existing_bytes: bytes,
     failure: BaseException,
+    *,
+    allow_exchange: bool,
 ) -> bool:
     source = rollback.name
     if source is None:
@@ -1828,12 +1833,21 @@ def _exchange_rollback_copy(
             directory_fd,
             expected_size=len(existing_bytes),
         )
-        _rename_exchange(directory_fd, source, name)
+        destination = _unvalidated_target_stat(directory_fd, name)
+        if destination is None:
+            _rename_noreplace(directory_fd, source, name)
+            exchanged = False
+        elif allow_exchange:
+            _rename_exchange(directory_fd, source, name)
+            exchanged = True
+        else:
+            raise WeightPlanTargetError("atomic replacement rollback destination was recreated")
         rollback.name = None
         _fsync_replacement_rollback(directory_fd, failure)
-        moved = _unvalidated_target_stat(directory_fd, source)
-        if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
-            temporary.name = source
+        if exchanged:
+            moved = _unvalidated_target_stat(directory_fd, source)
+            if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
+                temporary.name = source
         _validate_installed_temporary(
             rollback,
             directory_fd,
@@ -1853,6 +1867,8 @@ def _restore_from_rollback_copy(
     name: str,
     existing_bytes: bytes,
     failure: BaseException,
+    *,
+    allow_exchange: bool,
 ) -> bool:
     if _exchange_rollback_copy(
         backup,
@@ -1861,6 +1877,7 @@ def _restore_from_rollback_copy(
         name,
         existing_bytes,
         failure,
+        allow_exchange=allow_exchange,
     ):
         return True
 
@@ -1875,6 +1892,7 @@ def _restore_from_rollback_copy(
             name,
             existing_bytes,
             failure,
+            allow_exchange=allow_exchange,
         )
         return recovered
     except BaseException:
@@ -1913,9 +1931,11 @@ def _rollback_replacement(
     failure: BaseException,
 ) -> None:
     restored = False
+    allow_copy_exchange = False
     try:
         source_stat = _unvalidated_target_stat(directory_fd, source)
         installed_stat = _unvalidated_target_stat(directory_fd, name)
+        allow_copy_exchange = installed_stat is not None
         displaced_now = os.fstat(displaced_descriptor)
         displaced_bytes = _read_descriptor(displaced_descriptor)
         displaced_after = os.fstat(displaced_descriptor)
@@ -1942,8 +1962,14 @@ def _rollback_replacement(
         restore_replaced_destination = installed_is_temporary and displaced_now.st_nlink == 0
         if restore_original or restore_replaced_destination:
             assert source_stat is not None
-            _rename_exchange(directory_fd, source, name)
-            temporary.name = source if installed_is_temporary else None
+            if installed_stat is None:
+                allow_copy_exchange = False
+                _rename_noreplace(directory_fd, source, name)
+                allow_copy_exchange = True
+                temporary.name = None
+            else:
+                _rename_exchange(directory_fd, source, name)
+                temporary.name = source if installed_is_temporary else None
             _fsync_replacement_rollback(directory_fd, failure)
             if restore_original:
                 _validate_restored_original(
@@ -1974,6 +2000,7 @@ def _rollback_replacement(
             name,
             existing_bytes,
             failure,
+            allow_exchange=allow_copy_exchange,
         )
     if not restored:
         _add_note_safely(failure, "atomic_replacement_rollback_failed")
@@ -1988,6 +2015,7 @@ def _install_replacement_plan(
     rendered: bytes,
     existing: os.stat_result,
     existing_bytes: bytes,
+    final_validation: Callable[[], None],
 ) -> None:
     """Exchange one replacement while retaining an independent rollback copy."""
 
@@ -2063,6 +2091,12 @@ def _install_replacement_plan(
         except BaseException as exc:
             failure = exc
 
+    if failure is None:
+        try:
+            final_validation()
+        except BaseException as exc:
+            failure = exc
+
     if failure is not None:
         _rollback_replacement(
             temporary,
@@ -2133,6 +2167,22 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         )
         _validate_temporary_name(temporary, directory_fd, expected_size=len(rendered))
         assert temporary.name is not None
+
+        def final_validation() -> None:
+            assert temporary is not None
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
+            )
+            _verify_configured_target(
+                chain,
+                name,
+                identity=temporary.identity,
+                rendered=rendered,
+            )
+
         _install_temporary_plan(
             temporary,
             directory_fd,
@@ -2140,18 +2190,7 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
             rendered,
             existing,
             existing_bytes,
-        )
-        _validate_installed_temporary(
-            temporary,
-            directory_fd,
-            name,
-            expected=rendered,
-        )
-        _verify_configured_target(
-            chain,
-            name,
-            identity=temporary.identity,
-            rendered=rendered,
+            final_validation,
         )
         return True
     except BaseException as exc:
