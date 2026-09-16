@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -696,8 +697,93 @@ class _TemporaryPlan:
     name: str | None
 
 
+@dataclass(slots=True)
+class _WeightPlanWriteLock:
+    descriptor: int
+
+    def close(self) -> None:
+        descriptor, self.descriptor = self.descriptor, -1
+        if descriptor < 0:
+            return
+        primary: BaseException | None = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException as exc:
+            primary = exc
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+            else:
+                _add_note_safely(primary, "write_lock_descriptor_cleanup_failed")
+        if primary is not None:
+            raise primary
+
+
 def _effective_uid() -> int:
     return os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+
+
+def _write_lock_name(target_name: str) -> str:
+    digest = hashlib.sha256(os.fsencode(target_name)).hexdigest()
+    return f".weight-plan.lock-{digest}"
+
+
+def _validate_write_lock(value: os.stat_result) -> None:
+    if not stat.S_ISREG(value.st_mode):
+        raise WeightPlanTargetError("weight plan write lock must be a regular file")
+    if value.st_nlink != 1:
+        raise WeightPlanTargetError("weight plan write lock must not have hard links")
+    if value.st_uid != _effective_uid():
+        raise WeightPlanTargetError("weight plan write lock has an unexpected owner")
+    if stat.S_IMODE(value.st_mode) != WEIGHT_PLAN_FILE_MODE:
+        raise WeightPlanTargetError("weight plan write lock must have mode 0600")
+    if value.st_size != 0:
+        raise WeightPlanTargetError("weight plan write lock must be empty")
+
+
+def _acquire_write_lock(directory_fd: int, target_name: str) -> _WeightPlanWriteLock:
+    """Serialize cooperating writers through cleanup, installation, and rollback."""
+
+    name = _write_lock_name(target_name)
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = -1
+    created = False
+    locked = False
+    try:
+        try:
+            descriptor = os.open(
+                name,
+                flags | os.O_CREAT | os.O_EXCL,
+                WEIGHT_PLAN_FILE_MODE,
+                dir_fd=directory_fd,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+        if created:
+            os.fchmod(descriptor, WEIGHT_PLAN_FILE_MODE)
+        before = os.fstat(descriptor)
+        _validate_write_lock(before)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        after = os.fstat(descriptor)
+        _validate_write_lock(after)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _validate_write_lock(named)
+        if (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino):
+            raise WeightPlanTargetError("weight plan write lock changed identity")
+        return _WeightPlanWriteLock(descriptor=descriptor)
+    except BaseException as primary:
+        if descriptor >= 0:
+            if locked:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except BaseException:
+                    _add_note_safely(primary, "write_lock_release_failed")
+            _close_preserving(descriptor, primary, "write_lock_descriptor_cleanup_failed")
+        raise
 
 
 def _validate_directory(
@@ -1441,24 +1527,49 @@ def _install_temporary_plan(
         failure = exc
 
     if failure is not None:
-        if displaced_descriptor >= 0:
-            try:
-                os.close(displaced_descriptor)
-            except BaseException:
-                _add_note_safely(failure, "displaced_target_cleanup_failed")
         try:
             source_stat = _unvalidated_target_stat(directory_fd, source)
             installed_stat = _unvalidated_target_stat(directory_fd, name)
-            if (
-                source_stat is None
-                or installed_stat is None
-                or (installed_stat.st_dev, installed_stat.st_ino) != temporary.identity
-            ):
+            installed_is_temporary = (
+                installed_stat is not None
+                and (
+                    installed_stat.st_dev,
+                    installed_stat.st_ino,
+                )
+                == temporary.identity
+            )
+            source_is_displaced = source_stat is not None and (
+                source_stat.st_dev,
+                source_stat.st_ino,
+            ) == (expected_stat.st_dev, expected_stat.st_ino)
+            if installed_is_temporary:
+                # The exchanged source remained descriptor-bound.  Put the
+                # current source entry back at the configured destination;
+                # this also preserves a destination replacement that arrived
+                # immediately before the exchange.
+                _rename_exchange(directory_fd, source, name)
+                temporary.name = source
+            elif source_is_displaced:
+                # The source name was substituted before the exchange.  The
+                # pinned original destination is still recoverable at source,
+                # while the prepared inode has no remaining name.  Restore the
+                # original and leave the foreign source at the source path.
+                displaced_now = os.fstat(displaced_descriptor)
+                _validate_existing_target(displaced_now)
+                if (
+                    (displaced_now.st_dev, displaced_now.st_ino)
+                    != (expected_stat.st_dev, expected_stat.st_ino)
+                    or not _same_target(displaced_now, source_stat)
+                    or os.fstat(temporary.descriptor).st_nlink != 0
+                ):
+                    raise WeightPlanTargetError("atomic replacement rollback lost ownership")
+                _rename_exchange(directory_fd, source, name)
+                temporary.name = None
+            else:
                 raise WeightPlanTargetError("atomic replacement rollback lost ownership")
-            _rename_exchange(directory_fd, source, name)
-            temporary.name = source
         except BaseException:
             _add_note_safely(failure, "atomic_replacement_rollback_failed")
+        _close_preserving(displaced_descriptor, failure, "displaced_target_cleanup_failed")
         raise failure
 
     assert displaced_descriptor >= 0
@@ -1480,6 +1591,7 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
 
     parent, name = _secure_file_location(path)
     chain = _pin_directory_chain(parent)
+    write_lock: _WeightPlanWriteLock | None = None
     temporary: _TemporaryPlan | None = None
     primary: BaseException | None = None
     try:
@@ -1487,6 +1599,7 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         rendered = plan.canonical_bytes()
         if len(rendered) > MAX_WEIGHT_PLAN_BYTES:
             raise WeightPlanError("canonical weight plan exceeds the size limit")
+        write_lock = _acquire_write_lock(directory_fd, name)
         _revalidate_pinned_chain(chain)
         existing = _target_stat(directory_fd, name)
         if existing is not None:
@@ -1546,6 +1659,16 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
         except BaseException as exc:
             if primary is not None:
                 _add_note_safely(primary, "temporary_cleanup_failed")
+            else:
+                cleanup_primary = exc
+        try:
+            if write_lock is not None:
+                write_lock.close()
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "write_lock_cleanup_failed")
+            elif cleanup_primary is not None:
+                _add_note_safely(cleanup_primary, "write_lock_cleanup_failed")
             else:
                 cleanup_primary = exc
         try:
