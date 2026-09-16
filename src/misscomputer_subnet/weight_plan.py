@@ -924,6 +924,30 @@ def _validate_temporary_descriptor(
     return value
 
 
+def _validate_temporary_contents(
+    temporary: _TemporaryPlan,
+    *,
+    expected: bytes,
+    expected_nlink: int,
+) -> os.stat_result:
+    """Bind one prepared inode to exact bytes across a stable descriptor read."""
+
+    before = _validate_temporary_descriptor(
+        temporary,
+        expected_size=len(expected),
+        expected_nlink=expected_nlink,
+    )
+    rendered = _read_descriptor(temporary.descriptor)
+    after = _validate_temporary_descriptor(
+        temporary,
+        expected_size=len(expected),
+        expected_nlink=expected_nlink,
+    )
+    if rendered != expected or not _same_target(before, after):
+        raise WeightPlanTargetError("temporary weight plan bytes changed during validation")
+    return after
+
+
 def _validate_temporary_name(
     temporary: _TemporaryPlan,
     directory_fd: int,
@@ -936,6 +960,25 @@ def _validate_temporary_name(
     _validate_existing_target(named)
     if named.st_size != expected_size or (named.st_dev, named.st_ino) != temporary.identity:
         raise WeightPlanTargetError("temporary weight plan name changed identity")
+
+
+def _validate_installed_temporary(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    *,
+    expected: bytes,
+) -> None:
+    """Verify the exact prepared inode and bytes at the configured name."""
+
+    opened = _validate_temporary_contents(
+        temporary,
+        expected=expected,
+        expected_nlink=1,
+    )
+    named = _unvalidated_target_stat(directory_fd, name)
+    if named is None or not _same_target(opened, named):
+        raise WeightPlanTargetError("installed weight plan target changed identity")
 
 
 def _write_all(descriptor: int, rendered: bytes) -> None:
@@ -1593,6 +1636,7 @@ def _install_temporary_plan(
     temporary: _TemporaryPlan,
     directory_fd: int,
     name: str,
+    rendered: bytes,
     existing: os.stat_result | None,
     existing_bytes: bytes | None,
 ) -> None:
@@ -1607,33 +1651,54 @@ def _install_temporary_plan(
     source = temporary.name
     if source is None:
         raise WeightPlanTargetError("temporary weight plan has no install name")
+    _validate_temporary_contents(
+        temporary,
+        expected=rendered,
+        expected_nlink=1,
+    )
     if existing is None:
+        published = False
         try:
             _rename_noreplace(directory_fd, source, name)
+            published = True
         except FileExistsError as exc:
             raise WeightPlanTargetError(
                 "weight plan target changed before atomic installation"
             ) from exc
-        installed = _unvalidated_target_stat(directory_fd, name)
-        descriptor_stat = os.fstat(temporary.descriptor)
-        if (
-            installed is None
-            or (installed.st_dev, installed.st_ino) != temporary.identity
-            or (descriptor_stat.st_dev, descriptor_stat.st_ino) != temporary.identity
-            or descriptor_stat.st_nlink != 1
-        ):
-            failure = WeightPlanTargetError("weight plan source changed during atomic installation")
+        try:
+            temporary.name = None
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
+            )
+            os.fsync(directory_fd)
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
+            )
+        except BaseException as failure:
+            rollback_moved = False
             try:
-                _rename_noreplace(directory_fd, name, source)
-                restored = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
-                if (restored.st_dev, restored.st_ino) == temporary.identity:
+                if published:
+                    _rename_noreplace(directory_fd, name, source)
+                    rollback_moved = True
+                restored_stat = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
+                if (restored_stat.st_dev, restored_stat.st_ino) == temporary.identity:
                     temporary.name = source
                 else:
                     temporary.name = None
             except BaseException:
                 _add_note_safely(failure, "atomic_creation_rollback_failed")
+            if rollback_moved:
+                try:
+                    os.fsync(directory_fd)
+                except BaseException:
+                    _add_note_safely(failure, "atomic_creation_rollback_fsync_failed")
             raise failure
-        temporary.name = None
         return
 
     if existing_bytes is None:
@@ -1652,6 +1717,7 @@ def _install_temporary_plan(
             directory_fd,
             name,
             source,
+            rendered,
             existing,
             existing_bytes,
         )
@@ -1668,12 +1734,217 @@ def _install_temporary_plan(
                 raise
 
 
+def _fsync_replacement_rollback(directory_fd: int, failure: BaseException) -> None:
+    try:
+        os.fsync(directory_fd)
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_rollback_fsync_failed")
+
+
+def _validate_restored_original(
+    descriptor: int,
+    identity: tuple[int, int],
+    expected: bytes,
+    directory_fd: int,
+    name: str,
+) -> None:
+    before = os.fstat(descriptor)
+    _validate_existing_target(before)
+    rendered = _read_descriptor(descriptor)
+    after = os.fstat(descriptor)
+    _validate_existing_target(after)
+    named = _unvalidated_target_stat(directory_fd, name)
+    if (
+        (before.st_dev, before.st_ino) != identity
+        or rendered != expected
+        or not _same_target(before, after)
+        or named is None
+        or not _same_target(after, named)
+    ):
+        raise WeightPlanTargetError("atomic replacement did not restore original bytes")
+
+
+def _exchange_rollback_copy(
+    rollback: _TemporaryPlan,
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    existing_bytes: bytes,
+    failure: BaseException,
+) -> bool:
+    source = rollback.name
+    if source is None:
+        _add_note_safely(failure, "atomic_replacement_rollback_copy_is_unnamed")
+        return False
+    try:
+        _validate_temporary_contents(
+            rollback,
+            expected=existing_bytes,
+            expected_nlink=1,
+        )
+        _validate_temporary_name(
+            rollback,
+            directory_fd,
+            expected_size=len(existing_bytes),
+        )
+        _rename_exchange(directory_fd, source, name)
+        rollback.name = None
+        _fsync_replacement_rollback(directory_fd, failure)
+        moved = _unvalidated_target_stat(directory_fd, source)
+        if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
+            temporary.name = source
+        _validate_installed_temporary(
+            rollback,
+            directory_fd,
+            name,
+            expected=existing_bytes,
+        )
+        return True
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_rollback_copy_failed")
+        return False
+
+
+def _restore_from_rollback_copy(
+    backup: _TemporaryPlan,
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    existing_bytes: bytes,
+    failure: BaseException,
+) -> bool:
+    if _exchange_rollback_copy(
+        backup,
+        temporary,
+        directory_fd,
+        name,
+        existing_bytes,
+        failure,
+    ):
+        return True
+
+    recovery: _TemporaryPlan | None = None
+    recovered = False
+    try:
+        recovery = _prepare_temporary_plan(directory_fd, existing_bytes)
+        recovered = _exchange_rollback_copy(
+            recovery,
+            temporary,
+            directory_fd,
+            name,
+            existing_bytes,
+            failure,
+        )
+        return recovered
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_rollback_recovery_failed")
+        return False
+    finally:
+        if recovery is not None:
+            if recovered:
+                try:
+                    _cleanup_temporary_plan(recovery, directory_fd)
+                except BaseException:
+                    _add_note_safely(failure, "rollback_recovery_cleanup_failed")
+            else:
+                # A still-named exact recovery copy is more important than
+                # residue-free failure.  Close it without pathname deletion.
+                _close_preserving(
+                    recovery.descriptor,
+                    failure,
+                    "rollback_recovery_descriptor_cleanup_failed",
+                )
+        if not recovered and backup.name is not None:
+            # Likewise preserve a validated, still-linked primary copy when a
+            # hostile namespace prevents canonical restoration.
+            backup.name = None
+
+
+def _rollback_replacement(
+    temporary: _TemporaryPlan,
+    backup: _TemporaryPlan,
+    displaced_descriptor: int,
+    expected_stat: os.stat_result,
+    existing_bytes: bytes,
+    directory_fd: int,
+    source: str,
+    name: str,
+    failure: BaseException,
+) -> None:
+    restored = False
+    try:
+        source_stat = _unvalidated_target_stat(directory_fd, source)
+        installed_stat = _unvalidated_target_stat(directory_fd, name)
+        displaced_now = os.fstat(displaced_descriptor)
+        displaced_bytes = _read_descriptor(displaced_descriptor)
+        displaced_after = os.fstat(displaced_descriptor)
+        displaced_intact = (
+            (displaced_now.st_dev, displaced_now.st_ino)
+            == (expected_stat.st_dev, expected_stat.st_ino)
+            and displaced_bytes == existing_bytes
+            and _same_target(displaced_now, displaced_after)
+        )
+        installed_is_temporary = (
+            installed_stat is not None
+            and (installed_stat.st_dev, installed_stat.st_ino) == temporary.identity
+        )
+        source_is_displaced = source_stat is not None and (
+            source_stat.st_dev,
+            source_stat.st_ino,
+        ) == (expected_stat.st_dev, expected_stat.st_ino)
+        temporary_nlink = os.fstat(temporary.descriptor).st_nlink
+        restore_original = (
+            displaced_intact
+            and source_is_displaced
+            and (installed_is_temporary or temporary_nlink == 0)
+        )
+        restore_replaced_destination = installed_is_temporary and displaced_now.st_nlink == 0
+        if restore_original or restore_replaced_destination:
+            assert source_stat is not None
+            _rename_exchange(directory_fd, source, name)
+            temporary.name = source if installed_is_temporary else None
+            _fsync_replacement_rollback(directory_fd, failure)
+            if restore_original:
+                _validate_restored_original(
+                    displaced_descriptor,
+                    (expected_stat.st_dev, expected_stat.st_ino),
+                    existing_bytes,
+                    directory_fd,
+                    name,
+                )
+            else:
+                restored_target = _unvalidated_target_stat(directory_fd, name)
+                if restored_target is None or (
+                    restored_target.st_dev,
+                    restored_target.st_ino,
+                ) != (source_stat.st_dev, source_stat.st_ino):
+                    raise WeightPlanTargetError(
+                        "atomic replacement changed the rollback destination"
+                    )
+            restored = True
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_direct_rollback_failed")
+
+    if not restored:
+        restored = _restore_from_rollback_copy(
+            backup,
+            temporary,
+            directory_fd,
+            name,
+            existing_bytes,
+            failure,
+        )
+    if not restored:
+        _add_note_safely(failure, "atomic_replacement_rollback_failed")
+
+
 def _install_replacement_plan(
     temporary: _TemporaryPlan,
     backup: _TemporaryPlan,
     directory_fd: int,
     name: str,
     source: str,
+    rendered: bytes,
     existing: os.stat_result,
     existing_bytes: bytes,
 ) -> None:
@@ -1716,6 +1987,12 @@ def _install_replacement_plan(
         displaced_after = os.fstat(displaced_descriptor)
         mapped = _target_stat(directory_fd, source)
         installed = _target_stat(directory_fd, name)
+        _validate_installed_temporary(
+            temporary,
+            directory_fd,
+            name,
+            expected=rendered,
+        )
         if (
             (displaced_stat.st_dev, displaced_stat.st_ino)
             != (expected_stat.st_dev, expected_stat.st_ino)
@@ -1733,82 +2010,30 @@ def _install_replacement_plan(
     except BaseException as exc:
         failure = exc
 
-    if failure is not None:
+    if failure is None:
         try:
-            source_stat = _unvalidated_target_stat(directory_fd, source)
-            installed_stat = _unvalidated_target_stat(directory_fd, name)
-            displaced_now = os.fstat(displaced_descriptor)
-            displaced_bytes = _read_descriptor(displaced_descriptor)
-            displaced_after = os.fstat(displaced_descriptor)
-            displaced_intact = (
-                (displaced_now.st_dev, displaced_now.st_ino)
-                == (expected_stat.st_dev, expected_stat.st_ino)
-                and displaced_bytes == existing_bytes
-                and _same_target(displaced_now, displaced_after)
+            os.fsync(directory_fd)
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
             )
-            installed_is_temporary = (
-                installed_stat is not None
-                and (
-                    installed_stat.st_dev,
-                    installed_stat.st_ino,
-                )
-                == temporary.identity
-            )
-            source_is_displaced = source_stat is not None and (
-                source_stat.st_dev,
-                source_stat.st_ino,
-            ) == (expected_stat.st_dev, expected_stat.st_ino)
-            temporary_nlink = os.fstat(temporary.descriptor).st_nlink
-            if (
-                displaced_intact
-                and source_is_displaced
-                and (installed_is_temporary or temporary_nlink == 0)
-            ):
-                # Either the ordinary exchange completed, or a foreign source
-                # was exchanged after unlinking the prepared inode.  The exact
-                # original is still at ``source`` and can be restored without
-                # publishing unverified bytes.
-                _rename_exchange(directory_fd, source, name)
-                temporary.name = source if installed_is_temporary else None
-            elif installed_is_temporary and displaced_now.st_nlink == 0:
-                # The destination was replaced immediately before exchange.
-                # Its replacement is now at ``source``; restore that exact
-                # foreign entry rather than overwriting it with stale state.
-                _rename_exchange(directory_fd, source, name)
-                temporary.name = source
-            else:
-                # A moved-aside or content-mutated displaced inode is unsafe to
-                # publish.  Exchange the independent rollback copy into place;
-                # whatever occupied the target is preserved under the copy's
-                # former name and is retired only when it is our prepared inode.
-                backup_source = backup.name
-                if backup_source is None:
-                    raise WeightPlanTargetError("atomic replacement rollback copy is unnamed")
-                _validate_temporary_name(
-                    backup,
-                    directory_fd,
-                    expected_size=len(existing_bytes),
-                )
-                _rename_exchange(directory_fd, backup_source, name)
-                restored = _unvalidated_target_stat(directory_fd, name)
-                backup_after = os.fstat(backup.descriptor)
-                backup_bytes = _read_descriptor(backup.descriptor)
-                backup_final = os.fstat(backup.descriptor)
-                if (
-                    restored is None
-                    or (restored.st_dev, restored.st_ino) != backup.identity
-                    or (backup_after.st_dev, backup_after.st_ino) != backup.identity
-                    or backup_after.st_nlink != 1
-                    or backup_bytes != existing_bytes
-                    or not _same_target(backup_after, backup_final)
-                ):
-                    raise WeightPlanTargetError("atomic replacement rollback copy was substituted")
-                backup.name = None
-                moved = _unvalidated_target_stat(directory_fd, backup_source)
-                if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
-                    temporary.name = backup_source
-        except BaseException:
-            _add_note_safely(failure, "atomic_replacement_rollback_failed")
+        except BaseException as exc:
+            failure = exc
+
+    if failure is not None:
+        _rollback_replacement(
+            temporary,
+            backup,
+            displaced_descriptor,
+            expected_stat,
+            existing_bytes,
+            directory_fd,
+            source,
+            name,
+            failure,
+        )
         _close_preserving(displaced_descriptor, failure, "displaced_target_cleanup_failed")
         raise failure
 
@@ -1871,22 +2096,15 @@ def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> 
             temporary,
             directory_fd,
             name,
+            rendered,
             existing,
             existing_bytes,
         )
-        _validate_temporary_descriptor(
+        _validate_installed_temporary(
             temporary,
-            expected_size=len(rendered),
-            expected_nlink=1,
-        )
-        installed = _target_stat(directory_fd, name)
-        if installed is None or (installed.st_dev, installed.st_ino) != temporary.identity:
-            raise WeightPlanTargetError("installed weight plan target changed identity")
-        os.fsync(directory_fd)
-        _validate_temporary_descriptor(
-            temporary,
-            expected_size=len(rendered),
-            expected_nlink=1,
+            directory_fd,
+            name,
+            expected=rendered,
         )
         _verify_configured_target(
             chain,
