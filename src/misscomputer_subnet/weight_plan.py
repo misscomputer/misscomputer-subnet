@@ -1124,10 +1124,26 @@ def _rename_noreplace_between(
         raise OSError(error, os.strerror(error), source)
 
 
-def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
-    """Move one directory entry without ever replacing the destination."""
+def _rename_noreplace(
+    directory_fd: int,
+    source: str,
+    destination: str,
+) -> tuple[int, int] | None:
+    """Move without replacement and non-failingly identify the publication."""
 
+    source_stat = _unvalidated_target_stat(directory_fd, source)
     _rename_noreplace_between(directory_fd, source, directory_fd, destination)
+    try:
+        published = _unvalidated_target_stat(directory_fd, destination)
+    except BaseException:
+        return None
+    if (
+        source_stat is not None
+        and published is not None
+        and (published.st_dev, published.st_ino) == (source_stat.st_dev, source_stat.st_ino)
+    ):
+        return (published.st_dev, published.st_ino)
+    return None
 
 
 def _rename_exchange(directory_fd: int, first: str, second: str) -> tuple[int, int] | None:
@@ -2053,15 +2069,11 @@ def _validate_restored_original(
 
 def _record_rollback_publication(
     state: _RollbackDestinationState,
-    directory_fd: int,
-    name: str,
+    published_identity: tuple[int, int] | None,
 ) -> None:
-    """Authorize repair only for the exact entry this attempt just published."""
+    """Authorize repair only for the identity confirmed by the mutation itself."""
 
-    state.exchange_identity = None
-    published = _unvalidated_target_stat(directory_fd, name)
-    if published is not None:
-        state.exchange_identity = (published.st_dev, published.st_ino)
+    state.exchange_identity = published_identity
 
 
 def _exchange_rollback_copy(
@@ -2089,24 +2101,25 @@ def _exchange_rollback_copy(
             expected_size=len(existing_bytes),
         )
         destination = _unvalidated_target_stat(directory_fd, name)
+        published_identity: tuple[int, int] | None
         if destination is None:
             # This observation supersedes any earlier permission to exchange.
             # If RENAME_NOREPLACE collides, the recreated entry belongs to the
             # concurrent actor and no later recovery attempt may displace it.
             destination_state.exchange_identity = None
-            _rename_noreplace(directory_fd, source, name)
+            published_identity = _rename_noreplace(directory_fd, source, name)
             exchanged = False
         elif (destination.st_dev, destination.st_ino) == (destination_state.exchange_identity):
-            _rename_exchange(directory_fd, source, name)
+            published_identity = _rename_exchange(directory_fd, source, name)
             exchanged = True
         else:
             raise WeightPlanTargetError("atomic replacement rollback destination was recreated")
         rollback.name = None
-        # Durability must not depend on later bookkeeping or observation.  After
-        # the fsync, bind any recovery authority to the entry the mutation
-        # actually published, not to a stale pre-mutation source observation.
+        # Durability must not depend on later bookkeeping or observation. Bind
+        # recovery authority only to the identity confirmed by the successful
+        # mutation, never to a later observation that could see a foreign entry.
         _fsync_replacement_rollback(directory_fd, failure)
-        _record_rollback_publication(destination_state, directory_fd, name)
+        _record_rollback_publication(destination_state, published_identity)
         if exchanged:
             moved = _unvalidated_target_stat(directory_fd, source)
             if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
@@ -2233,16 +2246,17 @@ def _rollback_replacement(
             assert source_stat is not None
             if installed_stat is None:
                 destination_state.exchange_identity = None
-                _rename_noreplace(directory_fd, source, name)
+                published_identity = _rename_noreplace(directory_fd, source, name)
                 temporary.name = None
             else:
-                _rename_exchange(directory_fd, source, name)
+                published_identity = _rename_exchange(directory_fd, source, name)
                 temporary.name = source if installed_is_temporary else None
             # A successful restoring mutation requires a directory durability
             # attempt even if subsequent publication bookkeeping or validation
-            # fails.  The restored identity is known from the moved source.
+            # fails. Recovery authority comes from the mutation-confirmed
+            # identity, not from a post-fsync pathname observation.
             _fsync_replacement_rollback(directory_fd, failure)
-            _record_rollback_publication(destination_state, directory_fd, name)
+            _record_rollback_publication(destination_state, published_identity)
             _validate_restored_original(
                 displaced_descriptor,
                 (expected_stat.st_dev, expected_stat.st_ino),

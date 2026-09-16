@@ -90,9 +90,9 @@ def test_missing_backup_late_change_is_recovered(
         directory_fd: int,
         source: str,
         destination: str,
-    ) -> None:
+    ):
         nonlocal installed
-        real_exchange(directory_fd, source, destination)
+        identity = real_exchange(directory_fd, source, destination)
         if not installed and destination == target.name:
             installed = True
             _overwrite_name(
@@ -101,6 +101,7 @@ def test_missing_backup_late_change_is_recovered(
                 b"x" * len(original_bytes),
             )
             os.unlink(destination, dir_fd=directory_fd)
+        return identity
 
     def fail_after_install(directory_fd: int, name: str) -> os.stat_result | None:
         if installed:
@@ -111,7 +112,7 @@ def test_missing_backup_late_change_is_recovered(
         directory_fd: int,
         source: str,
         destination: str,
-    ) -> None:
+    ):
         nonlocal attacked
         if installed and destination == target.name and not attacked:
             attacked = True
@@ -122,7 +123,7 @@ def test_missing_backup_late_change_is_recovered(
                     attacker_bytes,
                     substitute=attack == "substitution",
                 )
-        real_noreplace(directory_fd, source, destination)
+        return real_noreplace(directory_fd, source, destination)
 
     monkeypatch.setattr(weight_plan, "_rename_exchange", remove_candidate_and_corrupt_displaced)
     monkeypatch.setattr(

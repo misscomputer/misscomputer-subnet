@@ -116,7 +116,7 @@ def test_late_direct_rollback_source_change_uses_pristine_copy(
     exchange_calls = 0
     attacked = False
 
-    def attack_restoring_source(directory_fd: int, source: str, destination: str) -> None:
+    def attack_restoring_source(directory_fd: int, source: str, destination: str):
         nonlocal exchange_calls, attacked
         exchange_calls += 1
         if exchange_calls == 2:
@@ -143,16 +143,17 @@ def test_late_direct_rollback_source_change_uses_pristine_copy(
                     _overwrite(descriptor, attacker_bytes)
                 finally:
                     os.close(descriptor)
-        real_exchange(directory_fd, source, destination)
+        return real_exchange(directory_fd, source, destination)
 
     installed = False
     real_target_stat = weight_plan._target_stat
 
-    def mark_initial_exchange(directory_fd: int, source: str, destination: str) -> None:
+    def mark_initial_exchange(directory_fd: int, source: str, destination: str):
         nonlocal installed
-        attack_restoring_source(directory_fd, source, destination)
+        identity = attack_restoring_source(directory_fd, source, destination)
         if destination == target.name and exchange_calls == 1:
             installed = True
+        return identity
 
     def fail_post_exchange(
         directory_fd: int,
@@ -194,7 +195,7 @@ def test_late_backup_rollback_source_change_is_recovered(
     installed = False
     attacked = False
 
-    def exchange(directory_fd: int, source: str, destination: str) -> None:
+    def exchange(directory_fd: int, source: str, destination: str):
         nonlocal exchange_calls, installed, attacked
         exchange_calls += 1
         if exchange_calls == 2:
@@ -221,7 +222,7 @@ def test_late_backup_rollback_source_change_is_recovered(
                     _overwrite(descriptor, attacker_bytes)
                 finally:
                     os.close(descriptor)
-        real_exchange(directory_fd, source, destination)
+        identity = real_exchange(directory_fd, source, destination)
         if exchange_calls == 1:
             installed = True
             descriptor = os.open(
@@ -233,6 +234,7 @@ def test_late_backup_rollback_source_change_is_recovered(
                 _overwrite(descriptor, b"x" * len(original.canonical_bytes()))
             finally:
                 os.close(descriptor)
+        return identity
 
     def fail_post_exchange(
         directory_fd: int,
