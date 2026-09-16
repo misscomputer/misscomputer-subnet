@@ -724,6 +724,13 @@ class _TemporaryPlan:
 
 
 @dataclass(slots=True)
+class _RollbackDestinationState:
+    """The exact destination entry one rollback attempt may replace."""
+
+    exchange_identity: tuple[int, int] | None
+
+
+@dataclass(slots=True)
 class _PrivateCleanupNamespaceMonitor:
     descriptor: int
     parent_watch: int
@@ -2021,6 +2028,19 @@ def _validate_restored_original(
         raise WeightPlanTargetError("atomic replacement did not restore original bytes")
 
 
+def _record_rollback_publication(
+    state: _RollbackDestinationState,
+    directory_fd: int,
+    name: str,
+) -> None:
+    """Authorize repair only for the entry this attempt just published."""
+
+    state.exchange_identity = None
+    published = _unvalidated_target_stat(directory_fd, name)
+    if published is not None:
+        state.exchange_identity = (published.st_dev, published.st_ino)
+
+
 def _exchange_rollback_copy(
     rollback: _TemporaryPlan,
     temporary: _TemporaryPlan,
@@ -2028,8 +2048,7 @@ def _exchange_rollback_copy(
     name: str,
     existing_bytes: bytes,
     failure: BaseException,
-    *,
-    allow_exchange: bool,
+    destination_state: _RollbackDestinationState,
 ) -> bool:
     source = rollback.name
     if source is None:
@@ -2048,14 +2067,19 @@ def _exchange_rollback_copy(
         )
         destination = _unvalidated_target_stat(directory_fd, name)
         if destination is None:
+            # This observation supersedes any earlier permission to exchange.
+            # If RENAME_NOREPLACE collides, the recreated entry belongs to the
+            # concurrent actor and no later recovery attempt may displace it.
+            destination_state.exchange_identity = None
             _rename_noreplace(directory_fd, source, name)
             exchanged = False
-        elif allow_exchange:
+        elif (destination.st_dev, destination.st_ino) == (destination_state.exchange_identity):
             _rename_exchange(directory_fd, source, name)
             exchanged = True
         else:
             raise WeightPlanTargetError("atomic replacement rollback destination was recreated")
         rollback.name = None
+        _record_rollback_publication(destination_state, directory_fd, name)
         _fsync_replacement_rollback(directory_fd, failure)
         if exchanged:
             moved = _unvalidated_target_stat(directory_fd, source)
@@ -2080,8 +2104,7 @@ def _restore_from_rollback_copy(
     name: str,
     existing_bytes: bytes,
     failure: BaseException,
-    *,
-    allow_exchange: bool,
+    destination_state: _RollbackDestinationState,
 ) -> bool:
     if _exchange_rollback_copy(
         backup,
@@ -2090,7 +2113,7 @@ def _restore_from_rollback_copy(
         name,
         existing_bytes,
         failure,
-        allow_exchange=allow_exchange,
+        destination_state,
     ):
         return True
 
@@ -2105,7 +2128,7 @@ def _restore_from_rollback_copy(
             name,
             existing_bytes,
             failure,
-            allow_exchange=allow_exchange,
+            destination_state,
         )
         return recovered
     except BaseException:
@@ -2144,11 +2167,15 @@ def _rollback_replacement(
     failure: BaseException,
 ) -> None:
     restored = False
-    allow_copy_exchange = False
+    destination_state = _RollbackDestinationState(exchange_identity=None)
     try:
         source_stat = _unvalidated_target_stat(directory_fd, source)
         installed_stat = _unvalidated_target_stat(directory_fd, name)
-        allow_copy_exchange = installed_stat is not None
+        if installed_stat is not None:
+            destination_state.exchange_identity = (
+                installed_stat.st_dev,
+                installed_stat.st_ino,
+            )
         displaced_now = os.fstat(displaced_descriptor)
         displaced_bytes = _read_descriptor(displaced_descriptor)
         displaced_after = os.fstat(displaced_descriptor)
@@ -2176,13 +2203,13 @@ def _rollback_replacement(
         if restore_original or restore_replaced_destination:
             assert source_stat is not None
             if installed_stat is None:
-                allow_copy_exchange = False
+                destination_state.exchange_identity = None
                 _rename_noreplace(directory_fd, source, name)
-                allow_copy_exchange = True
                 temporary.name = None
             else:
                 _rename_exchange(directory_fd, source, name)
                 temporary.name = source if installed_is_temporary else None
+            _record_rollback_publication(destination_state, directory_fd, name)
             _fsync_replacement_rollback(directory_fd, failure)
             if restore_original:
                 _validate_restored_original(
@@ -2213,7 +2240,7 @@ def _rollback_replacement(
             name,
             existing_bytes,
             failure,
-            allow_exchange=allow_copy_exchange,
+            destination_state,
         )
     if not restored:
         _add_note_safely(failure, "atomic_replacement_rollback_failed")
