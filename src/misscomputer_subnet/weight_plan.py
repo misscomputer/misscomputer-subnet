@@ -1095,11 +1095,14 @@ def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirecto
             descriptor = os.open(name, flags, dir_fd=directory_fd)
             opened = os.fstat(descriptor)
             mapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            scanned = _scanned_target_stat(directory_fd, name)
             if (
                 not stat.S_ISDIR(opened.st_mode)
                 or opened.st_uid != _effective_uid()
                 or stat.S_IMODE(opened.st_mode) != WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE
                 or (opened.st_dev, opened.st_ino) != (mapped.st_dev, mapped.st_ino)
+                or scanned is None
+                or (opened.st_dev, opened.st_ino) != (scanned.st_dev, scanned.st_ino)
             ):
                 raise WeightPlanTargetError("private cleanup directory changed identity")
             return _PrivateCleanupDirectory(
@@ -1110,10 +1113,10 @@ def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirecto
         except BaseException as primary:
             if descriptor >= 0:
                 _close_preserving(descriptor, primary, "private_cleanup_descriptor_close_failed")
-            try:
-                os.rmdir(name, dir_fd=directory_fd)
-            except BaseException:
-                _add_note_safely(primary, "private_cleanup_directory_retirement_failed")
+            # The pathname may already identify a same-UID replacement.  Once
+            # acquisition has failed there is no proven mapping to retire, so
+            # preserve the entry rather than applying rmdir to an unowned name.
+            _add_note_safely(primary, "private_cleanup_directory_retirement_deferred")
             raise
     raise WeightPlanTargetError("could not allocate a private cleanup directory")
 
@@ -1129,10 +1132,21 @@ def _close_private_cleanup_directory(
     try:
         opened = os.fstat(cleanup.descriptor)
         mapped = os.stat(cleanup.name, dir_fd=directory_fd, follow_symlinks=False)
-        if (opened.st_dev, opened.st_ino) != cleanup.identity or (
-            mapped.st_dev,
-            mapped.st_ino,
-        ) != cleanup.identity:
+        scanned = _scanned_target_stat(directory_fd, cleanup.name)
+        if (
+            (opened.st_dev, opened.st_ino) != cleanup.identity
+            or (
+                mapped.st_dev,
+                mapped.st_ino,
+            )
+            != cleanup.identity
+            or scanned is None
+            or (
+                scanned.st_dev,
+                scanned.st_ino,
+            )
+            != cleanup.identity
+        ):
             raise WeightPlanTargetError("private cleanup directory changed identity")
     except BaseException as exc:
         cleanup_error = exc
@@ -1146,10 +1160,13 @@ def _close_private_cleanup_directory(
     if cleanup_error is None:
         try:
             os.rmdir(cleanup.name, dir_fd=directory_fd)
-        except OSError as exc:
+        except BaseException as exc:
             # A non-empty directory contains an entry whose ownership could not
             # be proved.  Preserve it rather than turning cleanup into deletion.
-            if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+            if not isinstance(exc, OSError) or exc.errno not in {
+                errno.ENOTEMPTY,
+                errno.EEXIST,
+            }:
                 cleanup_error = exc
     if cleanup_error is not None:
         if primary is not None:
@@ -1226,7 +1243,19 @@ def _quarantine_and_unlink_temporary(
             and descriptor_stat.st_nlink > 0
         )
         captured = os.stat(quarantine, dir_fd=cleanup.descriptor, follow_symlinks=False)
-        captured_owned = (captured.st_dev, captured.st_ino) == identity
+        captured_descriptor = os.open(
+            quarantine,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=cleanup.descriptor,
+        )
+        try:
+            captured_opened = os.fstat(captured_descriptor)
+        finally:
+            os.close(captured_descriptor)
+        captured_owned = (captured.st_dev, captured.st_ino) == identity and (
+            captured_opened.st_dev,
+            captured_opened.st_ino,
+        ) == identity
         if not descriptor_owned or not captured_owned:
             _rename_noreplace_between(
                 cleanup.descriptor,
