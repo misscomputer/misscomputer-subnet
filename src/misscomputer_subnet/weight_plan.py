@@ -37,6 +37,9 @@ MAX_WEIGHT_PLAN_NEURONS = 65_536
 MAX_WEIGHT_PLAN_BYTES = 16 << 20
 MAX_BLOCK = (1 << 63) - 1
 MAX_VERSION_KEY = (1 << 64) - 1
+_AT_FDCWD: Final = -100
+_AT_SYMLINK_FOLLOW: Final = 0x400
+_AT_EMPTY_PATH: Final = 0x1000
 
 
 class WeightPlanError(ValueError):
@@ -966,7 +969,23 @@ def _link_unnamed_temporary(descriptor: int, directory_fd: int, name: str) -> No
         ctypes.c_char_p(b""),
         directory_fd,
         ctypes.c_char_p(os.fsencode(name)),
-        0x1000,  # AT_EMPTY_PATH
+        _AT_EMPTY_PATH,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+
+
+def _link_temporary_through_proc(descriptor: int, directory_fd: int, name: str) -> None:
+    """Link an open inode through procfs when ``AT_EMPTY_PATH`` needs capability."""
+
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    result = libc.linkat(
+        _AT_FDCWD,
+        ctypes.c_char_p(f"/proc/self/fd/{descriptor}".encode("ascii")),
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(name)),
+        _AT_SYMLINK_FOLLOW,
     )
     if result != 0:
         error = ctypes.get_errno()
@@ -1087,11 +1106,25 @@ def _quarantine_and_unlink_temporary(
         except OSError as exc:
             if exc.errno == errno.EEXIST:
                 continue
-            # A raced unlink can retire the last name before linkat observes
-            # the still-open descriptor.  In that case the foreign source is
-            # already independent of the owned inode and must be left alone.
             if exc.errno == errno.ENOENT:
-                return
+                # Linux before 6.10 also reports ENOENT when AT_EMPTY_PATH is
+                # denied to an unprivileged caller.  A zero link count proves
+                # actual retirement; otherwise retry the documented procfs
+                # form and surface failure rather than abandoning a live name.
+                if os.fstat(temporary.descriptor).st_nlink == 0:
+                    return
+                try:
+                    _link_temporary_through_proc(
+                        temporary.descriptor,
+                        directory_fd,
+                        candidate,
+                    )
+                except OSError as fallback_error:
+                    if fallback_error.errno == errno.EEXIST:
+                        continue
+                    raise
+                quarantine = candidate
+                break
             raise
         else:
             quarantine = candidate

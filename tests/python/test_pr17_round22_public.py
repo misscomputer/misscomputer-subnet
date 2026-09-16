@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""PR17 round-22 cooperating-writer and source-binding regressions."""
+"""PR17 round-22 writer, source-binding, and cleanup regressions."""
 
 from __future__ import annotations
 
@@ -296,3 +296,81 @@ def test_source_substitution_is_rejected_and_original_target_is_restored(
     finally:
         if foreign_descriptor >= 0:
             os.close(foreign_descriptor)
+
+
+def test_capability_limited_cleanup_retires_displaced_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RACE-4: ``ENOENT`` from capability-limited linkat is not retirement."""
+
+    target = tmp_path / "weight-plan.json"
+    original = plan(block=101)
+    replacement = plan(block=102)
+    assert weight_plan.write_weight_plan_atomic(original, target) is True
+    real_proc_link = weight_plan._link_temporary_through_proc
+    proc_links: list[str] = []
+
+    def capability_limited_link(
+        _descriptor: int,
+        _directory_fd: int,
+        name: str,
+    ) -> None:
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+
+    def record_proc_link(descriptor: int, directory_fd: int, name: str) -> None:
+        proc_links.append(name)
+        real_proc_link(descriptor, directory_fd, name)
+
+    monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", capability_limited_link)
+    monkeypatch.setattr(weight_plan, "_link_temporary_through_proc", record_proc_link)
+
+    assert weight_plan.write_weight_plan_atomic(replacement, target) is True
+    assert len(proc_links) == 1
+    assert target.read_bytes() == replacement.canonical_bytes()
+    assert stat.S_IMODE(target.stat().st_mode) == weight_plan.WEIGHT_PLAN_FILE_MODE
+    assert target.stat().st_nlink == 1
+    assert not list(tmp_path.glob(".weight-plan.tmp-*"))
+    assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
+
+
+def test_unavailable_cleanup_anchor_surfaces_unresolved_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live displaced inode is never mistaken for an already-retired inode."""
+
+    target = tmp_path / "weight-plan.json"
+    original = plan(block=101)
+    replacement = plan(block=102)
+    assert weight_plan.write_weight_plan_atomic(original, target) is True
+    unresolved = OSError(errno.EACCES, "procfs descriptor link denied")
+
+    def capability_limited_link(
+        _descriptor: int,
+        _directory_fd: int,
+        name: str,
+    ) -> None:
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+
+    def unavailable_fallback(
+        _descriptor: int,
+        _directory_fd: int,
+        _name: str,
+    ) -> None:
+        raise unresolved
+
+    monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", capability_limited_link)
+    monkeypatch.setattr(weight_plan, "_link_temporary_through_proc", unavailable_fallback)
+
+    with pytest.raises(OSError) as caught:
+        weight_plan.write_weight_plan_atomic(replacement, target)
+
+    assert caught.value is unresolved
+    assert target.read_bytes() == replacement.canonical_bytes()
+    residues = list(tmp_path.glob(".weight-plan.tmp-*"))
+    assert len(residues) == 1
+    assert residues[0].read_bytes() == original.canonical_bytes()
+    assert stat.S_IMODE(residues[0].stat().st_mode) == weight_plan.WEIGHT_PLAN_FILE_MODE
+    assert residues[0].stat().st_nlink == 1
+    assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
