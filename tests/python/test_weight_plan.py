@@ -491,4 +491,6 @@ def test_visible_temporary_hardlink_during_fsync_fails_closed(
     assert linked is True
     assert not target.exists()
     assert stolen.read_bytes() == candidate.canonical_bytes()
-    assert stolen.stat().st_nlink == 1
+    # Destructive pathname retirement is deferred: the owned inode remains
+    # linked from its owner-only cleanup directory as well as this stolen link.
+    assert stolen.stat().st_nlink == 2

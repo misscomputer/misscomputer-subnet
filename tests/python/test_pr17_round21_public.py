@@ -27,6 +27,14 @@ class BrokenNoteAbort(BaseException):
         raise RuntimeError(f"could not retain note: {note}")
 
 
+def _remove_residue(root: Path) -> None:
+    for directory, children, files in os.walk(root, topdown=False):
+        for name in files:
+            os.unlink(Path(directory, name))
+        for name in children:
+            os.rmdir(Path(directory, name))
+
+
 def _owned_temporary(directory_fd: int, name: str) -> weight_plan._TemporaryPlan:
     descriptor = os.open(
         name,
@@ -76,8 +84,7 @@ def test_cleanup_does_not_unlink_replacement_after_quarantine_validation(
             b"foreign quarantine replacement\n"
         )
     finally:
-        for residue in tmp_path.iterdir():
-            residue.unlink(missing_ok=True)
+        _remove_residue(tmp_path)
         try:
             os.close(descriptor)
         except OSError as exc:
@@ -124,10 +131,9 @@ def test_cleanup_never_captures_foreign_source_on_restore_collision(
 
         assert raced is True
         assert (tmp_path / source).read_bytes() == b"foreign source\n"
-        assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
+        assert list(tmp_path.glob(".weight-plan.cleanup-*"))
     finally:
-        for residue in tmp_path.iterdir():
-            residue.unlink(missing_ok=True)
+        _remove_residue(tmp_path)
         try:
             os.close(descriptor)
         except OSError as exc:

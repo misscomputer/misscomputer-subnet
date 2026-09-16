@@ -75,7 +75,7 @@ def test_target_close_failure_still_retires_reopened_directory_chain(
 
 
 @pytest.mark.parametrize("fault_type", [OSError, SimulatedCrash])
-def test_atomic_plan_unlink_failure_attempts_temporary_and_directory_cleanup(
+def test_atomic_plan_failure_defers_destructive_temporary_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_type: type[BaseException]
 ) -> None:
     plan, _ = persist_plan(tmp_path)
@@ -108,12 +108,14 @@ def test_atomic_plan_unlink_failure_attempts_temporary_and_directory_cleanup(
         patch.setattr(os, "unlink", unlink)
         with pytest.raises(fault_type):
             plan_module.write_weight_plan_atomic(plan, tmp_path / "second.json")
-    assert unlink_attempted
+    assert unlink_attempted is False
     assert_closed(list(set(descriptors)))
-    # Unlink refusal leaves only an owner-only, recoverable temporary artifact.
+    # Pathname destruction is deferred because Linux has no inode-conditional
+    # unlink.  Every retained artifact remains owner-only and recoverable.
     for path in tmp_path.glob(".weight-plan.tmp-*"):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
-        path.unlink()
+    for path in tmp_path.glob(".weight-plan.cleanup-*"):
+        assert stat.S_IMODE(path.stat().st_mode) == (plan_module.WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE)
 
 
 @pytest.mark.parametrize("stage", ["root_stat", "child_stat", "child_open"])

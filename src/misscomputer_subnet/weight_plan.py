@@ -1174,15 +1174,22 @@ def _open_private_cleanup_namespace_monitor(
     if descriptor < 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-    parent_watch = inotify_add_watch(
-        descriptor,
-        ctypes.c_char_p(os.fsencode(f"/proc/self/fd/{directory_fd}")),
-        _PRIVATE_CLEANUP_WATCH_MASK,
-    )
-    if parent_watch < 0:
-        error = ctypes.get_errno()
-        os.close(descriptor)
-        raise OSError(error, os.strerror(error))
+    try:
+        parent_watch = inotify_add_watch(
+            descriptor,
+            ctypes.c_char_p(os.fsencode(f"/proc/self/fd/{directory_fd}")),
+            _PRIVATE_CLEANUP_WATCH_MASK,
+        )
+        if parent_watch < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    except BaseException as primary:
+        _close_preserving(
+            descriptor,
+            primary,
+            "private_cleanup_monitor_close_failed",
+        )
+        raise
     return _PrivateCleanupNamespaceMonitor(
         descriptor=descriptor,
         parent_watch=parent_watch,
@@ -1373,10 +1380,9 @@ def _close_private_cleanup_directory(
     directory_fd: int,
     primary: BaseException | None,
 ) -> None:
-    """Close and, when empty and still owned, retire one cleanup directory."""
+    """Close one cleanup directory while preserving its namespace entry."""
 
     cleanup_error: BaseException | None = None
-    private_stable = True
     try:
         opened = os.fstat(cleanup.descriptor)
         mapped = os.stat(cleanup.name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1396,25 +1402,16 @@ def _close_private_cleanup_directory(
             != cleanup.identity
         ):
             raise WeightPlanTargetError("private cleanup directory changed identity")
-        parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+        parent_stable, _private_stable = _private_cleanup_namespace_is_stable(cleanup)
         if not parent_stable:
             raise WeightPlanTargetError("private cleanup directory changed identity")
     except BaseException as exc:
         cleanup_error = exc
-    if cleanup_error is None and private_stable:
-        try:
-            # Keep the validated descriptor pinned until the rmdir has
-            # completed.  Closing it first reopens a same-UID substitution
-            # window after the last identity observation.
-            os.rmdir(cleanup.name, dir_fd=directory_fd)
-        except BaseException as exc:
-            # A non-empty directory contains an entry whose ownership could not
-            # be proved.  Preserve it rather than turning cleanup into deletion.
-            if not isinstance(exc, OSError) or exc.errno not in {
-                errno.ENOTEMPTY,
-                errno.EEXIST,
-            }:
-                cleanup_error = exc
+    # Linux has no inode-conditional rmdir.  Even a pinned descriptor plus a
+    # drained inotify queue leaves a check-to-rmdir window in which the name
+    # can be replaced.  Preserve the owner-only directory rather than risk
+    # removing a foreign replacement.  The residue is a deliberate deferred
+    # retirement record, not authority for a later pathname deletion.
     try:
         os.close(cleanup.descriptor)
     except BaseException as exc:
@@ -1451,18 +1448,18 @@ def _temporary_name_matches(
     return (first.st_dev, first.st_ino) == expected and (second.st_dev, second.st_ino) == expected
 
 
-def _quarantine_and_unlink_temporary(
+def _quarantine_temporary_for_deferred_retirement(
     temporary: _TemporaryPlan,
     directory_fd: int,
     identity: tuple[int, int],
 ) -> None:
-    """Move a name into an owner-only directory before destructive cleanup.
+    """Move an owned name into an owner-only deferred-retirement directory.
 
     The cross-directory no-replace rename is the ownership boundary.  A late
     replacement is either left at ``source`` or moved intact into the private
-    directory, identified there, and restored without replacement.  Only the
-    descriptor-bound inode is ever passed to unlink, and only after it is no
-    longer reachable through the shared parent directory.
+    directory, identified there, and restored without replacement.  Linux has
+    no inode-conditional unlink, so a proven-owned entry is retained rather
+    than destructively retired through a mutable pathname.
     """
 
     source = temporary.name
@@ -1545,15 +1542,11 @@ def _quarantine_and_unlink_temporary(
                 if captured_owned and namespace_owned:
                     temporary.name = source
                 return
-            os.unlink(quarantine, dir_fd=cleanup.descriptor)
-            parent_stable, private_stable = _private_cleanup_namespace_is_stable(
-                cleanup,
-                allowed_private_name=quarantine,
-                allowed_private_mask=_IN_DELETE,
-                require_allowed_private_event=True,
-            )
-            if not parent_stable or not private_stable:
-                raise WeightPlanTargetError("private cleanup namespace changed identity")
+            # Linux has no inode-conditional unlink.  A final fstat or inotify
+            # drain cannot bind the following pathname mutation to the inode
+            # just validated.  Leave the proven-owned file in the owner-only
+            # cleanup directory instead of risking deletion of a late foreign
+            # replacement.  Closing its descriptors below remains mandatory.
             moved = False
             temporary.name = None
         except BaseException as exc:
@@ -1619,7 +1612,11 @@ def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> Non
                 failed(fstat_error)
     try:
         if temporary.name is not None and identity != (-1, -1):
-            _quarantine_and_unlink_temporary(temporary, directory_fd, identity)
+            _quarantine_temporary_for_deferred_retirement(
+                temporary,
+                directory_fd,
+                identity,
+            )
     except BaseException as exc:
         failed(exc)
     try:

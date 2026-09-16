@@ -105,7 +105,7 @@ def test_cleanup_never_unlinks_replacement_after_owned_scandir_observation(
 
         assert raced is True
         assert replacement.read_bytes() == b"foreign replacement\n"
-        assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
+        assert list(tmp_path.glob(".weight-plan.cleanup-*"))
     finally:
         replacement.unlink(missing_ok=True)
         try:
@@ -141,6 +141,7 @@ def test_cleanup_metadata_faults_preserve_the_exact_owned_inode(
     failure = _metadata_failure(kind, operation)
     real_stat, real_fstat = os.stat, os.fstat
     real_scandir, real_unlink = os.scandir, os.unlink
+    unlink_attempted = False
 
     def stat_value(path: int | str | bytes, *args: Any, **kwargs: Any) -> os.stat_result:
         if operation == "stat" and path == name:
@@ -158,11 +159,13 @@ def test_cleanup_metadata_faults_preserve_the_exact_owned_inode(
         return real_scandir(path)
 
     def unlink(path: int | str | bytes, *args: Any, **kwargs: Any) -> None:
+        nonlocal unlink_attempted
         if (
             operation == "unlink"
             and isinstance(path, str)
             and path.startswith(".weight-plan.cleanup-")
         ):
+            unlink_attempted = True
             raise failure
         real_unlink(path, *args, **kwargs)
 
@@ -172,11 +175,15 @@ def test_cleanup_metadata_faults_preserve_the_exact_owned_inode(
             patch.setattr(os, "fstat", fstat)
             patch.setattr(os, "scandir", scandir)
             patch.setattr(os, "unlink", unlink)
-            with pytest.raises(type(failure)) as caught:
+            if operation == "unlink":
                 weight_plan._cleanup_temporary_plan(temporary, directory_fd)
+                assert unlink_attempted is False
+            else:
+                with pytest.raises(type(failure)) as caught:
+                    weight_plan._cleanup_temporary_plan(temporary, directory_fd)
+                assert caught.value is failure
 
-        assert caught.value is failure
-        residue = list(tmp_path.iterdir())
+        residue = [path for path in tmp_path.rglob("*") if path.is_file()]
         assert len(residue) == 1
         value = residue[0].stat()
         assert (value.st_dev, value.st_ino) == expected_identity
@@ -259,7 +266,7 @@ def test_repeated_cleanup_faults_keep_first_failure_and_owned_residue(
 
 
 @pytest.mark.parametrize("primary_kind", ["typed_error", "base_exception"])
-def test_primary_persistence_abort_survives_cleanup_unlink_failure(
+def test_primary_persistence_abort_survives_deferred_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     primary_kind: str,
@@ -298,10 +305,15 @@ def test_primary_persistence_abort_survives_cleanup_unlink_failure(
                 weight_plan.write_weight_plan_atomic(plan(), target)
 
         assert caught.value is primary
-        assert "temporary_cleanup_failed" in getattr(primary, "__notes__", ())
+        assert "temporary_cleanup_failed" not in getattr(primary, "__notes__", ())
     finally:
         for residue in tmp_path.iterdir():
-            residue.unlink(missing_ok=True)
+            if residue.is_dir():
+                for child in residue.iterdir():
+                    child.unlink(missing_ok=True)
+                residue.rmdir()
+            else:
+                residue.unlink(missing_ok=True)
 
 
 def test_primary_persistence_error_survives_directory_close_failure(

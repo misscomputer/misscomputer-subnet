@@ -237,7 +237,8 @@ def test_completed_concurrent_writer_is_not_undone_by_stale_rollback(
         assert state["writer_result"] is True
         assert target.read_bytes() == candidate_b.canonical_bytes()
         assert not any(
-            path.name.startswith((".weight-plan.tmp-", ".weight-plan.cleanup-"))
+            path.is_file()
+            and path.name.startswith(".weight-plan.tmp-")
             and path.read_bytes() == candidate_b.canonical_bytes()
             for path in tmp_path.iterdir()
         )
@@ -329,7 +330,7 @@ def test_capability_limited_cleanup_retires_displaced_plan(
     assert stat.S_IMODE(target.stat().st_mode) == weight_plan.WEIGHT_PLAN_FILE_MODE
     assert target.stat().st_nlink == 1
     assert not list(tmp_path.glob(".weight-plan.tmp-*"))
-    assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
+    assert list(tmp_path.glob(".weight-plan.cleanup-*"))
 
 
 def test_unavailable_descriptor_linking_does_not_block_private_retirement(
@@ -363,4 +364,4 @@ def test_unavailable_descriptor_linking_does_not_block_private_retirement(
     assert weight_plan.write_weight_plan_atomic(replacement, target) is True
     assert target.read_bytes() == replacement.canonical_bytes()
     assert not list(tmp_path.glob(".weight-plan.tmp-*"))
-    assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
+    assert list(tmp_path.glob(".weight-plan.cleanup-*"))

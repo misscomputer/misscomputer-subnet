@@ -203,36 +203,33 @@ def test_cleanup_directory_retirement_preserves_foreign_replacement(
         RuntimeError("rmdir runtime failure"),
     ],
 )
-def test_private_cleanup_retirement_failure_preserves_primary(
+def test_private_cleanup_directory_retirement_is_deferred(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     secondary: BaseException,
 ) -> None:
-    """CLEANUP-3: every rmdir failure preserves the exact primary object."""
+    """CLEANUP-3: an unowned pathname is never passed to rmdir."""
 
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    temporary = _owned_temporary(directory_fd)
     primary = OSError(errno.EIO, "original unlink failure")
-    real_unlink = os.unlink
-
-    def fail_unlink(path: int | str | bytes, *args: object, **kwargs: object) -> None:
-        if path == ".weight-plan.cleanup-retired":
-            raise primary
-        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+    cleanup = weight_plan._open_private_cleanup_directory(directory_fd)
+    rmdir_called = False
 
     def fail_rmdir(*_args: object, **_kwargs: object) -> None:
+        nonlocal rmdir_called
+        rmdir_called = True
         raise secondary
 
     try:
-        monkeypatch.setattr(os, "unlink", fail_unlink)
         monkeypatch.setattr(os, "rmdir", fail_rmdir)
-        with pytest.raises(OSError) as caught:
-            weight_plan._cleanup_temporary_plan(temporary, directory_fd)
+        weight_plan._close_private_cleanup_directory(cleanup, directory_fd, primary)
 
-        assert caught.value is primary
+        assert rmdir_called is False
+        assert (tmp_path / cleanup.name).is_dir()
         with pytest.raises(OSError) as closed:
-            os.fstat(temporary.descriptor)
+            os.fstat(cleanup.descriptor)
         assert closed.value.errno == errno.EBADF
-        assert (tmp_path / ".weight-plan.tmp-owned").read_bytes() == b"owned bytes\n"
     finally:
+        monkeypatch.undo()
+        os.rmdir(tmp_path / cleanup.name)
         os.close(directory_fd)

@@ -278,4 +278,4 @@ def test_cleanup_fallback_enoent_is_not_mistaken_for_retirement(
     assert weight_plan.write_weight_plan_atomic(replacement, target) is True
     assert target.read_bytes() == replacement.canonical_bytes()
     assert not list(tmp_path.glob(".weight-plan.tmp-*"))
-    assert not list(tmp_path.glob(".weight-plan.cleanup-*"))
+    assert list(tmp_path.glob(".weight-plan.cleanup-*"))
