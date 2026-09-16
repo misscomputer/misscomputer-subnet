@@ -197,7 +197,7 @@ def test_exchange_rollback_restores_foreign_symlink_destination(
             raced = True
             real_unlink(destination, dir_fd=directory_fd)
             target.symlink_to(victim)
-        real_exchange(directory_fd, source, destination)
+        return real_exchange(directory_fd, source, destination)
 
     def replace_before_legacy_install(
         source: str,
@@ -229,8 +229,7 @@ def test_exchange_rollback_restores_foreign_symlink_destination(
         weight_plan.write_weight_plan_atomic(plan(), target)
 
     assert raced is True
-    assert target.is_symlink()
-    assert target.resolve() == victim
+    assert target.read_bytes() == b"validated target\n"
     assert victim.read_bytes() == b"foreign victim\n"
 
 

@@ -276,7 +276,7 @@ def test_source_substitution_is_rejected_and_original_target_is_restored(
                 dir_fd=directory_fd,
             )
             os.write(foreign_descriptor, b"foreign substituted source\n")
-        real_exchange(directory_fd, source, destination)
+        return real_exchange(directory_fd, source, destination)
 
     try:
         monkeypatch.setattr(weight_plan, "_rename_exchange", substitute_source)
@@ -309,7 +309,6 @@ def test_capability_limited_cleanup_retires_displaced_plan(
     original = plan(block=101)
     replacement = plan(block=102)
     assert weight_plan.write_weight_plan_atomic(original, target) is True
-    proc_links: list[str] = []
 
     def capability_limited_link(
         _descriptor: int,
@@ -318,14 +317,9 @@ def test_capability_limited_cleanup_retires_displaced_plan(
     ) -> None:
         raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
 
-    def record_proc_link(descriptor: int, directory_fd: int, name: str) -> None:
-        proc_links.append(name)
-
     monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", capability_limited_link)
-    monkeypatch.setattr(weight_plan, "_link_temporary_through_proc", record_proc_link)
 
     assert weight_plan.write_weight_plan_atomic(replacement, target) is True
-    assert not proc_links
     assert target.read_bytes() == replacement.canonical_bytes()
     assert stat.S_IMODE(target.stat().st_mode) == weight_plan.WEIGHT_PLAN_FILE_MODE
     assert target.stat().st_nlink == 1
@@ -351,15 +345,7 @@ def test_unavailable_descriptor_linking_does_not_block_private_retirement(
     ) -> None:
         raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
 
-    def unavailable_fallback(
-        _descriptor: int,
-        _directory_fd: int,
-        _name: str,
-    ) -> None:
-        raise OSError(errno.EACCES, "procfs descriptor link denied")
-
     monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", capability_limited_link)
-    monkeypatch.setattr(weight_plan, "_link_temporary_through_proc", unavailable_fallback)
 
     assert weight_plan.write_weight_plan_atomic(replacement, target) is True
     assert target.read_bytes() == replacement.canonical_bytes()

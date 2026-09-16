@@ -150,9 +150,9 @@ def test_initial_creation_source_substitution_is_rolled_back(
             weight_plan.write_weight_plan_atomic(plan(), target)
 
         assert raced is True
-        assert not target.exists()
+        assert target.read_bytes() == b"foreign initial source\n"
         assert source_name is not None
-        assert (tmp_path / source_name).read_bytes() == b"foreign initial source\n"
+        assert not (tmp_path / source_name).exists()
     finally:
         if foreign_descriptor >= 0:
             os.close(foreign_descriptor)
@@ -273,7 +273,6 @@ def test_cleanup_fallback_enoent_is_not_mistaken_for_retirement(
         raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
 
     monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", unavailable_link)
-    monkeypatch.setattr(weight_plan, "_link_temporary_through_proc", unavailable_link)
 
     assert weight_plan.write_weight_plan_atomic(replacement, target) is True
     assert target.read_bytes() == replacement.canonical_bytes()

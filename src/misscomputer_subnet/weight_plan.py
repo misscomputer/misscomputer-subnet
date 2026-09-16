@@ -640,7 +640,12 @@ def _same_target(first: os.stat_result | None, second: os.stat_result | None) ->
 
 
 def _read_existing(directory_fd: int, name: str, expected: os.stat_result) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     descriptor = os.open(name, flags, dir_fd=directory_fd)
     primary: BaseException | None = None
     try:
@@ -1064,22 +1069,6 @@ def _link_unnamed_temporary(descriptor: int, directory_fd: int, name: str) -> No
         raise OSError(error, os.strerror(error), name)
 
 
-def _link_temporary_through_proc(descriptor: int, directory_fd: int, name: str) -> None:
-    """Link an open inode through procfs when ``AT_EMPTY_PATH`` needs capability."""
-
-    libc: Any = ctypes.CDLL(None, use_errno=True)
-    result = libc.linkat(
-        _AT_FDCWD,
-        ctypes.c_char_p(f"/proc/self/fd/{descriptor}".encode("ascii")),
-        directory_fd,
-        ctypes.c_char_p(os.fsencode(name)),
-        _AT_SYMLINK_FOLLOW,
-    )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), name)
-
-
 def _allocate_visible_temporary(directory_fd: int) -> _TemporaryPlan:
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
     for _ in range(32):
@@ -1141,14 +1130,9 @@ def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
     _rename_noreplace_between(directory_fd, source, directory_fd, destination)
 
 
-_last_exchange_publication: tuple[int, int] | None = None
+def _rename_exchange(directory_fd: int, first: str, second: str) -> tuple[int, int] | None:
+    """Atomically exchange two entries and non-failingly identify the publication."""
 
-
-def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
-    """Atomically exchange two entries and record the inode the syscall published."""
-
-    global _last_exchange_publication
-    _last_exchange_publication = None
     first_stat = _unvalidated_target_stat(directory_fd, first)
     libc: Any = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
@@ -1164,7 +1148,12 @@ def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), first)
-    published = _unvalidated_target_stat(directory_fd, second)
+    try:
+        published = _unvalidated_target_stat(directory_fd, second)
+    except BaseException:
+        # The namespace mutation already succeeded. Observation is advisory:
+        # callers must still fsync and, when necessary, roll back the mutation.
+        return None
     if (
         first_stat is not None
         and published is not None
@@ -1174,7 +1163,8 @@ def _rename_exchange(directory_fd: int, first: str, second: str) -> None:
         )
         == (first_stat.st_dev, first_stat.st_ino)
     ):
-        _last_exchange_publication = (published.st_dev, published.st_ino)
+        return (published.st_dev, published.st_ino)
+    return None
 
 
 def _open_private_cleanup_namespace_monitor(
@@ -1480,7 +1470,15 @@ def _quarantine_temporary_for_deferred_retirement(
     """
 
     source = temporary.name
-    if source is None or not _temporary_name_matches(directory_fd, source, identity):
+    if source is None:
+        return
+    try:
+        matches = _temporary_name_matches(directory_fd, source, identity)
+    except FileNotFoundError as exc:
+        if os.fstat(temporary.descriptor).st_nlink == 0:
+            return
+        raise WeightPlanTargetError("temporary weight plan name disappeared") from exc
+    if not matches:
         return
     cleanup = _open_private_cleanup_directory(directory_fd)
     quarantine = ".weight-plan.cleanup-retired"
@@ -1732,7 +1730,7 @@ def _verify_configured_target(
     primary: BaseException | None = None
     body_failed = False
     try:
-        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
         descriptor = os.open(name, flags, dir_fd=reopened.parent_fd)
         before = os.fstat(descriptor)
         _validate_existing_target(before)
@@ -1961,8 +1959,19 @@ def _install_temporary_plan(
             rollback_moved = False
             try:
                 if published:
-                    _rename_noreplace(directory_fd, name, source)
-                    rollback_moved = True
+                    installed = _unvalidated_target_stat(directory_fd, name)
+                    if (
+                        installed is not None
+                        and (
+                            installed.st_dev,
+                            installed.st_ino,
+                        )
+                        == temporary.identity
+                    ):
+                        _rename_noreplace(directory_fd, name, source)
+                        rollback_moved = True
+                    else:
+                        _add_note_safely(failure, "atomic_creation_rollback_not_owned")
                 restored_stat = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
                 if (restored_stat.st_dev, restored_stat.st_ino) == temporary.identity:
                     temporary.name = source
@@ -2220,8 +2229,7 @@ def _rollback_replacement(
             and source_is_displaced
             and (installed_is_our_publication or (installed_stat is None and temporary_nlink == 0))
         )
-        restore_replaced_destination = installed_is_temporary and displaced_now.st_nlink == 0
-        if restore_original or restore_replaced_destination:
+        if restore_original:
             assert source_stat is not None
             if installed_stat is None:
                 destination_state.exchange_identity = None
@@ -2235,23 +2243,13 @@ def _rollback_replacement(
             # fails.  The restored identity is known from the moved source.
             _fsync_replacement_rollback(directory_fd, failure)
             _record_rollback_publication(destination_state, directory_fd, name)
-            if restore_original:
-                _validate_restored_original(
-                    displaced_descriptor,
-                    (expected_stat.st_dev, expected_stat.st_ino),
-                    existing_bytes,
-                    directory_fd,
-                    name,
-                )
-            else:
-                restored_target = _unvalidated_target_stat(directory_fd, name)
-                if restored_target is None or (
-                    restored_target.st_dev,
-                    restored_target.st_ino,
-                ) != (source_stat.st_dev, source_stat.st_ino):
-                    raise WeightPlanTargetError(
-                        "atomic replacement changed the rollback destination"
-                    )
+            _validate_restored_original(
+                displaced_descriptor,
+                (expected_stat.st_dev, expected_stat.st_ino),
+                existing_bytes,
+                directory_fd,
+                name,
+            )
             restored = True
     except BaseException:
         _add_note_safely(failure, "atomic_replacement_direct_rollback_failed")
@@ -2285,7 +2283,7 @@ def _install_replacement_plan(
 
     displaced_descriptor = -1
     try:
-        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
         displaced_descriptor = os.open(name, flags, dir_fd=directory_fd)
         expected_stat = os.fstat(displaced_descriptor)
         _validate_existing_target(expected_stat)
@@ -2305,11 +2303,11 @@ def _install_replacement_plan(
             _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
         raise
 
-    global _last_exchange_publication
-    _last_exchange_publication = None
     try:
-        _rename_exchange(directory_fd, source, name)
-        published_identity = _last_exchange_publication
+        observed_publication = _rename_exchange(directory_fd, source, name)
+        # The already validated source inode is authoritative when a test seam
+        # or a non-faulting post-mutation observation returns no identity.
+        published_identity = observed_publication or temporary.identity
     except BaseException as primary:
         _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
         raise

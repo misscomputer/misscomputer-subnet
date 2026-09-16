@@ -396,9 +396,10 @@ def test_replaced_destination_restoring_exchange_is_followed_by_directory_fsync(
         if exchange_calls == 1:
             os.unlink(destination, dir_fd=directory_fd)
             os.symlink(victim, destination, dir_fd=directory_fd)
-        real_exchange(directory_fd, source, destination)
+        result = real_exchange(directory_fd, source, destination)
         if exchange_calls == 2:
             rollback_exchange_seen = True
+        return result
 
     def fsync(descriptor: int) -> None:
         nonlocal rollback_directory_fsync_seen
@@ -413,8 +414,7 @@ def test_replaced_destination_restoring_exchange_is_followed_by_directory_fsync(
 
     assert rollback_exchange_seen is True
     assert rollback_directory_fsync_seen is True
-    assert target.is_symlink()
-    assert target.resolve() == victim
+    assert target.read_bytes() == original.canonical_bytes()
     assert victim.read_bytes() == b"foreign victim\n"
 
 
