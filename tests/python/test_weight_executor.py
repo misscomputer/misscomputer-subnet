@@ -182,6 +182,13 @@ def execute_config(
         confirm_network="finney",
         confirm_netuid=24,
         confirm_plan_digest=plan.digest_sha256,
+        confirm_execution_digest=derive_execution_vector(
+            plan,
+            metagraph(block=102),
+            network="finney",
+            netuid=24,
+            validator_hotkey=VALIDATOR,
+        ).digest_sha256,
         audit_state_path=str(audit),
         submission_timeout_seconds=1.0,
     )
@@ -298,6 +305,76 @@ def test_malformed_huge_json_numbers_return_one_sanitized_cli_error(
     assert captured.err == '{"error_code":"invalid_plan","status":"rejected"}\n'
     assert str(tmp_path) not in captured.err
     assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("confirmed_digest", [None, "0" * 64], ids=["missing", "mismatch"])
+def test_execute_cli_requires_exact_execution_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    confirmed_digest: str | None,
+) -> None:
+    import misscomputer_subnet.weight_signer_protocol as signer_module
+
+    plan, target = persist_plan(tmp_path)
+    chain = SequenceChain(metagraph(block=102))
+    signer_calls = 0
+
+    def unexpected_signer(**_: object) -> FakeSubmitter:
+        nonlocal signer_calls
+        signer_calls += 1
+        return FakeSubmitter(error=RuntimeError("unexpected signer access"))
+
+    argv = [
+        "misscomputer-weight-executor",
+        "--plan",
+        str(target),
+        "--subtensor-network",
+        "finney",
+        "--netuid",
+        "24",
+        "--validator-hotkey",
+        VALIDATOR,
+        "--execute",
+        "--confirm-network",
+        "finney",
+        "--confirm-netuid",
+        "24",
+        "--confirm-plan-digest",
+        plan.digest_sha256,
+        "--audit-state",
+        str(tmp_path / "audit.json"),
+        "--signer-socket",
+        str(tmp_path / "signer.sock"),
+        "--signer-uid",
+        str(os.getuid()),
+    ]
+    if confirmed_digest is not None:
+        argv.extend(["--confirm-execution-digest", confirmed_digest])
+    monkeypatch.setattr(executor_module.sys, "argv", argv)
+    monkeypatch.setattr(executor_module, "build_chain_query", lambda **_: chain)
+    monkeypatch.setattr(
+        signer_module,
+        "UnixWeightSignerClient",
+        unexpected_signer,
+    )
+    monkeypatch.setenv(EXECUTION_ACK_ENV, EXECUTION_ACK_VALUE)
+
+    with pytest.raises(SystemExit) as exit_info:
+        executor_module.main()
+
+    assert exit_info.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "error_code": "execution_digest_confirmation_required",
+        "status": "rejected",
+    }
+    expected_chain_access = int(confirmed_digest is not None)
+    assert chain.open_count == chain.sync_count == expected_chain_access
+    assert chain.close_count == 1
+    assert signer_calls == 0
+    assert not (tmp_path / "audit.json").exists()
 
 
 def test_safe_plan_loader_rejects_mode_links_symlinks_and_read_race(
@@ -640,6 +717,11 @@ async def test_commit_reveal_flip_at_send_check_is_retryable_pre_send_failure(
             {"confirm_plan_digest": "0" * 64},
             acknowledged(),
             "plan_digest_confirmation_required",
+        ),
+        (
+            {"confirm_execution_digest": None},
+            acknowledged(),
+            "execution_digest_confirmation_required",
         ),
         ({}, {}, "environment_acknowledgement_required"),
         ({}, {EXECUTION_ACK_ENV: "wrong"}, "environment_acknowledgement_required"),
@@ -1007,7 +1089,18 @@ async def test_stable_churn_before_preflight_executes_adjusted_vector_without_re
     )
     submitter = FakeSubmitter()
     summary = await run_weight_executor(
-        execute_config(plan, path, audit),
+        execute_config(
+            plan,
+            path,
+            audit,
+            confirm_execution_digest=derive_execution_vector(
+                plan,
+                metagraph(block=102, neurons=records),
+                network="finney",
+                netuid=24,
+                validator_hotkey=VALIDATOR,
+            ).digest_sha256,
+        ),
         chain=SequenceChain(
             metagraph(block=102, neurons=records),
             metagraph(block=103, neurons=tuple(reversed(records))),
