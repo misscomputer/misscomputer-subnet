@@ -1135,6 +1135,11 @@ def _validate_execution_gates(
             "plan_digest_confirmation_required",
             "execution requires the exact plan digest confirmation",
         )
+    if config.confirm_execution_digest is None:
+        raise WeightExecutionError(
+            "execution_digest_confirmation_required",
+            "execution requires the exact adjusted execution digest",
+        )
     if environ.get(EXECUTION_ACK_ENV) != EXECUTION_ACK_VALUE:
         raise WeightExecutionError(
             "environment_acknowledgement_required",
@@ -1593,6 +1598,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-network")
     parser.add_argument("--confirm-netuid", type=int)
     parser.add_argument("--confirm-plan-digest")
+    parser.add_argument("--confirm-execution-digest")
     parser.add_argument("--audit-state")
     parser.add_argument("--submission-timeout", type=float, default=180.0)
     parser.add_argument("--signer-socket", help="purpose-restricted signer Unix socket")
@@ -1610,6 +1616,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutorConfig:
         confirm_network=args.confirm_network,
         confirm_netuid=args.confirm_netuid,
         confirm_plan_digest=args.confirm_plan_digest,
+        confirm_execution_digest=args.confirm_execution_digest,
         audit_state_path=args.audit_state,
         submission_timeout_seconds=args.submission_timeout,
         signer_socket_path=args.signer_socket,
