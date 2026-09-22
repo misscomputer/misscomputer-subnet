@@ -320,6 +320,14 @@ class _SignerSubmitOperation:
     writer: asyncio.StreamWriter
 
 
+class SignerSocketUnavailable(SignerProtocolError):
+    """The signer socket was absent in the exact metadata observation."""
+
+
+class SignerSocketPublicationPending(SignerProtocolError):
+    """The exact safe socket observation retained its private staging link."""
+
+
 def unix_peer_uid(connection: socket.socket) -> int:
     if not hasattr(socket, "SO_PEERCRED"):
         raise SignerProtocolError(
@@ -335,19 +343,34 @@ def unix_peer_uid(connection: socket.socket) -> int:
     return int(uid)
 
 
-def validate_socket_inode(path: str, *, owner_uid: int) -> os.stat_result:
-    try:
-        value = os.lstat(path)
-    except OSError as exc:
-        raise SignerProtocolError("signer_socket_unsafe", "signer socket is unavailable") from exc
+def validate_socket_metadata(value: os.stat_result, *, owner_uid: int) -> os.stat_result:
+    """Classify one socket metadata observation without re-reading its path."""
+
     if (
         not stat.S_ISSOCK(value.st_mode)
         or value.st_uid != owner_uid
-        or value.st_nlink != 1
         or stat.S_IMODE(value.st_mode) & 0o007
     ):
         raise SignerProtocolError("signer_socket_unsafe", "signer socket is unsafe")
+    if value.st_nlink == 2:
+        raise SignerSocketPublicationPending(
+            "signer_publication_pending", "signer socket publication is still in progress"
+        )
+    if value.st_nlink != 1:
+        raise SignerProtocolError("signer_socket_unsafe", "signer socket is unsafe")
     return value
+
+
+def validate_socket_inode(path: str, *, owner_uid: int) -> os.stat_result:
+    """Pin one owner-confined Unix socket inode without following symlinks."""
+
+    try:
+        value = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise SignerSocketUnavailable("signer_unavailable", "signer socket is unavailable") from exc
+    except OSError as exc:
+        raise SignerProtocolError("signer_socket_unsafe", "signer socket is unavailable") from exc
+    return validate_socket_metadata(value, owner_uid=owner_uid)
 
 
 def socket_path_exists(path: str) -> bool:
@@ -446,17 +469,20 @@ class UnixWeightSignerClient:
             while True:
                 try:
                     before = validate_socket_inode(self.socket_path, owner_uid=self.signer_uid)
-                    reader, writer = await asyncio.open_unix_connection(self.socket_path)
-                except SignerProtocolError as exc:
-                    if socket_path_exists(self.socket_path):
-                        raise
+                except (SignerSocketPublicationPending, SignerSocketUnavailable) as exc:
                     if loop.time() >= deadline:
                         raise SignerProtocolError(
                             "signer_unavailable", "signer socket did not become available"
                         ) from exc
                     await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0.0)))
                     continue
+                try:
+                    reader, writer = await asyncio.open_unix_connection(self.socket_path)
                 except OSError as exc:
+                    if socket_path_exists(self.socket_path):
+                        raise SignerProtocolError(
+                            "signer_socket_unsafe", "signer socket is unsafe"
+                        ) from exc
                     if loop.time() >= deadline:
                         raise SignerProtocolError(
                             "signer_unavailable", "signer is unavailable"
@@ -472,7 +498,12 @@ class UnixWeightSignerClient:
                     raise SignerProtocolError(
                         "signer_peer_mismatch", "signer peer UID does not match"
                     )
-                after = validate_socket_inode(self.socket_path, owner_uid=self.signer_uid)
+                try:
+                    after = validate_socket_inode(self.socket_path, owner_uid=self.signer_uid)
+                except (SignerSocketPublicationPending, SignerSocketUnavailable) as exc:
+                    raise SignerProtocolError(
+                        "signer_socket_unsafe", "signer socket changed during connection"
+                    ) from exc
                 if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                     raise SignerProtocolError(
                         "signer_socket_unsafe", "signer socket changed during connection"
