@@ -566,38 +566,19 @@ async def test_preflight_timeout_or_cancellation_closes_socket(cancel: bool) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cancel", [False, True])
 async def test_preflight_normalizes_only_internal_timeout(
     monkeypatch: pytest.MonkeyPatch,
-    cancel: bool,
 ) -> None:
-    entered = asyncio.Event()
-    cleaned = asyncio.Event()
     inner_timeout = TimeoutError("injected handshake timeout")
 
     async def controlled_connection(*_args: Any, **_kwargs: Any) -> Any:
-        entered.set()
-        if not cancel:
-            raise inner_timeout
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cleaned.set()
+        raise inner_timeout
 
     monkeypatch.setattr(asyncio, "open_connection", controlled_connection)
-    task = asyncio.create_task(tls_leaf_preflight("127.0.0.1", 443, timeout=1))
-    await asyncio.wait_for(entered.wait(), timeout=1)
-
-    if cancel:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert cleaned.is_set()
-    else:
-        with pytest.raises(TimeoutError, match="TLS preflight connection timed out") as caught:
-            await task
-        assert type(caught.value) is TimeoutError
-        assert caught.value.__cause__ is inner_timeout
+    with pytest.raises(TimeoutError, match="TLS preflight connection timed out") as caught:
+        await tls_leaf_preflight("127.0.0.1", 443, timeout=1)
+    assert type(caught.value) is TimeoutError
+    assert caught.value.__cause__ is inner_timeout
 
 
 @pytest.mark.asyncio

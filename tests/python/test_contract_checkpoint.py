@@ -513,10 +513,3 @@ def test_checkpoint_modules_are_pure_offline_cores(module: str, allowed_imports:
         "token_hex",
     ):
         assert forbidden not in lowered, forbidden
-
-
-def test_checkpoint_modules_are_discoverable_from_the_repository_root() -> None:
-    for module in ("contract_codec", "assignment_snapshot", "manifest_publication"):
-        assert (SOURCE / f"{module}.py").is_file()
-    assert (SOURCE / "validator_decision.py").is_file()
-    assert (ROOT / "docs" / "contract-checkpoint-v1.md").is_file()

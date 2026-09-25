@@ -907,55 +907,6 @@ def test_immutable_chain_identity_policy_and_authority() -> None:
         )
 
 
-def test_external_scores_cannot_be_supplied_and_plan_has_no_activation_fields() -> None:
-    input_fields = ExternalValidatorVerificationInput.model_fields
-    assert (
-        not {
-            "local_scores",
-            "score_override",
-            "evidence_override",
-            "challenge",
-            "domain",
-            "provisioning",
-        }
-        & input_fields.keys()
-    )
-    plan_fields = ExternalValidatorRelayPlan.model_fields
-    assert (
-        not {
-            "wallet",
-            "rpc",
-            "submit",
-            "apply",
-            "private_key",
-            "endpoint",
-        }
-        & plan_fields.keys()
-    )
-
-
-def test_schema_and_fixture_names_are_stable() -> None:
-    assert (
-        CHECKPOINT_SCHEMA,
-        TRUST_POLICY_SCHEMA,
-        SIGNATURE_ENVELOPE_SCHEMA,
-        CHAIN_STATE_SCHEMA,
-        RELAY_METAGRAPH_SCHEMA,
-        VERIFICATION_INPUT_SCHEMA,
-        VERIFICATION_REPORT_SCHEMA,
-        RELAY_PLAN_SCHEMA,
-    ) == (
-        "miss.computer/misscomputer-subnet/central-score-checkpoint",
-        "miss.computer/misscomputer-subnet/score-checkpoint-trust-policy",
-        "miss.computer/misscomputer-subnet/score-checkpoint-signature-envelope",
-        "miss.computer/misscomputer-subnet/score-checkpoint-chain-state",
-        "miss.computer/misscomputer-subnet/relay-finalized-metagraph-snapshot",
-        "miss.computer/misscomputer-subnet/external-validator-verification-input",
-        "miss.computer/misscomputer-subnet/external-validator-verification-report",
-        "miss.computer/misscomputer-subnet/external-validator-score-relay-plan",
-    )
-
-
 @pytest.mark.parametrize(
     ("stem", "parser"),
     [

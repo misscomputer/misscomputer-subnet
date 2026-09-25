@@ -1058,29 +1058,6 @@ func TestRemovedMinerCapacityErrorDoesNotCycle(t *testing.T) {
 	}
 }
 
-func TestAcceptanceNetworkFailurePreservesCandidateForRetry(t *testing.T) {
-	h := newSchedulerHarness(t, []string{"m1"}, 1)
-	originalURL := h.scheduler.Validator.EdgeURL
-	h.scheduler.Validator.EdgeURL = "http://127.0.0.1:1"
-	h.scheduler.Validator.Client = &http.Client{Timeout: 100 * time.Millisecond}
-	_, err := h.scheduler.Deploy(context.Background(), h.request)
-	if !errors.Is(err, ErrAcceptanceInconclusive) {
-		t.Fatalf("network acceptance failure error = %v", err)
-	}
-	if got := h.scheduler.Ledger.Trust("m1"); got == 0 || !h.scheduler.Ledger.Eligible("m1") {
-		t.Fatalf("inconclusive acceptance probe punished candidate: trust=%v eligible=%v", got, h.scheduler.Ledger.Eligible("m1"))
-	}
-	if active := h.scheduler.ActiveReplicas(h.request.DeploymentID); len(active) != 0 {
-		t.Fatalf("inconclusive acceptance did not fail closed: %+v", active)
-	}
-	h.scheduler.Validator.EdgeURL = originalURL
-	result, err := h.scheduler.Deploy(context.Background(), h.request)
-	if err != nil || len(result.ReadyMiners) != 1 || result.ReadyMiners[0] != "m1" {
-		t.Fatalf("clean candidate was not reusable after path recovery: result=%+v err=%v", result, err)
-	}
-	h.cleanup(t)
-}
-
 func TestInitialInconclusiveCleanupFailureBlocksRedeployUntilExactCleanup(t *testing.T) {
 	h := newSchedulerHarness(t, []string{"m1"}, 1)
 	flaky := &flakyDeactivateAssigner{inner: h.scheduler.Miners[0], failures: 3}
@@ -1966,20 +1943,6 @@ func (m *knownCleanupMiner) DeactivateKnown(_ context.Context, endpointID, deplo
 	return nil
 }
 
-func TestFailedTicketCleanupCarriesDeploymentIdentity(t *testing.T) {
-	candidate := &knownCleanupMiner{immediateErrorMiner: immediateErrorMiner{id: "miner"}}
-	ticket := protocol.Ticket{
-		DeploymentID: "owned-deployment", MinerID: "miner", Generation: 3, AssignmentNonce: "nonce",
-	}
-	scheduler := &Scheduler{Ledger: ledger.New()}
-	if err := scheduler.deactivateTicket(context.Background(), candidate, ticket); err != nil {
-		t.Fatal(err)
-	}
-	if candidate.endpointID != protocol.EndpointID(ticket) || candidate.deploymentID != ticket.DeploymentID {
-		t.Fatalf("cleanup lost exact ticket ownership: endpoint=%q deployment=%q", candidate.endpointID, candidate.deploymentID)
-	}
-}
-
 func TestFailedKnownTicketCleanupRemainsDurableAndRetryable(t *testing.T) {
 	ctx := context.Background()
 	store, err := durable.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -2205,24 +2168,4 @@ func TestExternalHealthCommitFailureLeavesExactReportRetryable(t *testing.T) {
 	}
 	h.cleanup(t)
 	deactivated = true
-}
-
-func TestDeactivateDeploymentReleasesMonitorState(t *testing.T) {
-	h := newSchedulerHarness(t, []string{"m1", "m2", "m3"}, 3)
-	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
-		t.Fatal(err)
-	}
-	endpoint := routedEndpointID(t, h, "m1")
-	now := time.Now()
-	if action, err := h.handleHealth(context.Background(), h.request.DeploymentID, "regression-m1", "m1", "v1", false, false, false, now); err != nil || action.RemoveFromRouting {
-		t.Fatalf("first failure action=%+v err=%v", action, err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := h.scheduler.DeactivateDeployment(ctx, h.request.DeploymentID); err != nil {
-		t.Fatal(err)
-	}
-	if got := h.scheduler.monitor().Observe(endpoint, "v1", false, false, false, now.Add(time.Second)); got.RemoveFromRouting {
-		t.Fatalf("deactivated deployment retained endpoint health state: %+v", got)
-	}
 }

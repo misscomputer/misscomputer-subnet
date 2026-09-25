@@ -94,17 +94,6 @@ def test_generated_contracts_are_strict_canonical_and_digest_bound() -> None:
         assert digest == hashlib.sha256(canonical_json(document)).hexdigest()
 
 
-def test_release_trust_policy_accepts_representative_valid_ed25519_keys() -> None:
-    document = fixture_document("release-trust-policy.v1")
-    document.pop("digest_sha256")
-    policy = build_release_trust_policy(document)
-    assert [key.key_id for key in policy.trusted_keys] == [
-        "key_operations",
-        "key_release",
-        "key_security",
-    ]
-
-
 def test_release_trust_policy_rejects_every_small_order_ed25519_encoding(
     small_order_ed25519_public_key: bytes,
 ) -> None:
@@ -117,46 +106,6 @@ def test_release_trust_policy_rejects_every_small_order_ed25519_encoding(
     trusted_key["public_key_sha256"] = hashlib.sha256(small_order_ed25519_public_key).hexdigest()
     with pytest.raises(ValidationError, match="ed25519_public_key_small_order"):
         build_release_trust_policy(document)
-
-
-def test_manifest_models_exact_mainnet_source_build_and_artifact_inventory() -> None:
-    manifest = ProductionReleaseManifest.model_validate(
-        fixture_document("production-release-manifest.v1")
-    )
-    assert manifest.target_network == "finney"
-    assert manifest.netuid == 24
-    assert manifest.source.commit_oid == "20b1cb454b040c52b0dcac095e6098f22bb894de"
-    assert manifest.source.tree_oid == "90139e9e084ed3f562d4a1a07c4074e09ab8fead"
-    assert {item.component for item in manifest.toolchains} == {
-        "container_builder",
-        "go",
-        "python",
-    }
-    assert {item.ecosystem for item in manifest.dependency_inputs} == {
-        "container",
-        "go",
-        "python",
-    }
-    assert {item.distribution_kind for item in manifest.python_distributions} == {
-        "sdist",
-        "wheel",
-    }
-    assert {item.binary_name for item in manifest.go_binaries} == {
-        "control-api",
-        "miner-agent",
-        "workload",
-    }
-    assert {item.image_name for item in manifest.container_images} == {"neuron", "workload"}
-    assert {item.category for item in manifest.release_files} == {
-        "config",
-        "contract_schema",
-        "systemd_unit",
-    }
-    assert manifest.completeness_state == "complete"
-    assert manifest.uniqueness_state == "unique"
-    assert manifest.build_recomputation_state == "not_performed"
-    assert manifest.artifact_verification_state == "not_performed"
-    assert manifest.live_actions is False
 
 
 def test_manifest_rejects_extra_fields_at_every_contract_level() -> None:

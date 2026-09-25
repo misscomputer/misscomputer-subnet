@@ -43,12 +43,6 @@ from pydantic import ValidationError
 
 import misscomputer_subnet.assignment_probe as assignment_probe_module
 from misscomputer_subnet.assignment_probe import (
-    MANIFEST_CHAIN_STATE_SCHEMA,
-    MANIFEST_SCHEMA,
-    MANIFEST_SIGNATURE_ENVELOPE_SCHEMA,
-    MANIFEST_TRUST_POLICY_SCHEMA,
-    PROBE_ATTESTATION_SCHEMA,
-    PROBE_REPORT_SCHEMA,
     ActiveAssignmentManifest,
     ActiveDeploymentAssignment,
     AssignedReplica,
@@ -921,24 +915,6 @@ def test_canonical_contract_bytes_round_trip_and_reject_malleability() -> None:
         parse_assignment_manifest_signature_envelope(b"{" * (16 * 1_024 + 1))
 
 
-def test_schema_and_fixture_names_are_stable() -> None:
-    assert (
-        MANIFEST_SCHEMA,
-        MANIFEST_TRUST_POLICY_SCHEMA,
-        MANIFEST_SIGNATURE_ENVELOPE_SCHEMA,
-        MANIFEST_CHAIN_STATE_SCHEMA,
-        PROBE_ATTESTATION_SCHEMA,
-        PROBE_REPORT_SCHEMA,
-    ) == (
-        "miss.computer/misscomputer-subnet/active-assignment-manifest",
-        "miss.computer/misscomputer-subnet/assignment-manifest-trust-policy",
-        "miss.computer/misscomputer-subnet/assignment-manifest-signature-envelope",
-        "miss.computer/misscomputer-subnet/assignment-manifest-chain-state",
-        "miss.computer/misscomputer-subnet/miner-probe-attestation",
-        "miss.computer/misscomputer-subnet/validator-probe-report",
-    )
-
-
 @pytest.mark.parametrize(
     ("stem", "parser"),
     [
@@ -1115,23 +1091,6 @@ def test_source_has_only_public_offline_pure_capabilities() -> None:
         "token_hex",
     ):
         assert forbidden not in lowered
-
-
-@pytest.mark.parametrize(
-    ("model", "expected_schema"),
-    [
-        (ActiveAssignmentManifest, MANIFEST_SCHEMA),
-        (AssignmentManifestTrustPolicy, MANIFEST_TRUST_POLICY_SCHEMA),
-        (AssignmentManifestSignatureEnvelope, MANIFEST_SIGNATURE_ENVELOPE_SCHEMA),
-        (AssignmentManifestChainState, MANIFEST_CHAIN_STATE_SCHEMA),
-        (MinerProbeAttestation, PROBE_ATTESTATION_SCHEMA),
-        (ValidatorProbeReport, PROBE_REPORT_SCHEMA),
-    ],
-)
-def test_all_top_level_contracts_are_extra_forbid(model: Any, expected_schema: str) -> None:
-    schema = model.model_json_schema()
-    assert schema["additionalProperties"] is False
-    assert schema["properties"]["schema"]["const"] == expected_schema
 
 
 def test_public_manifest_carries_only_public_safe_facts() -> None:

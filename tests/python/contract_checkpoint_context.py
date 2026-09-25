@@ -737,15 +737,8 @@ def negative_document(
 
 def _mutate(rendered: bytes, **changes: Any) -> dict[str, Any]:
     document: dict[str, Any] = json.loads(rendered)
-    for key, value in changes.items():
-        if value is _DELETE:
-            del document[key]
-        else:
-            document[key] = value
+    document.update(changes)
     return document
-
-
-_DELETE = object()
 
 
 def reseal_decision(document: dict[str, Any]) -> dict[str, Any]:

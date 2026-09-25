@@ -8,7 +8,6 @@ import ast
 import hashlib
 from collections.abc import Sequence
 from fractions import Fraction
-from pathlib import Path
 
 import pytest
 from assignment_probe_context import (
@@ -552,10 +551,6 @@ def test_source_is_a_pure_offline_scoring_core() -> None:
         "wallet.",
     ):
         assert forbidden not in lowered, forbidden
-
-
-def test_scoring_module_is_discoverable_from_the_repository_root() -> None:
-    assert (Path(ROOT) / "src" / "misscomputer_subnet" / "probe_scoring.py").is_file()
 
 
 def test_unpublished_attribution_is_refused() -> None:

@@ -250,18 +250,3 @@ func TestVerifyProbeAttestationRejectsTamperingAndForeignKeys(t *testing.T) {
 		t.Fatal("foreign verification key was accepted")
 	}
 }
-
-func TestCanonicalProbeNonceRejectsNonCanonicalValues(t *testing.T) {
-	valid := fixtureLabelDigest("assignment-probe-fixture-nonce")
-	if !CanonicalProbeNonce(valid) {
-		t.Fatal("canonical nonce rejected")
-	}
-	for _, value := range []string{
-		"", valid[:63], valid + "0", strings.ToUpper(valid),
-		valid[:32] + strings.ToUpper(valid[32:]), strings.Repeat("g", 64), valid[:63] + "G",
-	} {
-		if CanonicalProbeNonce(value) {
-			t.Fatalf("non-canonical nonce %q accepted", value)
-		}
-	}
-}

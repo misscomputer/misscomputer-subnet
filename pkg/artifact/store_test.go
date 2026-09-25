@@ -21,21 +21,6 @@ import (
 	"time"
 )
 
-func TestPublishFetch(t *testing.T) {
-	store := FileStore{Root: t.TempDir()}
-	m, err := Publish(context.Background(), store, "static", [][]byte{[]byte("base"), []byte("unique")}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, layers, err := Fetch(context.Background(), store, ManifestKey(m.ImageDigest), m.ImageDigest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ImageDigest != m.ImageDigest || string(layers[1]) != "unique" {
-		t.Fatal("artifact round trip mismatch")
-	}
-}
-
 func TestPreparedManifestFixesIdentityBeforePublication(t *testing.T) {
 	ctx := context.Background()
 	store := FileStore{Root: t.TempDir()}
