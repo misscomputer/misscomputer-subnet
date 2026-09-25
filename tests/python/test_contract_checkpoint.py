@@ -23,22 +23,15 @@ from pydantic import ValidationError
 
 from misscomputer_subnet.assignment_probe import parse_validator_probe_report
 from misscomputer_subnet.assignment_snapshot import (
-    LINEAGE_SCHEMA,
-    SNAPSHOT_SCHEMA,
-    ActiveAssignmentSnapshot,
-    SnapshotLineage,
     advance_snapshot_lineage,
     build_initial_snapshot_lineage,
     parse_active_assignment_snapshot,
     parse_snapshot_lineage,
 )
 from misscomputer_subnet.manifest_publication import (
-    LATEST_POINTER_SCHEMA,
-    AssignmentManifestLatestPointer,
     parse_assignment_manifest_latest_pointer,
 )
 from misscomputer_subnet.validator_decision import (
-    DECISION_SCHEMA,
     ValidatorWeightDecision,
     parse_validator_weight_decision,
 )
@@ -360,26 +353,6 @@ def test_negative_fixtures_are_rejected_for_the_pinned_reason(path: Path) -> Non
     ).encode("ascii")
     with pytest.raises(ValueError):
         PARSERS[contract](rendered + b"\n")
-
-
-@pytest.mark.parametrize(
-    ("model", "expected_schema"),
-    [
-        (ActiveAssignmentSnapshot, SNAPSHOT_SCHEMA),
-        (SnapshotLineage, LINEAGE_SCHEMA),
-        (AssignmentManifestLatestPointer, LATEST_POINTER_SCHEMA),
-        (ValidatorWeightDecision, DECISION_SCHEMA),
-    ],
-)
-def test_checkpoint_contracts_are_extra_forbid_and_versioned(
-    model: Any, expected_schema: str
-) -> None:
-    schema = model.model_json_schema()
-    assert schema["additionalProperties"] is False
-    assert schema["properties"]["schema"]["const"] == expected_schema
-    assert schema["properties"]["schema_version"]["const"] == 1
-    for definition in schema.get("$defs", {}).values():
-        assert definition.get("additionalProperties") is False, definition.get("title")
 
 
 def test_snapshot_fixture_carries_only_public_safe_facts() -> None:

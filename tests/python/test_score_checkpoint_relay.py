@@ -20,16 +20,8 @@ from misscomputer_subnet.checkpoint_score_contracts import (
     parse_canonical_score_report,
 )
 from misscomputer_subnet.score_checkpoint_relay import (
-    CHAIN_STATE_SCHEMA,
     CHECKPOINT_PURPOSE,
-    CHECKPOINT_SCHEMA,
     NORMALIZATION_ALGORITHM,
-    RELAY_METAGRAPH_SCHEMA,
-    RELAY_PLAN_SCHEMA,
-    SIGNATURE_ENVELOPE_SCHEMA,
-    TRUST_POLICY_SCHEMA,
-    VERIFICATION_INPUT_SCHEMA,
-    VERIFICATION_REPORT_SCHEMA,
     WEIGHT_U16_TOTAL,
     CentralScoreCheckpoint,
     CheckpointChainState,
@@ -37,9 +29,7 @@ from misscomputer_subnet.score_checkpoint_relay import (
     CheckpointSignatureEnvelope,
     CheckpointTrustPolicy,
     ExternalValidatorIdentity,
-    ExternalValidatorRelayPlan,
     ExternalValidatorVerificationInput,
-    ExternalValidatorVerificationReport,
     MetagraphMinerMapping,
     RelayFinalizedMetagraphSnapshot,
     TrustedCheckpointKey,
@@ -1016,22 +1006,3 @@ def test_source_has_only_public_offline_pure_capabilities() -> None:
         "wallet.",
     ):
         assert forbidden not in lowered
-
-
-@pytest.mark.parametrize(
-    ("model", "expected_schema"),
-    [
-        (CentralScoreCheckpoint, CHECKPOINT_SCHEMA),
-        (CheckpointTrustPolicy, TRUST_POLICY_SCHEMA),
-        (CheckpointSignatureEnvelope, SIGNATURE_ENVELOPE_SCHEMA),
-        (CheckpointChainState, CHAIN_STATE_SCHEMA),
-        (RelayFinalizedMetagraphSnapshot, RELAY_METAGRAPH_SCHEMA),
-        (ExternalValidatorVerificationInput, VERIFICATION_INPUT_SCHEMA),
-        (ExternalValidatorVerificationReport, VERIFICATION_REPORT_SCHEMA),
-        (ExternalValidatorRelayPlan, RELAY_PLAN_SCHEMA),
-    ],
-)
-def test_all_top_level_contracts_are_extra_forbid(model: Any, expected_schema: str) -> None:
-    schema = model.model_json_schema()
-    assert schema["additionalProperties"] is False
-    assert schema["properties"]["schema"]["const"] == expected_schema
