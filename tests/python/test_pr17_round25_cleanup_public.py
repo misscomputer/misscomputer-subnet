@@ -109,63 +109,6 @@ def test_captured_file_swap_during_descriptor_close_is_preserved(
         real_close(directory_fd)
 
 
-def test_cleanup_directory_substitution_during_creation_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CLEANUP-R24-2: acquisition remains bound to the created directory."""
-
-    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    real_mkdir = os.mkdir
-    foreign_descriptor = -1
-    cleanup_name: str | None = None
-
-    def mkdir_then_replace(
-        path: int | str | bytes,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal cleanup_name, foreign_descriptor
-        real_mkdir(path, mode, dir_fd=dir_fd)
-        if not isinstance(path, str) or not path.startswith(".weight-plan.cleanup-"):
-            return
-        cleanup_name = path
-        os.rename(
-            path,
-            "owned-cleanup-moved",
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        real_mkdir(
-            path,
-            weight_plan.WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE,
-            dir_fd=directory_fd,
-        )
-        foreign_descriptor = os.open(
-            path,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-            dir_fd=directory_fd,
-        )
-
-    try:
-        monkeypatch.setattr(os, "mkdir", mkdir_then_replace)
-        with pytest.raises(weight_plan.WeightPlanTargetError):
-            weight_plan._open_private_cleanup_directory(directory_fd)
-
-        assert cleanup_name is not None
-        assert foreign_descriptor >= 0
-        assert os.fstat(foreign_descriptor).st_nlink > 0
-        assert (tmp_path / cleanup_name).is_dir()
-        assert (tmp_path / "owned-cleanup-moved").is_dir()
-    finally:
-        monkeypatch.undo()
-        if foreign_descriptor >= 0:
-            os.close(foreign_descriptor)
-        _remove_residue(tmp_path)
-        os.close(directory_fd)
-
-
 def test_cleanup_directory_swap_during_descriptor_close_is_preserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

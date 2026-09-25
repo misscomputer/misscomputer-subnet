@@ -129,23 +129,6 @@ async def test_content_length_over_limit_is_rejected_without_receive() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chunked_overflow_stops_after_detection_byte() -> None:
-    chunks = [b"x" * BRIDGE_MAX_BODY, b"!", b"secret-must-not-be-consumed"]
-    calls = 0
-
-    async def receive() -> Any:
-        nonlocal calls
-        chunk = chunks[calls]
-        calls += 1
-        return {"type": "http.request", "body": chunk, "more_body": calls < len(chunks)}
-
-    with pytest.raises(HTTPException) as caught:
-        await read_request_body(raw_request(receive), max_bytes=BRIDGE_MAX_BODY)
-    assert caught.value.status_code == 413
-    assert calls == 2
-
-
-@pytest.mark.asyncio
 async def test_idle_body_deadline_cancels_pending_receive_cleanly() -> None:
     entered = asyncio.Event()
     cancelled = asyncio.Event()

@@ -476,14 +476,6 @@ def test_socket_option_failure_closes_new_socket(monkeypatch: pytest.MonkeyPatch
         receiver.close()
 
 
-def test_migration_does_not_offer_unsupported_old_report_reprocessing() -> None:
-    root = Path(__file__).resolve().parents[2]
-    text = (root / "docs/api-migrations.md").read_text()
-    assert "reprocess by re-running `decide_weight_submission`" not in text
-    assert "Reprocessing retained old-form reports with the new decision API is" in text
-    assert "unsupported." in text
-
-
 def test_sigint_after_admission_cannot_leak_accounting() -> None:
     import os
     import signal

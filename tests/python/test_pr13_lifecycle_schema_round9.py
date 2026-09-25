@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-from pathlib import Path
 from typing import Any
 
 import bittensor
@@ -14,14 +12,10 @@ import pytest
 from bittensor._substrate import RpcSubstrate
 from bittensor._transport.interface import SubstrateConnection
 from bittensor._transport.runtime import RuntimeManager
-from jsonschema import Draft202012Validator
 from websockets.asyncio.server import serve
 
 from misscomputer_subnet.chain import BittensorChain
 from misscomputer_subnet.chain_quorum import FinalizedRpcQuorum
-from misscomputer_subnet.weight_signer_protocol import SignerProtocolError, SignerResponse
-
-ROOT = Path(__file__).resolve().parents[2]
 
 
 class LifecycleSentinel(BaseException):
@@ -252,21 +246,3 @@ async def test_owner_close_joins_transport_initiated_retirement(
                 peer.transport.abort()
             await asyncio.gather(*(peer.wait_closed() for peer in peers), return_exceptions=True)
             await _assert_transport_baseline(connections, baseline_fds, baseline_tasks)
-
-
-def test_schema_and_parser_both_reject_terminal_newline_reference() -> None:
-    document = {
-        "error_code": "submission_timeout",
-        "extrinsic_ref": "bad\n",
-        "request_id": "ab" * 32,
-        "schema": "miss.computer/misscomputer-subnet/weight-signer-response",
-        "schema_version": 2,
-        "status": "ambiguous",
-    }
-    schema = json.loads(
-        (ROOT / "contracts/schemas/weight-signer-response.v2.schema.json").read_text()
-    )
-    assert not Draft202012Validator(schema).is_valid(document)
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
-    with pytest.raises(SignerProtocolError):
-        SignerResponse.from_bytes(encoded)

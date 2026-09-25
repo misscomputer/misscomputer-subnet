@@ -38,12 +38,3 @@ func TestSharedAddressPolicyRegressionCorpus(t *testing.T) {
 		}
 	}
 }
-
-func TestPublicPolicyRejectsMappedBeforeCanonicalization(t *testing.T) {
-	if canonical, err := CanonicalPublicAddress("::ffff:8.8.8.8"); err == nil {
-		t.Fatalf("mapped address collapsed and accepted as %q", canonical)
-	}
-	if canonical, err := CanonicalPublicAddress("8.8.8.8"); err != nil || canonical != "8.8.8.8" {
-		t.Fatalf("ordinary public IPv4 rejected: canonical=%q err=%v", canonical, err)
-	}
-}

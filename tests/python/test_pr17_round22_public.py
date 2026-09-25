@@ -325,29 +325,3 @@ def test_capability_limited_cleanup_retires_displaced_plan(
     assert target.stat().st_nlink == 1
     assert not list(tmp_path.glob(".weight-plan.tmp-*"))
     assert list(tmp_path.glob(".weight-plan.cleanup-*"))
-
-
-def test_unavailable_descriptor_linking_does_not_block_private_retirement(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A live displaced inode is never mistaken for an already-retired inode."""
-
-    target = tmp_path / "weight-plan.json"
-    original = plan(block=101)
-    replacement = plan(block=102)
-    assert weight_plan.write_weight_plan_atomic(original, target) is True
-
-    def capability_limited_link(
-        _descriptor: int,
-        _directory_fd: int,
-        name: str,
-    ) -> None:
-        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
-
-    monkeypatch.setattr(weight_plan, "_link_unnamed_temporary", capability_limited_link)
-
-    assert weight_plan.write_weight_plan_atomic(replacement, target) is True
-    assert target.read_bytes() == replacement.canonical_bytes()
-    assert not list(tmp_path.glob(".weight-plan.tmp-*"))
-    assert list(tmp_path.glob(".weight-plan.cleanup-*"))

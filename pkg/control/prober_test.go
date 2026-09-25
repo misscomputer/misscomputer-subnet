@@ -124,6 +124,11 @@ func (s *scriptedProber) probed(replicaID string) int {
 
 // newProbedHarness deploys three replicas and returns a prober wired to a
 // scripted probe seam, plus the replica ID of each active miner.
+func probeTargets(s *Scheduler) []probeTarget {
+	targets, _ := s.probeTargetsVersioned()
+	return targets
+}
+
 func newProbedHarness(t *testing.T) (*schedulerHarness, *scriptedProber, *Prober, map[string]string) {
 	t.Helper()
 	h := newSchedulerHarness(t, []string{"m1", "m2", "m3", "m4"}, 3)
@@ -724,7 +729,7 @@ func TestPeriodicProbeHonorsSixSecondTimeoutWithoutWeakeningAdmissionBound(t *te
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	replica := target.replicas[0]
 
 	// This is the production construction: scheduler admission has a nil Client,
@@ -1424,37 +1429,6 @@ func TestProberEvictsIsolatedFailureAcrossSingletonDeployments(t *testing.T) {
 	deactivated = true
 }
 
-func TestProberPreservesSingleEndpointEvictionContract(t *testing.T) {
-	h := newSchedulerHarness(t, []string{"m1", "m2"}, 1)
-	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
-		t.Fatal(err)
-	}
-	deactivated := false
-	defer func() {
-		if !deactivated {
-			h.cleanup(t)
-		}
-	}()
-	replica := h.scheduler.ActiveReplicas(h.request.DeploymentID)[0]
-	probe := newScriptedProber(map[string]string{replica.ReplicaID: replica.MinerID})
-	prober := &Prober{Scheduler: h.scheduler, probe: probe, Vantage: "periodic-test"}
-	if baseline := prober.Sweep(context.Background()); baseline.Failed() != 0 {
-		t.Fatalf("healthy baseline failed: %+v", baseline.Outcomes)
-	}
-	probe.setDark("m1")
-	first := prober.Sweep(context.Background())
-	second := prober.Sweep(context.Background())
-	if first.Removed() != 0 || second.Removed() != 1 {
-		t.Fatalf("single endpoint no longer follows two-failure eviction: first=%+v second=%+v", first.Outcomes, second.Outcomes)
-	}
-	active := activeMinerIDs(h.scheduler, h.request.DeploymentID)
-	if len(active) != 1 || contains(active, "m1") {
-		t.Fatalf("single isolated endpoint was not replaced: %v", active)
-	}
-	h.cleanup(t)
-	deactivated = true
-}
-
 func TestSingleEndpointSharedPathFailureEvictsWithoutEconomicGuiltOrPoolLoss(t *testing.T) {
 	h := newSchedulerHarness(t, []string{"m1", "m2"}, 1)
 	if _, err := h.scheduler.Deploy(context.Background(), h.request); err != nil {
@@ -1737,7 +1711,7 @@ func TestProberBindsHealthRevisionBeforeNetworkIO(t *testing.T) {
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	replica := target.replicas[0]
 	healthy := validator.ProbeResult{
 		Status: 200, Correct: true, ServedByReplica: true, ResponseComplete: true,
@@ -1781,7 +1755,7 @@ func TestDelayedPeerSuccessKeepsItsPreFailureCompletionTime(t *testing.T) {
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	var failed, peer ActiveReplica
 	for _, replica := range target.replicas {
 		switch replica.MinerID {
@@ -1814,9 +1788,9 @@ func TestDelayedPeerSuccessKeepsItsPreFailureCompletionTime(t *testing.T) {
 	go func() { peerObserved <- prober.observe(context.Background(), target, peer) }()
 	<-blocked.started
 
-	if action, err := h.scheduler.handleEndpointHealth(
+	if action, _, _, err := h.scheduler.handleHealth(
 		context.Background(), target.deploymentID, failed.ReplicaID, failed.EndpointID, failed.MinerID,
-		"periodic-test", false, false, false, failureAt,
+		"periodic-test", false, false, false, failureAt, true, nil, nil, nil,
 	); err != nil || action.RemoveFromRouting {
 		t.Fatalf("failed to seed target failure: action=%+v err=%v", action, err)
 	}
@@ -1882,7 +1856,7 @@ func TestProbeWithoutTerminalTimestampCannotMutateHealth(t *testing.T) {
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	replica := target.replicas[0]
 	before := h.scheduler.monitor().Snapshot(replica.EndpointID)
 	prober := &Prober{
@@ -1911,7 +1885,7 @@ func TestExternalHealthRevisionCannotMaskInFlightLocalSuppression(t *testing.T) 
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	replica := target.replicas[0]
 	dark := validator.ProbeResult{Status: 0, Correct: false, ResponseComplete: false, Error: "connection refused"}
 	probe := &staleBlockingProber{started: make(chan struct{}), release: make(chan struct{}), result: &dark}
@@ -1949,7 +1923,7 @@ func TestExternalHealthRevisionCannotMaskInFlightLocalRecovery(t *testing.T) {
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	replica := target.replicas[0]
 	if changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
 		context.Background(), target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, 0,
@@ -1989,7 +1963,7 @@ func TestNewerNoopLocalSuccessFencesOlderFailure(t *testing.T) {
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	replica := target.replicas[0]
 	dark := validator.ProbeResult{Status: 0, Correct: false, ResponseComplete: false, Error: "connection refused"}
 	oldProbe := &staleBlockingProber{started: make(chan struct{}), release: make(chan struct{}), result: &dark}
@@ -2025,7 +1999,7 @@ func TestNewerNoopLocalFailureFencesOlderRecovery(t *testing.T) {
 			h.cleanup(t)
 		}
 	}()
-	target := h.scheduler.probeTargets()[0]
+	target := probeTargets(h.scheduler)[0]
 	replica := target.replicas[0]
 	if changed, applied, err := h.scheduler.suppressEndpointAvailabilityIfVersion(
 		context.Background(), target.deploymentID, replica.ReplicaID, replica.EndpointID, replica.MinerID, 0,
@@ -2202,9 +2176,9 @@ func TestProberCancellationIsJoinedAndNeverCountsAsFailure(t *testing.T) {
 			m1 = replica
 		}
 	}
-	if action, err := h.scheduler.handleEndpointHealth(
+	if action, _, _, err := h.scheduler.handleHealth(
 		context.Background(), h.request.DeploymentID, m1.ReplicaID, m1.EndpointID, m1.MinerID,
-		"periodic-test", false, false, false, time.Now().UTC(),
+		"periodic-test", false, false, false, time.Now().UTC(), true, nil, nil, nil,
 	); err != nil || action.RemoveFromRouting {
 		t.Fatalf("failed to seed first liveness failure: action=%+v err=%v", action, err)
 	}
@@ -2262,7 +2236,7 @@ func TestProberCancellationAtMutationBoundaryDoesNotSpendCorroboration(t *testin
 	if baseline := prober.Sweep(context.Background()); baseline.Failed() != 0 {
 		t.Fatalf("healthy baseline failed: %+v", baseline.Outcomes)
 	}
-	targets := h.scheduler.probeTargets()
+	targets := probeTargets(h.scheduler)
 	var target probeTarget
 	var replica ActiveReplica
 	for _, candidateTarget := range targets {

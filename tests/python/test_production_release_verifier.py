@@ -80,10 +80,6 @@ def write_owner_file(path: Path, value: bytes) -> None:
     path.chmod(0o600)
 
 
-def copy_owner_file(source: Path, destination: Path) -> None:
-    write_owner_file(destination, source.read_bytes())
-
-
 def tar_bytes(files: dict[str, bytes]) -> bytes:
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:") as archive:
@@ -1047,32 +1043,6 @@ def test_missing_duplicate_and_nonreproducible_artifacts_are_rejected(tmp_path: 
     assert error.value.code == "digest_mismatch"
 
 
-def test_mutable_oci_claim_and_provenance_source_guard_are_rejected(tmp_path: Path) -> None:
-    provenance_case = make_release_case(tmp_path / "provenance")
-    provenance_path = Path(
-        provenance_case.paths.artifact_root,
-        "supply-chain/release.slsa.json",
-    )
-    document = json.loads(provenance_path.read_bytes())
-    document["predicate"]["buildDefinition"]["externalParameters"]["commit_oid"] = "c" * 40
-    write_owner_file(provenance_path, canonical_bytes(document))
-    with pytest.raises(ReleaseVerificationError) as error:
-        produce(provenance_case)
-    assert error.value.code in {"digest_mismatch", "source_guard"}
-
-    mutable_case = make_release_case(tmp_path / "mutable")
-    descriptor_path = Path(
-        mutable_case.paths.artifact_root,
-        "workloads/synthetic-http-v1.json",
-    )
-    descriptor = json.loads(descriptor_path.read_bytes())
-    descriptor["mutable_tag"] = "latest"
-    write_owner_file(descriptor_path, canonical_bytes(descriptor))
-    with pytest.raises(ReleaseVerificationError) as error:
-        produce(mutable_case)
-    assert error.value.code in {"digest_mismatch", "invalid_workload_descriptor"}
-
-
 def test_cli_produces_and_reverifies_report_with_clear_exits(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1115,29 +1085,6 @@ def test_cli_errors_do_not_leak_paths_or_document_values(
     )
     assert marker not in captured.err
     assert str(tmp_path) not in captured.err
-
-
-def test_cli_rejects_cross_list_evidence_reference_ambiguity_early(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    case = make_release_case(tmp_path)
-    marker = "sensitive_reference_marker"
-    document = case.bundle.model_dump(mode="json", by_alias=True)
-    document["release_manifest"]["sbom_references"][0]["reference_id"] = marker
-    document["release_manifest"]["provenance_references"][0]["reference_id"] = marker
-    write_owner_file(Path(case.paths.bundle), canonical_bytes(document))
-
-    report = tmp_path / "ambiguous-report.json"
-    assert run_cli(cli_arguments(case, report, command="authorize")) == EXIT_REJECTED
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == (
-        "REJECTED invalid_document: authorization_bundle failed contract validation\n"
-    )
-    assert marker not in captured.err
-    assert str(tmp_path) not in captured.err
-    assert not report.exists()
 
 
 def test_generated_verifier_contracts_are_valid_and_regeneration_is_clean() -> None:

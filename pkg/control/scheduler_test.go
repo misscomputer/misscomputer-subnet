@@ -204,22 +204,22 @@ func TestReceiptBoundToExactTicket(t *testing.T) {
 	}
 	s := Scheduler{Ledger: ledger.New()}
 	result := miner.Result{Receipt: receipt, EndpointID: receipt.EndpointID}
-	if err := s.verifyResult(candidate, ticket, result); err != nil {
+	if err := s.verifyResultForDisposition(candidate, ticket, result, ScoringProductionEligible); err != nil {
 		t.Fatalf("matching receipt rejected: %v", err)
 	}
 	replayedForNewTicket := ticket
 	replayedForNewTicket.AssignmentNonce = "nonce-b"
-	if err := s.verifyResult(candidate, replayedForNewTicket, result); err == nil {
+	if err := s.verifyResultForDisposition(candidate, replayedForNewTicket, result, ScoringProductionEligible); err == nil {
 		t.Fatal("receipt replayed under a new ticket nonce was accepted")
 	}
 	replayedForNewGeneration := ticket
 	replayedForNewGeneration.Generation++
-	if err := s.verifyResult(candidate, replayedForNewGeneration, result); err == nil {
+	if err := s.verifyResultForDisposition(candidate, replayedForNewGeneration, result, ScoringProductionEligible); err == nil {
 		t.Fatal("receipt replayed under a new generation was accepted")
 	}
 	wrongEndpoint := result
 	wrongEndpoint.EndpointID = "d1-m1-g999"
-	if err := s.verifyResult(candidate, ticket, wrongEndpoint); err == nil {
+	if err := s.verifyResultForDisposition(candidate, ticket, wrongEndpoint, ScoringProductionEligible); err == nil {
 		t.Fatal("receipt with mismatched returned endpoint was accepted")
 	}
 }

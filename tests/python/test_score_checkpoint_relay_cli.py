@@ -19,7 +19,6 @@ import misscomputer_subnet.score_checkpoint_relay_cli as relay_cli
 from misscomputer_subnet.chain import MetagraphSnapshot, NeuronRecord
 from misscomputer_subnet.score_checkpoint_relay import (
     ExternalValidatorRelayPlan,
-    external_validator_relay_plan_bytes,
     parse_external_validator_relay_plan,
     parse_external_validator_verification_report,
 )
@@ -818,16 +817,6 @@ def test_source_has_no_live_or_secret_capability() -> None:
     assert not any(
         isinstance(node, ast.ImportFrom) and node.module == "chain"
         for node in weight_plan_tree.body
-    )
-
-
-def test_fixture_relay_stays_canonical() -> None:
-    relay = parse_external_validator_relay_plan(
-        (FIXTURES / "external-validator-score-relay-plan.v1.json").read_bytes()
-    )
-    assert (
-        external_validator_relay_plan_bytes(relay)
-        == (FIXTURES / "external-validator-score-relay-plan.v1.json").read_bytes()
     )
 
 

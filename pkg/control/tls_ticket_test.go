@@ -53,7 +53,7 @@ func TestSchedulerSignsExactMinerHTTPSPinIntoBoundTicket(t *testing.T) {
 		ValidatorServicePublicKey: hex.EncodeToString(validatorPublic),
 	})
 	now := time.Now().UTC()
-	ticket, err := scheduler.ticket(DeployRequest{DeploymentID: "app"}, assigner, "app.example", 1, now)
+	ticket, err := scheduler.ticketWithSubnet(DeployRequest{DeploymentID: "app"}, assigner, scheduler.Subnet, "app.example", 1, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestReservedCandidateCannotMixWithLaterSubnetPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reserved, _ := scheduler.reserveInitialCandidate(state)
+	reserved, _ := scheduler.reserveInitialCandidateSkipping(state, nil)
 	if reserved == nil || string(reserved.candidate.PublicKey()) != string(oldMinerPublic) || reserved.publicationID != "old-publication" {
 		t.Fatal("old publication candidate was not reserved")
 	}
@@ -188,7 +188,7 @@ func TestConcurrentPublicationInstallAndReservationNeverMix(t *testing.T) {
 		writer.Wait()
 	}()
 	for index := 0; index < 2_000; index++ {
-		reservation, _ := scheduler.reserveInitialCandidate(state)
+		reservation, _ := scheduler.reserveInitialCandidateSkipping(state, nil)
 		if reservation == nil || reservation.subnet == nil {
 			t.Fatal("publication reservation unexpectedly empty")
 		}

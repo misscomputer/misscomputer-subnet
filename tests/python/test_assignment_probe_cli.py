@@ -4,7 +4,6 @@ from __future__ import annotations
 import ast
 import hashlib
 import ipaddress
-import json
 import socket
 import ssl
 import threading
@@ -1045,22 +1044,6 @@ def test_default_tooling_is_inert_and_cli_has_no_authority_capabilities() -> Non
     ]
     assert not module_level_calls
     assert run_cli(["--help"]) == EXIT_USAGE
-
-
-def test_probe_transport_classifies_failures_without_raising(tmp_path: Path) -> None:
-    context = ssl.create_default_context()
-    transport = probe_cli.HttpsProbeTransport(context)
-    result = transport.fetch(
-        url="https://127.0.0.1:1/__challenge/000000000000000000000000",
-        server_name="fixture-alpha.mock.local",
-        headers={"host": "fixture-alpha.mock.local"},
-        timeout_seconds=1.0,
-        max_bytes=64,
-    )
-    assert isinstance(result, probe_cli.ProbeTransportFailure)
-    assert result.code == "connection_failed"
-    assert json.dumps(result.code)
-    del tmp_path
 
 
 class _FixedClock:

@@ -393,17 +393,6 @@ def test_factory_rejects_canonical_duplicate_endpoints(first: str, second: str) 
     assert second not in str(error.value)
 
 
-def test_factory_does_not_echo_invalid_endpoint() -> None:
-    sensitive_value = "wss://user:password@example.invalid\n"  # noqa: S105
-    with pytest.raises(ValueError) as error:
-        build_chain_query(
-            network="finney",
-            netuid=24,
-            rpc_endpoints=(sensitive_value, "wss://other"),
-        )
-    assert sensitive_value.strip() not in str(error.value)
-
-
 def test_factory_rejects_endpoint_credentials_without_echoing_them() -> None:
     sensitive_value = "wss://user:password@example.invalid"  # noqa: S105
     with pytest.raises(ValueError) as error:

@@ -478,13 +478,6 @@ func assignmentFromTicket(candidate miner.Assigner, ticket protocol.Ticket) acti
 	}
 }
 
-// retainCleanupLease transfers exact ownership from a reservation/active slot
-// into quarantine. It is idempotent for the same endpoint and never replaces a
-// newer cleanup incarnation for the miner.
-func (s *Scheduler) retainCleanupLease(state *deploymentState, candidate miner.Assigner, ticket protocol.Ticket, assignmentPending, requiresRetry bool) {
-	s.retainCleanupLeaseWithDisposition(state, candidate, ticket, assignmentPending, requiresRetry, false, false)
-}
-
 // retainAndClaimCleanupLease transfers exact ticket ownership and atomically
 // claims the only cleanup invocation allowed for that incarnation. No repair,
 // deployment teardown, or cancellation path can observe an unclaimed lease in
@@ -493,6 +486,9 @@ func (s *Scheduler) retainAndClaimCleanupLease(state *deploymentState, candidate
 	return s.retainCleanupLeaseWithDisposition(state, candidate, ticket, assignmentPending, requiresRetry, preserveExclusion, true)
 }
 
+// retainCleanupLeaseWithDisposition transfers exact ownership from a
+// reservation/active slot into quarantine. It is idempotent for the same
+// endpoint and never replaces a newer cleanup incarnation for the miner.
 func (s *Scheduler) retainCleanupLeaseWithDisposition(state *deploymentState, candidate miner.Assigner, ticket protocol.Ticket, assignmentPending, requiresRetry, preserveExclusion, claim bool) bool {
 	if state == nil || candidate == nil {
 		return false
@@ -980,10 +976,6 @@ func (s *Scheduler) beginDeployment(req DeployRequest, routeHost string, firstGe
 	return state, nil
 }
 
-func (s *Scheduler) reserveInitialCandidate(state *deploymentState) (*candidateReservation, int) {
-	return s.reserveInitialCandidateSkipping(state, nil)
-}
-
 func (s *Scheduler) reserveInitialCandidateSkipping(state *deploymentState, skip map[string]struct{}) (*candidateReservation, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1025,10 +1017,6 @@ func (s *Scheduler) reserveInitialCandidateSkipping(state *deploymentState, skip
 		}
 	}
 	return nil, len(state.active) + len(state.reserved)
-}
-
-func (s *Scheduler) reserveReplacementCandidate(state *deploymentState) (*candidateReservation, uint64, int, bool) {
-	return s.reserveReplacementCandidateSkipping(state, nil)
 }
 
 func (s *Scheduler) reserveReplacementCandidateSkipping(state *deploymentState, skip map[string]struct{}) (*candidateReservation, uint64, int, bool) {
@@ -1088,16 +1076,6 @@ func (s *Scheduler) releaseReservation(state *deploymentState, minerID string) {
 	s.mu.Lock()
 	if s.states[state.request.DeploymentID] == state {
 		delete(state.reserved, minerID)
-		s.maybeDeleteDeactivatedStateLocked(state)
-	}
-	s.mu.Unlock()
-}
-
-func (s *Scheduler) failReservation(state *deploymentState, minerID string) {
-	s.mu.Lock()
-	if s.states[state.request.DeploymentID] == state {
-		delete(state.reserved, minerID)
-		state.excluded[minerID] = struct{}{}
 		s.maybeDeleteDeactivatedStateLocked(state)
 	}
 	s.mu.Unlock()
@@ -1199,10 +1177,6 @@ func (s *Scheduler) rejectInconclusiveAcceptance(ctx context.Context, state *dep
 	)
 }
 
-func (s *Scheduler) ticket(req DeployRequest, candidate miner.Assigner, routeHost string, generation uint64, now time.Time) (protocol.Ticket, error) {
-	return s.ticketWithSubnet(req, candidate, s.subnetSnapshot(), routeHost, generation, now)
-}
-
 func (s *Scheduler) ticketForReservation(req DeployRequest, reservation *candidateReservation, routeHost string, generation uint64, now time.Time) (protocol.Ticket, error) {
 	if reservation == nil || reservation.candidate == nil {
 		return protocol.Ticket{}, errors.New("assignment candidate reservation is empty")
@@ -1254,10 +1228,6 @@ func (s *Scheduler) ticketWithSubnet(req DeployRequest, candidate miner.Assigner
 		t.Subnet = &binding
 	}
 	return t, protocol.SignTicket(&t, s.SigningKey)
-}
-
-func (s *Scheduler) verifyResult(candidate miner.Assigner, ticket protocol.Ticket, result miner.Result) error {
-	return s.verifyResultForDisposition(candidate, ticket, result, ScoringProductionEligible)
 }
 
 func (s *Scheduler) verifyResultForDisposition(candidate miner.Assigner, ticket protocol.Ticket, result miner.Result, disposition ScoringDisposition) error {
@@ -1365,12 +1335,6 @@ func (s *Scheduler) cleanupTicket(parent context.Context, candidate miner.Assign
 	return s.deactivateTicket(ctx, candidate, ticket)
 }
 
-func (s *Scheduler) cleanupEndpoint(parent context.Context, candidate miner.Assigner, endpointID string) error {
-	ctx, cancel := cleanupBudget(parent)
-	defer cancel()
-	return s.deactivate(ctx, candidate, endpointID)
-}
-
 func (s *Scheduler) monitor() *policy.Monitor {
 	s.mu.Lock()
 	if s.Health == nil {
@@ -1439,13 +1403,6 @@ func (s *Scheduler) HandleHealthWithCommit(ctx context.Context, deploymentID, re
 	if applied && err != nil {
 		err = &committedHealthActionError{cause: err}
 	}
-	return action, err
-}
-
-// handleEndpointHealth applies an internal observation only if endpointID is
-// still the exact active generation/nonce incarnation that was probed.
-func (s *Scheduler) handleEndpointHealth(ctx context.Context, deploymentID, replicaID, endpointID, minerID, vantage string, reachable, correct, fraudulent bool, at time.Time) (policy.Action, error) {
-	action, _, _, err := s.handleHealth(ctx, deploymentID, replicaID, endpointID, minerID, vantage, reachable, correct, fraudulent, at, true, nil, nil, nil)
 	return action, err
 }
 
@@ -2237,15 +2194,6 @@ func (s *Scheduler) SetSubnet(binding protocol.SubnetBinding) {
 	s.mu.Unlock()
 }
 
-func (s *Scheduler) subnetSnapshot() *protocol.SubnetBinding {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.Subnet == nil {
-		return nil
-	}
-	return cloneSubnetBinding(s.Subnet)
-}
-
 func cloneSubnetBinding(binding *protocol.SubnetBinding) *protocol.SubnetBinding {
 	if binding == nil {
 		return nil
@@ -2346,15 +2294,10 @@ type probeTarget struct {
 	replicas       []ActiveReplica
 }
 
-// probeTargets snapshots every deployment that is settled enough to probe:
+// probeTargetsVersioned snapshots every deployment that is settled enough to probe:
 // deploying and deactivating deployments are skipped so a sweep can never race
 // acceptance or teardown. The returned slices are copies, so the caller holds
 // no scheduler state while it performs network I/O.
-func (s *Scheduler) probeTargets() []probeTarget {
-	targets, _ := s.probeTargetsVersioned()
-	return targets
-}
-
 func (s *Scheduler) probeTargetsVersioned() ([]probeTarget, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
