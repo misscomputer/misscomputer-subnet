@@ -24,6 +24,7 @@ deployment.
 | Offline verification of the signed central score checkpoint | [signed-score-checkpoint-relay-runbook.md](signed-score-checkpoint-relay-runbook.md) |
 | Third-party verifier SDK path and restart/backup rules | [third-party-verifier-relay-runbook.md](third-party-verifier-relay-runbook.md) |
 | WeightPlan read-only preflight and reconciliation of uncertain attempts | [weight-reconciliation.md](weight-reconciliation.md) |
+| Submitting weights with the one-shot standalone signer | [weight-signer-runbook.md](weight-signer-runbook.md) |
 | Offline production release verification | [production-release-verifier-runbook.md](production-release-verifier-runbook.md) |
 
 ## Design and contracts

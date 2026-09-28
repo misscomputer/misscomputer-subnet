@@ -26,10 +26,16 @@ optional cross-check   misscomputer-score-checkpoint-relay
                                    │
 before any submission  misscomputer-weight-executor   (no --execute: read-only preflight)
                          re-check the plan against the live finalized chain
+                                   │
+submission (optional)  misscomputer-weight-signer     (separate OS user, holds the hotkey)
+                         + misscomputer-weight-executor --execute (wallet-free)
+                         one confirmed plan, one request, at most one extrinsic
 ```
 
-None of these commands can create workloads, routes, or scores, and none of
-them submits weights by itself. Background and scoring rules:
+None of these commands can create workloads, routes, or scores. Only the
+one-shot `misscomputer-weight-signer`, run under its own OS account together
+with `misscomputer-weight-executor --execute`, submits weights, and only for a
+plan whose digests you confirmed. Background and scoring rules:
 [public-validator-live-probe.md](public-validator-live-probe.md) and
 [organic-availability-scoring.md](organic-availability-scoring.md).
 
@@ -37,11 +43,6 @@ them submits weights by itself. Background and scoring rules:
 
 Be clear about these boundaries before you plan a deployment:
 
-- **Weight submission signer.** `misscomputer-weight-executor --execute` sends
-  the plan digest to a separately privileged signer over a peer-UID-pinned Unix
-  socket. That signer service is not part of this repository. Without it you
-  can run the full evidence pipeline and the read-only preflight, but this
-  software will not set weights.
 - **Validator control plane.** `misscomputer-validator` (the long-running
   neuron) is the bridge between an operator-owned Go control/scheduling
   service (`--go-control-url`, default `http://127.0.0.1:9201`) and the
@@ -63,6 +64,7 @@ Be clear about these boundaries before you plan a deployment:
 | `misscomputer-organic-window` | | ✔ reads the chain via RPC |
 | `misscomputer-score-checkpoint-relay` | ✔ offline, given the published files | |
 | `misscomputer-weight-executor` without `--execute` | | ✔ reads the chain only |
+| `misscomputer-weight-signer` + `misscomputer-weight-executor --execute` | | ✔ one weight transaction |
 
 ## Prerequisites
 
@@ -314,12 +316,19 @@ the plan digest, the adjusted execution digest, the block, and
 target/moved/omitted counts. A failure exits `2` with a JSON error on stderr
 (`error_code`, `status`).
 
+## Step 10: submit weights (live transaction)
+
 Submitting (`--execute`) additionally requires exact network, netuid, plan
 digest, and execution digest confirmations, an explicit environment
-acknowledgement, a durable `--audit-state` path, and the external signer
-(`--signer-socket`, `--signer-uid`). Treat an exit `2` after `--execute` as
-"unknown", never as "not submitted": follow
-[weight-reconciliation.md](weight-reconciliation.md) before any retry.
+acknowledgement, a durable `--audit-state` path, and a running
+`misscomputer-weight-signer` (`--signer-socket`, `--signer-uid`). The signer
+runs under a separate OS account that alone can read the hotkey; it reloads its
+own copy of the plan, re-derives the vector from its own finalized reads, and
+submits at most once. Account setup, the exact two-process procedure, and
+outputs are in [weight-signer-runbook.md](weight-signer-runbook.md).
+
+Treat an exit `2` after `--execute` as "unknown", never as "not submitted":
+follow [weight-reconciliation.md](weight-reconciliation.md) before any retry.
 
 ## Health, logs, and outputs
 

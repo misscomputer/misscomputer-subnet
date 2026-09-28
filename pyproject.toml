@@ -32,6 +32,7 @@ dev = [
 misscomputer-miner = "misscomputer_subnet.miner:main"
 misscomputer-validator = "misscomputer_subnet.validator:main"
 misscomputer-weight-executor = "misscomputer_subnet.weight_executor:main"
+misscomputer-weight-signer = "misscomputer_subnet.weight_signer:main"
 misscomputer-weight-reconcile = "misscomputer_subnet.weight_reconciliation:main"
 misscomputer-score-checkpoint-relay = "misscomputer_subnet.score_checkpoint_relay_cli:main"
 misscomputer-assignment-probe = "misscomputer_subnet.assignment_probe_cli:main"

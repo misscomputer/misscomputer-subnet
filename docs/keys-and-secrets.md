@@ -41,6 +41,8 @@ already copied somewhere unsafe.
 | Trust policy files and digests | validator | the subnet operator, out of band | Owner-only copy; the digest must come from an independent trusted channel | Wrong or swapped policy means every run is rejected |
 | Probe state root, manifest archive, epoch records | validator | the CLIs | Owner-only; never edited by hand | These are the audit trail for your weights; back up while stopped |
 | Checkpoint ledger state root | validator | `misscomputer-score-checkpoint-relay` | Owner-only; never edited by hand | Append-only; restore only complete, anchored backups |
+| Weight-signer hotkey copy | validator | you, copied from the trusted workstation | Readable only by the dedicated signer OS user; never by the executor account | Only process that can submit weights; see [weight-signer-runbook.md](weight-signer-runbook.md) |
+| Executor and signer audit ledgers | validator | `misscomputer-weight-executor`, `misscomputer-weight-signer` | Owner-only (`0600`), one per account; never edited, deleted, or moved | Replay barrier and evidence for reconciliation; losing one can permit a duplicate submission |
 | Miner state databases | miner | the processes | Owner-only | Nonce/replay and assignment state; keep across restarts |
 
 ## Wallet creation (trusted workstation)

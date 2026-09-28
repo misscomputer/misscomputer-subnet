@@ -171,3 +171,11 @@ proof that nothing was submitted; see
 [weight-reconciliation.md](weight-reconciliation.md). RPC alerts such as
 `rpc_snapshot_disagreement` or `rpc_finalized_rollback` are printed as JSON on
 stderr and should page an operator.
+
+### Weight signer
+
+`misscomputer-weight-signer` exits `0` (confirmed), `2` (nothing submitted by
+this run), or `3` (ambiguous, or confirmed with an audit write failure). Its
+error codes and actions are listed in
+[weight-signer-runbook.md](weight-signer-runbook.md#signer-output-and-exit-codes).
+`idempotency_blocked` is intentional: reconcile, never edit the ledger.

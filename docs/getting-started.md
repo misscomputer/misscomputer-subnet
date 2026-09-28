@@ -57,13 +57,15 @@ The install adds these console scripts to `.venv/bin`:
 | `misscomputer-organic-window` | validators | Seals a window decision and, when eligible, a WeightPlan |
 | `misscomputer-score-checkpoint-relay` | validators | Offline verification of a signed central score checkpoint |
 | `misscomputer-weight-executor` | validators | Read-only WeightPlan preflight; gated submission path |
+| `misscomputer-weight-signer` | validators | One-shot, separately privileged weight signer for one confirmed plan |
 | `misscomputer-weight-reconcile` | validators | Read-only reconciliation of an uncertain weight attempt |
 | `misscomputer-validator` | subnet operator | Long-running validator bridge; needs an operator-owned Go control service (see the validator guide) |
 | `misscomputer-release-verify` | release auditors | Offline production release verification |
 | `misscomputer-python-boundary`, `misscomputer-checkpoint-boundary` | tooling | One-shot request/response process boundaries |
 
 `misscomputer-miner`, `misscomputer-validator`, `misscomputer-weight-executor`,
-`misscomputer-weight-reconcile`, and `misscomputer-release-verify` print normal
+`misscomputer-weight-signer`, `misscomputer-weight-reconcile`, and
+`misscomputer-release-verify` print normal
 `--help` output. The hardened validator CLIs (`misscomputer-assignment-probe`,
 `misscomputer-organic-window`, `misscomputer-score-checkpoint-relay`)
 deliberately never echo arguments: `--help` prints only `REJECTED usage` and

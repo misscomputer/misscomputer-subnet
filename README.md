@@ -6,8 +6,10 @@ snapshot from the private provenance archive; it contains no source history or
 operator infrastructure.
 
 The software is licensed under `AGPL-3.0-only`. Operational secrets, central
-scoring policy and implementation, signer/executor operations, production host
-topology, cloud configuration, and private runbooks are intentionally absent.
+scoring policy and implementation, the operator's own signer/executor
+deployment, production host topology, cloud configuration, and private runbooks
+are intentionally absent. The standalone weight signer for independent
+validators is public (see [`docs/weight-signer-runbook.md`](docs/weight-signer-runbook.md)).
 
 ## Quickstart
 
@@ -36,7 +38,8 @@ protocols. Scheduling, route assignment, edge serving, the customer CLI, and
 their release pipelines are operator-owned and maintained outside this
 repository.
 The Python distribution provides the miner and validator neurons,
-checkpoint verification, weight execution, the online
+checkpoint verification, weight execution, the separately privileged one-shot
+`misscomputer-weight-signer` (see `docs/weight-signer-runbook.md`), the online
 `misscomputer-assignment-probe` public-validator hidden probes of organic app
 assignments (see `docs/public-validator-live-probe.md` and
 `docs/organic-availability-scoring.md`), and
