@@ -293,8 +293,19 @@ def classify_extrinsic_result(result: Any) -> SubmissionOutcome:
         if reference is None:
             return SubmissionOutcome("ambiguous", None, "missing_extrinsic_reference")
         return SubmissionOutcome("confirmed", reference, None)
-    if success is False and reference is not None:
-        # Included in a block with a failed dispatch: definitively not applied.
+    block_hash = getattr(result, "block_hash", None)
+    error = getattr(result, "error", None)
+    error_name = getattr(error, "name", None)
+    if (
+        success is False
+        and reference is not None
+        and isinstance(block_hash, str)
+        and bool(block_hash)
+        and isinstance(error_name, str)
+        and bool(error_name)
+    ):
+        # Only a named dispatch error tied to an included block proves the
+        # transaction did not apply. SDK failures can otherwise look identical.
         return SubmissionOutcome("rejected", reference, "chain_rejected")
     # A failure without an inclusion reference may be a pool rejection or a
     # lost subscription after the extrinsic entered the pool.

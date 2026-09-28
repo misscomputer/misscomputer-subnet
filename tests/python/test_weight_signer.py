@@ -12,7 +12,7 @@ from typing import Any
 
 import bittensor as bt
 import pytest
-from bittensor.result import ExtrinsicResult
+from bittensor.result import ChainError, ExtrinsicResult
 from test_weight_executor import (
     FIXED_TIME,
     MINER_A,
@@ -537,8 +537,32 @@ BLOCK_HASH = "0x" + "11" * 32
         ),
         (
             False,
-            ExtrinsicResult(False, "SettingWeightsTooFast", BLOCK_HASH, "1001-0004"),
+            ExtrinsicResult(
+                False,
+                "SettingWeightsTooFast",
+                BLOCK_HASH,
+                "1001-0004",
+                error=ChainError("SettingWeightsTooFast", "SettingWeightsTooFast"),
+            ),
             SubmissionOutcome("rejected", "1001-0004", "chain_rejected"),
+            1,
+        ),
+        (
+            False,
+            ExtrinsicResult(False, "No dispatch event", BLOCK_HASH, "1001-0005"),
+            SubmissionOutcome("ambiguous", None, "submission_not_included"),
+            1,
+        ),
+        (
+            False,
+            ExtrinsicResult(
+                False,
+                "SettingWeightsTooFast",
+                None,
+                "1001-0006",
+                error=ChainError("SettingWeightsTooFast", "SettingWeightsTooFast"),
+            ),
+            SubmissionOutcome("ambiguous", None, "submission_not_included"),
             1,
         ),
         (
@@ -553,6 +577,8 @@ BLOCK_HASH = "0x" + "11" * 32
         "commit-reveal-refused-before-signing",
         "transient-pool-failure-not-retried",
         "included-dispatch-failure",
+        "reference-without-dispatch-error",
+        "dispatch-error-without-block-hash",
         "success-without-reference",
     ],
 )

@@ -65,8 +65,8 @@ software isolation, not a hardware signer.
 | --- | --- | --- | --- |
 | success with inclusion reference (`<block>-<index>`) | `confirmed` | `confirmed` + reference | Weights included and finalized |
 | commit-reveal refused by the wrapped intent | `failed` / `definite_failure` | `rejected` `commit_reveal_unsupported` | Nothing was signed |
-| included, dispatch failed | `failed` / `definite_failure` (reference kept) | `rejected` `chain_rejected` | Definitively not applied |
-| failure without an inclusion reference (e.g. pool rejection) | `ambiguous` | `ambiguous` `submission_not_included` | Could have entered the pool; reconcile |
+| included, named dispatch error with block hash and reference | `failed` / `definite_failure` (reference kept) | `rejected` `chain_rejected` | Definitively not applied |
+| failure without all three proofs (e.g. pool rejection or missing dispatch event) | `ambiguous` | `ambiguous` `submission_not_included` | Could have entered the pool or applied; reconcile |
 | success without a reference | `ambiguous` | `ambiguous` `missing_extrinsic_reference` | Reconcile |
 | SDK exception (including SDK preflight errors such as rate limiting) | `ambiguous` | `ambiguous` `submission_exception` | Cannot prove the signing boundary; reconcile |
 | no answer within `--submission-timeout` | `ambiguous` | `ambiguous` `submission_timeout` | Reconcile |
@@ -116,11 +116,11 @@ able to read it:
 ```bash
 sudo install -d -m 0700 -o mc-weight-signer -g mc-weight-socket \
   /var/lib/misscomputer-weight-signer/wallets \
-  /var/lib/misscomputer-weight-signer/wallets/<wallet-name> \
-  /var/lib/misscomputer-weight-signer/wallets/<wallet-name>/hotkeys
+  '/var/lib/misscomputer-weight-signer/wallets/<wallet-name>' \
+  '/var/lib/misscomputer-weight-signer/wallets/<wallet-name>/hotkeys'
 sudo install -m 0600 -o mc-weight-signer -g mc-weight-socket \
-  /path/to/hotkeys/<hotkey-name> /path/to/hotkeys/<hotkey-name>pub.txt \
-  /var/lib/misscomputer-weight-signer/wallets/<wallet-name>/hotkeys/
+  '/path/to/hotkeys/<hotkey-name>' '/path/to/hotkeys/<hotkey-name>pub.txt' \
+  '/var/lib/misscomputer-weight-signer/wallets/<wallet-name>/hotkeys/'
 ```
 
 Install the package somewhere both accounts can execute but neither can
@@ -140,9 +140,9 @@ process.
 
    ```bash
    sudo install -m 0600 -o mc-weight-executor -g mc-weight-executor \
-     "$MC_BASE/plans/<window>.json" /var/lib/misscomputer-weight-executor/plans/<window>.json
+     "$MC_BASE/plans/<window>.json" '/var/lib/misscomputer-weight-executor/plans/<window>.json'
    sudo install -m 0600 -o mc-weight-signer -g mc-weight-socket \
-     "$MC_BASE/plans/<window>.json" /var/lib/misscomputer-weight-signer/plans/<window>.json
+     "$MC_BASE/plans/<window>.json" '/var/lib/misscomputer-weight-signer/plans/<window>.json'
    ```
 
 3. **Start the signer** (it waits up to `--accept-timeout` seconds, default
@@ -150,7 +150,7 @@ process.
 
    ```bash
    sudo -u mc-weight-signer /opt/misscomputer/bin/misscomputer-weight-signer \
-     --plan /var/lib/misscomputer-weight-signer/plans/<window>.json \
+     --plan '/var/lib/misscomputer-weight-signer/plans/<window>.json' \
      --audit-state /var/lib/misscomputer-weight-signer/ledger/audit.json \
      --socket /run/misscomputer-weight-signer/signer.sock \
      --socket-gid "$(getent group mc-weight-socket | cut -d: -f3)" \
@@ -174,7 +174,7 @@ process.
    sudo -u mc-weight-executor env \
      MISSCOMPUTER_WEIGHT_EXECUTION_ACK=I_ACKNOWLEDGE_THIS_SUBMITS_VALIDATOR_WEIGHTS \
      /opt/misscomputer/bin/misscomputer-weight-executor \
-     --plan /var/lib/misscomputer-weight-executor/plans/<window>.json \
+     --plan '/var/lib/misscomputer-weight-executor/plans/<window>.json' \
      --subtensor-network "$MC_NETWORK" --netuid "$MC_NETUID" \
      --rpc-endpoint 'wss://<rpc-provider-one>' \
      --rpc-endpoint 'wss://<rpc-provider-two>' \
