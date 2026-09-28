@@ -9,6 +9,27 @@ The software is licensed under `AGPL-3.0-only`. Operational secrets, central
 scoring policy and implementation, signer/executor operations, production host
 topology, cloud configuration, and private runbooks are intentionally absent.
 
+## Quickstart
+
+| Goal | Guide |
+| --- | --- |
+| Install and verify locally (no wallet or network needed) | [`docs/getting-started.md`](docs/getting-started.md) |
+| Handle wallets, TLS keys, and secrets safely | [`docs/keys-and-secrets.md`](docs/keys-and-secrets.md) |
+| Run a miner | [`docs/miner-quickstart.md`](docs/miner-quickstart.md) |
+| Run an independent validator | [`docs/validator-quickstart.md`](docs/validator-quickstart.md) |
+| Diagnose an error | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
+| Browse all documentation | [`docs/README.md`](docs/README.md) |
+
+```bash
+git clone https://github.com/misscomputer/misscomputer-subnet.git
+cd misscomputer-subnet
+python3.12 -m venv .venv && . .venv/bin/activate
+python -m pip install -e .
+go build -o build/miner-agent ./cmd/miner-agent   # miners only; needs Go 1.23
+```
+
+## Repository overview
+
 `cmd/miner-agent` is the miner's Go agent. The validator neuron verifies
 assignments and communicates with miners over the public synapse and bridge
 protocols. Scheduling, route assignment, edge serving, the customer CLI, and
