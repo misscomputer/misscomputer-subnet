@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 from contextlib import suppress
@@ -25,6 +26,7 @@ from test_weight_executor import (
     metagraph,
 )
 
+from misscomputer_subnet import chain_transport
 from misscomputer_subnet.chain import NeuronRecord
 from misscomputer_subnet.weight_executor import (
     AuditStateStore,
@@ -40,6 +42,7 @@ from misscomputer_subnet.weight_signer import (
     SignerConfig,
     SubmissionOutcome,
     WeightSignerError,
+    _sdk_submission_factory,
     require_separate_identity,
     run_weight_signer,
 )
@@ -461,9 +464,13 @@ def test_signer_identity_must_be_unprivileged_and_distinct() -> None:
 class OfflineSubstrate:
     """Transport double below the real SDK ``Client.execute`` and ``SetWeights`` code."""
 
-    def __init__(self, *, commit_reveal: bool, result: ExtrinsicResult) -> None:
+    def __init__(
+        self, *, commit_reveal: bool, result: ExtrinsicResult, rate_limit: int = 0
+    ) -> None:
         self.commit_reveal = commit_reveal
         self.result = result
+        self.rate_limit = rate_limit
+        self.submit_entered = False
         self.submitted: list[tuple[Any, dict[str, Any]]] = []
 
     async def connect(self) -> None:
@@ -487,8 +494,8 @@ class OfflineSubstrate:
         return {
             "Uids": 0,
             "CommitRevealWeightsEnabled": self.commit_reveal,
-            "WeightsSetRateLimit": 0,
-            "LastUpdate": [0],
+            "WeightsSetRateLimit": self.rate_limit,
+            "LastUpdate": [999],
             "MinAllowedWeights": 0,
             "MaxWeightsLimit": 65_535,
             "Tempo": 360,
@@ -506,6 +513,7 @@ class OfflineSubstrate:
         raise RuntimeError("fee estimation is unavailable offline")
 
     async def submit(self, call: Any, keypair: Any, **options: Any) -> ExtrinsicResult:
+        self.submit_entered = True
         del keypair
         self.submitted.append((call, options))
         return self.result
@@ -620,3 +628,88 @@ async def test_sdk_submission_classifies_effect_through_real_execute(
         assert call.params["dests"] == [1, 2]
         assert call.params["version_key"] == 2
         assert options["wait_for_finalization"] is True
+
+
+async def test_sdk_rate_limit_is_definite_before_substrate_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wallet = bt.Wallet("validator", "hot", path=str(tmp_path))
+    wallet.create_new_hotkey(suppress=True)
+    keypair = wallet.hotkey
+    substrates: list[OfflineSubstrate] = []
+
+    class OfflineTransport(OfflineSubstrate):
+        def __init__(self, endpoint: str, *, pinned: bool) -> None:
+            assert endpoint == "finney" and pinned
+            super().__init__(
+                commit_reveal=False,
+                result=ExtrinsicResult(True, "Success", BLOCK_HASH, "1001-0003"),
+                rate_limit=10,
+            )
+            substrates.append(self)
+
+    monkeypatch.setattr(chain_transport, "_OwnedRpcSubstrate", OfflineTransport)
+    args = argparse.Namespace(
+        submit_endpoint=None,
+        subtensor_network="finney",
+        wallet_path=str(tmp_path),
+        wallet_name="validator",
+        wallet_hotkey="hot",
+    )
+    submission = _sdk_submission_factory(args)(make_plan())
+    vector = ExecutionVector(
+        plan_digest_sha256="a" * 64,
+        network="finney",
+        netuid=24,
+        validator_hotkey=keypair.ss58_address,
+        version_key=2,
+        weights=(ExecutionWeight("miner-a", 1, 1, 0.4), ExecutionWeight("miner-b", 2, 2, 0.6)),
+        omitted=(),
+    )
+    await submission.open()
+    try:
+        assert await submission.submit(vector) == SubmissionOutcome(
+            "rejected", error_code="submission_preflight_failed"
+        )
+    finally:
+        await submission.close()
+    assert len(substrates) == 1
+    assert substrates[0].submit_entered is False
+    assert substrates[0].submitted == []
+
+
+@pytest.mark.parametrize("fault", ["mismatched_public", "missing_private"])
+async def test_sdk_wallet_checks_signing_key_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    wallet = bt.Wallet("validator", "hot", path=str(tmp_path))
+    wallet.create_new_hotkey(suppress=True)
+    expected = wallet.hotkey.ss58_address
+    if fault == "mismatched_public":
+        other = bt.sp_core.Keypair.create_from_uri("//Bob")
+        wallet.hotkeypub_file.set_keypair(other, encrypt=False, overwrite=True)
+    else:
+        await asyncio.to_thread(os.unlink, wallet.hotkey_file.path)
+
+    class OfflineClient:
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(bt, "Client", lambda *_args, **_kwargs: OfflineClient())
+    args = argparse.Namespace(
+        submit_endpoint=None,
+        subtensor_network="finney",
+        wallet_path=str(tmp_path),
+        wallet_name="validator",
+        wallet_hotkey="hot",
+    )
+    submission = _sdk_submission_factory(args)(make_plan())
+    with pytest.raises((WeightSignerError, FileNotFoundError)) as refused:
+        await submission.open()
+    if fault == "mismatched_public":
+        assert isinstance(refused.value, WeightSignerError)
+        assert refused.value.code == "signer_hotkey_mismatch"
+    assert submission.hotkey != expected

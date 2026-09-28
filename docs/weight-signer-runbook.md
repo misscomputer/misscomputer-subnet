@@ -54,6 +54,11 @@ What the signer enforces:
   `wait_for_inclusion=True`, `wait_for_finalization=True` over a pinned
   endpoint without transport fallbacks. The intent is wrapped so that a build
   that selects a timelocked commit-reveal extrinsic fails before any signing.
+  Before the send marker, the signer loads the actual private hotkey and checks
+  that any public hotkey file matches it. An SDK error before entering its
+  substrate submit boundary is a definite pre-submission failure; errors after
+  that boundary remain ambiguous unless an included dispatch error proves
+  rejection.
 
 What it does not protect against: root on the host, the signer's own OS user,
 or replacement of the installed package, unit, or configuration. It is
@@ -68,7 +73,8 @@ software isolation, not a hardware signer.
 | included, named dispatch error with block hash and reference | `failed` / `definite_failure` (reference kept) | `rejected` `chain_rejected` | Definitively not applied |
 | failure without all three proofs (e.g. pool rejection or missing dispatch event) | `ambiguous` | `ambiguous` `submission_not_included` | Could have entered the pool or applied; reconcile |
 | success without a reference | `ambiguous` | `ambiguous` `missing_extrinsic_reference` | Reconcile |
-| SDK exception (including SDK preflight errors such as rate limiting) | `ambiguous` | `ambiguous` `submission_exception` | Cannot prove the signing boundary; reconcile |
+| SDK preflight exception before substrate submit (including rate limiting) | `failed` / `definite_failure` | `rejected` `submission_preflight_failed` | No extrinsic was attempted; the plan is still replay-blocked |
+| SDK exception after substrate submit begins | `ambiguous` | `ambiguous` `submission_exception` | Effect cannot be ruled out; reconcile |
 | no answer within `--submission-timeout` | `ambiguous` | `ambiguous` `submission_timeout` | Reconcile |
 
 Failures before the `submission_started` marker (wallet unavailable, hotkey

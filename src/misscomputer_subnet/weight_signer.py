@@ -218,6 +218,7 @@ class BittensorWeightSubmission:
         version_key: int,
         wallet_factory: Callable[[], tuple[Any, str]],
         client_factory: Callable[[], Any],
+        submit_entered: Callable[[], bool] | None = None,
         intent_type: Callable[[], type[Any]] = _plaintext_set_weights_type,
     ) -> None:
         self.netuid = netuid
@@ -225,6 +226,7 @@ class BittensorWeightSubmission:
         self.hotkey = ""
         self._wallet_factory = wallet_factory
         self._client_factory = client_factory
+        self._submit_entered = submit_entered
         self._intent_type = intent_type
         self._wallet: Any = None
         self._client: Any = None
@@ -274,8 +276,11 @@ class BittensorWeightSubmission:
             # resolves a signer: nothing was signed or submitted.
             return SubmissionOutcome("rejected", error_code="commit_reveal_unsupported")
         except Exception:
-            # An SDK preflight failure cannot be distinguished from a failure
-            # after signing by the exception alone.
+            # The production substrate records entry before nonce resolution,
+            # signing, or RPC submission. An exception before that boundary
+            # proves that the SDK never attempted an extrinsic.
+            if self._submit_entered is not None and not self._submit_entered():
+                return SubmissionOutcome("rejected", error_code="submission_preflight_failed")
             return SubmissionOutcome("ambiguous", error_code="submission_exception")
         return classify_extrinsic_result(result)
 
@@ -748,6 +753,8 @@ async def _serve(
         try:
             submission = resources.submission = submission_factory(plan)
             await submission.open()
+        except WeightSignerError:
+            raise
         except Exception as exc:
             raise WeightSignerError("submission_unavailable", "signing is unavailable") from exc
         if submission.hotkey != config.validator_hotkey:
@@ -910,22 +917,41 @@ def _sdk_submission_factory(
         import bittensor as bt
 
         wallet = bt.Wallet(args.wallet_name, args.wallet_hotkey, path=wallet_path)
-        return wallet, str(bt.resolve_signer(wallet, role="hotkey").ss58_address)
+        # The SDK's public signer view reads hotkeypub.txt, but SetWeights.build
+        # and signing use wallet.hotkey. Load the actual private key now, before
+        # the durable send marker, and pin that exact keypair in the wallet.
+        hotkey = wallet.hotkey
+        try:
+            public_hotkey = wallet.hotkeypub
+        except FileNotFoundError:
+            pass  # Legacy hotkey-only wallets remain supported.
+        else:
+            if public_hotkey.ss58_address != hotkey.ss58_address:
+                raise WeightSignerError(
+                    "signer_hotkey_mismatch", "public and private hotkey files disagree"
+                )
+        return wallet, str(hotkey.ss58_address)
 
-    def client_factory() -> Any:
+    def factory(plan: WeightPlan) -> WeightSubmission:
         import bittensor as bt
 
         from .chain_transport import _OwnedRpcSubstrate
 
-        # Pinned: no transport fallback endpoint may receive the extrinsic.
-        return bt.Client(endpoint, substrate=_OwnedRpcSubstrate(endpoint, pinned=True))
+        class TrackedSubmitSubstrate(_OwnedRpcSubstrate):
+            submit_entered = False
 
-    def factory(plan: WeightPlan) -> WeightSubmission:
+            async def submit(self, call: Any, keypair: Any, **options: Any) -> Any:
+                self.submit_entered = True
+                return await super().submit(call, keypair, **options)
+
+        # Pinned: no transport fallback endpoint may receive the extrinsic.
+        substrate = TrackedSubmitSubstrate(endpoint, pinned=True)
         return BittensorWeightSubmission(
             netuid=plan.netuid,
             version_key=plan.version_key,
             wallet_factory=wallet_factory,
-            client_factory=client_factory,
+            client_factory=lambda: bt.Client(endpoint, substrate=substrate),
+            submit_entered=lambda: substrate.submit_entered,
         )
 
     return factory
