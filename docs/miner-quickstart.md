@@ -91,11 +91,11 @@ each placeholder:
 
 ```bash
 export MC_NETWORK=finney                 # SDK network name: finney (mainnet) or test
-export MC_NETUID=<NETUID>                # the subnet netuid from official announcements
-export MC_WALLET=<wallet-name>
-export MC_HOTKEY=<hotkey-name>
-export MC_HOTKEY_SS58=<hotkey-ss58-address>
-export MC_PUBLIC_IP=<public-numeric-ip>
+export MC_NETUID='<NETUID>'                # the subnet netuid from official announcements
+export MC_WALLET='<wallet-name>'
+export MC_HOTKEY='<hotkey-name>'
+export MC_HOTKEY_SS58='<hotkey-ss58-address>'
+export MC_PUBLIC_IP='<public-numeric-ip>'
 export MC_AXON_PORT=8091
 export MC_REPO=/path/to/misscomputer-subnet
 ```
@@ -117,7 +117,7 @@ Then read your UID back with the
 `btcli subnets show --netuid "$MC_NETUID" --network "$MC_NETWORK"`, and set:
 
 ```bash
-export MC_UID=<your-uid>
+export MC_UID='<your-uid>'
 ```
 
 Copy only the hotkey to the server as described in
@@ -165,7 +165,7 @@ restart the miner and require a fresh validator capability handshake
 Save the pin; the Go agent needs it:
 
 ```bash
-export MC_TLS_SHA256=<leaf sha256 from the output>
+export MC_TLS_SHA256='<leaf-sha256-from-the-output>'
 ```
 
 You can print it again at any time with
@@ -362,8 +362,9 @@ development, not for receiving live assignments.
 
 ## Running as services (example)
 
-Any supervisor works. A minimal systemd sketch; adjust paths, and keep the S3
-variables in a root-owned mode-`0600` `EnvironmentFile`:
+Any supervisor works. A minimal systemd sketch; replace every placeholder and
+adjust paths before enabling it. Keep the S3 variables in a root-owned
+mode-`0600` `EnvironmentFile`:
 
 ```ini
 # /etc/systemd/system/misscomputer-miner-agent.service

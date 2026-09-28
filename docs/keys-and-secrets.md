@@ -50,8 +50,8 @@ environment). Commands below were checked against `btcli` 9.23; confirm with
 `btcli <command> --help` for your version.
 
 ```bash
-btcli wallet new-coldkey --wallet-name <wallet-name>
-btcli wallet new-hotkey --wallet-name <wallet-name> --hotkey <hotkey-name>
+btcli wallet new-coldkey --wallet-name '<wallet-name>'
+btcli wallet new-hotkey --wallet-name '<wallet-name>' --hotkey '<hotkey-name>'
 ```
 
 Write the mnemonics down offline. Then copy only the hotkey to the server,

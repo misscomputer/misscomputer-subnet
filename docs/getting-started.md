@@ -1,9 +1,9 @@
 # Getting started
 
-This page gets a fresh machine from `git clone` to a verified local install.
-Everything here runs locally; nothing on this page registers a key, spends
-TAO, or sends a transaction. Role-specific steps continue in the
-[miner quickstart](miner-quickstart.md) and the
+This page gets a fresh machine from `git clone` to a verified install.
+The optional chain check reads a public network; nothing on this page
+registers a key, spends TAO, or sends a transaction. Role-specific steps
+continue in the [miner quickstart](miner-quickstart.md) and the
 [validator quickstart](validator-quickstart.md).
 
 ## What runs where

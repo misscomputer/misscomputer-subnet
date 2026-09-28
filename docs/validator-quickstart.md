@@ -102,8 +102,8 @@ All tests should pass.
 ## Step 1: register (live transactions)
 
 ```bash
-btcli subnets register --netuid <NETUID> --network finney \
-  --wallet-name <wallet-name> --hotkey <hotkey-name>
+btcli subnets register --netuid '<NETUID>' --network finney \
+  --wallet-name '<wallet-name>' --hotkey '<hotkey-name>'
 ```
 
 Add stake per your own policy with `btcli`, then confirm with the
@@ -115,10 +115,10 @@ to the server.
 
 ```bash
 export MC_NETWORK=finney
-export MC_NETUID=<NETUID>
-export MC_WALLET=<wallet-name>
-export MC_HOTKEY=<hotkey-name>
-export MC_HOTKEY_SS58=<hotkey-ss58-address>
+export MC_NETUID='<NETUID>'
+export MC_WALLET='<wallet-name>'
+export MC_HOTKEY='<hotkey-name>'
+export MC_HOTKEY_SS58='<hotkey-ss58-address>'
 export MC_BASE=/srv/misscomputer-validator
 ```
 
@@ -155,7 +155,7 @@ same place as the file:
 
 ```bash
 install -m 0600 /path/to/received/trust-policy.json "$MC_BASE/probe/trust-policy.json"
-export MC_POLICY_SHA256=<independently-obtained-sha256>
+export MC_POLICY_SHA256='<independently-obtained-sha256>'
 echo "$MC_POLICY_SHA256  $MC_BASE/probe/trust-policy.json" | sha256sum -c -
 ```
 
@@ -187,7 +187,7 @@ Take your finalized height from your own node or RPC (for example the
 reports `finalized=True`):
 
 ```bash
-export MC_FINALIZED_HEIGHT=<validator-finalized-block-height>
+export MC_FINALIZED_HEIGHT='<validator-finalized-block-height>'
 EPOCH=$(( $(date +%s) / 300 ))
 
 misscomputer-assignment-probe \
