@@ -32,7 +32,9 @@ phase, RPC count, and public heights only.
 
 Run the evidence tool as the OS account that owns the selected mode-0600
 ledger. Inspect the executor and signer ledgers separately; agreement between
-their reports is useful evidence but does not merge their histories.
+their reports is useful evidence but does not merge their histories. The
+public `misscomputer-weight-signer` writes the same ledger format (see
+[weight-signer-runbook.md](weight-signer-runbook.md)).
 
 ```bash
 misscomputer-weight-reconcile \

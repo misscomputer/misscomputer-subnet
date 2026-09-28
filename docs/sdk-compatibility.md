@@ -57,9 +57,14 @@ neurons and the shared chain query adapter. The live query adapter has no public
 former ordinary daemon call path
 `adapter.client.execute(SetWeights(...), adapter.wallet)`. The wallet-free
 executor can send only one canonical digest request over a peer-UID-pinned Unix
-socket. The separately privileged one-shot signer independently reloads the
-plan, derives the current vector, checks both digests, and constructs its wallet
-and client only after its own durable in-progress receipt.
+socket. The separately privileged one-shot signer
+(`misscomputer_subnet.weight_signer`, console script
+`misscomputer-weight-signer`) independently reloads the plan, derives the
+current vector, checks both digests, and constructs its wallet and client only
+after its own durable in-progress receipt. It submits through a client whose
+transport is pinned to one endpoint without fallbacks, and classifies a failed
+result without an inclusion reference as ambiguous rather than rejected,
+because a lost subscription and a pool rejection are indistinguishable there.
 
 The inspected v11.1 `SetWeights` intent preflights registration and rate limit,
 conforms the supplied relative vector to current subnet min-count/max-weight
