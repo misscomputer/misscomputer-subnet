@@ -1,0 +1,273 @@
+{
+  "$defs": {
+    "TrustedManifestKey": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "ed25519",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "key_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+          "title": "Key Id",
+          "type": "string"
+        },
+        "public_key_base64": {
+          "maxLength": 44,
+          "minLength": 44,
+          "title": "Public Key Base64",
+          "type": "string"
+        },
+        "public_key_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Public Key Sha256",
+          "type": "string"
+        },
+        "purposes": {
+          "items": {
+            "const": "active_assignment_manifest_publication_v1",
+            "type": "string"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "title": "Purposes",
+          "type": "array"
+        },
+        "revoked_at_epoch": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Revoked At Epoch"
+        },
+        "roles": {
+          "items": {
+            "enum": [
+              "assignment_auditor",
+              "assignment_issuer",
+              "assignment_security"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Roles",
+          "type": "array"
+        },
+        "valid_from_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid From Epoch",
+          "type": "integer"
+        },
+        "valid_until_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid Until Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key_id",
+        "algorithm",
+        "public_key_base64",
+        "public_key_sha256",
+        "roles",
+        "purposes",
+        "valid_from_epoch",
+        "valid_until_epoch",
+        "revoked_at_epoch"
+      ],
+      "title": "TrustedManifestKey",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Validator-local pin of the central manifest authority and probe bounds.",
+  "properties": {
+    "allowed_route_host_suffixes": {
+      "items": {
+        "maxLength": 253,
+        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+        "type": "string"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "title": "Allowed Route Host Suffixes",
+      "type": "array"
+    },
+    "central_authority_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Central Authority Fingerprint Sha256",
+      "type": "string"
+    },
+    "max_finalized_height_gap": {
+      "maximum": 1000000,
+      "minimum": 1,
+      "title": "Max Finalized Height Gap",
+      "type": "integer"
+    },
+    "max_future_skew_seconds": {
+      "maximum": 300,
+      "minimum": 0,
+      "title": "Max Future Skew Seconds",
+      "type": "integer"
+    },
+    "max_manifest_age_seconds": {
+      "maximum": 86400,
+      "minimum": 1,
+      "title": "Max Manifest Age Seconds",
+      "type": "integer"
+    },
+    "max_manifest_lifetime_seconds": {
+      "maximum": 86400,
+      "minimum": 1,
+      "title": "Max Manifest Lifetime Seconds",
+      "type": "integer"
+    },
+    "max_response_bytes": {
+      "maximum": 1048576,
+      "minimum": 64,
+      "title": "Max Response Bytes",
+      "type": "integer"
+    },
+    "max_sequence_gap": {
+      "maximum": 64,
+      "minimum": 1,
+      "title": "Max Sequence Gap",
+      "type": "integer"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "pinned_edge_leaf_certificate_sha256": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "maxItems": 16,
+      "title": "Pinned Edge Leaf Certificate Sha256",
+      "type": "array"
+    },
+    "policy_id": {
+      "const": "miss-computer-active-assignment-manifest-trust-v1",
+      "title": "Policy Id",
+      "type": "string"
+    },
+    "probe_scheme": {
+      "const": "https",
+      "title": "Probe Scheme",
+      "type": "string"
+    },
+    "probe_timeout_millis": {
+      "maximum": 60000,
+      "minimum": 100,
+      "title": "Probe Timeout Millis",
+      "type": "integer"
+    },
+    "purpose": {
+      "const": "active_assignment_manifest_publication_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "required_roles": {
+      "items": {
+        "enum": [
+          "assignment_auditor",
+          "assignment_issuer",
+          "assignment_security"
+        ],
+        "type": "string"
+      },
+      "maxItems": 3,
+      "minItems": 1,
+      "title": "Required Roles",
+      "type": "array"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/assignment-manifest-trust-policy",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "threshold": {
+      "maximum": 16,
+      "minimum": 1,
+      "title": "Threshold",
+      "type": "integer"
+    },
+    "trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Trust Policy Digest Sha256",
+      "type": "string"
+    },
+    "trusted_keys": {
+      "items": {
+        "$ref": "#/$defs/TrustedManifestKey"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "title": "Trusted Keys",
+      "type": "array"
+    },
+    "valid_from_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Valid From Epoch",
+      "type": "integer"
+    },
+    "valid_until_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Valid Until Epoch",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "policy_id",
+    "purpose",
+    "network",
+    "netuid",
+    "central_authority_fingerprint_sha256",
+    "threshold",
+    "required_roles",
+    "trusted_keys",
+    "valid_from_epoch",
+    "valid_until_epoch",
+    "max_manifest_age_seconds",
+    "max_future_skew_seconds",
+    "max_manifest_lifetime_seconds",
+    "max_sequence_gap",
+    "max_finalized_height_gap",
+    "allowed_route_host_suffixes",
+    "probe_scheme",
+    "probe_timeout_millis",
+    "max_response_bytes",
+    "pinned_edge_leaf_certificate_sha256",
+    "trust_policy_digest_sha256"
+  ],
+  "title": "AssignmentManifestTrustPolicy",
+  "type": "object"
+}

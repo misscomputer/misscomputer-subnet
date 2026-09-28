@@ -1,0 +1,64 @@
+{
+  "additionalProperties": false,
+  "description": "The exact object the validator Go service key signs for one edge request.\n\n``path`` is the raw (escaped) application path after\n``/runtime/<endpoint_id>``; ``query`` is the raw query without ``?``.",
+  "properties": {
+    "body_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Body Sha256",
+      "type": "string"
+    },
+    "endpoint_id": {
+      "maxLength": 320,
+      "minLength": 3,
+      "title": "Endpoint Id",
+      "type": "string"
+    },
+    "method": {
+      "enum": [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS"
+      ],
+      "title": "Method",
+      "type": "string"
+    },
+    "nonce": {
+      "pattern": "^[0-9a-f]{32}$",
+      "title": "Nonce",
+      "type": "string"
+    },
+    "path": {
+      "maxLength": 8192,
+      "pattern": "^/[\\x21-\\x7e]*$",
+      "title": "Path",
+      "type": "string"
+    },
+    "query": {
+      "maxLength": 8192,
+      "pattern": "^[\\x21-\\x7e]*$",
+      "title": "Query",
+      "type": "string"
+    },
+    "timestamp": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Timestamp",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "body_sha256",
+    "endpoint_id",
+    "method",
+    "nonce",
+    "path",
+    "query",
+    "timestamp"
+  ],
+  "title": "EdgeRuntimeRequest",
+  "type": "object"
+}

@@ -1,0 +1,428 @@
+{
+  "$defs": {
+    "FraudEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "observation_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "endpoint_id",
+        "observation_digest_sha256"
+      ],
+      "title": "FraudEvidence",
+      "type": "object"
+    },
+    "MinerAvailability": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_denominator": {
+          "minimum": 1,
+          "title": "Availability Denominator",
+          "type": "integer"
+        },
+        "availability_numerator": {
+          "minimum": 0,
+          "title": "Availability Numerator",
+          "type": "integer"
+        },
+        "eligible_endpoint_epochs": {
+          "maximum": 66060288,
+          "minimum": 1,
+          "title": "Eligible Endpoint Epochs",
+          "type": "integer"
+        },
+        "fraudulent_attestations": {
+          "minimum": 0,
+          "title": "Fraudulent Attestations",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "eligible_endpoint_epochs",
+        "availability_numerator",
+        "availability_denominator",
+        "fraudulent_attestations"
+      ],
+      "title": "MinerAvailability",
+      "type": "object"
+    },
+    "MinerScoreRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_denominator": {
+          "minimum": 1,
+          "title": "Availability Denominator",
+          "type": "integer"
+        },
+        "availability_numerator": {
+          "minimum": 0,
+          "title": "Availability Numerator",
+          "type": "integer"
+        },
+        "canonical_score_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Canonical Score Ppm",
+          "type": "integer"
+        },
+        "eligibility_status": {
+          "enum": [
+            "eligible",
+            "ineligible"
+          ],
+          "title": "Eligibility Status",
+          "type": "string"
+        },
+        "eligible_endpoint_epochs": {
+          "minimum": 1,
+          "title": "Eligible Endpoint Epochs",
+          "type": "integer"
+        },
+        "fraudulent_attestations": {
+          "minimum": 0,
+          "title": "Fraudulent Attestations",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "reason_codes": {
+          "items": {
+            "enum": [
+              "attestation_fraud",
+              "eligible"
+            ],
+            "type": "string"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "title": "Reason Codes",
+          "type": "array"
+        },
+        "record_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Record Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "eligibility_status",
+        "reason_codes",
+        "eligible_endpoint_epochs",
+        "availability_numerator",
+        "availability_denominator",
+        "fraudulent_attestations",
+        "canonical_score_ppm",
+        "record_digest_sha256"
+      ],
+      "title": "MinerScoreRecord",
+      "type": "object"
+    },
+    "OrganicAvailabilityScore": {
+      "additionalProperties": false,
+      "description": "``organic-availability-score`` v1: per-miner availability over a window of epochs.",
+      "properties": {
+        "abstained_epochs": {
+          "items": {
+            "maximum": 4611686018427387904,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2016,
+          "title": "Abstained Epochs",
+          "type": "array"
+        },
+        "epoch_indexes": {
+          "items": {
+            "maximum": 4611686018427387904,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2016,
+          "minItems": 1,
+          "title": "Epoch Indexes",
+          "type": "array"
+        },
+        "epoch_score_digests": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "maxItems": 2016,
+          "minItems": 1,
+          "title": "Epoch Score Digests",
+          "type": "array"
+        },
+        "epoch_seconds": {
+          "maximum": 3600,
+          "minimum": 60,
+          "title": "Epoch Seconds",
+          "type": "integer"
+        },
+        "fraud_evidence": {
+          "items": {
+            "$ref": "#/$defs/FraudEvidence"
+          },
+          "maxItems": 524288,
+          "title": "Fraud Evidence",
+          "type": "array"
+        },
+        "miners": {
+          "items": {
+            "$ref": "#/$defs/MinerAvailability"
+          },
+          "maxItems": 32768,
+          "title": "Miners",
+          "type": "array"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "const": "finney",
+          "title": "Network",
+          "type": "string"
+        },
+        "purpose": {
+          "const": "organic_availability_scoring_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/organic-availability-score",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "score_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Score Digest Sha256",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "purpose",
+        "network",
+        "netuid",
+        "validator_hotkey",
+        "epoch_seconds",
+        "epoch_indexes",
+        "epoch_score_digests",
+        "abstained_epochs",
+        "miners",
+        "fraud_evidence",
+        "score_digest_sha256"
+      ],
+      "title": "OrganicAvailabilityScore",
+      "type": "object"
+    },
+    "OrganicScoringPolicy": {
+      "additionalProperties": false,
+      "description": "The central scoring parameters a checkpoint trust policy pins by digest.",
+      "properties": {
+        "epoch_seconds": {
+          "maximum": 3600,
+          "minimum": 60,
+          "title": "Epoch Seconds",
+          "type": "integer"
+        },
+        "fraud_disposition": {
+          "const": "ineligible",
+          "title": "Fraud Disposition",
+          "type": "string"
+        },
+        "min_attempts": {
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Min Attempts",
+          "type": "integer"
+        },
+        "probes_per_endpoint": {
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Probes Per Endpoint",
+          "type": "integer"
+        },
+        "purpose": {
+          "const": "organic_availability_scoring_v1",
+          "title": "Purpose",
+          "type": "string"
+        }
+      },
+      "required": [
+        "purpose",
+        "epoch_seconds",
+        "probes_per_endpoint",
+        "min_attempts",
+        "fraud_disposition"
+      ],
+      "title": "OrganicScoringPolicy",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "``organic-central-score-report`` v1: the central validator's sealed availability.",
+  "properties": {
+    "availability_score": {
+      "$ref": "#/$defs/OrganicAvailabilityScore"
+    },
+    "central_authority_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Central Authority Fingerprint Sha256",
+      "type": "string"
+    },
+    "eligible_miner_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Eligible Miner Count",
+      "type": "integer"
+    },
+    "finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Finalized Block Hash",
+      "type": "string"
+    },
+    "finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Height",
+      "type": "integer"
+    },
+    "ineligible_miner_count": {
+      "maximum": 4096,
+      "minimum": 0,
+      "title": "Ineligible Miner Count",
+      "type": "integer"
+    },
+    "input_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "miner_scores": {
+      "items": {
+        "$ref": "#/$defs/MinerScoreRecord"
+      },
+      "maxItems": 4096,
+      "title": "Miner Scores",
+      "type": "array"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Policy Digest Sha256",
+      "type": "string"
+    },
+    "report_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Report Digest Sha256",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/organic-central-score-report",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "score_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Score Vector Digest Sha256",
+      "type": "string"
+    },
+    "scoring_policy": {
+      "$ref": "#/$defs/OrganicScoringPolicy"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "policy_digest_sha256",
+    "scoring_policy",
+    "input_snapshot_digest_sha256",
+    "central_authority_fingerprint_sha256",
+    "network",
+    "netuid",
+    "finalized_height",
+    "finalized_block_hash",
+    "availability_score",
+    "eligible_miner_count",
+    "ineligible_miner_count",
+    "miner_scores",
+    "score_vector_digest_sha256",
+    "report_digest_sha256"
+  ],
+  "title": "CanonicalScoreReport",
+  "type": "object"
+}

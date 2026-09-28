@@ -1,0 +1,214 @@
+{
+  "$defs": {
+    "RelayWeightEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "source_canonical_score_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Source Canonical Score Ppm",
+          "type": "integer"
+        },
+        "source_eligibility_status": {
+          "enum": [
+            "eligible",
+            "ineligible"
+          ],
+          "title": "Source Eligibility Status",
+          "type": "string"
+        },
+        "weight_u16": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Weight U16",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "source_eligibility_status",
+        "source_canonical_score_ppm",
+        "weight_u16"
+      ],
+      "title": "RelayWeightEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "canonical_score_report_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Canonical Score Report Digest Sha256",
+      "type": "string"
+    },
+    "checkpoint_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Checkpoint Digest Sha256",
+      "type": "string"
+    },
+    "expires_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Expires At Epoch",
+      "type": "integer"
+    },
+    "finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Finalized Block Hash",
+      "type": "string"
+    },
+    "finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Epoch",
+      "type": "integer"
+    },
+    "finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Height",
+      "type": "integer"
+    },
+    "input_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "metagraph_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Metagraph Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "next_chain_state_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Next Chain State Digest Sha256",
+      "type": "string"
+    },
+    "normalization_algorithm": {
+      "const": "largest_remainder_score_ppm_to_u16_v1",
+      "title": "Normalization Algorithm",
+      "type": "string"
+    },
+    "plan_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Plan Digest Sha256",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "external_validator_weight_relay_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/external-validator-score-relay-plan",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "score_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Score Vector Digest Sha256",
+      "type": "string"
+    },
+    "validator_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Validator Hotkey",
+      "type": "string"
+    },
+    "validator_uid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Validator Uid",
+      "type": "integer"
+    },
+    "verification_input_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Verification Input Digest Sha256",
+      "type": "string"
+    },
+    "verification_report_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Verification Report Digest Sha256",
+      "type": "string"
+    },
+    "weight_domain": {
+      "const": "weight-plan.v1/u16-normalized",
+      "title": "Weight Domain",
+      "type": "string"
+    },
+    "weight_total_u16": {
+      "const": 65535,
+      "title": "Weight Total U16",
+      "type": "integer"
+    },
+    "weight_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Weight Vector Digest Sha256",
+      "type": "string"
+    },
+    "weights": {
+      "items": {
+        "$ref": "#/$defs/RelayWeightEntry"
+      },
+      "maxItems": 4096,
+      "minItems": 1,
+      "title": "Weights",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "validator_uid",
+    "validator_hotkey",
+    "finalized_height",
+    "finalized_block_hash",
+    "finalized_epoch",
+    "expires_at_epoch",
+    "checkpoint_digest_sha256",
+    "canonical_score_report_digest_sha256",
+    "input_snapshot_digest_sha256",
+    "score_vector_digest_sha256",
+    "metagraph_snapshot_digest_sha256",
+    "verification_input_digest_sha256",
+    "verification_report_digest_sha256",
+    "next_chain_state_digest_sha256",
+    "weight_domain",
+    "normalization_algorithm",
+    "weight_total_u16",
+    "weights",
+    "weight_vector_digest_sha256",
+    "plan_digest_sha256"
+  ],
+  "title": "ExternalValidatorRelayPlan",
+  "type": "object"
+}

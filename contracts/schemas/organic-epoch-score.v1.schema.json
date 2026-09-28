@@ -1,0 +1,719 @@
+{
+  "$defs": {
+    "EndpointEpochTally": {
+      "additionalProperties": false,
+      "properties": {
+        "application_failures": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Application Failures",
+          "type": "integer"
+        },
+        "attempts": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "availability_denominator": {
+          "anyOf": [
+            {
+              "maximum": 524288,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Availability Denominator"
+        },
+        "availability_numerator": {
+          "anyOf": [
+            {
+              "maximum": 524288,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Availability Numerator"
+        },
+        "corroborating_requests": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Corroborating Requests",
+          "type": "integer"
+        },
+        "corroborating_windows": {
+          "maximum": 64,
+          "minimum": 0,
+          "title": "Corroborating Windows",
+          "type": "integer"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "disposition": {
+          "enum": [
+            "abstain_insufficient_attempts",
+            "eligible",
+            "excluded_app_inconclusive",
+            "excluded_common_mode"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "fraudulent_attestations": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Fraudulent Attestations",
+          "type": "integer"
+        },
+        "miner_failures": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Miner Failures",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "path_failures": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Path Failures",
+          "type": "integer"
+        },
+        "successes": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Successes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deployment_id",
+        "endpoint_id",
+        "miner_uid",
+        "miner_hotkey",
+        "attempts",
+        "successes",
+        "application_failures",
+        "miner_failures",
+        "path_failures",
+        "fraudulent_attestations",
+        "disposition",
+        "availability_numerator",
+        "availability_denominator",
+        "corroborating_windows",
+        "corroborating_requests"
+      ],
+      "title": "EndpointEpochTally",
+      "type": "object"
+    },
+    "FraudEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "observation_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "endpoint_id",
+        "observation_digest_sha256"
+      ],
+      "title": "FraudEvidence",
+      "type": "object"
+    },
+    "MinerProbeAttestationV2": {
+      "additionalProperties": false,
+      "description": "Miner service-key statement for one validator probe of one organic endpoint.",
+      "properties": {
+        "artifact_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Artifact Digest",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "observed_at": {
+          "maxLength": 64,
+          "title": "Observed At",
+          "type": "string"
+        },
+        "probe_nonce": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Probe Nonce",
+          "type": "string"
+        },
+        "request_method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "title": "Request Method",
+          "type": "string"
+        },
+        "request_path": {
+          "maxLength": 1024,
+          "pattern": "^/(?:[\\x21\\x22\\x24-\\x2e\\x30-\\x3e\\x40-\\x7e][\\x21\\x22\\x24-\\x3e\\x40-\\x7e]*)?$",
+          "title": "Request Path",
+          "type": "string"
+        },
+        "response_body_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Response Body Sha256",
+          "type": "string"
+        },
+        "response_header_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Response Header Sha256",
+          "type": "string"
+        },
+        "response_status": {
+          "maximum": 599,
+          "minimum": 100,
+          "title": "Response Status",
+          "type": "integer"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/miner-probe-attestation",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "signature_hex": {
+          "pattern": "^[0-9a-f]{128}$",
+          "title": "Signature Hex",
+          "type": "string"
+        },
+        "ticket_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Ticket Digest",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "endpoint_id",
+        "generation",
+        "ticket_digest",
+        "artifact_digest",
+        "validator_hotkey",
+        "probe_nonce",
+        "request_method",
+        "request_path",
+        "response_status",
+        "response_body_sha256",
+        "response_header_sha256",
+        "observed_at",
+        "signature_hex"
+      ],
+      "title": "MinerProbeAttestationV2",
+      "type": "object"
+    },
+    "OrganicProbeObservation": {
+      "additionalProperties": false,
+      "description": "One sealed attempted probe of one published organic endpoint incarnation.",
+      "properties": {
+        "assignment_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assignment Digest Sha256",
+          "type": "string"
+        },
+        "attestation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MinerProbeAttestationV2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attestation_status": {
+          "enum": [
+            "fraudulent",
+            "not_presented",
+            "rejected",
+            "verified"
+          ],
+          "title": "Attestation Status",
+          "type": "string"
+        },
+        "attribution": {
+          "enum": [
+            "application",
+            "miner",
+            "none",
+            "path"
+          ],
+          "title": "Attribution",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "failure_code": {
+          "anyOf": [
+            {
+              "enum": [
+                "attestation_fraud",
+                "attestation_invalid",
+                "attestation_missing",
+                "connection_failed",
+                "edge_generated",
+                "marker_missing",
+                "response_oversized",
+                "timeout",
+                "tls_certificate_invalid",
+                "tls_handshake_failed",
+                "tls_pin_mismatch",
+                "transport_error",
+                "unexpected_status"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Failure Code"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "issued_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+          "title": "Issued At",
+          "type": "string"
+        },
+        "latency_millis": {
+          "maximum": 3600000,
+          "minimum": 0,
+          "title": "Latency Millis",
+          "type": "integer"
+        },
+        "manifest_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Digest Sha256",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "observation_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Digest Sha256",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "failure",
+            "success"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "probe_nonce": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Probe Nonce",
+          "type": "string"
+        },
+        "request_method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "title": "Request Method",
+          "type": "string"
+        },
+        "request_path": {
+          "maxLength": 1024,
+          "pattern": "^/(?:[\\x21\\x22\\x24-\\x2e\\x30-\\x3e\\x40-\\x7e][\\x21\\x22\\x24-\\x3e\\x40-\\x7e]*)?$",
+          "title": "Request Path",
+          "type": "string"
+        },
+        "response_body_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Body Sha256"
+        },
+        "response_bytes": {
+          "maximum": 1048577,
+          "minimum": 0,
+          "title": "Response Bytes",
+          "type": "integer"
+        },
+        "response_status": {
+          "anyOf": [
+            {
+              "maximum": 599,
+              "minimum": 100,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Status"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/organic-probe-observation",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tls_leaf_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tls Leaf Certificate Sha256"
+        },
+        "trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Trust Policy Digest Sha256",
+          "type": "string"
+        },
+        "upstream_marker": {
+          "title": "Upstream Marker",
+          "type": "boolean"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "validator_hotkey",
+        "manifest_digest_sha256",
+        "trust_policy_digest_sha256",
+        "deployment_id",
+        "assignment_digest_sha256",
+        "endpoint_id",
+        "generation",
+        "miner_uid",
+        "miner_hotkey",
+        "probe_nonce",
+        "issued_at",
+        "request_method",
+        "request_path",
+        "latency_millis",
+        "outcome",
+        "failure_code",
+        "attribution",
+        "upstream_marker",
+        "response_status",
+        "response_bytes",
+        "response_body_sha256",
+        "tls_leaf_certificate_sha256",
+        "attestation_status",
+        "attestation",
+        "observation_digest_sha256"
+      ],
+      "title": "OrganicProbeObservation",
+      "type": "object"
+    },
+    "ServingCorroboration": {
+      "additionalProperties": false,
+      "description": "Caller projection of one ``organic-serving-window`` for audit; never scored.",
+      "properties": {
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "origin": {
+          "title": "Origin",
+          "type": "boolean"
+        },
+        "requests": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Requests",
+          "type": "integer"
+        },
+        "window_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Window Digest Sha256",
+          "type": "string"
+        },
+        "window_start_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window Start Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "endpoint_id",
+        "window_start_epoch",
+        "window_digest_sha256",
+        "requests",
+        "origin"
+      ],
+      "title": "ServingCorroboration",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "``organic-epoch-score`` v1: one validator's sealed, deterministic epoch score inputs.",
+  "properties": {
+    "corroboration": {
+      "items": {
+        "$ref": "#/$defs/ServingCorroboration"
+      },
+      "maxItems": 32768,
+      "title": "Corroboration",
+      "type": "array"
+    },
+    "endpoints": {
+      "items": {
+        "$ref": "#/$defs/EndpointEpochTally"
+      },
+      "maxItems": 32768,
+      "title": "Endpoints",
+      "type": "array"
+    },
+    "epoch_index": {
+      "maximum": 4611686018427387904,
+      "minimum": 0,
+      "title": "Epoch Index",
+      "type": "integer"
+    },
+    "epoch_score_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Epoch Score Digest Sha256",
+      "type": "string"
+    },
+    "epoch_seconds": {
+      "maximum": 3600,
+      "minimum": 60,
+      "title": "Epoch Seconds",
+      "type": "integer"
+    },
+    "epoch_status": {
+      "enum": [
+        "common_mode_unavailable",
+        "no_eligible_endpoints",
+        "scored"
+      ],
+      "title": "Epoch Status",
+      "type": "string"
+    },
+    "fraud_evidence": {
+      "items": {
+        "$ref": "#/$defs/FraudEvidence"
+      },
+      "maxItems": 524288,
+      "title": "Fraud Evidence",
+      "type": "array"
+    },
+    "inconclusive_deployments": {
+      "items": {
+        "maxLength": 63,
+        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        "type": "string"
+      },
+      "maxItems": 4096,
+      "title": "Inconclusive Deployments",
+      "type": "array"
+    },
+    "manifest_digests": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "maxItems": 1024,
+      "title": "Manifest Digests",
+      "type": "array"
+    },
+    "min_attempts": {
+      "maximum": 16,
+      "minimum": 1,
+      "title": "Min Attempts",
+      "type": "integer"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "observation_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Observation Vector Digest Sha256",
+      "type": "string"
+    },
+    "observations": {
+      "items": {
+        "$ref": "#/$defs/OrganicProbeObservation"
+      },
+      "maxItems": 524288,
+      "title": "Observations",
+      "type": "array"
+    },
+    "path_unavailable_endpoint_count": {
+      "maximum": 524288,
+      "minimum": 0,
+      "title": "Path Unavailable Endpoint Count",
+      "type": "integer"
+    },
+    "purpose": {
+      "const": "organic_availability_scoring_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "sampled_endpoint_count": {
+      "maximum": 524288,
+      "minimum": 0,
+      "title": "Sampled Endpoint Count",
+      "type": "integer"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/organic-epoch-score",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "validator_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Validator Hotkey",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "validator_hotkey",
+    "epoch_seconds",
+    "epoch_index",
+    "min_attempts",
+    "manifest_digests",
+    "epoch_status",
+    "sampled_endpoint_count",
+    "path_unavailable_endpoint_count",
+    "inconclusive_deployments",
+    "endpoints",
+    "fraud_evidence",
+    "corroboration",
+    "observations",
+    "observation_vector_digest_sha256",
+    "epoch_score_digest_sha256"
+  ],
+  "title": "OrganicEpochScore",
+  "type": "object"
+}

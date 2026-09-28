@@ -1,0 +1,1905 @@
+{
+  "$defs": {
+    "ActiveAssignmentManifestV2": {
+      "additionalProperties": false,
+      "description": "Public snapshot of active miner routes after verified cutover (no origins).",
+      "properties": {
+        "assignment_vector_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assignment Vector Digest Sha256",
+          "type": "string"
+        },
+        "central_authority_fingerprint_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Central Authority Fingerprint Sha256",
+          "type": "string"
+        },
+        "deployments": {
+          "items": {
+            "$ref": "#/$defs/OrganicDeploymentAssignment"
+          },
+          "maxItems": 4096,
+          "title": "Deployments",
+          "type": "array"
+        },
+        "expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Expires At Epoch",
+          "type": "integer"
+        },
+        "finalized_block_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Finalized Block Hash",
+          "type": "string"
+        },
+        "finalized_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Finalized Epoch",
+          "type": "integer"
+        },
+        "finalized_height": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Finalized Height",
+          "type": "integer"
+        },
+        "issued_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Issued At Epoch",
+          "type": "integer"
+        },
+        "manifest_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Digest Sha256",
+          "type": "string"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "const": "finney",
+          "title": "Network",
+          "type": "string"
+        },
+        "previous_manifest_digest_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Previous Manifest Digest Sha256"
+        },
+        "probe_port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Probe Port",
+          "type": "integer"
+        },
+        "probe_scheme": {
+          "const": "https",
+          "title": "Probe Scheme",
+          "type": "string"
+        },
+        "purpose": {
+          "const": "active_assignment_manifest_publication_v2",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "route_host_suffix": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host Suffix",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/active-assignment-manifest",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Trust Policy Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "purpose",
+        "network",
+        "netuid",
+        "central_authority_fingerprint_sha256",
+        "trust_policy_digest_sha256",
+        "finalized_height",
+        "finalized_block_hash",
+        "finalized_epoch",
+        "sequence",
+        "previous_manifest_digest_sha256",
+        "issued_at_epoch",
+        "expires_at_epoch",
+        "route_host_suffix",
+        "probe_scheme",
+        "probe_port",
+        "deployments",
+        "assignment_vector_digest_sha256",
+        "manifest_digest_sha256"
+      ],
+      "title": "ActiveAssignmentManifestV2",
+      "type": "object"
+    },
+    "AssignmentManifestTrustPolicy": {
+      "additionalProperties": false,
+      "description": "Validator-local pin of the central manifest authority and probe bounds.",
+      "properties": {
+        "allowed_route_host_suffixes": {
+          "items": {
+            "maxLength": 253,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Allowed Route Host Suffixes",
+          "type": "array"
+        },
+        "central_authority_fingerprint_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Central Authority Fingerprint Sha256",
+          "type": "string"
+        },
+        "max_finalized_height_gap": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Max Finalized Height Gap",
+          "type": "integer"
+        },
+        "max_future_skew_seconds": {
+          "maximum": 300,
+          "minimum": 0,
+          "title": "Max Future Skew Seconds",
+          "type": "integer"
+        },
+        "max_manifest_age_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Max Manifest Age Seconds",
+          "type": "integer"
+        },
+        "max_manifest_lifetime_seconds": {
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Max Manifest Lifetime Seconds",
+          "type": "integer"
+        },
+        "max_response_bytes": {
+          "maximum": 1048576,
+          "minimum": 64,
+          "title": "Max Response Bytes",
+          "type": "integer"
+        },
+        "max_sequence_gap": {
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max Sequence Gap",
+          "type": "integer"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "const": "finney",
+          "title": "Network",
+          "type": "string"
+        },
+        "pinned_edge_leaf_certificate_sha256": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Pinned Edge Leaf Certificate Sha256",
+          "type": "array"
+        },
+        "policy_id": {
+          "const": "miss-computer-active-assignment-manifest-trust-v1",
+          "title": "Policy Id",
+          "type": "string"
+        },
+        "probe_scheme": {
+          "const": "https",
+          "title": "Probe Scheme",
+          "type": "string"
+        },
+        "probe_timeout_millis": {
+          "maximum": 60000,
+          "minimum": 100,
+          "title": "Probe Timeout Millis",
+          "type": "integer"
+        },
+        "purpose": {
+          "const": "active_assignment_manifest_publication_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "required_roles": {
+          "items": {
+            "enum": [
+              "assignment_auditor",
+              "assignment_issuer",
+              "assignment_security"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Required Roles",
+          "type": "array"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/assignment-manifest-trust-policy",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "threshold": {
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Threshold",
+          "type": "integer"
+        },
+        "trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Trust Policy Digest Sha256",
+          "type": "string"
+        },
+        "trusted_keys": {
+          "items": {
+            "$ref": "#/$defs/TrustedManifestKey"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Trusted Keys",
+          "type": "array"
+        },
+        "valid_from_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid From Epoch",
+          "type": "integer"
+        },
+        "valid_until_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid Until Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "policy_id",
+        "purpose",
+        "network",
+        "netuid",
+        "central_authority_fingerprint_sha256",
+        "threshold",
+        "required_roles",
+        "trusted_keys",
+        "valid_from_epoch",
+        "valid_until_epoch",
+        "max_manifest_age_seconds",
+        "max_future_skew_seconds",
+        "max_manifest_lifetime_seconds",
+        "max_sequence_gap",
+        "max_finalized_height_gap",
+        "allowed_route_host_suffixes",
+        "probe_scheme",
+        "probe_timeout_millis",
+        "max_response_bytes",
+        "pinned_edge_leaf_certificate_sha256",
+        "trust_policy_digest_sha256"
+      ],
+      "title": "AssignmentManifestTrustPolicy",
+      "type": "object"
+    },
+    "EndpointEpochTally": {
+      "additionalProperties": false,
+      "properties": {
+        "application_failures": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Application Failures",
+          "type": "integer"
+        },
+        "attempts": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "availability_denominator": {
+          "anyOf": [
+            {
+              "maximum": 524288,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Availability Denominator"
+        },
+        "availability_numerator": {
+          "anyOf": [
+            {
+              "maximum": 524288,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Availability Numerator"
+        },
+        "corroborating_requests": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Corroborating Requests",
+          "type": "integer"
+        },
+        "corroborating_windows": {
+          "maximum": 64,
+          "minimum": 0,
+          "title": "Corroborating Windows",
+          "type": "integer"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "disposition": {
+          "enum": [
+            "abstain_insufficient_attempts",
+            "eligible",
+            "excluded_app_inconclusive",
+            "excluded_common_mode"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "fraudulent_attestations": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Fraudulent Attestations",
+          "type": "integer"
+        },
+        "miner_failures": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Miner Failures",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "path_failures": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Path Failures",
+          "type": "integer"
+        },
+        "successes": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Successes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deployment_id",
+        "endpoint_id",
+        "miner_uid",
+        "miner_hotkey",
+        "attempts",
+        "successes",
+        "application_failures",
+        "miner_failures",
+        "path_failures",
+        "fraudulent_attestations",
+        "disposition",
+        "availability_numerator",
+        "availability_denominator",
+        "corroborating_windows",
+        "corroborating_requests"
+      ],
+      "title": "EndpointEpochTally",
+      "type": "object"
+    },
+    "FraudEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "observation_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "endpoint_id",
+        "observation_digest_sha256"
+      ],
+      "title": "FraudEvidence",
+      "type": "object"
+    },
+    "MinerAvailability": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_denominator": {
+          "minimum": 1,
+          "title": "Availability Denominator",
+          "type": "integer"
+        },
+        "availability_numerator": {
+          "minimum": 0,
+          "title": "Availability Numerator",
+          "type": "integer"
+        },
+        "eligible_endpoint_epochs": {
+          "maximum": 66060288,
+          "minimum": 1,
+          "title": "Eligible Endpoint Epochs",
+          "type": "integer"
+        },
+        "fraudulent_attestations": {
+          "minimum": 0,
+          "title": "Fraudulent Attestations",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "eligible_endpoint_epochs",
+        "availability_numerator",
+        "availability_denominator",
+        "fraudulent_attestations"
+      ],
+      "title": "MinerAvailability",
+      "type": "object"
+    },
+    "MinerProbeAttestationV2": {
+      "additionalProperties": false,
+      "description": "Miner service-key statement for one validator probe of one organic endpoint.",
+      "properties": {
+        "artifact_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Artifact Digest",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "observed_at": {
+          "maxLength": 64,
+          "title": "Observed At",
+          "type": "string"
+        },
+        "probe_nonce": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Probe Nonce",
+          "type": "string"
+        },
+        "request_method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "title": "Request Method",
+          "type": "string"
+        },
+        "request_path": {
+          "maxLength": 1024,
+          "pattern": "^/(?:[\\x21\\x22\\x24-\\x2e\\x30-\\x3e\\x40-\\x7e][\\x21\\x22\\x24-\\x3e\\x40-\\x7e]*)?$",
+          "title": "Request Path",
+          "type": "string"
+        },
+        "response_body_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Response Body Sha256",
+          "type": "string"
+        },
+        "response_header_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Response Header Sha256",
+          "type": "string"
+        },
+        "response_status": {
+          "maximum": 599,
+          "minimum": 100,
+          "title": "Response Status",
+          "type": "integer"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/miner-probe-attestation",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 2,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "signature_hex": {
+          "pattern": "^[0-9a-f]{128}$",
+          "title": "Signature Hex",
+          "type": "string"
+        },
+        "ticket_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Ticket Digest",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "endpoint_id",
+        "generation",
+        "ticket_digest",
+        "artifact_digest",
+        "validator_hotkey",
+        "probe_nonce",
+        "request_method",
+        "request_path",
+        "response_status",
+        "response_body_sha256",
+        "response_header_sha256",
+        "observed_at",
+        "signature_hex"
+      ],
+      "title": "MinerProbeAttestationV2",
+      "type": "object"
+    },
+    "OrganicAssignedReplica": {
+      "additionalProperties": false,
+      "properties": {
+        "activated_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Activated At Epoch",
+          "type": "integer"
+        },
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "chain_block": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Chain Block",
+          "type": "integer"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "expires_at_block": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "expires_at_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Expires At Epoch",
+          "type": "integer"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_tls_certificate_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Tls Certificate Sha256",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "receipt_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Receipt Digest",
+          "type": "string"
+        },
+        "replica_id": {
+          "maxLength": 256,
+          "minLength": 3,
+          "title": "Replica Id",
+          "type": "string"
+        },
+        "route_state": {
+          "const": "active",
+          "title": "Route State",
+          "type": "string"
+        },
+        "ticket_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Ticket Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "miner_service_public_key",
+        "miner_tls_certificate_sha256",
+        "generation",
+        "assignment_nonce",
+        "replica_id",
+        "endpoint_id",
+        "ticket_digest",
+        "receipt_digest",
+        "chain_block",
+        "expires_at_block",
+        "activated_at_epoch",
+        "expires_at_epoch",
+        "route_state"
+      ],
+      "title": "OrganicAssignedReplica",
+      "type": "object"
+    },
+    "OrganicAvailabilityScore": {
+      "additionalProperties": false,
+      "description": "``organic-availability-score`` v1: per-miner availability over a window of epochs.",
+      "properties": {
+        "abstained_epochs": {
+          "items": {
+            "maximum": 4611686018427387904,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2016,
+          "title": "Abstained Epochs",
+          "type": "array"
+        },
+        "epoch_indexes": {
+          "items": {
+            "maximum": 4611686018427387904,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2016,
+          "minItems": 1,
+          "title": "Epoch Indexes",
+          "type": "array"
+        },
+        "epoch_score_digests": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "maxItems": 2016,
+          "minItems": 1,
+          "title": "Epoch Score Digests",
+          "type": "array"
+        },
+        "epoch_seconds": {
+          "maximum": 3600,
+          "minimum": 60,
+          "title": "Epoch Seconds",
+          "type": "integer"
+        },
+        "fraud_evidence": {
+          "items": {
+            "$ref": "#/$defs/FraudEvidence"
+          },
+          "maxItems": 524288,
+          "title": "Fraud Evidence",
+          "type": "array"
+        },
+        "miners": {
+          "items": {
+            "$ref": "#/$defs/MinerAvailability"
+          },
+          "maxItems": 32768,
+          "title": "Miners",
+          "type": "array"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "const": "finney",
+          "title": "Network",
+          "type": "string"
+        },
+        "purpose": {
+          "const": "organic_availability_scoring_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/organic-availability-score",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "score_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Score Digest Sha256",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "purpose",
+        "network",
+        "netuid",
+        "validator_hotkey",
+        "epoch_seconds",
+        "epoch_indexes",
+        "epoch_score_digests",
+        "abstained_epochs",
+        "miners",
+        "fraud_evidence",
+        "score_digest_sha256"
+      ],
+      "title": "OrganicAvailabilityScore",
+      "type": "object"
+    },
+    "OrganicDeploymentAssignment": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Artifact Digest",
+          "type": "string"
+        },
+        "assignment_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assignment Digest Sha256",
+          "type": "string"
+        },
+        "attestation_requirement": {
+          "const": "miner_service_key_v2",
+          "title": "Attestation Requirement",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/OrganicHealthProbe"
+        },
+        "replicas": {
+          "items": {
+            "$ref": "#/$defs/OrganicAssignedReplica"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Replicas",
+          "type": "array"
+        },
+        "route_host": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host",
+          "type": "string"
+        }
+      },
+      "required": [
+        "deployment_id",
+        "route_host",
+        "artifact_digest",
+        "health",
+        "attestation_requirement",
+        "replicas",
+        "assignment_digest_sha256"
+      ],
+      "title": "OrganicDeploymentAssignment",
+      "type": "object"
+    },
+    "OrganicEpochScore": {
+      "additionalProperties": false,
+      "description": "``organic-epoch-score`` v1: one validator's sealed, deterministic epoch score inputs.",
+      "properties": {
+        "corroboration": {
+          "items": {
+            "$ref": "#/$defs/ServingCorroboration"
+          },
+          "maxItems": 32768,
+          "title": "Corroboration",
+          "type": "array"
+        },
+        "endpoints": {
+          "items": {
+            "$ref": "#/$defs/EndpointEpochTally"
+          },
+          "maxItems": 32768,
+          "title": "Endpoints",
+          "type": "array"
+        },
+        "epoch_index": {
+          "maximum": 4611686018427387904,
+          "minimum": 0,
+          "title": "Epoch Index",
+          "type": "integer"
+        },
+        "epoch_score_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Epoch Score Digest Sha256",
+          "type": "string"
+        },
+        "epoch_seconds": {
+          "maximum": 3600,
+          "minimum": 60,
+          "title": "Epoch Seconds",
+          "type": "integer"
+        },
+        "epoch_status": {
+          "enum": [
+            "common_mode_unavailable",
+            "no_eligible_endpoints",
+            "scored"
+          ],
+          "title": "Epoch Status",
+          "type": "string"
+        },
+        "fraud_evidence": {
+          "items": {
+            "$ref": "#/$defs/FraudEvidence"
+          },
+          "maxItems": 524288,
+          "title": "Fraud Evidence",
+          "type": "array"
+        },
+        "inconclusive_deployments": {
+          "items": {
+            "maxLength": 63,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Inconclusive Deployments",
+          "type": "array"
+        },
+        "manifest_digests": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "title": "Manifest Digests",
+          "type": "array"
+        },
+        "min_attempts": {
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Min Attempts",
+          "type": "integer"
+        },
+        "netuid": {
+          "const": 24,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "const": "finney",
+          "title": "Network",
+          "type": "string"
+        },
+        "observation_vector_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Vector Digest Sha256",
+          "type": "string"
+        },
+        "observations": {
+          "items": {
+            "$ref": "#/$defs/OrganicProbeObservation"
+          },
+          "maxItems": 524288,
+          "title": "Observations",
+          "type": "array"
+        },
+        "path_unavailable_endpoint_count": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Path Unavailable Endpoint Count",
+          "type": "integer"
+        },
+        "purpose": {
+          "const": "organic_availability_scoring_v1",
+          "title": "Purpose",
+          "type": "string"
+        },
+        "sampled_endpoint_count": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Sampled Endpoint Count",
+          "type": "integer"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/organic-epoch-score",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "purpose",
+        "network",
+        "netuid",
+        "validator_hotkey",
+        "epoch_seconds",
+        "epoch_index",
+        "min_attempts",
+        "manifest_digests",
+        "epoch_status",
+        "sampled_endpoint_count",
+        "path_unavailable_endpoint_count",
+        "inconclusive_deployments",
+        "endpoints",
+        "fraud_evidence",
+        "corroboration",
+        "observations",
+        "observation_vector_digest_sha256",
+        "epoch_score_digest_sha256"
+      ],
+      "title": "OrganicEpochScore",
+      "type": "object"
+    },
+    "OrganicHealthProbe": {
+      "additionalProperties": false,
+      "description": "Sanitized public health predicate published for hidden validator probes.",
+      "properties": {
+        "expected_statuses": {
+          "items": {
+            "maximum": 599,
+            "minimum": 100,
+            "type": "integer"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Expected Statuses",
+          "type": "array"
+        },
+        "method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 1024,
+          "pattern": "^/(?:[\\x21\\x22\\x24-\\x2e\\x30-\\x3e\\x40-\\x7e][\\x21\\x22\\x24-\\x3e\\x40-\\x7e]*)?$",
+          "title": "Path",
+          "type": "string"
+        },
+        "response_marker": {
+          "anyOf": [
+            {
+              "pattern": "^[\\x20-\\x7e]{1,256}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Marker"
+        }
+      },
+      "required": [
+        "method",
+        "path",
+        "expected_statuses",
+        "response_marker"
+      ],
+      "title": "OrganicHealthProbe",
+      "type": "object"
+    },
+    "OrganicProbeObservation": {
+      "additionalProperties": false,
+      "description": "One sealed attempted probe of one published organic endpoint incarnation.",
+      "properties": {
+        "assignment_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Assignment Digest Sha256",
+          "type": "string"
+        },
+        "attestation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MinerProbeAttestationV2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attestation_status": {
+          "enum": [
+            "fraudulent",
+            "not_presented",
+            "rejected",
+            "verified"
+          ],
+          "title": "Attestation Status",
+          "type": "string"
+        },
+        "attribution": {
+          "enum": [
+            "application",
+            "miner",
+            "none",
+            "path"
+          ],
+          "title": "Attribution",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "failure_code": {
+          "anyOf": [
+            {
+              "enum": [
+                "attestation_fraud",
+                "attestation_invalid",
+                "attestation_missing",
+                "connection_failed",
+                "edge_generated",
+                "marker_missing",
+                "response_oversized",
+                "timeout",
+                "tls_certificate_invalid",
+                "tls_handshake_failed",
+                "tls_pin_mismatch",
+                "transport_error",
+                "unexpected_status"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Failure Code"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "issued_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+          "title": "Issued At",
+          "type": "string"
+        },
+        "latency_millis": {
+          "maximum": 3600000,
+          "minimum": 0,
+          "title": "Latency Millis",
+          "type": "integer"
+        },
+        "manifest_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Manifest Digest Sha256",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "observation_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Digest Sha256",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "failure",
+            "success"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "probe_nonce": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Probe Nonce",
+          "type": "string"
+        },
+        "request_method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "title": "Request Method",
+          "type": "string"
+        },
+        "request_path": {
+          "maxLength": 1024,
+          "pattern": "^/(?:[\\x21\\x22\\x24-\\x2e\\x30-\\x3e\\x40-\\x7e][\\x21\\x22\\x24-\\x3e\\x40-\\x7e]*)?$",
+          "title": "Request Path",
+          "type": "string"
+        },
+        "response_body_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Body Sha256"
+        },
+        "response_bytes": {
+          "maximum": 1048577,
+          "minimum": 0,
+          "title": "Response Bytes",
+          "type": "integer"
+        },
+        "response_status": {
+          "anyOf": [
+            {
+              "maximum": 599,
+              "minimum": 100,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Status"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/organic-probe-observation",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "tls_leaf_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tls Leaf Certificate Sha256"
+        },
+        "trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Trust Policy Digest Sha256",
+          "type": "string"
+        },
+        "upstream_marker": {
+          "title": "Upstream Marker",
+          "type": "boolean"
+        },
+        "validator_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Validator Hotkey",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "schema_version",
+        "validator_hotkey",
+        "manifest_digest_sha256",
+        "trust_policy_digest_sha256",
+        "deployment_id",
+        "assignment_digest_sha256",
+        "endpoint_id",
+        "generation",
+        "miner_uid",
+        "miner_hotkey",
+        "probe_nonce",
+        "issued_at",
+        "request_method",
+        "request_path",
+        "latency_millis",
+        "outcome",
+        "failure_code",
+        "attribution",
+        "upstream_marker",
+        "response_status",
+        "response_bytes",
+        "response_body_sha256",
+        "tls_leaf_certificate_sha256",
+        "attestation_status",
+        "attestation",
+        "observation_digest_sha256"
+      ],
+      "title": "OrganicProbeObservation",
+      "type": "object"
+    },
+    "ServingCorroboration": {
+      "additionalProperties": false,
+      "description": "Caller projection of one ``organic-serving-window`` for audit; never scored.",
+      "properties": {
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "origin": {
+          "title": "Origin",
+          "type": "boolean"
+        },
+        "requests": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Requests",
+          "type": "integer"
+        },
+        "window_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Window Digest Sha256",
+          "type": "string"
+        },
+        "window_start_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Window Start Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "endpoint_id",
+        "window_start_epoch",
+        "window_digest_sha256",
+        "requests",
+        "origin"
+      ],
+      "title": "ServingCorroboration",
+      "type": "object"
+    },
+    "TrustedManifestKey": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "ed25519",
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "key_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+          "title": "Key Id",
+          "type": "string"
+        },
+        "public_key_base64": {
+          "maxLength": 44,
+          "minLength": 44,
+          "title": "Public Key Base64",
+          "type": "string"
+        },
+        "public_key_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Public Key Sha256",
+          "type": "string"
+        },
+        "purposes": {
+          "items": {
+            "const": "active_assignment_manifest_publication_v1",
+            "type": "string"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "title": "Purposes",
+          "type": "array"
+        },
+        "revoked_at_epoch": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Revoked At Epoch"
+        },
+        "roles": {
+          "items": {
+            "enum": [
+              "assignment_auditor",
+              "assignment_issuer",
+              "assignment_security"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Roles",
+          "type": "array"
+        },
+        "valid_from_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid From Epoch",
+          "type": "integer"
+        },
+        "valid_until_epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Valid Until Epoch",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key_id",
+        "algorithm",
+        "public_key_base64",
+        "public_key_sha256",
+        "roles",
+        "purposes",
+        "valid_from_epoch",
+        "valid_until_epoch",
+        "revoked_at_epoch"
+      ],
+      "title": "TrustedManifestKey",
+      "type": "object"
+    },
+    "WeightDecisionPolicy": {
+      "additionalProperties": false,
+      "description": "Validator-local decision thresholds. Each validator decides independently.",
+      "properties": {
+        "max_registered_height_gap": {
+          "default": 600,
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Max Registered Height Gap",
+          "type": "integer"
+        },
+        "min_scored_epochs": {
+          "default": 6,
+          "maximum": 2016,
+          "minimum": 1,
+          "title": "Min Scored Epochs",
+          "type": "integer"
+        }
+      },
+      "title": "WeightDecisionPolicy",
+      "type": "object"
+    },
+    "WeightDecisionRow": {
+      "additionalProperties": false,
+      "description": "One registered miner: its class, weight, and the availability behind it.",
+      "properties": {
+        "availability_denominator": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Availability Denominator"
+        },
+        "availability_numerator": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Availability Numerator"
+        },
+        "classification": {
+          "enum": [
+            "fraud_evidence",
+            "scored",
+            "unscored"
+          ],
+          "title": "Classification",
+          "type": "string"
+        },
+        "eligible_endpoint_epochs": {
+          "minimum": 0,
+          "title": "Eligible Endpoint Epochs",
+          "type": "integer"
+        },
+        "hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Uid",
+          "type": "integer"
+        },
+        "weight": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Weight",
+          "type": "number"
+        }
+      },
+      "required": [
+        "uid",
+        "hotkey",
+        "classification",
+        "weight",
+        "eligible_endpoint_epochs",
+        "availability_numerator",
+        "availability_denominator"
+      ],
+      "title": "WeightDecisionRow",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Sealed, archivable outcome of one organic scoring window: abstain or submit.",
+  "properties": {
+    "abstain_reasons": {
+      "items": {
+        "enum": [
+          "insufficient_scored_epochs",
+          "no_positive_evidence",
+          "registered_set_unbound",
+          "terminal_manifest_policy_rejected",
+          "terminal_manifest_rejected",
+          "terminal_manifest_stale",
+          "terminal_manifest_unavailable"
+        ],
+        "type": "string"
+      },
+      "maxItems": 7,
+      "title": "Abstain Reasons",
+      "type": "array"
+    },
+    "availability_score": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrganicAvailabilityScore"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decision": {
+      "enum": [
+        "abstain",
+        "submit"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "decision_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Decision Digest Sha256",
+      "type": "string"
+    },
+    "decision_policy": {
+      "$ref": "#/$defs/WeightDecisionPolicy"
+    },
+    "epochs": {
+      "items": {
+        "$ref": "#/$defs/OrganicEpochScore"
+      },
+      "maxItems": 2016,
+      "title": "Epochs",
+      "type": "array"
+    },
+    "manifests": {
+      "items": {
+        "$ref": "#/$defs/ActiveAssignmentManifestV2"
+      },
+      "maxItems": 1024,
+      "title": "Manifests",
+      "type": "array"
+    },
+    "metagraph_identity_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Metagraph Identity Fingerprint Sha256",
+      "type": "string"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "organic_validator_weight_decision_v2",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "registered_finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Registered Finalized Block Hash",
+      "type": "string"
+    },
+    "registered_finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Registered Finalized Epoch",
+      "type": "integer"
+    },
+    "registered_finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Registered Finalized Height",
+      "type": "integer"
+    },
+    "registered_miner_count": {
+      "maximum": 4096,
+      "minimum": 1,
+      "title": "Registered Miner Count",
+      "type": "integer"
+    },
+    "rows": {
+      "items": {
+        "$ref": "#/$defs/WeightDecisionRow"
+      },
+      "maxItems": 4096,
+      "minItems": 1,
+      "title": "Rows",
+      "type": "array"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/validator-weight-decision",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "scored_epoch_count": {
+      "maximum": 2016,
+      "minimum": 0,
+      "title": "Scored Epoch Count",
+      "type": "integer"
+    },
+    "terminal_evaluated_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Terminal Evaluated At Epoch",
+      "type": "integer"
+    },
+    "terminal_finalized_block_hash": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Block Hash"
+    },
+    "terminal_finalized_epoch": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Epoch"
+    },
+    "terminal_finalized_height": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Finalized Height"
+    },
+    "terminal_manifest_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Digest Sha256"
+    },
+    "terminal_manifest_rejection_code": {
+      "anyOf": [
+        {
+          "pattern": "^[a-z0-9_]{1,64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Rejection Code"
+    },
+    "terminal_manifest_sequence": {
+      "anyOf": [
+        {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Terminal Manifest Sequence"
+    },
+    "terminal_manifest_status": {
+      "enum": [
+        "rejected",
+        "unavailable",
+        "verified"
+      ],
+      "title": "Terminal Manifest Status",
+      "type": "string"
+    },
+    "trust_policies": {
+      "items": {
+        "$ref": "#/$defs/AssignmentManifestTrustPolicy"
+      },
+      "maxItems": 16,
+      "title": "Trust Policies",
+      "type": "array"
+    },
+    "validator_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Validator Hotkey",
+      "type": "string"
+    },
+    "validator_uid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Validator Uid",
+      "type": "integer"
+    },
+    "weight_plan_rows_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Weight Plan Rows Digest Sha256"
+    },
+    "window_end_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Window End Epoch",
+      "type": "integer"
+    },
+    "window_start_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Window Start Epoch",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "validator_uid",
+    "validator_hotkey",
+    "window_start_epoch",
+    "window_end_epoch",
+    "decision",
+    "abstain_reasons",
+    "decision_policy",
+    "trust_policies",
+    "terminal_manifest_status",
+    "terminal_manifest_rejection_code",
+    "terminal_evaluated_at_epoch",
+    "terminal_manifest_digest_sha256",
+    "terminal_manifest_sequence",
+    "terminal_finalized_height",
+    "terminal_finalized_block_hash",
+    "terminal_finalized_epoch",
+    "manifests",
+    "epochs",
+    "availability_score",
+    "scored_epoch_count",
+    "registered_finalized_height",
+    "registered_finalized_block_hash",
+    "registered_finalized_epoch",
+    "registered_miner_count",
+    "metagraph_identity_fingerprint_sha256",
+    "rows",
+    "weight_plan_rows_digest_sha256",
+    "decision_digest_sha256"
+  ],
+  "title": "ValidatorWeightDecision",
+  "type": "object"
+}

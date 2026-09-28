@@ -1,0 +1,45 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "block": {
+      "minimum": 0,
+      "title": "Block",
+      "type": "integer"
+    },
+    "hotkeys": {
+      "items": {
+        "maxLength": 2048,
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Hotkeys",
+      "type": "array"
+    },
+    "netuid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Network",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "network",
+    "netuid",
+    "block",
+    "hotkeys"
+  ],
+  "title": "MinerSet",
+  "type": "object"
+}

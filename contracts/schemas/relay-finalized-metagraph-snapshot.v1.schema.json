@@ -1,0 +1,149 @@
+{
+  "$defs": {
+    "ExternalValidatorIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "active": {
+          "const": true,
+          "title": "Active",
+          "type": "boolean"
+        },
+        "hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Uid",
+          "type": "integer"
+        },
+        "validator_permit": {
+          "const": true,
+          "title": "Validator Permit",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "uid",
+        "hotkey",
+        "active",
+        "validator_permit"
+      ],
+      "title": "ExternalValidatorIdentity",
+      "type": "object"
+    },
+    "MetagraphMinerMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Uid",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "uid",
+        "hotkey"
+      ],
+      "title": "MetagraphMinerMapping",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "finalized": {
+      "const": true,
+      "title": "Finalized",
+      "type": "boolean"
+    },
+    "finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Finalized Block Hash",
+      "type": "string"
+    },
+    "finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Epoch",
+      "type": "integer"
+    },
+    "finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Height",
+      "type": "integer"
+    },
+    "metagraph_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Metagraph Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "miner_mapping_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Miner Mapping Digest Sha256",
+      "type": "string"
+    },
+    "miner_mappings": {
+      "items": {
+        "$ref": "#/$defs/MetagraphMinerMapping"
+      },
+      "maxItems": 4096,
+      "minItems": 1,
+      "title": "Miner Mappings",
+      "type": "array"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "external_validator_checkpoint_verification_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/relay-finalized-metagraph-snapshot",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "validator": {
+      "$ref": "#/$defs/ExternalValidatorIdentity"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "finalized",
+    "finalized_height",
+    "finalized_block_hash",
+    "finalized_epoch",
+    "validator",
+    "miner_mappings",
+    "miner_mapping_digest_sha256",
+    "metagraph_snapshot_digest_sha256"
+  ],
+  "title": "RelayFinalizedMetagraphSnapshot",
+  "type": "object"
+}

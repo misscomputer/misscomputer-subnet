@@ -1,0 +1,253 @@
+{
+  "$comment": "Canonical bytes, state/receipt transition consistency, unique attempts, attempt-key derivation, execution-vector digest/mapping equality, canonical order, unique UID/hotkey projections, credential-free network identity, and normalized sums are semantic checks.",
+  "$id": "https://miss.computer/contracts/weight-execution-audit.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "attempts": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "attempt_key": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "execution_digest_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "mapping": {
+            "additionalProperties": false,
+            "properties": {
+              "omitted": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "hotkey": {
+                      "maxLength": 256,
+                      "minLength": 1,
+                      "pattern": "^[!-~]+$",
+                      "type": "string"
+                    },
+                    "planned_uid": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "hotkey",
+                    "planned_uid"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 65536,
+                "type": "array"
+              },
+              "weights": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "hotkey": {
+                      "maxLength": 256,
+                      "minLength": 1,
+                      "pattern": "^[!-~]+$",
+                      "type": "string"
+                    },
+                    "planned_uid": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "uid": {
+                      "maximum": 65535,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "weight": {
+                      "exclusiveMinimum": 0,
+                      "maximum": 1,
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "hotkey",
+                    "planned_uid",
+                    "uid",
+                    "weight"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 65536,
+                "minItems": 1,
+                "type": "array"
+              }
+            },
+            "required": [
+              "omitted",
+              "weights"
+            ],
+            "type": "object"
+          },
+          "netuid": {
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "network": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[!-~]+$",
+            "type": "string"
+          },
+          "plan_digest_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "preflight_block": {
+            "maximum": 9223372036854775807,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "receipt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "error_code": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "pattern": "^[a-z0-9_]{1,64}$",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "extrinsic_ref": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "maxLength": 256,
+                        "minLength": 1,
+                        "pattern": "^[!-~]+$",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "outcome": {
+                    "enum": [
+                      "confirmed",
+                      "pre_send_failure",
+                      "definite_failure",
+                      "ambiguous"
+                    ]
+                  }
+                },
+                "required": [
+                  "error_code",
+                  "extrinsic_ref",
+                  "outcome"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "send_check_block": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "maximum": 9223372036854775807,
+                "minimum": 0,
+                "type": "integer"
+              }
+            ]
+          },
+          "started_at": {
+            "format": "date-time",
+            "maxLength": 40,
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "in_progress",
+              "confirmed",
+              "failed",
+              "ambiguous"
+            ]
+          },
+          "submission_started": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "maxLength": 40,
+            "type": "string"
+          },
+          "validator_hotkey": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[!-~]+$",
+            "type": "string"
+          },
+          "version_key": {
+            "maximum": 18446744073709551615,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attempt_id",
+          "attempt_key",
+          "execution_digest_sha256",
+          "mapping",
+          "netuid",
+          "network",
+          "plan_digest_sha256",
+          "preflight_block",
+          "receipt",
+          "send_check_block",
+          "started_at",
+          "status",
+          "submission_started",
+          "updated_at",
+          "validator_hotkey",
+          "version_key"
+        ],
+        "type": "object"
+      },
+      "maxItems": 4096,
+      "type": "array"
+    },
+    "digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/weight-execution-audit"
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "attempts",
+    "digest_sha256",
+    "schema",
+    "schema_version"
+  ],
+  "title": "Weight execution audit state v1",
+  "type": "object"
+}

@@ -1,0 +1,1395 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Online public-validator hidden probes of organic app assignments (contract §17.2).
+
+This module is the only network-capable boundary of the organic probe flow.
+For one five-minute epoch it loads a locally pinned trust policy, obtains one
+signed ``active-assignment-manifest`` v2 from an explicit operator-supplied file
+or URL, verifies it through :mod:`organic_manifest` against a locked local
+acceptance state, derives the epoch's hidden schedule from a validator-private
+seed, and at each scheduled instant sends exactly one targeted HTTPS request
+carrying an ``organic-probe-authorization`` signed by the validator hotkey. It
+judges every response and its miner attestation v2 with :mod:`organic_probe`
+and seals one ``organic-epoch-score`` record with :mod:`organic_scoring`.
+
+Its only signing capability is the purpose-limited hotkey facade that signs
+organic probe authorizations. It has no RPC, weight, submission, scheduling
+daemon, or activation capability: an operator (or a timer) runs one epoch per
+invocation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import functools
+import hashlib
+import os
+import re
+import ssl
+import stat
+import sys
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Final, Literal, NoReturn, Protocol, cast
+from urllib.parse import urlsplit
+
+import httpx
+from pydantic import ValidationError
+
+from .assignment_probe import (
+    MAX_DOCUMENT_BYTES,
+    MAX_EPOCH,
+    MAX_KEYS,
+    MAX_RESPONSE_BYTES_CEILING,
+    AssignmentManifestChainState,
+    AssignmentManifestSignatureEnvelope,
+    AssignmentManifestTrustPolicy,
+    AssignmentProbeError,
+    ProbeResponse,
+    ProbeTransportFailure,
+    assignment_manifest_chain_state_bytes,
+    build_initial_manifest_chain_state,
+    parse_assignment_manifest_chain_state,
+    parse_assignment_manifest_signature_envelope,
+    parse_assignment_manifest_trust_policy,
+)
+from .organic_contracts import ORGANIC_PROBE_AUTHORIZATION_HEADER, ActiveAssignmentManifestV2
+from .organic_manifest import (
+    OrganicManifestVerification,
+    anchor_organic_manifest_chain_state,
+    organic_assignment_manifest_bytes,
+    parse_organic_assignment_manifest,
+    verify_organic_assignment_manifest,
+)
+from .organic_probe import (
+    DEFAULT_EPOCH_SECONDS,
+    PROBE_SEED_BYTES,
+    OrganicProbeObservation,
+    build_probe_authorization,
+    epoch_index_of,
+    evaluate_organic_probe,
+    find_replica,
+    plan_hidden_probes,
+    probe_authorization_header,
+)
+from .organic_scoring import (
+    DEFAULT_MIN_ATTEMPTS,
+    OrganicEpochScore,
+    organic_epoch_score_bytes,
+    score_organic_epoch,
+)
+from .probe_transport import (
+    RequestBudget,
+    TransportBuilder,
+    default_httpx_transport,
+)
+from .score_checkpoint_relay_cli import (
+    CheckpointRelayCLIError,
+    InputFile,
+    _load_input_bytes,
+    _normalized_absolute_path,
+)
+
+EXIT_OK: Final = 0
+EXIT_REJECTED: Final = 2
+EXIT_DEGRADED: Final = 3
+EXIT_USAGE: Final = 64
+EXIT_INTERNAL: Final = 70
+EXIT_BUSY: Final = 75
+
+STATE_ROOT_MODE: Final = 0o700
+STATE_FILE_MODE: Final = 0o600
+STATE_NAME: Final = "state.json"
+STATE_INSTALL_NAME: Final = ".state.install"
+LOCK_NAME: Final = "probe.lock"
+MAX_TRUST_POLICY_BYTES: Final = 256 * 1_024
+MAX_SIGNATURE_BYTES: Final = 16 * 1_024
+MAX_STATE_BYTES: Final = 64 * 1_024
+MAX_FETCH_BYTES: Final = 16 * 1_024 * 1_024
+MAX_CA_BUNDLE_BYTES: Final = 1_024 * 1_024
+USER_AGENT: Final = "misscomputer-assignment-probe/2"
+#: A scheduled probe fired later than this after its planned instant is
+#: skipped rather than sent: a late run must not cluster probes predictably.
+MAX_FIRE_DELAY_MILLIS: Final = 10_000
+_HOTKEY = re.compile(r"^[A-Za-z0-9]{1,128}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_HOSTNAME = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+
+TrustedStateAnchor = Literal["current", "genesis"] | str
+
+
+class AssignmentProbeCLIError(ValueError):
+    """Stable failure code whose text never contains an input value or path."""
+
+    def __init__(self, code: str) -> None:
+        safe = (
+            code
+            if code
+            and len(code) <= 64
+            and code.isascii()
+            and all(
+                character.islower() or character.isdigit() or character == "_" for character in code
+            )
+            else "internal_error"
+        )
+        super().__init__(safe)
+        self.code = safe
+
+
+def _fail(code: str) -> NoReturn:
+    raise AssignmentProbeCLIError(code)
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestSource:
+    """Exactly one explicit manifest origin: a local canonical file or an HTTPS URL."""
+
+    file: InputFile | None = None
+    url: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.file is None) == (self.url is None):
+            raise AssignmentProbeCLIError("manifest_source_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SignatureSource:
+    file: InputFile | None = None
+    url: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.file is None) == (self.url is None):
+            raise AssignmentProbeCLIError("signature_source_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WalletSelector:
+    """The validator wallet whose hotkey signs organic probe authorizations."""
+
+    name: str
+    hotkey: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class AssignmentProbeCLIConfig:
+    trust_policy: InputFile
+    manifest: ManifestSource
+    signatures: tuple[SignatureSource, ...]
+    #: Validator-private 32 CSPRNG bytes; never published.
+    probe_seed: InputFile
+    epoch_index: int
+    #: The validator's own finalized chain height when the epoch starts;
+    #: every published block lease is enforced against it before any probe.
+    current_finalized_height: int
+    validator_hotkey: str
+    wallet: WalletSelector
+    state_root: str
+    trusted_state_anchor: str
+    epoch_output: str
+    #: Owner-only directory receiving ``<manifest-digest>.json`` for every
+    #: manifest this run verified live; the window coordinator replays from it.
+    manifest_archive_dir: str
+    edge_origin: str | None = None
+    tls_ca_file: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AssignmentProbeCLIResult:
+    epoch: OrganicEpochScore
+    next_chain_state: AssignmentManifestChainState
+    state_advanced: bool
+    skipped_probes: int
+
+
+class ProbeTransport(Protocol):
+    """One bounded HTTPS request; every outcome is classified, never raised."""
+
+    def fetch(
+        self,
+        *,
+        url: str,
+        server_name: str,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        max_bytes: int,
+        method: str = "GET",
+    ) -> ProbeResponse | ProbeTransportFailure: ...
+
+
+TransportFactory = Callable[[ssl.SSLContext], ProbeTransport]
+#: Returns the purpose-limited authorization signer and its ss58 hotkey.
+SignerFactory = Callable[[WalletSelector], tuple[Callable[[bytes], bytes], str]]
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in seen and len(seen) < 16:
+        seen.append(current)
+        current = current.__cause__ or current.__context__
+    return seen
+
+
+def _classify_transport_error(exc: Exception) -> str:
+    chain = _exception_chain(exc)
+    if any(isinstance(item, httpx.TimeoutException | TimeoutError) for item in chain):
+        return "timeout"
+    if any(isinstance(item, ssl.SSLCertVerificationError) for item in chain):
+        return "tls_certificate_invalid"
+    if any(isinstance(item, ssl.SSLError) for item in chain):
+        return "tls_handshake_failed"
+    if isinstance(exc, httpx.ConnectError | ConnectionError | OSError):
+        return "connection_failed"
+    return "transport_error"
+
+
+def _peer_leaf_sha256(response: httpx.Response) -> str | None:
+    stream = response.extensions.get("network_stream")
+    if stream is None:
+        return None
+    ssl_object = stream.get_extra_info("ssl_object")
+    getter = getattr(ssl_object, "getpeercert", None)
+    if getter is None:
+        return None
+    try:
+        der = getter(True)
+    except (ValueError, OSError):
+        return None
+    if not isinstance(der, bytes) or not der:
+        return None
+    return hashlib.sha256(der).hexdigest()
+
+
+def _oversized(
+    latency_millis: int,
+    *,
+    response_status: int | None,
+    tls_leaf_certificate_sha256: str | None,
+    response_bytes: int,
+) -> ProbeTransportFailure:
+    return ProbeTransportFailure(
+        "response_oversized",
+        latency_millis,
+        response_status=response_status,
+        tls_leaf_certificate_sha256=tls_leaf_certificate_sha256,
+        response_bytes=response_bytes,
+    )
+
+
+class HttpsProbeTransport:
+    """httpx-based transport: no redirects, no environment proxies, exact byte bounds.
+
+    One absolute deadline governs the whole request. httpx's per-operation
+    timeouts only cap each read or write, so a peer that trickles header or
+    body bytes just inside them could hold a request open indefinitely; the
+    connection therefore runs on :class:`DeadlineNetworkBackend`, which clamps
+    every connect, TLS, write, and read to the time remaining in the budget on
+    one monotonic clock and raises the matching timeout when nothing remains.
+    The transport also measures the elapsed time immediately before it
+    inspects the response headers, before every response-derived return
+    (``Content-Length`` rejection, body rejection, and the response itself),
+    and at every body chunk, so a request that finishes just after the budget
+    is a timeout too, never a response (see :class:`RequestBudget` for the
+    exact boundary). A wire status outside the contract's ``100..599`` is a
+    ``transport_error`` with no recorded status. ``clock`` and
+    ``transport_factory`` exist so the boundary can be tested deterministically.
+    """
+
+    def __init__(
+        self,
+        ssl_context: ssl.SSLContext,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        transport_factory: TransportBuilder | None = None,
+    ) -> None:
+        self._context = ssl_context
+        self._clock = clock
+        self._transport_factory = transport_factory or default_httpx_transport
+
+    def fetch(
+        self,
+        *,
+        url: str,
+        server_name: str,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        max_bytes: int,
+        method: str = "GET",
+    ) -> ProbeResponse | ProbeTransportFailure:
+        if method not in {"GET", "HEAD"}:
+            return ProbeTransportFailure("transport_error", 0)
+        budget = RequestBudget(timeout_seconds, clock=self._clock)
+        leaf: str | None = None
+        status: int | None = None
+
+        def timed_out(latency_millis: int) -> ProbeTransportFailure:
+            return ProbeTransportFailure(
+                "timeout",
+                latency_millis,
+                response_status=status,
+                tls_leaf_certificate_sha256=leaf,
+            )
+
+        def response_derived(
+            build: Callable[[int], ProbeResponse | ProbeTransportFailure],
+        ) -> ProbeResponse | ProbeTransportFailure:
+            latency_millis = budget.latency_millis()
+            if budget.exhausted(latency_millis):
+                return timed_out(latency_millis)
+            return build(latency_millis)
+
+        try:
+            with httpx.Client(
+                transport=self._transport_factory(self._context, budget.remaining_seconds),
+                timeout=httpx.Timeout((budget.budget_millis + 1) / 1000),
+                follow_redirects=False,
+                max_redirects=0,
+                trust_env=False,
+            ) as client:
+                with client.stream(
+                    method,
+                    url,
+                    headers=dict(headers),
+                    extensions={"sni_hostname": server_name},
+                ) as response:
+                    leaf = _peer_leaf_sha256(response)
+                    in_contract = 100 <= response.status_code <= 599
+                    status = response.status_code if in_contract else None
+                    # The headers are a response: judge the budget before
+                    # anything derived from them can be reported.
+                    arrival = budget.latency_millis()
+                    if budget.exhausted(arrival):
+                        return timed_out(arrival)
+                    if not in_contract:
+                        # Outside the contract's status range: a fault of the
+                        # peer's wire format, never an observation with a status.
+                        return ProbeTransportFailure(
+                            "transport_error", arrival, tls_leaf_certificate_sha256=leaf
+                        )
+                    declared = response.headers.get("content-length")
+                    declared_bytes: int | None = None
+                    if declared is not None:
+                        declared_bytes = (
+                            int(declared)
+                            if declared.isascii() and declared.isdigit()
+                            else MAX_RESPONSE_BYTES_CEILING + 1
+                        )
+                    if declared_bytes is not None and declared_bytes > max_bytes:
+                        return response_derived(
+                            functools.partial(
+                                _oversized,
+                                response_status=status,
+                                tls_leaf_certificate_sha256=leaf,
+                                response_bytes=min(declared_bytes, MAX_RESPONSE_BYTES_CEILING + 1),
+                            )
+                        )
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in response.iter_raw(chunk_size=16_384):
+                        arrival = budget.latency_millis()
+                        if budget.exhausted(arrival):
+                            return timed_out(arrival)
+                        total += len(chunk)
+                        if total > max_bytes:
+                            return response_derived(
+                                functools.partial(
+                                    _oversized,
+                                    response_status=status,
+                                    tls_leaf_certificate_sha256=leaf,
+                                    response_bytes=min(total, MAX_RESPONSE_BYTES_CEILING + 1),
+                                )
+                            )
+                        chunks.append(chunk)
+                    observed_headers = tuple(
+                        (str(key), str(value)) for key, value in response.headers.multi_items()
+                    )
+                    body = b"".join(chunks)
+                    return response_derived(
+                        lambda latency_millis: ProbeResponse(
+                            status=response.status_code,
+                            headers=observed_headers,
+                            body=body,
+                            latency_millis=latency_millis,
+                            tls_leaf_certificate_sha256=leaf,
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001 - every transport fault is classified
+            latency_millis = budget.latency_millis()
+            if budget.exhausted(latency_millis):
+                return timed_out(latency_millis)
+            code = _classify_transport_error(exc)
+            # A transport/OS timeout before our deadline is a transport fault,
+            # not evidence that this policy's whole-request budget expired.
+            if code == "timeout":
+                code = "transport_error"
+            return ProbeTransportFailure(
+                cast(
+                    Literal[
+                        "connection_failed",
+                        "response_oversized",
+                        "timeout",
+                        "tls_certificate_invalid",
+                        "tls_handshake_failed",
+                        "transport_error",
+                    ],
+                    code,
+                ),
+                latency_millis,
+                tls_leaf_certificate_sha256=leaf,
+            )
+
+
+def _default_transport_factory(context: ssl.SSLContext) -> ProbeTransport:
+    return HttpsProbeTransport(context)
+
+
+_SENSITIVE_COMPONENTS: Final = frozenset(
+    {
+        ".env",
+        ".ssh",
+        "credential",
+        "credentials",
+        "private-key",
+        "private_key",
+        "secret",
+        "secrets",
+        "wallet",
+        "wallets",
+    }
+)
+
+
+def _normalized_bundle_path(path: str) -> str:
+    """Public certificate bundles may be ``.pem``/``.crt`` but never live beside secrets."""
+
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\x00" in path
+        or not path.startswith("/")
+        or path.startswith("//")
+        or path != os.path.normpath(path)
+    ):
+        _fail("ca_bundle_path_unsafe")
+    components = path.split("/")[1:]
+    if not components or any(
+        not component
+        or component.casefold() in _SENSITIVE_COMPONENTS
+        or component.casefold().endswith((".key", ".p12", ".pfx"))
+        for component in components
+    ):
+        _fail("ca_bundle_path_unsafe")
+    return path
+
+
+def _read_ca_bundle(path: str) -> str:
+    normalized = _normalized_bundle_path(path)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(normalized, flags)
+    except OSError as exc:
+        raise AssignmentProbeCLIError("ca_bundle_unreadable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CA_BUNDLE_BYTES:
+            _fail("ca_bundle_unsafe")
+        rendered = os.read(descriptor, MAX_CA_BUNDLE_BYTES + 1)
+        if not rendered or len(rendered) > MAX_CA_BUNDLE_BYTES or os.read(descriptor, 1):
+            _fail("ca_bundle_unsafe")
+    except OSError as exc:
+        raise AssignmentProbeCLIError("ca_bundle_unreadable") from exc
+    finally:
+        os.close(descriptor)
+    if b"PRIVATE KEY" in rendered or b"-----BEGIN CERTIFICATE-----" not in rendered:
+        _fail("ca_bundle_unsafe")
+    try:
+        return rendered.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise AssignmentProbeCLIError("ca_bundle_unsafe") from exc
+
+
+def build_probe_ssl_context(tls_ca_file: str | None) -> ssl.SSLContext:
+    """Strict TLS 1.2+ client context trusting the system store or one explicit bundle."""
+
+    try:
+        if tls_ca_file is None:
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        else:
+            context = ssl.create_default_context(
+                ssl.Purpose.SERVER_AUTH, cadata=_read_ca_bundle(tls_ca_file)
+            )
+    except ssl.SSLError as exc:
+        raise AssignmentProbeCLIError("ca_bundle_invalid") from exc
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
+def _validated_https_url(value: str, *, code: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 2_048 or not value.isascii():
+        _fail(code)
+    parts = urlsplit(value)
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or parts.fragment
+        or parts.query
+        or not parts.hostname
+        or not _HOSTNAME.fullmatch(parts.hostname)
+    ):
+        _fail(code)
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise AssignmentProbeCLIError(code) from exc
+    if port is not None and not 1 <= port <= 65_535:
+        _fail(code)
+    return value
+
+
+def _validated_edge_origin(value: str) -> str:
+    validated = _validated_https_url(value, code="edge_origin_invalid")
+    parts = urlsplit(validated)
+    if parts.path not in {"", "/"}:
+        _fail("edge_origin_invalid")
+    return validated.rstrip("/")
+
+
+def _fetch_document(
+    transport: ProbeTransport,
+    url: str,
+    *,
+    max_bytes: int,
+    timeout_seconds: float,
+    code: str,
+) -> bytes:
+    validated = _validated_https_url(url, code=f"{code}_url_invalid")
+    host = urlsplit(validated).hostname or ""
+    result = transport.fetch(
+        url=validated,
+        server_name=host,
+        headers={
+            "accept": "application/json",
+            "accept-encoding": "identity",
+            "cache-control": "no-cache",
+            "user-agent": USER_AGENT,
+        },
+        timeout_seconds=timeout_seconds,
+        max_bytes=max_bytes,
+    )
+    if isinstance(result, ProbeTransportFailure):
+        _fail(f"{code}_fetch_{result.code}")
+    if result.status != 200:
+        _fail(f"{code}_fetch_status_invalid")
+    if not result.body:
+        _fail(f"{code}_fetch_empty")
+    return result.body
+
+
+def _load_trust_policy(value: InputFile) -> AssignmentManifestTrustPolicy:
+    from .production_release_verifier import HardenedFileSet
+
+    try:
+        rendered = _load_input_bytes(
+            HardenedFileSet(),
+            value,
+            label="assignment_manifest_trust_policy",
+            max_bytes=MAX_TRUST_POLICY_BYTES,
+        )
+    except CheckpointRelayCLIError as exc:
+        raise AssignmentProbeCLIError(exc.code) from exc
+    try:
+        return parse_assignment_manifest_trust_policy(rendered)
+    except (TypeError, ValueError, ValidationError, RecursionError) as exc:
+        raise AssignmentProbeCLIError("trust_policy_invalid") from exc
+
+
+def _load_file_bytes(value: InputFile, *, label: str, max_bytes: int) -> bytes:
+    from .production_release_verifier import HardenedFileSet
+
+    try:
+        return _load_input_bytes(HardenedFileSet(), value, label=label, max_bytes=max_bytes)
+    except CheckpointRelayCLIError as exc:
+        raise AssignmentProbeCLIError(exc.code) from exc
+
+
+def _load_publication(
+    manifest_source: ManifestSource,
+    signature_sources: Sequence[SignatureSource],
+    transport: ProbeTransport,
+    policy: AssignmentManifestTrustPolicy,
+) -> tuple[ActiveAssignmentManifestV2, tuple[AssignmentManifestSignatureEnvelope, ...]]:
+    timeout_seconds = policy.probe_timeout_millis / 1000
+    if manifest_source.file is not None:
+        manifest_bytes = _load_file_bytes(
+            manifest_source.file,
+            label="active_assignment_manifest",
+            max_bytes=MAX_DOCUMENT_BYTES,
+        )
+    else:
+        manifest_bytes = _fetch_document(
+            transport,
+            cast(str, manifest_source.url),
+            max_bytes=MAX_FETCH_BYTES,
+            timeout_seconds=timeout_seconds,
+            code="manifest",
+        )
+    try:
+        manifest = parse_organic_assignment_manifest(manifest_bytes)
+    except (TypeError, ValueError, ValidationError, RecursionError) as exc:
+        raise AssignmentProbeCLIError("manifest_invalid") from exc
+    if not 1 <= len(signature_sources) <= MAX_KEYS:
+        _fail("signature_count_invalid")
+    envelopes: list[AssignmentManifestSignatureEnvelope] = []
+    for index, source in enumerate(signature_sources):
+        if source.file is not None:
+            rendered = _load_file_bytes(
+                source.file,
+                label=f"manifest_signature_{index:02d}",
+                max_bytes=MAX_SIGNATURE_BYTES,
+            )
+        else:
+            rendered = _fetch_document(
+                transport,
+                cast(str, source.url),
+                max_bytes=MAX_SIGNATURE_BYTES,
+                timeout_seconds=timeout_seconds,
+                code="signature",
+            )
+        try:
+            envelopes.append(parse_assignment_manifest_signature_envelope(rendered))
+        except (TypeError, ValueError, ValidationError, RecursionError) as exc:
+            raise AssignmentProbeCLIError("signature_invalid") from exc
+    signer_ids = [item.signer_key_id for item in envelopes]
+    if len(signer_ids) != len(set(signer_ids)):
+        _fail("signature_set_noncanonical")
+    return manifest, tuple(sorted(envelopes, key=lambda item: item.signer_key_id))
+
+
+def _effective_uid() -> int:
+    return os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+
+
+def _safe_parent(value: os.stat_result) -> bool:
+    if not stat.S_ISDIR(value.st_mode) or value.st_uid not in {0, _effective_uid()}:
+        return False
+    unsafe = stat.S_IMODE(value.st_mode) & 0o022
+    return not unsafe or bool(value.st_mode & stat.S_ISVTX)
+
+
+class _StateRoot:
+    """Exclusive owner-only directory holding one canonical acceptance state file."""
+
+    def __init__(self, path: str) -> None:
+        self.path = _normalized_absolute_path(path, code="state_root_path_unsafe")
+        self._directory_fd = -1
+        self._lock_fd = -1
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        parent_path, name = self.path.rsplit("/", 1)
+        parent_path = parent_path or "/"
+        try:
+            parent_fd = os.open(parent_path, flags)
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_root_unsafe") from exc
+        try:
+            if not _safe_parent(os.fstat(parent_fd)):
+                _fail("state_root_unsafe")
+            try:
+                os.mkdir(name, STATE_ROOT_MODE, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise AssignmentProbeCLIError("state_root_unsafe") from exc
+            self._directory_fd = os.open(name, flags, dir_fd=parent_fd)
+            metadata = os.fstat(self._directory_fd)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != _effective_uid()
+                or stat.S_IMODE(metadata.st_mode) != STATE_ROOT_MODE
+            ):
+                _fail("state_root_unsafe")
+            self._lock()
+        except OSError as exc:
+            self.close()
+            raise AssignmentProbeCLIError("state_root_unsafe") from exc
+        except AssignmentProbeCLIError:
+            self.close()
+            raise
+        finally:
+            os.close(parent_fd)
+
+    def _lock(self) -> None:
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+        self._lock_fd = os.open(LOCK_NAME, flags, STATE_FILE_MODE, dir_fd=self._directory_fd)
+        metadata = os.fstat(self._lock_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != _effective_uid():
+            _fail("state_root_unsafe")
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise AssignmentProbeCLIError("probe_busy") from exc
+
+    def entries(self) -> set[str]:
+        try:
+            return set(os.listdir(self._directory_fd))
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_root_unsafe") from exc
+
+    def read_state(self) -> AssignmentManifestChainState | None:
+        entries = self.entries()
+        if STATE_NAME not in entries:
+            return None
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            descriptor = os.open(STATE_NAME, flags, dir_fd=self._directory_fd)
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_file_unsafe") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != _effective_uid()
+                or stat.S_IMODE(metadata.st_mode) != STATE_FILE_MODE
+                or metadata.st_nlink != 1
+                or not 0 < metadata.st_size <= MAX_STATE_BYTES
+            ):
+                _fail("state_file_unsafe")
+            rendered = os.read(descriptor, MAX_STATE_BYTES + 1)
+            if len(rendered) != metadata.st_size or os.read(descriptor, 1):
+                _fail("state_file_unsafe")
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_file_unsafe") from exc
+        finally:
+            os.close(descriptor)
+        try:
+            return parse_assignment_manifest_chain_state(rendered)
+        except (TypeError, ValueError, ValidationError, RecursionError) as exc:
+            raise AssignmentProbeCLIError("state_file_invalid") from exc
+
+    def _remove_install_residue(self) -> None:
+        """Remove only a safe temp file left by an interrupted locked install."""
+
+        try:
+            metadata = os.stat(STATE_INSTALL_NAME, dir_fd=self._directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_install_residue") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != _effective_uid()
+            or stat.S_IMODE(metadata.st_mode) != STATE_FILE_MODE
+            or metadata.st_nlink != 1
+            or metadata.st_size > MAX_STATE_BYTES
+        ):
+            _fail("state_install_residue")
+        try:
+            os.unlink(STATE_INSTALL_NAME, dir_fd=self._directory_fd)
+            os.fsync(self._directory_fd)
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_install_residue") from exc
+
+    def replace_state(self, rendered: bytes) -> None:
+        self._remove_install_residue()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            descriptor = os.open(
+                STATE_INSTALL_NAME, flags, STATE_FILE_MODE, dir_fd=self._directory_fd
+            )
+        except FileExistsError as exc:
+            raise AssignmentProbeCLIError("state_install_residue") from exc
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_write_failed") from exc
+        try:
+            os.fchmod(descriptor, STATE_FILE_MODE)
+            view = memoryview(rendered)
+            offset = 0
+            while offset < len(view):
+                written = os.write(descriptor, view[offset:])
+                if written <= 0:
+                    _fail("state_write_failed")
+                offset += written
+            os.fsync(descriptor)
+            os.replace(
+                STATE_INSTALL_NAME,
+                STATE_NAME,
+                src_dir_fd=self._directory_fd,
+                dst_dir_fd=self._directory_fd,
+            )
+            os.fsync(self._directory_fd)
+        except OSError as exc:
+            raise AssignmentProbeCLIError("state_write_failed") from exc
+        finally:
+            os.close(descriptor)
+        installed = self.read_state()
+        if installed is None or assignment_manifest_chain_state_bytes(installed) != rendered:
+            _fail("state_write_failed")
+
+    def close(self) -> None:
+        if self._lock_fd >= 0:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(self._lock_fd)
+            self._lock_fd = -1
+        if self._directory_fd >= 0:
+            os.close(self._directory_fd)
+            self._directory_fd = -1
+
+    def __enter__(self) -> _StateRoot:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def persist_verified_manifest_head(
+    *,
+    state_root: str,
+    trust_policy: AssignmentManifestTrustPolicy,
+    head_manifest: ActiveAssignmentManifestV2,
+    head_signatures: Sequence[AssignmentManifestSignatureEnvelope],
+    evaluation_epoch: int,
+    current_finalized_height: int,
+    expected_anchor_sha256: str,
+    expected_next_state_sha256: str,
+) -> AssignmentManifestChainState:
+    """Re-verify a public-verifier head live under the probe lock and persist its state.
+
+    ``expected_anchor_sha256`` is the independently retained durable state the
+    verifier started from; ``expected_next_state_sha256`` compare-binds this
+    independent re-verification to the verifier's result before installation.
+    Holding the probe lock makes a concurrent probe run fail busy instead of
+    racing the handoff.
+    """
+
+    if (
+        _DIGEST.fullmatch(expected_anchor_sha256) is None
+        or _DIGEST.fullmatch(expected_next_state_sha256) is None
+    ):
+        _fail("state_anchor_invalid")
+    policy = AssignmentManifestTrustPolicy.model_validate(
+        trust_policy.model_dump(mode="json", by_alias=True)
+    )
+    with _StateRoot(state_root) as root:
+        prior = _resolve_prior_state(root, policy, expected_anchor_sha256)
+        try:
+            verified = verify_organic_assignment_manifest(
+                head_manifest,
+                tuple(head_signatures),
+                policy,
+                prior,
+                evaluation_epoch=evaluation_epoch,
+                current_finalized_height=current_finalized_height,
+            ).next_chain_state
+        except (TypeError, ValueError, ValidationError, RecursionError) as exc:
+            raise AssignmentProbeCLIError("handoff_invalid") from exc
+        if verified.state_digest_sha256 != expected_next_state_sha256:
+            _fail("handoff_state_mismatch")
+        root.replace_state(assignment_manifest_chain_state_bytes(verified))
+        return verified
+
+
+def _resolve_prior_state(
+    root: _StateRoot,
+    policy: AssignmentManifestTrustPolicy,
+    anchor: str,
+) -> AssignmentManifestChainState:
+    existing = root.read_state()
+    if anchor == "genesis":
+        if existing is not None or root.entries() - {LOCK_NAME}:
+            _fail("state_anchor_stale")
+        return build_initial_manifest_chain_state(policy)
+    if existing is None:
+        _fail("state_missing")
+    if anchor == "current":
+        pass
+    elif _DIGEST.fullmatch(anchor) is None:
+        _fail("state_anchor_invalid")
+    elif existing.state_digest_sha256 != anchor:
+        _fail("state_anchor_stale")
+    if (
+        existing.trust_policy_digest_sha256 != policy.trust_policy_digest_sha256
+        or existing.central_authority_fingerprint_sha256
+        != policy.central_authority_fingerprint_sha256
+    ):
+        _fail("state_binding_mismatch")
+    return existing
+
+
+def _output_target(path: str, *, state_root: str) -> tuple[str, str]:
+    normalized = _normalized_absolute_path(path, code="output_path_unsafe")
+    if normalized == state_root or normalized.startswith(state_root + "/"):
+        _fail("output_path_unsafe")
+    parent_path, name = normalized.rsplit("/", 1)
+    if not name or name in {".", ".."}:
+        _fail("output_path_unsafe")
+    return parent_path or "/", name
+
+
+def _preflight_output(path: str, *, state_root: str) -> None:
+    parent_path, name = _output_target(path, state_root=state_root)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        parent_fd = os.open(parent_path, flags)
+    except OSError as exc:
+        raise AssignmentProbeCLIError("output_parent_unsafe") from exc
+    try:
+        if not _safe_parent(os.fstat(parent_fd)):
+            _fail("output_parent_unsafe")
+        try:
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise AssignmentProbeCLIError("output_unsafe") from exc
+        _fail("output_exists")
+    finally:
+        os.close(parent_fd)
+
+
+def _write_output(path: str, rendered: bytes, *, state_root: str) -> None:
+    parent_path, name = _output_target(path, state_root=state_root)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        parent_fd = os.open(parent_path, directory_flags)
+    except OSError as exc:
+        raise AssignmentProbeCLIError("output_parent_unsafe") from exc
+    try:
+        if not _safe_parent(os.fstat(parent_fd)):
+            _fail("output_parent_unsafe")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            descriptor = os.open(name, flags, STATE_FILE_MODE, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise AssignmentProbeCLIError("output_exists") from exc
+        except OSError as exc:
+            raise AssignmentProbeCLIError("output_write_failed") from exc
+        try:
+            os.fchmod(descriptor, STATE_FILE_MODE)
+            view = memoryview(rendered)
+            offset = 0
+            while offset < len(view):
+                written = os.write(descriptor, view[offset:])
+                if written <= 0:
+                    _fail("output_write_failed")
+                offset += written
+            os.fsync(descriptor)
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise AssignmentProbeCLIError("output_write_failed") from exc
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+
+
+def archive_verified_manifest(
+    directory: str, manifest: ActiveAssignmentManifestV2, *, state_root: str
+) -> None:
+    """Install ``<digest>.json`` once; an existing entry must hold the exact same bytes."""
+
+    rendered = organic_assignment_manifest_bytes(manifest)
+    directory_path = _normalized_absolute_path(directory, code="manifest_archive_unsafe")
+    target = f"{directory_path}/{manifest.manifest_digest_sha256}.json"
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        directory_fd = os.open(directory_path, flags)
+    except OSError as exc:
+        raise AssignmentProbeCLIError("manifest_archive_unsafe") from exc
+    try:
+        metadata = os.fstat(directory_fd)
+        if metadata.st_uid != _effective_uid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+            _fail("manifest_archive_unsafe")
+        try:
+            existing = os.open(
+                f"{manifest.manifest_digest_sha256}.json",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            existing = -1
+        except OSError as exc:
+            raise AssignmentProbeCLIError("manifest_archive_unsafe") from exc
+    finally:
+        os.close(directory_fd)
+    if existing < 0:
+        _write_output(target, rendered, state_root=state_root)
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(existing).st_mode):
+            _fail("manifest_archive_unsafe")
+        stored = os.read(existing, MAX_FETCH_BYTES + 1)
+    except OSError as exc:
+        raise AssignmentProbeCLIError("manifest_archive_unsafe") from exc
+    finally:
+        os.close(existing)
+    if stored != rendered:
+        _fail("manifest_archive_conflict")
+
+
+def _probe_url(
+    manifest: ActiveAssignmentManifestV2,
+    route_host: str,
+    path: str,
+    edge_origin: str | None,
+) -> str:
+    if edge_origin is not None:
+        return f"{edge_origin}{path}"
+    return f"{manifest.probe_scheme}://{route_host}:{manifest.probe_port}{path}"
+
+
+def run_hidden_probe_epoch(
+    manifest: ActiveAssignmentManifestV2,
+    policy: AssignmentManifestTrustPolicy,
+    transport: ProbeTransport,
+    *,
+    seed: bytes,
+    validator_hotkey: str,
+    sign: Callable[[bytes], bytes],
+    epoch_index: int,
+    edge_origin: str | None,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[list[OrganicProbeObservation], int]:
+    """Fire one epoch's hidden schedule; return the sealed observations and skipped count.
+
+    Each probe waits for its private instant, signs a fresh authorization at
+    the actual send time, and is judged against the manifest entry it
+    targeted. A probe whose instant already lies more than
+    :data:`MAX_FIRE_DELAY_MILLIS` in the past, or whose send time has left the
+    epoch, is skipped (counted, never sent late).
+    """
+
+    plan = plan_hidden_probes(
+        seed=seed,
+        validator_hotkey=validator_hotkey,
+        manifest=manifest,
+        epoch_index=epoch_index,
+    )
+    epoch_end_millis = (epoch_index + 1) * DEFAULT_EPOCH_SECONDS * 1_000
+    observations: list[OrganicProbeObservation] = []
+    skipped = 0
+    for planned in plan:
+        now_millis = int(clock() * 1_000)
+        if planned.fire_at_millis > now_millis:
+            sleep((planned.fire_at_millis - now_millis) / 1_000)
+            now_millis = int(clock() * 1_000)
+        if (
+            now_millis - planned.fire_at_millis > MAX_FIRE_DELAY_MILLIS
+            or now_millis >= epoch_end_millis
+            or epoch_index_of(now_millis // 1_000) != epoch_index
+        ):
+            skipped += 1
+            continue
+        deployment, _ = find_replica(manifest, planned.endpoint_id)
+        authorization = build_probe_authorization(
+            validator_hotkey=validator_hotkey,
+            endpoint_id=planned.endpoint_id,
+            generation=planned.generation,
+            method=planned.method,
+            path=planned.path,
+            nonce=planned.nonce,
+            issued_at_epoch=now_millis // 1_000,
+            sign=sign,
+        )
+        result = transport.fetch(
+            url=_probe_url(manifest, deployment.route_host, planned.path, edge_origin),
+            server_name=deployment.route_host,
+            headers={
+                "host": deployment.route_host,
+                "accept": "*/*",
+                "accept-encoding": "identity",
+                "cache-control": "no-cache",
+                "user-agent": USER_AGENT,
+                ORGANIC_PROBE_AUTHORIZATION_HEADER: probe_authorization_header(authorization),
+            },
+            timeout_seconds=policy.probe_timeout_millis / 1000,
+            max_bytes=policy.max_response_bytes,
+            method=planned.method,
+        )
+        observations.append(evaluate_organic_probe(manifest, policy, authorization, result))
+    return observations, skipped
+
+
+def _default_signer_factory(
+    wallet: WalletSelector,
+) -> tuple[Callable[[bytes], bytes], str]:
+    import bittensor as bt
+
+    from .auth import HotkeySigningFacade
+
+    facade = HotkeySigningFacade(
+        bt.Wallet(wallet.name, wallet.hotkey, path=os.path.expanduser(wallet.path))
+    )
+    return facade.sign_organic_probe_authorization, facade.hotkey
+
+
+def _verify_head(
+    root: _StateRoot,
+    config: AssignmentProbeCLIConfig,
+    policy: AssignmentManifestTrustPolicy,
+    manifest: ActiveAssignmentManifestV2,
+    signatures: tuple[AssignmentManifestSignatureEnvelope, ...],
+    evaluation_epoch: int,
+) -> OrganicManifestVerification:
+    prior_state = _resolve_prior_state(root, policy, config.trusted_state_anchor)
+    verify = (
+        anchor_organic_manifest_chain_state
+        if config.trusted_state_anchor == "genesis"
+        else verify_organic_assignment_manifest
+    )
+    return verify(
+        manifest,
+        signatures,
+        policy,
+        prior_state,
+        evaluation_epoch=evaluation_epoch,
+        current_finalized_height=config.current_finalized_height,
+    )
+
+
+def execute_assignment_probe(
+    config: AssignmentProbeCLIConfig,
+    *,
+    transport_factory: TransportFactory = _default_transport_factory,
+    signer_factory: SignerFactory = _default_signer_factory,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> AssignmentProbeCLIResult:
+    """Verify the current manifest, run one hidden-probe epoch, and seal its record."""
+
+    if (
+        isinstance(config.epoch_index, bool)
+        or not isinstance(config.epoch_index, int)
+        or not 0 <= config.epoch_index <= MAX_EPOCH // DEFAULT_EPOCH_SECONDS
+        or isinstance(config.current_finalized_height, bool)
+        or not isinstance(config.current_finalized_height, int)
+        or not 0 <= config.current_finalized_height <= MAX_EPOCH
+        or not isinstance(config.validator_hotkey, str)
+        or _HOTKEY.fullmatch(config.validator_hotkey) is None
+    ):
+        _fail("operator_context_invalid")
+    evaluation_epoch = int(clock())
+    if epoch_index_of(evaluation_epoch) > config.epoch_index:
+        _fail("epoch_already_elapsed")
+    edge_origin = (
+        _validated_edge_origin(config.edge_origin) if config.edge_origin is not None else None
+    )
+    ssl_context = build_probe_ssl_context(config.tls_ca_file)
+    transport = transport_factory(ssl_context)
+    policy = _load_trust_policy(config.trust_policy)
+    seed = _load_file_bytes(config.probe_seed, label="probe_seed", max_bytes=PROBE_SEED_BYTES)
+    if len(seed) != PROBE_SEED_BYTES:
+        _fail("probe_seed_invalid")
+    file_inputs: list[InputFile] = [config.trust_policy, config.probe_seed]
+    if config.manifest.file is not None:
+        file_inputs.append(config.manifest.file)
+    file_inputs.extend(item.file for item in config.signatures if item.file is not None)
+    input_paths = {
+        _normalized_absolute_path(item.path, code="input_path_unsafe") for item in file_inputs
+    }
+    sign, signer_hotkey = signer_factory(config.wallet)
+    if signer_hotkey != config.validator_hotkey:
+        _fail("wallet_hotkey_mismatch")
+    with _StateRoot(config.state_root) as root:
+        if _normalized_absolute_path(config.epoch_output, code="output_path_unsafe") in (
+            input_paths
+        ):
+            _fail("output_path_alias")
+        _preflight_output(config.epoch_output, state_root=root.path)
+        manifest, signatures = _load_publication(
+            config.manifest, config.signatures, transport, policy
+        )
+        verification = _verify_head(root, config, policy, manifest, signatures, evaluation_epoch)
+        # Archive before the state advances: a refused archive leaves no trace.
+        archive_verified_manifest(
+            config.manifest_archive_dir, verification.manifest, state_root=root.path
+        )
+        state_advanced = not verification.reprobe
+        if state_advanced:
+            root.replace_state(assignment_manifest_chain_state_bytes(verification.next_chain_state))
+        observations, skipped = run_hidden_probe_epoch(
+            verification.manifest,
+            policy,
+            transport,
+            seed=seed,
+            validator_hotkey=config.validator_hotkey,
+            sign=sign,
+            epoch_index=config.epoch_index,
+            edge_origin=edge_origin,
+            clock=clock,
+            sleep=sleep,
+        )
+        epoch = score_organic_epoch(
+            [verification.manifest],
+            observations,
+            validator_hotkey=config.validator_hotkey,
+            epoch_index=config.epoch_index,
+            min_attempts=DEFAULT_MIN_ATTEMPTS,
+        )
+        _write_output(
+            config.epoch_output,
+            organic_epoch_score_bytes(epoch),
+            state_root=root.path,
+        )
+    return AssignmentProbeCLIResult(
+        epoch=epoch,
+        next_chain_state=verification.next_chain_state,
+        state_advanced=state_advanced,
+        skipped_probes=skipped,
+    )
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        del message
+        raise AssignmentProbeCLIError("usage")
+
+
+def _unsigned_decimal(value: str) -> int:
+    if (
+        not value
+        or not value.isascii()
+        or not value.isdigit()
+        or (len(value) > 1 and value.startswith("0"))
+    ):
+        raise argparse.ArgumentTypeError("invalid")
+    parsed = int(value)
+    if parsed > MAX_EPOCH:
+        raise argparse.ArgumentTypeError("invalid")
+    return parsed
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(
+        prog="misscomputer-assignment-probe",
+        description="One epoch of hidden validator probes of organic app assignments.",
+        allow_abbrev=False,
+        add_help=False,
+    )
+    parser.add_argument("--trust-policy", required=True)
+    parser.add_argument("--trust-policy-sha256", required=True)
+    manifest = parser.add_mutually_exclusive_group(required=True)
+    manifest.add_argument("--manifest-file")
+    manifest.add_argument("--manifest-url")
+    parser.add_argument("--manifest-sha256")
+    parser.add_argument("--signature-file", action="append", default=[])
+    parser.add_argument("--signature-sha256", action="append", default=[])
+    parser.add_argument("--signature-url", action="append", default=[])
+    parser.add_argument("--probe-seed-file", required=True)
+    parser.add_argument("--probe-seed-sha256", required=True)
+    parser.add_argument("--epoch-index", required=True, type=_unsigned_decimal)
+    parser.add_argument("--finalized-height", required=True, type=_unsigned_decimal)
+    parser.add_argument("--validator-hotkey", required=True)
+    parser.add_argument("--wallet-name", required=True)
+    parser.add_argument("--wallet-hotkey", required=True)
+    parser.add_argument("--wallet-path", default="~/.bittensor/wallets")
+    parser.add_argument("--state-root", required=True)
+    parser.add_argument("--trusted-state-anchor", required=True)
+    parser.add_argument("--epoch-output", required=True)
+    parser.add_argument("--manifest-archive-dir", required=True)
+    parser.add_argument("--edge-origin")
+    parser.add_argument("--tls-ca-file")
+    return parser
+
+
+def _config_from_arguments(arguments: argparse.Namespace) -> AssignmentProbeCLIConfig:
+    signature_files = cast(list[str], arguments.signature_file)
+    signature_digests = cast(list[str], arguments.signature_sha256)
+    signature_urls = cast(list[str], arguments.signature_url)
+    if len(signature_files) != len(signature_digests):
+        _fail("signature_count_invalid")
+    manifest_file = cast(str | None, arguments.manifest_file)
+    manifest_digest = cast(str | None, arguments.manifest_sha256)
+    if (manifest_file is None) != (manifest_digest is None):
+        _fail("usage")
+    manifest = (
+        ManifestSource(file=InputFile(manifest_file, cast(str, manifest_digest)))
+        if manifest_file is not None
+        else ManifestSource(url=cast(str, arguments.manifest_url))
+    )
+    signatures = (
+        *(
+            SignatureSource(file=InputFile(path, digest))
+            for path, digest in zip(signature_files, signature_digests, strict=True)
+        ),
+        *(SignatureSource(url=url) for url in signature_urls),
+    )
+    if not signatures:
+        _fail("usage")
+    return AssignmentProbeCLIConfig(
+        trust_policy=InputFile(
+            cast(str, arguments.trust_policy), cast(str, arguments.trust_policy_sha256)
+        ),
+        manifest=manifest,
+        signatures=signatures,
+        probe_seed=InputFile(
+            cast(str, arguments.probe_seed_file), cast(str, arguments.probe_seed_sha256)
+        ),
+        epoch_index=cast(int, arguments.epoch_index),
+        current_finalized_height=cast(int, arguments.finalized_height),
+        validator_hotkey=cast(str, arguments.validator_hotkey),
+        wallet=WalletSelector(
+            name=cast(str, arguments.wallet_name),
+            hotkey=cast(str, arguments.wallet_hotkey),
+            path=cast(str, arguments.wallet_path),
+        ),
+        state_root=cast(str, arguments.state_root),
+        trusted_state_anchor=cast(str, arguments.trusted_state_anchor),
+        epoch_output=cast(str, arguments.epoch_output),
+        manifest_archive_dir=cast(str, arguments.manifest_archive_dir),
+        edge_origin=cast(str | None, arguments.edge_origin),
+        tls_ca_file=cast(str | None, arguments.tls_ca_file),
+    )
+
+
+def run_cli(argv: Sequence[str]) -> int:
+    """Run with stable statuses and without echoing arguments, paths, or content."""
+
+    try:
+        arguments = _parser().parse_args(list(argv))
+        result = execute_assignment_probe(_config_from_arguments(arguments))
+        epoch = result.epoch
+        sys.stdout.write(
+            f"PROBED status={epoch.epoch_status} epoch={epoch.epoch_index} "
+            f"endpoints={epoch.sampled_endpoint_count} "
+            f"observations={len(epoch.observations)} skipped={result.skipped_probes} "
+            f"next_state_sha256={result.next_chain_state.state_digest_sha256}\n"
+        )
+        return EXIT_OK if epoch.epoch_status == "scored" else EXIT_DEGRADED
+    except AssignmentProbeError as exc:
+        sys.stderr.write(f"REJECTED {exc.code}\n")
+        return EXIT_REJECTED
+    except AssignmentProbeCLIError as exc:
+        sys.stderr.write(f"REJECTED {exc.code}\n")
+        if exc.code == "usage":
+            return EXIT_USAGE
+        if exc.code == "probe_busy":
+            return EXIT_BUSY
+        return EXIT_REJECTED
+    except CheckpointRelayCLIError as exc:
+        sys.stderr.write(f"REJECTED {exc.code}\n")
+        return EXIT_REJECTED
+    except (ValidationError, TypeError, ValueError):
+        sys.stderr.write("REJECTED input_contract_invalid\n")
+        return EXIT_REJECTED
+    except Exception:
+        sys.stderr.write("ERROR internal_error\n")
+        return EXIT_INTERNAL
+
+
+def main() -> None:
+    raise SystemExit(run_cli(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()

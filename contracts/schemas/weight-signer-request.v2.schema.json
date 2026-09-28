@@ -1,0 +1,168 @@
+{
+  "$id": "https://miss.computer/contracts/weight-signer-request.v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "execution_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "execution_vector": {
+      "additionalProperties": false,
+      "properties": {
+        "digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 253,
+          "minLength": 1,
+          "type": "string"
+        },
+        "omitted": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "hotkey": {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[!-~]+$",
+                "type": "string"
+              },
+              "planned_uid": {
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "hotkey",
+              "planned_uid"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "plan_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/weight-execution-vector"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "validator_hotkey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[!-~]+$",
+          "type": "string"
+        },
+        "version_key": {
+          "maximum": 2147483647,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "weights": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "hotkey": {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[!-~]+$",
+                "type": "string"
+              },
+              "planned_uid": {
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "uid": {
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "weight": {
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "type": "number"
+              }
+            },
+            "required": [
+              "hotkey",
+              "planned_uid",
+              "uid",
+              "weight"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "digest_sha256",
+        "netuid",
+        "network",
+        "omitted",
+        "plan_digest_sha256",
+        "schema",
+        "schema_version",
+        "validator_hotkey",
+        "version_key",
+        "weights"
+      ],
+      "type": "object"
+    },
+    "netuid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 253,
+      "minLength": 1,
+      "type": "string"
+    },
+    "plan_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "request_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/weight-signer-request"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "validator_hotkey": {
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[!-~]+$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "execution_digest_sha256",
+    "execution_vector",
+    "netuid",
+    "network",
+    "plan_digest_sha256",
+    "request_id",
+    "schema",
+    "schema_version",
+    "validator_hotkey"
+  ],
+  "title": "Purpose-restricted weight signer request v2",
+  "type": "object"
+}

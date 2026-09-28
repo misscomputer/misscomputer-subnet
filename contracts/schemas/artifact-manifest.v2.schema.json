@@ -1,0 +1,180 @@
+{
+  "$defs": {
+    "ArtifactLayer": {
+      "additionalProperties": false,
+      "properties": {
+        "diff_id": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Diff Id",
+          "type": "string"
+        },
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "media_type": {
+          "enum": [
+            "application/vnd.oci.image.layer.v1.tar",
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+          ],
+          "title": "Media Type",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Size",
+          "type": "integer"
+        },
+        "uncompressed_size": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Uncompressed Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "diff_id",
+        "digest",
+        "media_type",
+        "size",
+        "uncompressed_size"
+      ],
+      "title": "ArtifactLayer",
+      "type": "object"
+    },
+    "ArtifactPlatform": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "const": "amd64",
+          "title": "Architecture",
+          "type": "string"
+        },
+        "os": {
+          "const": "linux",
+          "title": "Os",
+          "type": "string"
+        }
+      },
+      "required": [
+        "architecture",
+        "os"
+      ],
+      "title": "ArtifactPlatform",
+      "type": "object"
+    },
+    "OCIConfigDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "media_type": {
+          "const": "application/vnd.oci.image.config.v1+json",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "digest",
+        "size",
+        "media_type"
+      ],
+      "title": "OCIConfigDescriptor",
+      "type": "object"
+    },
+    "OCIManifestDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Digest",
+          "type": "string"
+        },
+        "media_type": {
+          "const": "application/vnd.oci.image.manifest.v1+json",
+          "title": "Media Type",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "digest",
+        "size",
+        "media_type"
+      ],
+      "title": "OCIManifestDescriptor",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Content-addressed R2 manifest; ``artifact_digest`` is sha256 of its exact bytes.",
+  "properties": {
+    "config": {
+      "$ref": "#/$defs/OCIConfigDescriptor"
+    },
+    "layers": {
+      "items": {
+        "$ref": "#/$defs/ArtifactLayer"
+      },
+      "maxItems": 127,
+      "minItems": 1,
+      "title": "Layers",
+      "type": "array"
+    },
+    "oci_manifest": {
+      "$ref": "#/$defs/OCIManifestDescriptor"
+    },
+    "platform": {
+      "$ref": "#/$defs/ArtifactPlatform"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/artifact-manifest",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 2,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "uncompressed_bytes": {
+      "maximum": 1073741824,
+      "minimum": 1,
+      "title": "Uncompressed Bytes",
+      "type": "integer"
+    },
+    "workload_type": {
+      "const": "oci-image-v1",
+      "title": "Workload Type",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "workload_type",
+    "platform",
+    "oci_manifest",
+    "config",
+    "layers",
+    "uncompressed_bytes"
+  ],
+  "title": "ArtifactManifest",
+  "type": "object"
+}

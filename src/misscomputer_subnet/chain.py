@@ -1,0 +1,632 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Small current-SDK chain adapter and deterministic mock metagraph."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol, TypeVar
+
+import bittensor as bt
+
+from .async_lifecycle import drain_cleanup
+from .auth import HotkeySigningFacade
+from .chain_transport import _OwnedRpcSubstrate
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True, slots=True)
+class NeuronRecord:
+    uid: int
+    hotkey: str
+    validator_permit: bool
+    tao_stake: float
+    axon: str | None
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class MetagraphSnapshot:
+    network: str
+    netuid: int
+    block: int
+    tempo: int
+    neurons: tuple[NeuronRecord, ...]
+    # Bittensor v11.1 exposes the finalized head through its substrate
+    # transport. Live reads are pinned to that block when the capability is
+    # present; older/alternate clients fall back to a head read guarded by the
+    # same conservative monotonic admission used by MetagraphState.
+    finalized: bool = False
+
+    @property
+    def epoch(self) -> int:
+        return self.block // max(self.tempo, 1)
+
+    def by_hotkey(self, hotkey: str) -> NeuronRecord | None:
+        return next((neuron for neuron in self.neurons if neuron.hotkey == hotkey), None)
+
+    def identity_fingerprint(self) -> tuple[Any, ...]:
+        """Comparable scheduling identity for same-height reorg detection."""
+        neurons = tuple(
+            sorted(
+                (
+                    neuron.uid,
+                    neuron.hotkey,
+                    neuron.validator_permit,
+                    repr(neuron.tao_stake),
+                    neuron.axon or "",
+                    neuron.active,
+                )
+                for neuron in self.neurons
+            )
+        )
+        return (self.network, self.netuid, self.block, self.tempo, neurons)
+
+
+@dataclass(slots=True)
+class _ChainReadOperation:
+    task: asyncio.Task[Any]
+    completion: asyncio.Future[None]
+    depth: int = 1
+
+
+class ChainQuery(Protocol):
+    """Read-only metagraph lifecycle exposed to neuron application code."""
+
+    async def open(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+    async def sync(self) -> MetagraphSnapshot: ...
+
+
+class BittensorChain:
+    """Narrow metagraph query adapter with no public wallet or raw client."""
+
+    __slots__ = (
+        "__client",
+        "__close_task",
+        "__generation",
+        "__lifecycle_lock",
+        "__open_task",
+        "__operations",
+        "__retiring",
+        "network",
+        "netuid",
+        "rpc_endpoint",
+    )
+
+    def __init__(
+        self,
+        *,
+        network: str,
+        netuid: int,
+        rpc_endpoint: str | None = None,
+    ) -> None:
+        self.network = network
+        self.netuid = netuid
+        self.rpc_endpoint = rpc_endpoint
+        self.__client: Any = None
+        self.__close_task: asyncio.Task[None] | None = None
+        self.__generation = 0
+        self.__lifecycle_lock = asyncio.Lock()
+        self.__open_task: asyncio.Task[None] | None = None
+        self.__operations: dict[asyncio.Task[Any], _ChainReadOperation] = {}
+        self.__retiring = False
+
+    async def open(self) -> None:
+        async with self.__lifecycle_lock:
+            if self.__retiring or self.__close_task is not None:
+                raise RuntimeError("chain is retiring")
+            if self.__client is not None:
+                raise RuntimeError("chain is already open")
+            network = self.rpc_endpoint if self.rpc_endpoint is not None else self.network
+            # Both Client and the raw transport backend are owned before connect()
+            # can acquire a socket. Subtensor's awaitable wrapper publishes too late.
+            client = bt.Client(
+                network,
+                substrate=_OwnedRpcSubstrate(network, pinned=self.rpc_endpoint is not None),
+            )
+            self.__generation += 1
+            generation = self.__generation
+            self.__client = client
+            opening = asyncio.create_task(
+                self._finish_open(client, generation),
+                name="bittensor-chain-open",
+            )
+            self.__open_task = opening
+        try:
+            await opening
+        except BaseException as primary:
+            try:
+                await drain_cleanup(
+                    self._retire_open(client, opening, generation),
+                    name="bittensor-chain-open-cleanup",
+                )
+            except BaseException:
+                primary.add_note("chain_open_cleanup_failed")
+            raise
+
+    async def _finish_open(self, client: Any, generation: int) -> None:
+        current = asyncio.current_task()
+        try:
+            await client.connect()
+            async with self.__lifecycle_lock:
+                if (
+                    self.__generation != generation
+                    or self.__client is not client
+                    or self.__retiring
+                ):
+                    raise RuntimeError("chain open was superseded by close")
+        finally:
+            async with self.__lifecycle_lock:
+                if self.__open_task is current:
+                    self.__open_task = None
+
+    async def _retire_open(
+        self,
+        client: Any,
+        opening: asyncio.Task[None],
+        generation: int,
+    ) -> None:
+        """Retire one failed public-open generation before exposing its failure."""
+
+        # Cancellation normally propagates from open() to its child, but the
+        # child may already have completed successfully at the result handoff.
+        # Mark it cancelled synchronously so close can drain either schedule.
+        opening.cancel()
+        async with self.__lifecycle_lock:
+            closing: asyncio.Task[None] | None = None
+            if self.__generation == generation:
+                closing = self.__close_task
+                if closing is None and self.__client is client:
+                    closing = self._begin_close(client, opening, generation)
+                elif self.__open_task is opening:
+                    # A concurrent retirement may already have detached the
+                    # client. Never depend on the child's finally block to
+                    # release the stale opener slot.
+                    self.__open_task = None
+        if closing is None:
+            # A newer generation can exist only after the captured generation
+            # reached its close fixed point. Retrieve the old child's result
+            # without acting on the replacement.
+            await asyncio.gather(opening, return_exceptions=True)
+            return
+        await self._join_close(closing)
+
+    async def close(self) -> None:
+        caller = asyncio.current_task()
+        await drain_cleanup(self._request_close(caller), name="bittensor-chain-cleanup")
+
+    async def _request_close(self, caller: asyncio.Task[Any] | None) -> None:
+        async with self.__lifecycle_lock:
+            closing = self.__close_task
+            if closing is None:
+                client = self.__client
+                opening = self.__open_task
+                if client is None and opening is None:
+                    return
+                if client is None:
+                    raise RuntimeError("chain opening operation lost its client")
+                # Close admission before publishing the asynchronous retirement.
+                # The task remains shared until both the admitted opener and every
+                # SDK layer are at a fixed point.
+                closing = self._begin_close(client, opening, self.__generation, caller)
+        await self._join_close(closing)
+
+    def _begin_close(
+        self,
+        client: Any,
+        opening: asyncio.Task[None] | None,
+        generation: int,
+        caller: asyncio.Task[Any] | None = None,
+    ) -> asyncio.Task[None]:
+        """Publish one close task while the lifecycle lock is held."""
+
+        self.__retiring = True
+        self.__client = None
+        if self.__open_task is opening:
+            self.__open_task = None
+        closing = asyncio.create_task(
+            self._finish_close(client, opening, generation, caller),
+            name="bittensor-chain-close",
+        )
+        self.__close_task = closing
+        return closing
+
+    async def _join_close(self, closing: asyncio.Task[None]) -> None:
+        try:
+            await closing
+        finally:
+            async with self.__lifecycle_lock:
+                if self.__close_task is closing and closing.done():
+                    self.__close_task = None
+
+    async def _finish_close(
+        self,
+        client: Any,
+        opening: asyncio.Task[None] | None,
+        generation: int,
+        caller: asyncio.Task[Any] | None,
+    ) -> None:
+        primary: BaseException | None = None
+        try:
+            self._cancel_read_operations(caller)
+            try:
+                await self._close_client(client)
+            except BaseException as exc:
+                primary = exc
+            # Begin transport retirement before waiting for the opener. Closing the
+            # SDK resolves ordinary pending RPC initialization, while a codec that
+            # intentionally resists shutdown remains an owned operation and keeps
+            # the retirement/reopen gate closed until it unwinds.
+            if opening is not None:
+                await asyncio.gather(opening, return_exceptions=True)
+            await self._drain_read_operations(caller)
+            if primary is not None:
+                raise primary
+        finally:
+            async with self.__lifecycle_lock:
+                if self.__generation == generation:
+                    self.__retiring = False
+
+    async def _admit_read(self) -> tuple[_ChainReadOperation, Any]:
+        current = asyncio.current_task()
+        if current is None:
+            raise RuntimeError("chain read has no owning task")
+        async with self.__lifecycle_lock:
+            if self.__retiring or self.__close_task is not None:
+                raise RuntimeError("chain is retiring")
+            client = self.__client
+            if client is None:
+                raise RuntimeError("chain is not open")
+            ownership = self.__operations.get(current)
+            if ownership is None:
+                ownership = _ChainReadOperation(
+                    task=current,
+                    completion=asyncio.get_running_loop().create_future(),
+                )
+                self.__operations[current] = ownership
+            else:
+                ownership.depth += 1
+            return ownership, client
+
+    def _release_read(self, ownership: _ChainReadOperation) -> None:
+        current = self.__operations.get(ownership.task)
+        if current is not ownership:
+            return
+        ownership.depth -= 1
+        if ownership.depth == 0:
+            del self.__operations[ownership.task]
+            if not ownership.completion.done():
+                ownership.completion.set_result(None)
+
+    async def _run_read(self, read: Callable[[Any], Awaitable[T]]) -> T:
+        ownership, client = await self._admit_read()
+        try:
+            return await read(client)
+        finally:
+            # No await: repeated cancellation cannot strand the completion.
+            self._release_read(ownership)
+
+    def _cancel_read_operations(self, caller: asyncio.Task[Any] | None) -> None:
+        for ownership in tuple(self.__operations.values()):
+            if ownership.task is not caller and not ownership.completion.done():
+                ownership.task.cancel()
+
+    async def _drain_read_operations(self, caller: asyncio.Task[Any] | None) -> None:
+        while True:
+            async with self.__lifecycle_lock:
+                pending = tuple(
+                    ownership.completion
+                    for ownership in self.__operations.values()
+                    if ownership.task is not caller and not ownership.completion.done()
+                )
+            if not pending:
+                return
+            await asyncio.gather(
+                *(asyncio.shield(completion) for completion in pending),
+                return_exceptions=True,
+            )
+
+    @staticmethod
+    async def _close_client(client: Any) -> None:
+        close = getattr(client, "close", None) or getattr(client, "aclose", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+    async def sync(self) -> MetagraphSnapshot:
+        async def read(client: Any) -> MetagraphSnapshot:
+            finalized_block = await self._finalized_block(client)
+            return await self._read_metagraph(client, finalized_block)
+
+        return await self._run_read(read)
+
+    async def latest_finalized_block(self) -> int:
+        """Return an exact finalized height or fail when the RPC lacks support."""
+
+        async def read(client: Any) -> int:
+            finalized_block = await self._finalized_block(client)
+            if finalized_block is None:
+                raise RuntimeError("RPC does not expose finalized-head reads")
+            return finalized_block
+
+        return await self._run_read(read)
+
+    async def sync_at_finalized(self, block: int) -> MetagraphSnapshot:
+        """Read one caller-proven finalized height from this RPC."""
+
+        if block < 0:
+            raise RuntimeError("finalized block is invalid")
+        return await self._run_read(lambda client: self._read_metagraph(client, block))
+
+    async def finalized_view(self) -> tuple[MetagraphSnapshot, str]:
+        """Read the finalized head's block hash and the metagraph at exactly that head.
+
+        The hash is returned as 64 lowercase hex characters. Clients without
+        the finalized-head RPC helpers fail closed.
+        """
+
+        async def read(client: Any) -> tuple[MetagraphSnapshot, str]:
+            substrate = getattr(client, "_substrate", None)
+            raw = getattr(substrate, "raw", None)
+            finalized_head = getattr(raw, "get_chain_finalised_head", None)
+            block_number = getattr(raw, "get_block_number", None)
+            if not callable(finalized_head) or not callable(block_number):
+                raise RuntimeError("RPC does not expose finalized-head reads")
+            block_hash = str(await finalized_head())
+            height = int(await block_number(block_hash))
+            normalized = block_hash.removeprefix("0x").lower()
+            if len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized):
+                raise RuntimeError("finalized block hash is invalid")
+            snapshot = await self._read_metagraph(client, height)
+            return snapshot, normalized
+
+        return await self._run_read(read)
+
+    async def _read_metagraph(self, client: Any, block: int | None) -> MetagraphSnapshot:
+        if block is None:
+            graph = await client.subnets.metagraph(netuid=self.netuid, commitments=False)
+        else:
+            graph = await client.subnets.metagraph(
+                netuid=self.netuid,
+                block=block,
+                commitments=False,
+            )
+        if graph is None:
+            raise RuntimeError(f"netuid {self.netuid} does not exist on {self.network}")
+        graph_block = int(graph.block)
+        graph_tempo = int(graph.tempo)
+        if graph_block < 0 or graph_tempo < 1:
+            raise RuntimeError("metagraph returned an invalid block or tempo")
+        if block is not None and graph_block != block:
+            raise RuntimeError("finalized metagraph read returned a different block")
+        neurons = tuple(
+            NeuronRecord(
+                uid=int(neuron.uid),
+                hotkey=str(neuron.hotkey),
+                validator_permit=bool(neuron.validator_permit),
+                tao_stake=_tao_value(neuron.tao_stake),
+                axon=str(neuron.axon) if neuron.axon else None,
+                active=bool(neuron.active),
+            )
+            for neuron in graph.neurons
+        )
+        return MetagraphSnapshot(
+            network=self.network,
+            netuid=self.netuid,
+            block=graph_block,
+            tempo=graph_tempo,
+            neurons=neurons,
+            finalized=block is not None,
+        )
+
+    async def commit_reveal_enabled(self, block: int) -> bool:
+        """Read the subnet's weight mode at one exact finalized block."""
+
+        async def read(client: Any) -> bool:
+            return bool(await client.subnets.commit_reveal_enabled(self.netuid, block=block))
+
+        return await self._run_read(read)
+
+    async def validator_weights(self, block: int, validator_uid: int) -> dict[int, float]:
+        """Read one validator's normalized weight row at an exact block."""
+
+        if block < 0 or not 0 <= validator_uid <= 65_535:
+            raise RuntimeError("weight-row identity is invalid")
+        return await self._run_read(
+            lambda client: self._read_validator_weights(client, block, validator_uid)
+        )
+
+    async def _read_validator_weights(
+        self,
+        client: Any,
+        block: int,
+        validator_uid: int,
+    ) -> dict[int, float]:
+        rows = await client.weights.weights(self.netuid, block=block)
+        if not isinstance(rows, dict):
+            raise RuntimeError("weight row response is invalid")
+        raw_row = rows.get(validator_uid, {})
+        if not isinstance(raw_row, dict):
+            raise RuntimeError("validator weight row is invalid")
+        row: dict[int, float] = {}
+        for raw_uid, raw_weight in raw_row.items():
+            if (
+                isinstance(raw_uid, bool)
+                or not isinstance(raw_uid, int)
+                or isinstance(raw_weight, bool)
+                or not isinstance(raw_weight, (int, float))
+            ):
+                raise RuntimeError("validator weight row contains an invalid value")
+            uid = raw_uid
+            weight = float(raw_weight)
+            if not 0 <= uid <= 65_535 or not math.isfinite(weight) or not 0.0 < weight <= 1.0:
+                raise RuntimeError("validator weight row contains an invalid value")
+            if uid in row:
+                raise RuntimeError("validator weight row contains a duplicate UID")
+            row[uid] = weight
+        if row and not math.isclose(math.fsum(row.values()), 1.0, rel_tol=0.0, abs_tol=1e-12):
+            raise RuntimeError("validator weight row is not normalized")
+        return dict(sorted(row.items()))
+
+    async def _finalized_block(self, client: Any) -> int | None:
+        """Return the finalized height exposed by the pinned Bittensor v11 SDK.
+
+        ``Client`` does not publish a one-shot finalized-height method, but its
+        v11.1 substrate transport does publish the two exact RPC helpers used
+        here. Capability detection keeps this adapter compatible with clients
+        that omit them; those clients remain protected by MetagraphState's
+        monotonic/same-height-conflict checks instead of silently accepting a
+        rollback.
+        """
+        substrate = getattr(client, "_substrate", None)
+        raw = getattr(substrate, "raw", None)
+        finalized_head = getattr(raw, "get_chain_finalised_head", None)
+        block_number = getattr(raw, "get_block_number", None)
+        if not callable(finalized_head) or not callable(block_number):
+            return None
+        block_hash = await finalized_head()
+        return int(await block_number(block_hash))
+
+
+def _tao_value(value: Any) -> float:
+    raw = getattr(value, "tao", value)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class MockPeer:
+    uri: str
+    uid: int
+    axon: str | None
+    validator_permit: bool
+    tao_stake: float
+
+    @property
+    def keypair(self) -> Any:
+        return bt.sp_core.Keypair.create_from_uri(self.uri)
+
+    @property
+    def hotkey(self) -> str:
+        return str(self.keypair.ss58_address)
+
+
+def load_mock_peers(value: str) -> tuple[MockPeer, ...]:
+    # Avoid treating an inline JSON document as an OS path (long documents can
+    # exceed platform pathname limits before Path.exists returns).
+    if value.lstrip().startswith("["):
+        raw = json.loads(value)
+    else:
+        raw = json.loads(Path(value).read_text())
+    return tuple(
+        MockPeer(
+            uri=str(item["uri"]),
+            uid=int(item["uid"]),
+            axon=str(item["axon"]) if item.get("axon") else None,
+            validator_permit=bool(item.get("validator_permit", False)),
+            tao_stake=float(item.get("tao_stake", 0)),
+        )
+        for item in raw
+    )
+
+
+class MockChain:
+    def __init__(
+        self,
+        *,
+        network: str,
+        netuid: int,
+        own_uri: str,
+        peers: tuple[MockPeer, ...],
+        initial_block: int = 100,
+        tempo: int = 12,
+    ) -> None:
+        self.network = network
+        self.netuid = netuid
+        self.hotkey_signer = HotkeySigningFacade(bt.sp_core.Keypair.create_from_uri(own_uri))
+        self.hotkey = self.hotkey_signer.hotkey
+        self.peers = peers
+        self.block = initial_block
+        self.tempo = tempo
+        self._lock = asyncio.Lock()
+
+    async def open(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def sync(self) -> MetagraphSnapshot:
+        async with self._lock:
+            # All mock processes derive a common monotonically increasing
+            # block clock without a coordinator or live chain.
+            self.block = max(self.block + 1, int(time.time()))
+            return MetagraphSnapshot(
+                network=self.network,
+                netuid=self.netuid,
+                block=self.block,
+                tempo=self.tempo,
+                neurons=tuple(
+                    NeuronRecord(
+                        uid=peer.uid,
+                        hotkey=peer.hotkey,
+                        validator_permit=peer.validator_permit,
+                        tao_stake=peer.tao_stake,
+                        axon=peer.axon,
+                    )
+                    for peer in self.peers
+                ),
+                # The deterministic mock has no competing fork-choice or RPC
+                # head. Each serialized tick is therefore its finalized view.
+                finalized=True,
+            )
+
+    async def commit_reveal_enabled(self, block: int) -> bool:
+        del block
+        return False
+
+
+class MetagraphState:
+    def __init__(self) -> None:
+        self._snapshot: MetagraphSnapshot | None = None
+        self._lock = asyncio.Lock()
+
+    async def set(self, snapshot: MetagraphSnapshot) -> None:
+        async with self._lock:
+            if (
+                not snapshot.network
+                or not 0 <= snapshot.netuid <= 65_535
+                or snapshot.block < 0
+                or snapshot.tempo < 1
+            ):
+                raise RuntimeError("invalid metagraph snapshot identity")
+            current = self._snapshot
+            if current is not None:
+                if snapshot.network != current.network or snapshot.netuid != current.netuid:
+                    raise RuntimeError("metagraph subnet identity changed")
+                if snapshot.block < current.block:
+                    raise RuntimeError("metagraph block rollback rejected")
+                if (
+                    snapshot.block == current.block
+                    and snapshot.identity_fingerprint() != current.identity_fingerprint()
+                ):
+                    raise RuntimeError("conflicting metagraph snapshot at committed block")
+            self._snapshot = snapshot
+
+    async def get(self) -> MetagraphSnapshot:
+        async with self._lock:
+            if self._snapshot is None:
+                raise RuntimeError("metagraph has not synchronized")
+            return self._snapshot

@@ -1,0 +1,56 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "caller_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Caller Hotkey",
+      "type": "string"
+    },
+    "chain_block": {
+      "minimum": 0,
+      "title": "Chain Block",
+      "type": "integer"
+    },
+    "challenge": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Challenge",
+      "type": "string"
+    },
+    "netuid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Network",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "default": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "request_id",
+    "network",
+    "netuid",
+    "chain_block",
+    "caller_hotkey",
+    "challenge"
+  ],
+  "title": "CapabilitiesSynapse",
+  "type": "object"
+}

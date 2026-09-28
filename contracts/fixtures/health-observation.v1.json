@@ -1,0 +1,1 @@
+{"availability":1.0,"correct":true,"deployment_id":"fixture-app","fraudulent":false,"latency_ms":42,"miner_hotkey":"miner-hotkey","observed_at":"2026-08-22T08:01:00Z","protocol":"subnet-synapse.v1","reachable":true,"replica_id":"fixture-app-miner-hotkey","vantage":"validator-a"}

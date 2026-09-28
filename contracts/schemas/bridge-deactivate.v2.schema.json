@@ -1,0 +1,134 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "miner_transport": {
+            "const": "https"
+          }
+        },
+        "required": [
+          "miner_transport"
+        ]
+      },
+      "then": {
+        "properties": {
+          "miner_tls_certificate_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "miner_transport": {
+            "const": "http"
+          }
+        },
+        "required": [
+          "miner_transport"
+        ]
+      },
+      "then": {
+        "properties": {
+          "miner_tls_certificate_sha256": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "description": "Cleanup bound to the exact authenticated identity of one assignment.\n\nA deactivation is transport for retiring durable state, so it must never\nresolve to a handle that merely shares the hotkey: the expected UID, axon,\nand service-key fingerprint pin the assignment's authenticated identity.",
+  "properties": {
+    "axon_url": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Axon Url",
+      "type": "string"
+    },
+    "deployment_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "endpoint_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Endpoint Id",
+      "type": "string"
+    },
+    "miner_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Miner Hotkey",
+      "type": "string"
+    },
+    "miner_service_public_key": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Miner Service Public Key",
+      "type": "string"
+    },
+    "miner_tls_certificate_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Miner Tls Certificate Sha256"
+    },
+    "miner_transport": {
+      "enum": [
+        "https",
+        "http"
+      ],
+      "title": "Miner Transport",
+      "type": "string"
+    },
+    "miner_uid": {
+      "anyOf": [
+        {
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Miner Uid"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "request_id",
+    "endpoint_id",
+    "deployment_id",
+    "miner_hotkey",
+    "axon_url",
+    "miner_service_public_key",
+    "miner_transport",
+    "miner_tls_certificate_sha256"
+  ],
+  "title": "BridgeDeactivateRequest",
+  "type": "object"
+}

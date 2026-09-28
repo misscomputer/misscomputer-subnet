@@ -1,0 +1,27 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "non_deactivated_assignments": {
+      "minimum": 0,
+      "title": "Non Deactivated Assignments",
+      "type": "integer"
+    },
+    "pending_startup_assignments": {
+      "minimum": 0,
+      "title": "Pending Startup Assignments",
+      "type": "integer"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v2",
+      "title": "Protocol",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "non_deactivated_assignments",
+    "pending_startup_assignments"
+  ],
+  "title": "RecoveryResponse",
+  "type": "object"
+}

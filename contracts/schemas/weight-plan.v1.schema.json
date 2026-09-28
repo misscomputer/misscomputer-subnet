@@ -1,0 +1,132 @@
+{
+  "$comment": "Canonical key ordering, unique UID/hotkey projections, normalized weight sum, snapshot epoch/expiry relationships, credential-free network identity, and digest verification are semantic checks.",
+  "$id": "https://miss.computer/contracts/weight-plan.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "created_block": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "expires_at_block": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "netuid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "network": {
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[!-~]+$",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/weight-plan"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "snapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "block": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "epoch": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "finalized": {
+          "const": true
+        },
+        "identity_fingerprint": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "tempo": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "block",
+        "epoch",
+        "finalized",
+        "identity_fingerprint",
+        "tempo"
+      ],
+      "type": "object"
+    },
+    "validator_hotkey": {
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[!-~]+$",
+      "type": "string"
+    },
+    "version_key": {
+      "maximum": 18446744073709551615,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "weights": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "hotkey": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[!-~]+$",
+            "type": "string"
+          },
+          "uid": {
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "weight": {
+            "exclusiveMinimum": 0,
+            "maximum": 1,
+            "type": "number"
+          }
+        },
+        "required": [
+          "hotkey",
+          "uid",
+          "weight"
+        ],
+        "type": "object"
+      },
+      "maxItems": 65536,
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "created_block",
+    "digest_sha256",
+    "expires_at_block",
+    "netuid",
+    "network",
+    "schema",
+    "schema_version",
+    "snapshot",
+    "validator_hotkey",
+    "version_key",
+    "weights"
+  ],
+  "title": "WeightPlan v1",
+  "type": "object"
+}

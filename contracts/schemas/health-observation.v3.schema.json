@@ -1,0 +1,128 @@
+{
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "correct": {
+            "const": true
+          }
+        },
+        "required": [
+          "correct"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reachable": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "fraudulent": {
+            "const": true
+          }
+        },
+        "required": [
+          "fraudulent"
+        ]
+      },
+      "then": {
+        "properties": {
+          "correct": {
+            "const": false
+          },
+          "reachable": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "availability": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Availability",
+      "type": "number"
+    },
+    "correct": {
+      "title": "Correct",
+      "type": "boolean"
+    },
+    "deployment_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Deployment Id",
+      "type": "string"
+    },
+    "endpoint_id": {
+      "maxLength": 320,
+      "minLength": 3,
+      "title": "Endpoint Id",
+      "type": "string"
+    },
+    "fraudulent": {
+      "title": "Fraudulent",
+      "type": "boolean"
+    },
+    "latency_ms": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Latency Ms",
+      "type": "integer"
+    },
+    "miner_hotkey": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Miner Hotkey",
+      "type": "string"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v3",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "reachable": {
+      "title": "Reachable",
+      "type": "boolean"
+    },
+    "replica_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Replica Id",
+      "type": "string"
+    },
+    "vantage": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Vantage",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "deployment_id",
+    "replica_id",
+    "endpoint_id",
+    "miner_hotkey",
+    "vantage",
+    "reachable",
+    "correct",
+    "fraudulent",
+    "latency_ms",
+    "availability",
+    "observed_at"
+  ],
+  "title": "HealthObservation",
+  "type": "object"
+}

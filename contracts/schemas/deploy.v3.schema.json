@@ -1,0 +1,673 @@
+{
+  "$defs": {
+    "DeploymentTicketV4": {
+      "additionalProperties": false,
+      "properties": {
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "expires_at": {
+          "maxLength": 64,
+          "title": "Expires At",
+          "type": "string"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "health": {
+          "$ref": "#/$defs/TicketHealth"
+        },
+        "image_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Image Digest",
+          "type": "string"
+        },
+        "issued_at": {
+          "maxLength": 64,
+          "title": "Issued At",
+          "type": "string"
+        },
+        "manifest_key": {
+          "pattern": "^v1/manifests/[0-9a-f]{64}\\.json$",
+          "title": "Manifest Key",
+          "type": "string"
+        },
+        "miner_id": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Id",
+          "type": "string"
+        },
+        "resources": {
+          "$ref": "#/$defs/SmallV1Resources"
+        },
+        "route_host": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "title": "Route Host",
+          "type": "string"
+        },
+        "signature": {
+          "pattern": "^[0-9a-f]{128}$",
+          "title": "Signature",
+          "type": "string"
+        },
+        "subnet": {
+          "$ref": "#/$defs/SubnetBinding"
+        },
+        "version": {
+          "const": "deployment.v4",
+          "title": "Version",
+          "type": "string"
+        },
+        "workload": {
+          "$ref": "#/$defs/TicketWorkload"
+        }
+      },
+      "required": [
+        "version",
+        "deployment_id",
+        "generation",
+        "image_digest",
+        "manifest_key",
+        "miner_id",
+        "route_host",
+        "assignment_nonce",
+        "workload",
+        "resources",
+        "health",
+        "issued_at",
+        "expires_at",
+        "subnet",
+        "signature"
+      ],
+      "title": "DeploymentTicketV4",
+      "type": "object"
+    },
+    "ServiceKeyBinding": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "validator"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport": {
+                "const": "local"
+              },
+              "transport_certificate_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "role": {
+                "const": "miner"
+              }
+            },
+            "required": [
+              "role"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport": {
+                "enum": [
+                  "https",
+                  "http"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "transport": {
+                "const": "https"
+              }
+            },
+            "required": [
+              "transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport_certificate_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "transport": {
+                "enum": [
+                  "local",
+                  "http"
+                ]
+              }
+            },
+            "required": [
+              "transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport_certificate_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "challenge": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Challenge",
+          "type": "string"
+        },
+        "expires_at_block": {
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Hotkey",
+          "type": "string"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Network",
+          "type": "string"
+        },
+        "protocol": {
+          "const": "service-binding.v2",
+          "default": "service-binding.v2",
+          "title": "Protocol",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "validator",
+            "miner"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Service Public Key",
+          "type": "string"
+        },
+        "signature": {
+          "default": "",
+          "title": "Signature",
+          "type": "string"
+        },
+        "transport": {
+          "enum": [
+            "local",
+            "https",
+            "http"
+          ],
+          "title": "Transport",
+          "type": "string"
+        },
+        "transport_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Transport Certificate Sha256"
+        },
+        "uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Uid"
+        },
+        "valid_from_block": {
+          "minimum": 0,
+          "title": "Valid From Block",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role",
+        "transport",
+        "transport_certificate_sha256",
+        "network",
+        "netuid",
+        "hotkey",
+        "service_public_key",
+        "generation",
+        "valid_from_block",
+        "expires_at_block",
+        "challenge"
+      ],
+      "title": "ServiceKeyBinding",
+      "type": "object"
+    },
+    "SmallV1Resources": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_millis": {
+          "const": 1000,
+          "title": "Cpu Millis",
+          "type": "integer"
+        },
+        "disk_mb": {
+          "const": 2048,
+          "title": "Disk Mb",
+          "type": "integer"
+        },
+        "memory_mb": {
+          "const": 1024,
+          "title": "Memory Mb",
+          "type": "integer"
+        },
+        "pids": {
+          "const": 256,
+          "title": "Pids",
+          "type": "integer"
+        },
+        "tmpfs_mb": {
+          "const": 64,
+          "title": "Tmpfs Mb",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpu_millis",
+        "memory_mb",
+        "disk_mb",
+        "pids",
+        "tmpfs_mb"
+      ],
+      "title": "SmallV1Resources",
+      "type": "object"
+    },
+    "SubnetBinding": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "miner_transport": {
+                "const": "https"
+              }
+            },
+            "required": [
+              "miner_transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "miner_tls_certificate_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "miner_transport": {
+                "const": "http"
+              }
+            },
+            "required": [
+              "miner_transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "miner_tls_certificate_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "chain_block": {
+          "minimum": 0,
+          "title": "Chain Block",
+          "type": "integer"
+        },
+        "epoch": {
+          "minimum": 0,
+          "title": "Epoch",
+          "type": "integer"
+        },
+        "expires_at_block": {
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "miner_axon_url": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Axon Url",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_tls_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Miner Tls Certificate Sha256"
+        },
+        "miner_transport": {
+          "enum": [
+            "https",
+            "http"
+          ],
+          "title": "Miner Transport",
+          "type": "string"
+        },
+        "miner_uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Miner Uid"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Network",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Validator Hotkey",
+          "type": "string"
+        },
+        "validator_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Validator Service Public Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "network",
+        "netuid",
+        "validator_hotkey",
+        "miner_hotkey",
+        "miner_axon_url",
+        "miner_transport",
+        "miner_tls_certificate_sha256",
+        "chain_block",
+        "epoch",
+        "expires_at_block",
+        "validator_service_public_key",
+        "miner_service_public_key"
+      ],
+      "title": "SubnetBinding",
+      "type": "object"
+    },
+    "TicketHealth": {
+      "additionalProperties": false,
+      "description": "``deployment.v4`` health: the customer predicate plus the fixed threshold.",
+      "properties": {
+        "expected_statuses": {
+          "items": {
+            "maximum": 599,
+            "minimum": 100,
+            "type": "integer"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Expected Statuses",
+          "type": "array"
+        },
+        "failure_threshold": {
+          "const": 2,
+          "title": "Failure Threshold",
+          "type": "integer"
+        },
+        "interval_millis": {
+          "maximum": 10000,
+          "minimum": 500,
+          "title": "Interval Millis",
+          "type": "integer"
+        },
+        "method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 1024,
+          "pattern": "^/(?:[\\x21\\x22\\x24-\\x2e\\x30-\\x3e\\x40-\\x7e][\\x21\\x22\\x24-\\x3e\\x40-\\x7e]*)?$",
+          "title": "Path",
+          "type": "string"
+        },
+        "probe_timeout_millis": {
+          "maximum": 10000,
+          "minimum": 1000,
+          "title": "Probe Timeout Millis",
+          "type": "integer"
+        },
+        "response_marker": {
+          "anyOf": [
+            {
+              "pattern": "^[\\x20-\\x7e]{1,256}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Marker"
+        },
+        "startup_timeout_millis": {
+          "maximum": 120000,
+          "minimum": 5000,
+          "title": "Startup Timeout Millis",
+          "type": "integer"
+        },
+        "successes_required": {
+          "maximum": 5,
+          "minimum": 1,
+          "title": "Successes Required",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "method",
+        "path",
+        "expected_statuses",
+        "response_marker",
+        "successes_required",
+        "interval_millis",
+        "probe_timeout_millis",
+        "startup_timeout_millis",
+        "failure_threshold"
+      ],
+      "title": "TicketHealth",
+      "type": "object"
+    },
+    "TicketWorkload": {
+      "additionalProperties": false,
+      "properties": {
+        "container_port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Container Port",
+          "type": "integer"
+        },
+        "env": {
+          "$ref": "#/$defs/WorkloadEnv"
+        },
+        "kind": {
+          "const": "oci-image-v1",
+          "title": "Kind",
+          "type": "string"
+        },
+        "runtime_profile": {
+          "const": "small-v1",
+          "title": "Runtime Profile",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "container_port",
+        "runtime_profile",
+        "env"
+      ],
+      "title": "TicketWorkload",
+      "type": "object"
+    },
+    "WorkloadEnv": {
+      "additionalProperties": false,
+      "properties": {
+        "HOST": {
+          "const": "0.0.0.0",
+          "title": "Host",
+          "type": "string"
+        },
+        "PORT": {
+          "pattern": "^[1-9][0-9]{0,4}$",
+          "title": "Port",
+          "type": "string"
+        }
+      },
+      "required": [
+        "HOST",
+        "PORT"
+      ],
+      "title": "WorkloadEnv",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "caller_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Caller Hotkey",
+      "type": "string"
+    },
+    "current_block": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Current Block",
+      "type": "integer"
+    },
+    "protocol": {
+      "const": "subnet-synapse.v3",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    },
+    "ticket": {
+      "$ref": "#/$defs/DeploymentTicketV4"
+    },
+    "validator_binding": {
+      "$ref": "#/$defs/ServiceKeyBinding"
+    }
+  },
+  "required": [
+    "protocol",
+    "request_id",
+    "current_block",
+    "caller_hotkey",
+    "validator_binding",
+    "ticket"
+  ],
+  "title": "DeploySynapseV3",
+  "type": "object"
+}

@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "CheckpointScoreEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_score_ppm": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Canonical Score Ppm",
+          "type": "integer"
+        },
+        "eligibility_status": {
+          "enum": [
+            "eligible",
+            "ineligible"
+          ],
+          "title": "Eligibility Status",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "record_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Record Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "eligibility_status",
+        "canonical_score_ppm",
+        "record_digest_sha256"
+      ],
+      "title": "CheckpointScoreEntry",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "canonical_score_report_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Canonical Score Report Digest Sha256",
+      "type": "string"
+    },
+    "central_authority_fingerprint_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Central Authority Fingerprint Sha256",
+      "type": "string"
+    },
+    "central_scoring_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Central Scoring Policy Digest Sha256",
+      "type": "string"
+    },
+    "checkpoint_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Checkpoint Digest Sha256",
+      "type": "string"
+    },
+    "evaluation_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Evaluation Epoch",
+      "type": "integer"
+    },
+    "expires_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Expires At Epoch",
+      "type": "integer"
+    },
+    "finalized_block_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Finalized Block Hash",
+      "type": "string"
+    },
+    "finalized_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Epoch",
+      "type": "integer"
+    },
+    "finalized_height": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Finalized Height",
+      "type": "integer"
+    },
+    "input_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "issued_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Issued At Epoch",
+      "type": "integer"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "previous_checkpoint_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Previous Checkpoint Digest Sha256"
+    },
+    "purpose": {
+      "const": "central_score_checkpoint_weight_relay_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "report_score_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Report Score Vector Digest Sha256",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/central-score-checkpoint",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "score_vector": {
+      "items": {
+        "$ref": "#/$defs/CheckpointScoreEntry"
+      },
+      "maxItems": 4096,
+      "minItems": 1,
+      "title": "Score Vector",
+      "type": "array"
+    },
+    "score_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Score Vector Digest Sha256",
+      "type": "string"
+    },
+    "sequence": {
+      "maximum": 9223372036854775807,
+      "minimum": 1,
+      "title": "Sequence",
+      "type": "integer"
+    },
+    "trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Trust Policy Digest Sha256",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "central_authority_fingerprint_sha256",
+    "central_scoring_policy_digest_sha256",
+    "trust_policy_digest_sha256",
+    "finalized_height",
+    "finalized_block_hash",
+    "finalized_epoch",
+    "input_snapshot_digest_sha256",
+    "canonical_score_report_digest_sha256",
+    "report_score_vector_digest_sha256",
+    "score_vector",
+    "score_vector_digest_sha256",
+    "sequence",
+    "issued_at_epoch",
+    "evaluation_epoch",
+    "expires_at_epoch",
+    "previous_checkpoint_digest_sha256",
+    "checkpoint_digest_sha256"
+  ],
+  "title": "CentralScoreCheckpoint",
+  "type": "object"
+}

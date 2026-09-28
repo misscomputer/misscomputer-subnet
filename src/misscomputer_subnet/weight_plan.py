@@ -1,0 +1,2509 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Canonical, immutable validator weight plans and safe local persistence."""
+
+from __future__ import annotations
+
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import secrets
+import stat
+import struct
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Final
+from urllib.parse import urlsplit
+
+from .validator_decision import (
+    ValidatorWeightDecision,
+    _validated_weight_submission,
+)
+
+if TYPE_CHECKING:
+    from .chain import MetagraphSnapshot, NeuronRecord
+
+WEIGHT_PLAN_SCHEMA = "miss.computer/misscomputer-subnet/weight-plan"
+WEIGHT_PLAN_SCHEMA_VERSION = 1
+# This is the protocol discriminator forwarded to Bittensor's weight call, not
+# a per-plan nonce. Canonical plan and surrounding workflow digests bind each
+# plan instance to its snapshot, identities, and provenance.
+WEIGHT_PLAN_PROTOCOL_VERSION_KEY: Final = 2
+SNAPSHOT_IDENTITY_SCHEMA = "miss.computer/misscomputer-subnet/metagraph-identity/v1"
+WEIGHT_PLAN_FILE_MODE = 0o600
+WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE = 0o700
+_WEIGHT_PLAN_PRIVATE_DIRECTORY_ACQUISITION_MODE: Final = 0o500
+MAX_WEIGHT_PLAN_NEURONS = 65_536
+MAX_WEIGHT_PLAN_BYTES = 16 << 20
+MAX_BLOCK = (1 << 63) - 1
+MAX_VERSION_KEY = (1 << 64) - 1
+_AT_FDCWD: Final = -100
+_AT_SYMLINK_FOLLOW: Final = 0x400
+_AT_EMPTY_PATH: Final = 0x1000
+_IN_ATTRIB: Final = 0x00000004
+_IN_MOVED_FROM: Final = 0x00000040
+_IN_MOVED_TO: Final = 0x00000080
+_IN_CREATE: Final = 0x00000100
+_IN_DELETE: Final = 0x00000200
+_IN_DELETE_SELF: Final = 0x00000400
+_IN_MOVE_SELF: Final = 0x00000800
+_IN_Q_OVERFLOW: Final = 0x00004000
+_IN_IGNORED: Final = 0x00008000
+_IN_ISDIR: Final = 0x40000000
+_INOTIFY_EVENT = struct.Struct("iIII")
+_PRIVATE_CLEANUP_WATCH_MASK: Final = (
+    _IN_ATTRIB
+    | _IN_MOVED_FROM
+    | _IN_MOVED_TO
+    | _IN_CREATE
+    | _IN_DELETE
+    | _IN_DELETE_SELF
+    | _IN_MOVE_SELF
+)
+
+
+class WeightPlanError(ValueError):
+    """The proposed plan data is unsafe or ambiguous."""
+
+
+class WeightPlanTargetError(WeightPlanError):
+    """The requested durable plan target is unsafe."""
+
+
+def _add_note_safely(primary: BaseException, note: str) -> None:
+    """Retain cleanup context without allowing a broken hook to replace ``primary``."""
+
+    try:
+        BaseException.add_note(primary, note)
+    except BaseException:
+        # Exception identity and resource retirement take precedence over an
+        # optional diagnostic annotation, including for hostile subclasses.
+        return
+
+
+def _close_preserving(descriptor: int, primary: BaseException, note: str) -> None:
+    """Close one descriptor without replacing an already-selected failure."""
+
+    try:
+        os.close(descriptor)
+    except BaseException:
+        _add_note_safely(primary, note)
+
+
+def _canonical_json(value: object) -> bytes:
+    try:
+        rendered = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise WeightPlanError("weight plan is not canonical JSON") from exc
+    return rendered.encode("ascii")
+
+
+def _validate_text(value: object, *, field_name: str, maximum: int = 256) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or value != value.strip()
+        or not value.isascii()
+        or any(ord(character) < 0x21 or ord(character) > 0x7E for character in value)
+    ):
+        raise WeightPlanError(f"{field_name} is invalid")
+    return value
+
+
+def _validate_network_identity(value: object, *, field_name: str = "network") -> str:
+    """Accept public aliases or credential-free canonical websocket endpoints."""
+
+    network = _validate_text(value, field_name=field_name)
+    if "://" not in network:
+        if len(network) > 64 or any(
+            not (character.isalnum() or character in {"-", "_"}) for character in network
+        ):
+            raise WeightPlanError(
+                f"{field_name} must be a public alias or credential-free websocket endpoint"
+            )
+        return network
+    try:
+        endpoint = urlsplit(network)
+        port = endpoint.port
+    except ValueError as exc:
+        raise WeightPlanError(f"{field_name} is invalid") from exc
+    if (
+        endpoint.scheme not in {"ws", "wss"}
+        or not endpoint.netloc
+        or endpoint.hostname is None
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint.path
+        or endpoint.query
+        or endpoint.fragment
+        or endpoint.netloc.endswith(":")
+        or (port is not None and not 1 <= port <= 65_535)
+    ):
+        raise WeightPlanError(
+            f"{field_name} must be a public alias or credential-free websocket endpoint"
+        )
+    return network
+
+
+def _validate_integer(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise WeightPlanError(f"{field_name} is out of range")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class WeightPlanEntry:
+    """One exact metagraph identity and its normalized positive weight."""
+
+    uid: int
+    hotkey: str
+    weight: float
+
+    def __post_init__(self) -> None:
+        _validate_integer(self.uid, field_name="weight UID", minimum=0, maximum=65_535)
+        _validate_text(self.hotkey, field_name="weight hotkey")
+        try:
+            normalized = float(self.weight)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise WeightPlanError("normalized weight is out of range") from exc
+        if (
+            isinstance(self.weight, bool)
+            or not isinstance(self.weight, (int, float))
+            or not (math.isfinite(normalized) and 0.0 < normalized <= 1.0)
+        ):
+            raise WeightPlanError("normalized weight is out of range")
+        object.__setattr__(self, "weight", normalized)
+
+    def document(self) -> dict[str, object]:
+        return {"hotkey": self.hotkey, "uid": self.uid, "weight": self.weight}
+
+
+@dataclass(frozen=True, slots=True)
+class WeightPlanSnapshot:
+    """The exact finalized metagraph view that authorizes a plan."""
+
+    block: int
+    tempo: int
+    epoch: int
+    finalized: bool
+    identity_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _validate_integer(self.block, field_name="snapshot block", minimum=0, maximum=MAX_BLOCK)
+        _validate_integer(self.tempo, field_name="snapshot tempo", minimum=1, maximum=MAX_BLOCK)
+        _validate_integer(self.epoch, field_name="snapshot epoch", minimum=0, maximum=MAX_BLOCK)
+        if self.epoch != self.block // self.tempo:
+            raise WeightPlanError("snapshot epoch does not match block and tempo")
+        if self.finalized is not True:
+            raise WeightPlanError("weight plans require a finalized metagraph snapshot")
+        if len(self.identity_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in self.identity_fingerprint
+        ):
+            raise WeightPlanError("snapshot identity fingerprint is invalid")
+
+    def document(self) -> dict[str, object]:
+        return {
+            "block": self.block,
+            "epoch": self.epoch,
+            "finalized": self.finalized,
+            "identity_fingerprint": self.identity_fingerprint,
+            "tempo": self.tempo,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WeightPlan:
+    """Immutable canonical input for a future, separate one-shot executor.
+
+    ``digest_sha256`` authenticates the canonical JSON document without the
+    digest field itself. The on-disk document adds that digest and one trailing
+    newline; no wall-clock value participates, so the same snapshot and inputs
+    always produce exactly the same bytes.
+    """
+
+    network: str
+    netuid: int
+    validator_hotkey: str
+    snapshot: WeightPlanSnapshot
+    weights: tuple[WeightPlanEntry, ...]
+    version_key: int
+    created_block: int
+    expires_at_block: int
+    schema: str = field(default=WEIGHT_PLAN_SCHEMA, init=False)
+    schema_version: int = field(default=WEIGHT_PLAN_SCHEMA_VERSION, init=False)
+    digest_sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        _validate_network_identity(self.network)
+        _validate_integer(self.netuid, field_name="netuid", minimum=0, maximum=65_535)
+        _validate_text(self.validator_hotkey, field_name="validator hotkey")
+        _validate_integer(
+            self.version_key,
+            field_name="version key",
+            minimum=0,
+            maximum=MAX_VERSION_KEY,
+        )
+        _validate_integer(
+            self.created_block,
+            field_name="created block",
+            minimum=0,
+            maximum=MAX_BLOCK,
+        )
+        _validate_integer(
+            self.expires_at_block,
+            field_name="expiry block",
+            minimum=0,
+            maximum=MAX_BLOCK,
+        )
+        if self.created_block != self.snapshot.block:
+            raise WeightPlanError("created block must equal the finalized snapshot block")
+        expiry_limit = _conservative_expiry_limit(self.snapshot.block, self.snapshot.tempo)
+        if not self.created_block < self.expires_at_block <= expiry_limit:
+            raise WeightPlanError("expiry block exceeds the conservative snapshot window")
+        if not self.weights:
+            raise WeightPlanError("weight plan must contain at least one positive entry")
+        ordered = tuple(sorted(self.weights, key=lambda entry: (entry.uid, entry.hotkey)))
+        if self.weights != ordered:
+            raise WeightPlanError("weight plan entries are not canonically ordered")
+        if len({entry.uid for entry in self.weights}) != len(self.weights):
+            raise WeightPlanError("weight plan contains duplicate UIDs")
+        if len({entry.hotkey for entry in self.weights}) != len(self.weights):
+            raise WeightPlanError("weight plan contains duplicate hotkeys")
+        if any(entry.hotkey == self.validator_hotkey for entry in self.weights):
+            raise WeightPlanError("weight plan cannot assign weight to its validator")
+        if not math.isclose(
+            math.fsum(entry.weight for entry in self.weights),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        ):
+            raise WeightPlanError("weight plan entries are not normalized")
+        object.__setattr__(
+            self,
+            "digest_sha256",
+            hashlib.sha256(_canonical_json(self._unsigned_document())).hexdigest(),
+        )
+
+    def _unsigned_document(self) -> dict[str, object]:
+        return {
+            "created_block": self.created_block,
+            "expires_at_block": self.expires_at_block,
+            "netuid": self.netuid,
+            "network": self.network,
+            "schema": self.schema,
+            "schema_version": self.schema_version,
+            "snapshot": self.snapshot.document(),
+            "validator_hotkey": self.validator_hotkey,
+            "version_key": self.version_key,
+            "weights": [entry.document() for entry in self.weights],
+        }
+
+    def document(self) -> dict[str, object]:
+        value = self._unsigned_document()
+        value["digest_sha256"] = self.digest_sha256
+        return value
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json(self.document()) + b"\n"
+
+
+def _validate_snapshot_neuron(neuron: NeuronRecord) -> tuple[int, str, dict[str, object]]:
+    uid = _validate_integer(neuron.uid, field_name="snapshot UID", minimum=0, maximum=65_535)
+    hotkey = _validate_text(neuron.hotkey, field_name="snapshot hotkey")
+    if not isinstance(neuron.validator_permit, bool) or not isinstance(neuron.active, bool):
+        raise WeightPlanError("snapshot neuron flags are invalid")
+    if (
+        isinstance(neuron.tao_stake, bool)
+        or not isinstance(neuron.tao_stake, (int, float))
+        or not math.isfinite(float(neuron.tao_stake))
+        or float(neuron.tao_stake) < 0.0
+    ):
+        raise WeightPlanError("snapshot stake is invalid")
+    if neuron.axon is not None:
+        _validate_text(neuron.axon, field_name="snapshot axon identity", maximum=4_096)
+    identity: dict[str, object] = {
+        "active": neuron.active,
+        "axon": neuron.axon,
+        "hotkey": hotkey,
+        "tao_stake_hex": float(neuron.tao_stake).hex(),
+        "uid": uid,
+        "validator_permit": neuron.validator_permit,
+    }
+    return uid, hotkey, identity
+
+
+def snapshot_identity_fingerprint(snapshot: MetagraphSnapshot) -> str:
+    """Hash the complete, validated, order-independent metagraph identity."""
+
+    network = _validate_network_identity(snapshot.network, field_name="snapshot network")
+    netuid = _validate_integer(
+        snapshot.netuid, field_name="snapshot netuid", minimum=0, maximum=65_535
+    )
+    block = _validate_integer(
+        snapshot.block, field_name="snapshot block", minimum=0, maximum=MAX_BLOCK
+    )
+    tempo = _validate_integer(
+        snapshot.tempo, field_name="snapshot tempo", minimum=1, maximum=MAX_BLOCK
+    )
+    if snapshot.finalized is not True:
+        raise WeightPlanError("weight plans require a finalized metagraph snapshot")
+    if not snapshot.neurons or len(snapshot.neurons) > MAX_WEIGHT_PLAN_NEURONS:
+        raise WeightPlanError("snapshot neuron collection is empty or too large")
+    identities = [_validate_snapshot_neuron(neuron) for neuron in snapshot.neurons]
+    if len({uid for uid, _, _ in identities}) != len(identities):
+        raise WeightPlanError("snapshot contains duplicate UIDs")
+    if len({hotkey for _, hotkey, _ in identities}) != len(identities):
+        raise WeightPlanError("snapshot contains duplicate hotkeys")
+    ordered = [identity for _, _, identity in sorted(identities, key=lambda item: item[:2])]
+    document = {
+        "block": block,
+        "epoch": block // tempo,
+        "finalized": True,
+        "netuid": netuid,
+        "network": network,
+        "neurons": ordered,
+        "schema": SNAPSHOT_IDENTITY_SCHEMA,
+        "tempo": tempo,
+    }
+    return hashlib.sha256(_canonical_json(document)).hexdigest()
+
+
+def _conservative_expiry_limit(block: int, tempo: int) -> int:
+    epoch = block // tempo
+    next_epoch_block = (epoch + 1) * tempo
+    quarter_tempo_window = max(1, tempo // 4)
+    return min(block + quarter_tempo_window, next_epoch_block, MAX_BLOCK)
+
+
+def conservative_expiry_block(snapshot: MetagraphSnapshot) -> int:
+    """Expire within both one quarter-tempo and the current epoch boundary."""
+
+    block = _validate_integer(
+        snapshot.block, field_name="snapshot block", minimum=0, maximum=MAX_BLOCK
+    )
+    tempo = _validate_integer(
+        snapshot.tempo, field_name="snapshot tempo", minimum=1, maximum=MAX_BLOCK
+    )
+    expiry = _conservative_expiry_limit(block, tempo)
+    if expiry <= block:
+        raise WeightPlanError("snapshot is too close to the supported block limit")
+    return expiry
+
+
+def _weight_rows(value: object) -> Sequence[object]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise WeightPlanError("weight rows must be a JSON array")
+    if not value or len(value) > MAX_WEIGHT_PLAN_NEURONS:
+        raise WeightPlanError("weight rows are empty or too large")
+    return value
+
+
+def build_weight_plan(
+    *,
+    snapshot: MetagraphSnapshot,
+    validator_hotkey: str,
+    rows: object,
+    version_key: int,
+) -> WeightPlan:
+    """Validate and normalize Go dry-run rows against one finalized snapshot."""
+
+    validator_hotkey = _validate_text(validator_hotkey, field_name="validator hotkey")
+    fingerprint = snapshot_identity_fingerprint(snapshot)
+    by_hotkey = {neuron.hotkey: neuron for neuron in snapshot.neurons}
+    validator = by_hotkey.get(validator_hotkey)
+    if validator is None or not validator.active or not validator.validator_permit:
+        raise WeightPlanError(
+            "validator hotkey is absent, inactive, or lacks a permit in the snapshot"
+        )
+
+    seen_hotkeys: set[str] = set()
+    positive: list[tuple[int, str, float]] = []
+    for item in _weight_rows(rows):
+        if not isinstance(item, Mapping):
+            raise WeightPlanError("weight row is not an object")
+        hotkey = _validate_text(item.get("miner_hotkey"), field_name="weight hotkey")
+        if hotkey in seen_hotkeys:
+            raise WeightPlanError("weight rows contain a duplicate hotkey")
+        seen_hotkeys.add(hotkey)
+        raw_weight = item.get("weight")
+        if isinstance(raw_weight, bool) or not isinstance(raw_weight, (int, float)):
+            raise WeightPlanError("weight value is not a JSON number")
+        weight = float(raw_weight)
+        if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+            raise WeightPlanError("weight value is non-finite or out of range")
+        neuron = by_hotkey.get(hotkey)
+        if neuron is None:
+            raise WeightPlanError("weight hotkey is absent from the finalized snapshot")
+        if hotkey == validator_hotkey or not neuron.active:
+            raise WeightPlanError("weight target is not an active miner")
+        if weight > 0.0:
+            positive.append((neuron.uid, hotkey, weight))
+
+    if not positive:
+        raise WeightPlanError("weight rows contain no positive targets")
+    positive.sort(key=lambda item: (item[0], item[1]))
+    if len({uid for uid, _, _ in positive}) != len(positive):
+        raise WeightPlanError("weight rows resolve to duplicate UIDs")
+    total = math.fsum(weight for _, _, weight in positive)
+    if not math.isfinite(total) or total <= 0.0:
+        raise WeightPlanError("weight total is invalid")
+    normalized = [weight / total for _, _, weight in positive]
+    correction_index = max(range(len(normalized)), key=lambda index: normalized[index])
+    normalized[correction_index] += 1.0 - math.fsum(normalized)
+    entries = tuple(
+        WeightPlanEntry(uid=uid, hotkey=hotkey, weight=normalized[index])
+        for index, (uid, hotkey, _) in enumerate(positive)
+    )
+    plan_snapshot = WeightPlanSnapshot(
+        block=snapshot.block,
+        tempo=snapshot.tempo,
+        epoch=snapshot.epoch,
+        finalized=snapshot.finalized,
+        identity_fingerprint=fingerprint,
+    )
+    return WeightPlan(
+        network=snapshot.network,
+        netuid=snapshot.netuid,
+        validator_hotkey=validator_hotkey,
+        snapshot=plan_snapshot,
+        weights=entries,
+        version_key=version_key,
+        created_block=snapshot.block,
+        expires_at_block=conservative_expiry_block(snapshot),
+    )
+
+
+def eligible_weight_targets(
+    snapshot: MetagraphSnapshot, *, validator_hotkey: str
+) -> frozenset[tuple[int, str]]:
+    """Every ``(uid, hotkey)`` a decision must judge: active neurons other than the validator.
+
+    This is exactly the set :func:`build_weight_plan` would accept a row for,
+    so a decision whose rows cover it has classified every miner the plan
+    could weight; a decision that omits one has silently left a miner out of
+    the judgement while still naming the complete snapshot fingerprint.
+    """
+
+    validator_hotkey = _validate_text(validator_hotkey, field_name="validator hotkey")
+    targets: set[tuple[int, str]] = set()
+    for neuron in snapshot.neurons:
+        uid, hotkey, _ = _validate_snapshot_neuron(neuron)
+        if hotkey != validator_hotkey and neuron.active:
+            targets.add((uid, hotkey))
+    return frozenset(targets)
+
+
+def build_weight_plan_from_decision(
+    decision: ValidatorWeightDecision,
+    *,
+    snapshot: MetagraphSnapshot,
+    finalized_block_hash: str,
+    version_key: int,
+) -> WeightPlan:
+    """The only path from a sealed ``validator-weight-decision`` to a weight plan.
+
+    The decision names the finalized metagraph view it was judged against:
+    network, netuid, validator identity, finalized height, block hash, epoch,
+    the complete identity fingerprint, and every registered UID/hotkey pair.
+    All of it is checked against the snapshot the plan will be built from
+    before the unchanged :func:`build_weight_plan` sees a single row, so a
+    decision can never be replayed against a different chain segment, a
+    reorganised metagraph, or a remapped UID. The decision's rows must also be
+    exactly the snapshot's eligible weight targets
+    (:func:`eligible_weight_targets`): a decision that omits an eligible miner
+    is refused, so no miner can be left out of the judgement while the
+    fingerprint still names the complete set.
+    """
+
+    # ``frozen=True`` prevents attribute assignment but does not make a
+    # Pydantic model's nested lists immutable. Snapshot the complete sealed
+    # decision once, then consult only that private copy: a caller mutating
+    # ``decision.rows`` concurrently cannot make the identity checks observe
+    # different rows from the ones committed to ``rows``.
+    decision, row_values = _validated_weight_submission(decision)
+    rows = tuple({"miner_hotkey": hotkey, "weight": weight} for hotkey, weight in row_values)
+    if snapshot.finalized is not True:
+        raise WeightPlanError("weight plans require a finalized metagraph snapshot")
+    if (
+        _validate_network_identity(snapshot.network, field_name="snapshot network")
+        != decision.network
+        or snapshot.netuid != decision.netuid
+    ):
+        raise WeightPlanError("decision network identity does not match the snapshot")
+    block = _validate_integer(
+        snapshot.block, field_name="snapshot block", minimum=0, maximum=MAX_BLOCK
+    )
+    tempo = _validate_integer(
+        snapshot.tempo, field_name="snapshot tempo", minimum=1, maximum=MAX_BLOCK
+    )
+    if block != decision.registered_finalized_height:
+        raise WeightPlanError("decision finalized height does not match the snapshot block")
+    if block // tempo != decision.registered_finalized_epoch:
+        raise WeightPlanError("decision finalized epoch does not match the snapshot epoch")
+    if (
+        not isinstance(finalized_block_hash, str)
+        or finalized_block_hash != decision.registered_finalized_block_hash
+    ):
+        raise WeightPlanError("decision finalized block hash does not match the snapshot")
+    by_hotkey = {neuron.hotkey: neuron for neuron in snapshot.neurons}
+    validator = by_hotkey.get(decision.validator_hotkey)
+    if validator is None or validator.uid != decision.validator_uid:
+        raise WeightPlanError("decision validator identity is absent from the snapshot")
+    for row in decision.rows:
+        neuron = by_hotkey.get(row.hotkey)
+        if neuron is None or neuron.uid != row.uid:
+            raise WeightPlanError("decision row identity is absent from or remapped in snapshot")
+    if snapshot_identity_fingerprint(snapshot) != decision.metagraph_identity_fingerprint_sha256:
+        raise WeightPlanError("decision metagraph fingerprint does not match the snapshot")
+    row_identities = frozenset((row.uid, row.hotkey) for row in decision.rows)
+    if row_identities != eligible_weight_targets(
+        snapshot, validator_hotkey=decision.validator_hotkey
+    ):
+        raise WeightPlanError("decision rows do not cover the complete eligible miner set")
+    return build_weight_plan(
+        snapshot=snapshot,
+        validator_hotkey=decision.validator_hotkey,
+        rows=rows,
+        version_key=version_key,
+    )
+
+
+def _validate_existing_target(target: os.stat_result) -> None:
+    if not stat.S_ISREG(target.st_mode):
+        raise WeightPlanTargetError("weight plan target must be a regular file, not a symlink")
+    if target.st_nlink != 1:
+        raise WeightPlanTargetError("weight plan target must not have hard links")
+    if hasattr(os, "geteuid") and target.st_uid != os.geteuid():
+        raise WeightPlanTargetError("weight plan target must be owned by the validator user")
+    if stat.S_IMODE(target.st_mode) != WEIGHT_PLAN_FILE_MODE:
+        raise WeightPlanTargetError("existing weight plan target must have mode 0600")
+    if target.st_size > MAX_WEIGHT_PLAN_BYTES:
+        raise WeightPlanTargetError("existing weight plan target is unexpectedly large")
+
+
+def _target_stat(directory_fd: int, name: str) -> os.stat_result | None:
+    try:
+        target = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    _validate_existing_target(target)
+    return target
+
+
+def _unvalidated_target_stat(directory_fd: int, name: str) -> os.stat_result | None:
+    """Observe one entry for rollback without accepting it as application data."""
+
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _same_target(first: os.stat_result | None, second: os.stat_result | None) -> bool:
+    if first is None or second is None:
+        return first is second
+    return (
+        first.st_dev,
+        first.st_ino,
+        first.st_mode,
+        first.st_nlink,
+        first.st_uid,
+        first.st_size,
+        first.st_mtime_ns,
+        first.st_ctime_ns,
+    ) == (
+        second.st_dev,
+        second.st_ino,
+        second.st_mode,
+        second.st_nlink,
+        second.st_uid,
+        second.st_size,
+        second.st_mtime_ns,
+        second.st_ctime_ns,
+    )
+
+
+def _read_existing(directory_fd: int, name: str, expected: os.stat_result) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    primary: BaseException | None = None
+    try:
+        opened = os.fstat(descriptor)
+        _validate_existing_target(opened)
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            raise WeightPlanTargetError("weight plan target changed during validation")
+        chunks: list[bytes] = []
+        remaining = MAX_WEIGHT_PLAN_BYTES
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining == 0 and os.read(descriptor, 1):
+            raise WeightPlanTargetError("existing weight plan target is unexpectedly large")
+        return b"".join(chunks)
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            os.close(descriptor)
+        except BaseException:
+            if primary is not None:
+                _add_note_safely(primary, "target_cleanup_failed")
+            else:
+                raise
+
+
+def _secure_file_location(path: str | os.PathLike[str]) -> tuple[str, str]:
+    raw_path = os.fspath(path)
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        raise WeightPlanTargetError("weight plan path is invalid")
+    if (
+        raw_path.endswith(os.sep)
+        or os.path.basename(raw_path) in {".", ".."}
+        or any(component in {".", ".."} for component in raw_path.split(os.sep))
+    ):
+        raise WeightPlanTargetError("weight plan path must name a file")
+    absolute_path = os.path.abspath(raw_path)
+    parent = os.path.dirname(absolute_path)
+    name = os.path.basename(absolute_path)
+    if not name or name in {".", ".."}:
+        raise WeightPlanTargetError("weight plan path must name a file")
+    return parent, name
+
+
+@dataclass(slots=True)
+class _PinnedDirectoryChain:
+    absolute_parent: str
+    components: tuple[str, ...]
+    descriptors: list[int]
+    identities: tuple[tuple[int, int], ...]
+
+    @property
+    def parent_fd(self) -> int:
+        return self.descriptors[-1]
+
+    def close(self) -> None:
+        descriptors, self.descriptors = self.descriptors, []
+        primary: BaseException | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    _add_note_safely(primary, "directory_additional_cleanup_failed")
+        if primary is not None:
+            raise primary
+
+
+@dataclass(slots=True)
+class _TemporaryPlan:
+    descriptor: int
+    identity: tuple[int, int]
+    name: str | None
+
+
+@dataclass(slots=True)
+class _RollbackDestinationState:
+    """The exact destination entry one rollback attempt may replace."""
+
+    exchange_identity: tuple[int, int] | None
+
+
+@dataclass(slots=True)
+class _PrivateCleanupNamespaceMonitor:
+    descriptor: int
+    parent_watch: int
+    private_watch: int = -1
+
+
+@dataclass(slots=True)
+class _PrivateCleanupDirectory:
+    descriptor: int
+    identity: tuple[int, int]
+    name: str
+    monitor: _PrivateCleanupNamespaceMonitor
+
+
+@dataclass(slots=True)
+class _WeightPlanWriteLock:
+    descriptor: int
+
+    def close(self) -> None:
+        descriptor, self.descriptor = self.descriptor, -1
+        if descriptor < 0:
+            return
+        primary: BaseException | None = None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except BaseException as exc:
+            primary = exc
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+            else:
+                _add_note_safely(primary, "write_lock_descriptor_cleanup_failed")
+        if primary is not None:
+            raise primary
+
+
+def _effective_uid() -> int:
+    return os.geteuid() if hasattr(os, "geteuid") else os.getuid()
+
+
+def _write_lock_name(target_name: str) -> str:
+    digest = hashlib.sha256(os.fsencode(target_name)).hexdigest()
+    return f".weight-plan.lock-{digest}"
+
+
+def _validate_write_lock(value: os.stat_result) -> None:
+    if not stat.S_ISREG(value.st_mode):
+        raise WeightPlanTargetError("weight plan write lock must be a regular file")
+    if value.st_nlink != 1:
+        raise WeightPlanTargetError("weight plan write lock must not have hard links")
+    if value.st_uid != _effective_uid():
+        raise WeightPlanTargetError("weight plan write lock has an unexpected owner")
+    if stat.S_IMODE(value.st_mode) != WEIGHT_PLAN_FILE_MODE:
+        raise WeightPlanTargetError("weight plan write lock must have mode 0600")
+    if value.st_size != 0:
+        raise WeightPlanTargetError("weight plan write lock must be empty")
+
+
+def _acquire_write_lock(directory_fd: int, target_name: str) -> _WeightPlanWriteLock:
+    """Serialize cooperating writers through cleanup, installation, and rollback."""
+
+    name = _write_lock_name(target_name)
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = -1
+    created = False
+    locked = False
+    try:
+        try:
+            descriptor = os.open(
+                name,
+                flags | os.O_CREAT | os.O_EXCL,
+                WEIGHT_PLAN_FILE_MODE,
+                dir_fd=directory_fd,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+        if created:
+            os.fchmod(descriptor, WEIGHT_PLAN_FILE_MODE)
+        before = os.fstat(descriptor)
+        _validate_write_lock(before)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        after = os.fstat(descriptor)
+        _validate_write_lock(after)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _validate_write_lock(named)
+        if (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino):
+            raise WeightPlanTargetError("weight plan write lock changed identity")
+        return _WeightPlanWriteLock(descriptor=descriptor)
+    except BaseException as primary:
+        if descriptor >= 0:
+            if locked:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except BaseException:
+                    _add_note_safely(primary, "write_lock_release_failed")
+            _close_preserving(descriptor, primary, "write_lock_descriptor_cleanup_failed")
+        raise
+
+
+def _validate_directory(
+    value: os.stat_result,
+    *,
+    final_parent: bool,
+) -> None:
+    if not stat.S_ISDIR(value.st_mode):
+        raise WeightPlanTargetError("weight plan path component is not a directory")
+    if value.st_uid not in {0, _effective_uid()}:
+        raise WeightPlanTargetError(
+            "weight plan ancestor must be owned by root or the validator user"
+        )
+    unsafe_write_bits = stat.S_IMODE(value.st_mode) & 0o022
+    sticky_ancestor = bool(value.st_mode & stat.S_ISVTX) and not final_parent
+    if unsafe_write_bits and not sticky_ancestor:
+        location = "parent" if final_parent else "ancestor"
+        raise WeightPlanTargetError(
+            f"weight plan {location} must not be writable by group or other users"
+        )
+
+
+def _directory_flags() -> int:
+    required = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required) or os.open not in os.supports_dir_fd:
+        raise WeightPlanTargetError("secure openat directory traversal is unavailable")
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _pin_directory_chain(absolute_parent: str) -> _PinnedDirectoryChain:
+    components = tuple(component for component in absolute_parent.split(os.sep) if component)
+    descriptors: list[int] = []
+    identities: list[tuple[int, int]] = []
+    flags = _directory_flags()
+    try:
+        descriptor = os.open(os.sep, flags)
+        descriptors.append(descriptor)
+        root_stat = os.fstat(descriptor)
+        _validate_directory(root_stat, final_parent=not components)
+        identities.append((root_stat.st_dev, root_stat.st_ino))
+        for index, component in enumerate(components):
+            if component in {".", ".."} or os.sep in component:
+                raise WeightPlanTargetError("weight plan path component is invalid")
+            try:
+                descriptor = os.open(component, flags, dir_fd=descriptors[-1])
+            except OSError as exc:
+                raise WeightPlanTargetError(
+                    "weight plan parent chain is missing, symlinked, or unsafe"
+                ) from exc
+            descriptors.append(descriptor)
+            component_stat = os.fstat(descriptor)
+            _validate_directory(component_stat, final_parent=index == len(components) - 1)
+            identities.append((component_stat.st_dev, component_stat.st_ino))
+        return _PinnedDirectoryChain(
+            absolute_parent=absolute_parent,
+            components=components,
+            descriptors=descriptors,
+            identities=tuple(identities),
+        )
+    except BaseException as primary:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException:
+                _add_note_safely(primary, "directory_cleanup_failed")
+        raise
+
+
+def _revalidate_pinned_chain(chain: _PinnedDirectoryChain) -> None:
+    for index, descriptor in enumerate(chain.descriptors):
+        current = os.fstat(descriptor)
+        _validate_directory(current, final_parent=index == len(chain.descriptors) - 1)
+        if (current.st_dev, current.st_ino) != chain.identities[index]:
+            raise WeightPlanTargetError("pinned weight plan directory changed identity")
+    reopened = _pin_directory_chain(chain.absolute_parent)
+    primary: BaseException | None = None
+    try:
+        if reopened.identities != chain.identities:
+            raise WeightPlanTargetError("configured weight plan directory changed during install")
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            reopened.close()
+        except BaseException:
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
+            else:
+                raise
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = MAX_WEIGHT_PLAN_BYTES
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 1 << 20))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if remaining == 0 and os.read(descriptor, 1):
+        raise WeightPlanTargetError("installed weight plan is unexpectedly large")
+    return b"".join(chunks)
+
+
+def _validate_temporary_descriptor(
+    temporary: _TemporaryPlan,
+    *,
+    expected_size: int,
+    expected_nlink: int,
+) -> os.stat_result:
+    value = os.fstat(temporary.descriptor)
+    if not stat.S_ISREG(value.st_mode):
+        raise WeightPlanTargetError("temporary weight plan inode is not a regular file")
+    if (value.st_dev, value.st_ino) != temporary.identity:
+        raise WeightPlanTargetError("temporary weight plan inode changed identity")
+    if value.st_uid != _effective_uid():
+        raise WeightPlanTargetError("temporary weight plan inode changed owner")
+    if stat.S_IMODE(value.st_mode) != WEIGHT_PLAN_FILE_MODE:
+        raise WeightPlanTargetError("temporary weight plan inode changed mode")
+    if value.st_size != expected_size:
+        raise WeightPlanTargetError("temporary weight plan inode changed size")
+    if value.st_nlink != expected_nlink:
+        raise WeightPlanTargetError("temporary weight plan inode acquired an unexpected hard link")
+    return value
+
+
+def _validate_temporary_contents(
+    temporary: _TemporaryPlan,
+    *,
+    expected: bytes,
+    expected_nlink: int,
+) -> os.stat_result:
+    """Bind one prepared inode to exact bytes across a stable descriptor read."""
+
+    before = _validate_temporary_descriptor(
+        temporary,
+        expected_size=len(expected),
+        expected_nlink=expected_nlink,
+    )
+    rendered = _read_descriptor(temporary.descriptor)
+    after = _validate_temporary_descriptor(
+        temporary,
+        expected_size=len(expected),
+        expected_nlink=expected_nlink,
+    )
+    if rendered != expected or not _same_target(before, after):
+        raise WeightPlanTargetError("temporary weight plan bytes changed during validation")
+    return after
+
+
+def _validate_temporary_name(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    *,
+    expected_size: int,
+) -> None:
+    if temporary.name is None:
+        raise WeightPlanTargetError("temporary weight plan has no install name")
+    named = os.stat(temporary.name, dir_fd=directory_fd, follow_symlinks=False)
+    _validate_existing_target(named)
+    if named.st_size != expected_size or (named.st_dev, named.st_ino) != temporary.identity:
+        raise WeightPlanTargetError("temporary weight plan name changed identity")
+
+
+def _validate_installed_temporary(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    *,
+    expected: bytes,
+) -> None:
+    """Verify the exact prepared inode and bytes at the configured name."""
+
+    opened = _validate_temporary_contents(
+        temporary,
+        expected=expected,
+        expected_nlink=1,
+    )
+    named = _unvalidated_target_stat(directory_fd, name)
+    if named is None or not _same_target(opened, named):
+        raise WeightPlanTargetError("installed weight plan target changed identity")
+
+
+def _write_all(descriptor: int, rendered: bytes) -> None:
+    view = memoryview(rendered)
+    offset = 0
+    while offset < len(view):
+        written = os.write(descriptor, view[offset:])
+        if written <= 0:
+            raise OSError("short write while persisting weight plan")
+        offset += written
+
+
+def _open_unnamed_temporary(directory_fd: int) -> int | None:
+    if not hasattr(os, "O_TMPFILE"):
+        return None
+    flags = os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC
+    try:
+        return os.open(".", flags, WEIGHT_PLAN_FILE_MODE, dir_fd=directory_fd)
+    except OSError as exc:
+        if exc.errno in {
+            errno.EINVAL,
+            errno.EISDIR,
+            errno.ENOSYS,
+            errno.EOPNOTSUPP,
+            errno.EPERM,
+        }:
+            return None
+        raise
+
+
+def _link_unnamed_temporary(descriptor: int, directory_fd: int, name: str) -> None:
+    # Python does not expose linkat(AT_EMPTY_PATH).  Linux filesystems that
+    # support O_TMPFILE use this tiny libc seam to materialize the already
+    # fsynced inode only for the final rename.  Other systems use the visible
+    # O_EXCL fallback below.
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    result = libc.linkat(
+        descriptor,
+        ctypes.c_char_p(b""),
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(name)),
+        _AT_EMPTY_PATH,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+
+
+def _allocate_visible_temporary(directory_fd: int) -> _TemporaryPlan:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    for _ in range(32):
+        candidate = f".weight-plan.tmp-{secrets.token_hex(16)}"
+        try:
+            descriptor = os.open(
+                candidate,
+                flags,
+                WEIGHT_PLAN_FILE_MODE,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        temporary = _TemporaryPlan(
+            descriptor=descriptor,
+            identity=(-1, -1),
+            name=candidate,
+        )
+        try:
+            value = os.fstat(descriptor)
+            temporary.identity = (value.st_dev, value.st_ino)
+            return temporary
+        except BaseException as primary:
+            try:
+                _cleanup_temporary_plan(temporary, directory_fd)
+            except BaseException:
+                _add_note_safely(primary, "temporary_acquisition_cleanup_failed")
+            raise
+    raise WeightPlanTargetError("could not allocate a private temporary plan file")
+
+
+def _rename_noreplace_between(
+    source_directory_fd: int,
+    source: str,
+    destination_directory_fd: int,
+    destination: str,
+) -> None:
+    """Move one directory entry between pinned directories without replacement."""
+
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), source)
+    result = renameat2(
+        source_directory_fd,
+        ctypes.c_char_p(os.fsencode(source)),
+        destination_directory_fd,
+        ctypes.c_char_p(os.fsencode(destination)),
+        1,  # RENAME_NOREPLACE
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), source)
+
+
+def _rename_noreplace(
+    directory_fd: int,
+    source: str,
+    destination: str,
+) -> tuple[int, int] | None:
+    """Move without replacement and non-failingly identify the publication."""
+
+    source_stat = _unvalidated_target_stat(directory_fd, source)
+    _rename_noreplace_between(directory_fd, source, directory_fd, destination)
+    try:
+        published = _unvalidated_target_stat(directory_fd, destination)
+    except BaseException:
+        return None
+    if (
+        source_stat is not None
+        and published is not None
+        and (published.st_dev, published.st_ino) == (source_stat.st_dev, source_stat.st_ino)
+    ):
+        return (published.st_dev, published.st_ino)
+    return None
+
+
+def _rename_exchange(directory_fd: int, first: str, second: str) -> tuple[int, int] | None:
+    """Atomically exchange two entries and non-failingly identify the publication."""
+
+    first_stat = _unvalidated_target_stat(directory_fd, first)
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), first)
+    result = renameat2(
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(first)),
+        directory_fd,
+        ctypes.c_char_p(os.fsencode(second)),
+        2,  # RENAME_EXCHANGE
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), first)
+    try:
+        published = _unvalidated_target_stat(directory_fd, second)
+    except BaseException:
+        # The namespace mutation already succeeded. Observation is advisory:
+        # callers must still fsync and, when necessary, roll back the mutation.
+        return None
+    if (
+        first_stat is not None
+        and published is not None
+        and (
+            published.st_dev,
+            published.st_ino,
+        )
+        == (first_stat.st_dev, first_stat.st_ino)
+    ):
+        return (published.st_dev, published.st_ino)
+    return None
+
+
+def _open_private_cleanup_namespace_monitor(
+    directory_fd: int,
+) -> _PrivateCleanupNamespaceMonitor:
+    """Watch the parent namespace before creating cleanup authority within it."""
+
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    inotify_init1 = getattr(libc, "inotify_init1", None)
+    inotify_add_watch = getattr(libc, "inotify_add_watch", None)
+    if inotify_init1 is None or inotify_add_watch is None:
+        raise WeightPlanTargetError("private cleanup namespace monitoring is unavailable")
+    descriptor = inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    try:
+        parent_watch = inotify_add_watch(
+            descriptor,
+            ctypes.c_char_p(os.fsencode(f"/proc/self/fd/{directory_fd}")),
+            _PRIVATE_CLEANUP_WATCH_MASK,
+        )
+        if parent_watch < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    except BaseException as primary:
+        _close_preserving(
+            descriptor,
+            primary,
+            "private_cleanup_monitor_close_failed",
+        )
+        raise
+    return _PrivateCleanupNamespaceMonitor(
+        descriptor=descriptor,
+        parent_watch=parent_watch,
+    )
+
+
+def _add_private_cleanup_directory_watch(
+    monitor: _PrivateCleanupNamespaceMonitor,
+    descriptor: int,
+) -> None:
+    libc: Any = ctypes.CDLL(None, use_errno=True)
+    private_watch = libc.inotify_add_watch(
+        monitor.descriptor,
+        ctypes.c_char_p(os.fsencode(f"/proc/self/fd/{descriptor}")),
+        _PRIVATE_CLEANUP_WATCH_MASK,
+    )
+    if private_watch < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    monitor.private_watch = private_watch
+
+
+def _read_private_cleanup_namespace_events(
+    monitor: _PrivateCleanupNamespaceMonitor,
+) -> list[tuple[int, int, str]]:
+    events: list[tuple[int, int, str]] = []
+    while True:
+        try:
+            payload = os.read(monitor.descriptor, 64 << 10)
+        except BlockingIOError:
+            break
+        if not payload:
+            break
+        offset = 0
+        while offset < len(payload):
+            watch, mask, _cookie, name_length = _INOTIFY_EVENT.unpack_from(payload, offset)
+            offset += _INOTIFY_EVENT.size
+            raw_name = payload[offset : offset + name_length]
+            offset += name_length
+            name = os.fsdecode(raw_name.split(b"\0", 1)[0])
+            events.append((watch, mask, name))
+    return events
+
+
+def _private_cleanup_creation_is_owned(
+    monitor: _PrivateCleanupNamespaceMonitor,
+    name: str,
+) -> bool:
+    matching: list[int] = []
+    for watch, mask, event_name in _read_private_cleanup_namespace_events(monitor):
+        if mask & (_IN_Q_OVERFLOW | _IN_IGNORED):
+            return False
+        if watch == monitor.parent_watch and event_name == name:
+            matching.append(mask)
+    return len(matching) == 1 and bool(matching[0] & _IN_CREATE) and bool(matching[0] & _IN_ISDIR)
+
+
+def _private_cleanup_namespace_is_stable(
+    cleanup: _PrivateCleanupDirectory,
+    *,
+    allowed_private_name: str | None = None,
+    allowed_private_mask: int = 0,
+    require_allowed_private_event: bool = False,
+) -> tuple[bool, bool]:
+    """Consume the lease log and report parent-name and private-dir stability."""
+
+    parent_stable = True
+    private_stable = True
+    allowed_count = 0
+    for watch, mask, event_name in _read_private_cleanup_namespace_events(cleanup.monitor):
+        if mask & (_IN_Q_OVERFLOW | _IN_IGNORED):
+            parent_stable = False
+            private_stable = False
+            continue
+        if watch == cleanup.monitor.parent_watch and event_name == cleanup.name:
+            if mask & ~(_IN_ATTRIB | _IN_ISDIR):
+                parent_stable = False
+        elif watch == cleanup.monitor.private_watch:
+            if mask & _IN_ATTRIB:
+                continue
+            if (
+                allowed_private_name is not None
+                and event_name == allowed_private_name
+                and mask & allowed_private_mask
+                and not mask & ~(allowed_private_mask | _IN_ISDIR)
+            ):
+                allowed_count += 1
+            else:
+                private_stable = False
+    if require_allowed_private_event and allowed_count != 1:
+        private_stable = False
+    return parent_stable, private_stable
+
+
+def _close_private_cleanup_namespace_monitor(
+    monitor: _PrivateCleanupNamespaceMonitor,
+    primary: BaseException | None,
+) -> BaseException | None:
+    try:
+        os.close(monitor.descriptor)
+    except BaseException as exc:
+        if primary is None:
+            return exc
+        _add_note_safely(primary, "private_cleanup_monitor_close_failed")
+    return primary
+
+
+def _open_private_cleanup_directory(directory_fd: int) -> _PrivateCleanupDirectory:
+    """Create and pin an unpredictable owner-only directory for destructive cleanup."""
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    for _ in range(32):
+        name = f".weight-plan.cleanup-{secrets.token_hex(16)}"
+        monitor = _open_private_cleanup_namespace_monitor(directory_fd)
+        try:
+            os.mkdir(
+                name,
+                _WEIGHT_PLAN_PRIVATE_DIRECTORY_ACQUISITION_MODE,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            monitor_error = _close_private_cleanup_namespace_monitor(monitor, None)
+            if monitor_error is not None:
+                raise monitor_error from None
+            continue
+        except BaseException as primary:
+            _close_private_cleanup_namespace_monitor(monitor, primary)
+            raise
+        descriptor = -1
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+            opened = os.fstat(descriptor)
+            mapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            scanned = _scanned_target_stat(directory_fd, name)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != _effective_uid()
+                or stat.S_IMODE(opened.st_mode) != _WEIGHT_PLAN_PRIVATE_DIRECTORY_ACQUISITION_MODE
+                or (opened.st_dev, opened.st_ino) != (mapped.st_dev, mapped.st_ino)
+                or scanned is None
+                or (opened.st_dev, opened.st_ino) != (scanned.st_dev, scanned.st_ino)
+            ):
+                raise WeightPlanTargetError("private cleanup directory changed identity")
+            # A successful mkdir is not an ownership capability: the name can
+            # be replaced by a same-UID, same-mode directory before open.  The
+            # parent watch was installed first, so exactly one creation event
+            # derives the opened directory's authority from this attempt.
+            if not _private_cleanup_creation_is_owned(monitor, name):
+                raise WeightPlanTargetError("private cleanup directory creation was replaced")
+            _add_private_cleanup_directory_watch(monitor, descriptor)
+            os.fchmod(descriptor, WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE)
+            opened = os.fstat(descriptor)
+            mapped = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            scanned = _scanned_target_stat(directory_fd, name)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != _effective_uid()
+                or stat.S_IMODE(opened.st_mode) != WEIGHT_PLAN_PRIVATE_DIRECTORY_MODE
+                or (opened.st_dev, opened.st_ino) != (mapped.st_dev, mapped.st_ino)
+                or scanned is None
+                or (opened.st_dev, opened.st_ino) != (scanned.st_dev, scanned.st_ino)
+            ):
+                raise WeightPlanTargetError("private cleanup directory changed identity")
+            cleanup = _PrivateCleanupDirectory(
+                descriptor=descriptor,
+                identity=(opened.st_dev, opened.st_ino),
+                name=name,
+                monitor=monitor,
+            )
+            parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+            if not parent_stable or not private_stable:
+                raise WeightPlanTargetError("private cleanup directory changed identity")
+            return cleanup
+        except BaseException as primary:
+            if descriptor >= 0:
+                _close_preserving(descriptor, primary, "private_cleanup_descriptor_close_failed")
+            _close_private_cleanup_namespace_monitor(monitor, primary)
+            # The pathname may already identify a same-UID replacement.  Once
+            # acquisition has failed there is no proven mapping to retire, so
+            # preserve the entry rather than applying rmdir to an unowned name.
+            _add_note_safely(primary, "private_cleanup_directory_retirement_deferred")
+            raise
+    raise WeightPlanTargetError("could not allocate a private cleanup directory")
+
+
+def _close_private_cleanup_directory(
+    cleanup: _PrivateCleanupDirectory,
+    directory_fd: int,
+    primary: BaseException | None,
+) -> None:
+    """Close one cleanup directory while preserving its namespace entry."""
+
+    cleanup_error: BaseException | None = None
+    try:
+        opened = os.fstat(cleanup.descriptor)
+        mapped = os.stat(cleanup.name, dir_fd=directory_fd, follow_symlinks=False)
+        scanned = _scanned_target_stat(directory_fd, cleanup.name)
+        if (
+            (opened.st_dev, opened.st_ino) != cleanup.identity
+            or (
+                mapped.st_dev,
+                mapped.st_ino,
+            )
+            != cleanup.identity
+            or scanned is None
+            or (
+                scanned.st_dev,
+                scanned.st_ino,
+            )
+            != cleanup.identity
+        ):
+            raise WeightPlanTargetError("private cleanup directory changed identity")
+        parent_stable, _private_stable = _private_cleanup_namespace_is_stable(cleanup)
+        if not parent_stable:
+            raise WeightPlanTargetError("private cleanup directory changed identity")
+    except BaseException as exc:
+        cleanup_error = exc
+    # Linux has no inode-conditional rmdir.  Even a pinned descriptor plus a
+    # drained inotify queue leaves a check-to-rmdir window in which the name
+    # can be replaced.  Preserve the owner-only directory rather than risk
+    # removing a foreign replacement.  The residue is a deliberate deferred
+    # retirement record, not authority for a later pathname deletion.
+    try:
+        os.close(cleanup.descriptor)
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+        else:
+            _add_note_safely(cleanup_error, "private_cleanup_descriptor_close_failed")
+    cleanup_error = _close_private_cleanup_namespace_monitor(cleanup.monitor, cleanup_error)
+    if cleanup_error is not None:
+        if primary is not None:
+            _add_note_safely(primary, "private_cleanup_directory_retirement_failed")
+        else:
+            raise cleanup_error
+
+
+def _scanned_target_stat(directory_fd: int, name: str) -> os.stat_result | None:
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            if entry.name == name:
+                return entry.stat(follow_symlinks=False)
+    return None
+
+
+def _temporary_name_matches(
+    directory_fd: int,
+    name: str,
+    identity: tuple[int, int],
+) -> bool:
+    first = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    second = _scanned_target_stat(directory_fd, name)
+    if second is None:
+        return False
+    expected = identity
+    return (first.st_dev, first.st_ino) == expected and (second.st_dev, second.st_ino) == expected
+
+
+def _quarantine_temporary_for_deferred_retirement(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    identity: tuple[int, int],
+) -> None:
+    """Move an owned name into an owner-only deferred-retirement directory.
+
+    The cross-directory no-replace rename is the ownership boundary.  A late
+    replacement is either left at ``source`` or moved intact into the private
+    directory, identified there, and restored without replacement.  Linux has
+    no inode-conditional unlink, so a proven-owned entry is retained rather
+    than destructively retired through a mutable pathname.
+    """
+
+    source = temporary.name
+    if source is None:
+        return
+    try:
+        matches = _temporary_name_matches(directory_fd, source, identity)
+    except FileNotFoundError as exc:
+        if os.fstat(temporary.descriptor).st_nlink == 0:
+            return
+        raise WeightPlanTargetError("temporary weight plan name disappeared") from exc
+    if not matches:
+        return
+    cleanup = _open_private_cleanup_directory(directory_fd)
+    quarantine = ".weight-plan.cleanup-retired"
+    moved = False
+    primary: BaseException | None = None
+    try:
+        try:
+            parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+            if not parent_stable or not private_stable:
+                raise WeightPlanTargetError("private cleanup namespace changed identity")
+            _rename_noreplace_between(
+                directory_fd,
+                source,
+                cleanup.descriptor,
+                quarantine,
+            )
+        except FileNotFoundError:
+            # A missing source is retirement only when the descriptor proves
+            # that the owned inode has no other name.  Do not repeat the former
+            # blanket ENOENT suppression that stranded moved-aside plans.
+            if os.fstat(temporary.descriptor).st_nlink == 0:
+                return
+            raise
+        moved = True
+        temporary.name = None
+        parent_stable, private_stable = _private_cleanup_namespace_is_stable(
+            cleanup,
+            allowed_private_name=quarantine,
+            allowed_private_mask=_IN_MOVED_TO,
+            require_allowed_private_event=True,
+        )
+        if not parent_stable or not private_stable:
+            raise WeightPlanTargetError("private cleanup namespace changed identity")
+        descriptor_stat = os.fstat(temporary.descriptor)
+        descriptor_owned = (
+            stat.S_ISREG(descriptor_stat.st_mode)
+            and (descriptor_stat.st_dev, descriptor_stat.st_ino) == identity
+            and descriptor_stat.st_uid == _effective_uid()
+            and stat.S_IMODE(descriptor_stat.st_mode) == WEIGHT_PLAN_FILE_MODE
+            and descriptor_stat.st_nlink > 0
+        )
+        captured = os.stat(quarantine, dir_fd=cleanup.descriptor, follow_symlinks=False)
+        if not hasattr(os, "O_PATH"):
+            raise WeightPlanTargetError("non-opening metadata descriptors are unavailable")
+        captured_descriptor = os.open(
+            quarantine,
+            os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=cleanup.descriptor,
+        )
+        captured_primary: BaseException | None = None
+        try:
+            captured_opened = os.fstat(captured_descriptor)
+            captured_owned = (
+                stat.S_ISREG(captured_opened.st_mode)
+                and captured_opened.st_uid == _effective_uid()
+                and stat.S_IMODE(captured_opened.st_mode) == WEIGHT_PLAN_FILE_MODE
+                and (captured.st_dev, captured.st_ino) == identity
+                and (captured_opened.st_dev, captured_opened.st_ino) == identity
+            )
+            parent_stable, private_stable = _private_cleanup_namespace_is_stable(cleanup)
+            namespace_owned = parent_stable and private_stable
+            if not descriptor_owned or not captured_owned or not namespace_owned:
+                _rename_noreplace_between(
+                    cleanup.descriptor,
+                    quarantine,
+                    directory_fd,
+                    source,
+                )
+                moved = False
+                _private_cleanup_namespace_is_stable(
+                    cleanup,
+                    allowed_private_name=quarantine,
+                    allowed_private_mask=_IN_MOVED_FROM,
+                    require_allowed_private_event=True,
+                )
+                if captured_owned and namespace_owned:
+                    temporary.name = source
+                return
+            # Linux has no inode-conditional unlink.  A final fstat or inotify
+            # drain cannot bind the following pathname mutation to the inode
+            # just validated.  Leave the proven-owned file in the owner-only
+            # cleanup directory instead of risking deletion of a late foreign
+            # replacement.  Closing its descriptors below remains mandatory.
+            moved = False
+            temporary.name = None
+        except BaseException as exc:
+            captured_primary = exc
+            raise
+        finally:
+            if captured_primary is None:
+                os.close(captured_descriptor)
+            else:
+                _close_preserving(
+                    captured_descriptor,
+                    captured_primary,
+                    "captured_descriptor_close_failed",
+                )
+    except BaseException as exc:
+        primary = exc
+        if moved:
+            try:
+                _rename_noreplace_between(
+                    cleanup.descriptor,
+                    quarantine,
+                    directory_fd,
+                    source,
+                )
+                _private_cleanup_namespace_is_stable(
+                    cleanup,
+                    allowed_private_name=quarantine,
+                    allowed_private_mask=_IN_MOVED_FROM,
+                    require_allowed_private_event=True,
+                )
+                restored = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
+                if (restored.st_dev, restored.st_ino) == identity:
+                    temporary.name = source
+            except BaseException:
+                _add_note_safely(primary, "temporary_quarantine_restore_failed")
+        raise
+    finally:
+        _close_private_cleanup_directory(cleanup, directory_fd, primary)
+
+
+def _cleanup_temporary_plan(temporary: _TemporaryPlan, directory_fd: int) -> None:
+    primary: BaseException | None = None
+
+    def failed(exc: BaseException) -> None:
+        nonlocal primary
+        if primary is None:
+            primary = exc
+        else:
+            _add_note_safely(primary, "temporary_additional_cleanup_failed")
+
+    identity = temporary.identity
+    if identity == (-1, -1):
+        try:
+            descriptor_stat = os.fstat(temporary.descriptor)
+            identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            temporary.identity = identity
+        except BaseException as fstat_error:
+            try:
+                descriptor_stat = os.stat(temporary.descriptor)
+                identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                temporary.identity = identity
+            except BaseException:
+                failed(fstat_error)
+    try:
+        if temporary.name is not None and identity != (-1, -1):
+            _quarantine_temporary_for_deferred_retirement(
+                temporary,
+                directory_fd,
+                identity,
+            )
+    except BaseException as exc:
+        failed(exc)
+    try:
+        os.close(temporary.descriptor)
+    except BaseException as exc:
+        failed(exc)
+    if primary is not None:
+        raise primary
+
+
+def _prepare_temporary_plan(directory_fd: int, rendered: bytes) -> _TemporaryPlan:
+    descriptor = _open_unnamed_temporary(directory_fd)
+    if descriptor is not None:
+        temporary = _TemporaryPlan(
+            descriptor=descriptor,
+            identity=(-1, -1),
+            name=None,
+        )
+        try:
+            value = os.fstat(descriptor)
+            temporary.identity = (value.st_dev, value.st_ino)
+            os.fchmod(descriptor, WEIGHT_PLAN_FILE_MODE)
+            _write_all(descriptor, rendered)
+            os.fsync(descriptor)
+            _validate_temporary_descriptor(
+                temporary,
+                expected_size=len(rendered),
+                expected_nlink=0,
+            )
+            for _ in range(32):
+                candidate = f".weight-plan.tmp-{secrets.token_hex(16)}"
+                try:
+                    _link_unnamed_temporary(descriptor, directory_fd, candidate)
+                except OSError as exc:
+                    if exc.errno == errno.EEXIST:
+                        continue
+                    if exc.errno in {
+                        errno.EINVAL,
+                        errno.ENOENT,
+                        errno.ENOSYS,
+                        errno.EOPNOTSUPP,
+                        errno.EPERM,
+                    }:
+                        break
+                    raise
+                temporary.name = candidate
+                _validate_temporary_descriptor(
+                    temporary,
+                    expected_size=len(rendered),
+                    expected_nlink=1,
+                )
+                _validate_temporary_name(
+                    temporary,
+                    directory_fd,
+                    expected_size=len(rendered),
+                )
+                return temporary
+        except BaseException as primary:
+            try:
+                _cleanup_temporary_plan(temporary, directory_fd)
+            except BaseException:
+                _add_note_safely(primary, "temporary_cleanup_failed")
+            raise
+        os.close(descriptor)
+
+    temporary = _allocate_visible_temporary(directory_fd)
+    try:
+        os.fchmod(temporary.descriptor, WEIGHT_PLAN_FILE_MODE)
+        _write_all(temporary.descriptor, rendered)
+        os.fsync(temporary.descriptor)
+        _validate_temporary_descriptor(
+            temporary,
+            expected_size=len(rendered),
+            expected_nlink=1,
+        )
+        _validate_temporary_name(temporary, directory_fd, expected_size=len(rendered))
+        return temporary
+    except BaseException as primary:
+        try:
+            _cleanup_temporary_plan(temporary, directory_fd)
+        except BaseException:
+            _add_note_safely(primary, "temporary_cleanup_failed")
+        raise
+
+
+def _verify_configured_target(
+    chain: _PinnedDirectoryChain,
+    name: str,
+    *,
+    identity: tuple[int, int],
+    rendered: bytes,
+) -> None:
+    _revalidate_pinned_chain(chain)
+    reopened = _pin_directory_chain(chain.absolute_parent)
+    descriptor = -1
+    primary: BaseException | None = None
+    body_failed = False
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        descriptor = os.open(name, flags, dir_fd=reopened.parent_fd)
+        before = os.fstat(descriptor)
+        _validate_existing_target(before)
+        if (before.st_dev, before.st_ino) != identity:
+            raise WeightPlanTargetError("configured weight plan target changed identity")
+        if _read_descriptor(descriptor) != rendered:
+            raise WeightPlanTargetError("configured weight plan target has different bytes")
+        after = os.fstat(descriptor)
+        _validate_existing_target(after)
+        if not _same_target(before, after):
+            raise WeightPlanTargetError("configured weight plan target changed while verified")
+        named = _target_stat(reopened.parent_fd, name)
+        if named is None or not _same_target(after, named):
+            raise WeightPlanTargetError("configured weight plan target changed after verification")
+    except OSError as exc:
+        body_failed = True
+        primary = WeightPlanTargetError("configured weight plan target is unavailable")
+        raise primary from exc
+    except BaseException as exc:
+        body_failed = True
+        primary = exc
+        raise
+    finally:
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "target_cleanup_failed")
+            else:
+                primary = exc
+        try:
+            reopened.close()
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
+            else:
+                primary = exc
+        if not body_failed and primary is not None:
+            raise primary
+
+
+def _exact_object(
+    value: object,
+    *,
+    field_name: str,
+    keys: frozenset[str],
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise WeightPlanError(f"{field_name} has an unsupported shape")
+    return value
+
+
+def _parse_weight_plan(rendered: bytes) -> WeightPlan:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise WeightPlanError("weight plan contains a duplicate JSON key")
+            value[key] = item
+        return value
+
+    try:
+        document = json.loads(rendered.decode("ascii"), object_pairs_hook=unique_object)
+    except WeightPlanError:
+        raise
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise WeightPlanError("weight plan is not valid canonical JSON") from exc
+    root = _exact_object(
+        document,
+        field_name="weight plan",
+        keys=frozenset(
+            {
+                "created_block",
+                "digest_sha256",
+                "expires_at_block",
+                "netuid",
+                "network",
+                "schema",
+                "schema_version",
+                "snapshot",
+                "validator_hotkey",
+                "version_key",
+                "weights",
+            }
+        ),
+    )
+    if root["schema"] != WEIGHT_PLAN_SCHEMA:
+        raise WeightPlanError("weight plan schema is unsupported")
+    if root["schema_version"] != WEIGHT_PLAN_SCHEMA_VERSION:
+        raise WeightPlanError("weight plan schema version is unsupported")
+    snapshot_document = _exact_object(
+        root["snapshot"],
+        field_name="weight plan snapshot",
+        keys=frozenset({"block", "epoch", "finalized", "identity_fingerprint", "tempo"}),
+    )
+    raw_weights = _weight_rows(root["weights"])
+    entries: list[WeightPlanEntry] = []
+    for raw_entry in raw_weights:
+        entry = _exact_object(
+            raw_entry,
+            field_name="weight plan entry",
+            keys=frozenset({"hotkey", "uid", "weight"}),
+        )
+        entries.append(
+            WeightPlanEntry(
+                uid=entry["uid"],  # type: ignore[arg-type]
+                hotkey=entry["hotkey"],  # type: ignore[arg-type]
+                weight=entry["weight"],  # type: ignore[arg-type]
+            )
+        )
+    plan = WeightPlan(
+        network=root["network"],  # type: ignore[arg-type]
+        netuid=root["netuid"],  # type: ignore[arg-type]
+        validator_hotkey=root["validator_hotkey"],  # type: ignore[arg-type]
+        snapshot=WeightPlanSnapshot(
+            block=snapshot_document["block"],  # type: ignore[arg-type]
+            tempo=snapshot_document["tempo"],  # type: ignore[arg-type]
+            epoch=snapshot_document["epoch"],  # type: ignore[arg-type]
+            finalized=snapshot_document["finalized"],  # type: ignore[arg-type]
+            identity_fingerprint=snapshot_document["identity_fingerprint"],  # type: ignore[arg-type]
+        ),
+        weights=tuple(entries),
+        version_key=root["version_key"],  # type: ignore[arg-type]
+        created_block=root["created_block"],  # type: ignore[arg-type]
+        expires_at_block=root["expires_at_block"],  # type: ignore[arg-type]
+    )
+    supplied_digest = root["digest_sha256"]
+    if supplied_digest != plan.digest_sha256:
+        raise WeightPlanError("weight plan digest does not match its canonical document")
+    if rendered != plan.canonical_bytes():
+        raise WeightPlanError("weight plan bytes are not the exact canonical document")
+    return plan
+
+
+def load_weight_plan(path: str | os.PathLike[str]) -> WeightPlan:
+    """Safely load one exact canonical WeightPlan v1 from a pinned path.
+
+    The returned immutable object no longer depends on the configured pathname.
+    The complete parent chain, target inode, link count, owner, mode, size, and
+    bytes are revalidated before the pinned descriptors are released.
+    """
+
+    parent, name = _secure_file_location(path)
+    chain = _pin_directory_chain(parent)
+    primary: BaseException | None = None
+    try:
+        _revalidate_pinned_chain(chain)
+        target = _target_stat(chain.parent_fd, name)
+        if target is None:
+            raise WeightPlanTargetError("weight plan target does not exist")
+        rendered = _read_existing(chain.parent_fd, name, target)
+        if not _same_target(target, _target_stat(chain.parent_fd, name)):
+            raise WeightPlanTargetError("weight plan target changed during validation")
+        _verify_configured_target(
+            chain,
+            name,
+            identity=(target.st_dev, target.st_ino),
+            rendered=rendered,
+        )
+        return _parse_weight_plan(rendered)
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        try:
+            chain.close()
+        except BaseException:
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
+            else:
+                raise
+
+
+def _install_temporary_plan(
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    rendered: bytes,
+    existing: os.stat_result | None,
+    existing_bytes: bytes | None,
+    final_validation: Callable[[], None],
+) -> None:
+    """Install ``temporary`` without destroying an unvalidated destination.
+
+    Creation uses ``RENAME_NOREPLACE``. Replacement uses ``RENAME_EXCHANGE``
+    so a destination that raced validation is retained under the temporary
+    name, checked through an open descriptor, and atomically restored before
+    the operation is rejected.
+    """
+
+    source = temporary.name
+    if source is None:
+        raise WeightPlanTargetError("temporary weight plan has no install name")
+    _validate_temporary_contents(
+        temporary,
+        expected=rendered,
+        expected_nlink=1,
+    )
+    if existing is None:
+        published = False
+        try:
+            _rename_noreplace(directory_fd, source, name)
+            published = True
+        except FileExistsError as exc:
+            raise WeightPlanTargetError(
+                "weight plan target changed before atomic installation"
+            ) from exc
+        try:
+            temporary.name = None
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
+            )
+            os.fsync(directory_fd)
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
+            )
+            final_validation()
+        except BaseException as failure:
+            rollback_moved = False
+            try:
+                if published:
+                    installed = _unvalidated_target_stat(directory_fd, name)
+                    if (
+                        installed is not None
+                        and (
+                            installed.st_dev,
+                            installed.st_ino,
+                        )
+                        == temporary.identity
+                    ):
+                        _rename_noreplace(directory_fd, name, source)
+                        rollback_moved = True
+                    else:
+                        _add_note_safely(failure, "atomic_creation_rollback_not_owned")
+                restored_stat = os.stat(source, dir_fd=directory_fd, follow_symlinks=False)
+                if (restored_stat.st_dev, restored_stat.st_ino) == temporary.identity:
+                    temporary.name = source
+                else:
+                    temporary.name = None
+            except BaseException:
+                _add_note_safely(failure, "atomic_creation_rollback_failed")
+            if rollback_moved:
+                try:
+                    os.fsync(directory_fd)
+                except BaseException:
+                    _add_note_safely(failure, "atomic_creation_rollback_fsync_failed")
+            raise failure
+        return
+
+    if existing_bytes is None:
+        raise WeightPlanTargetError("existing weight plan bytes are unavailable")
+
+    # An exchanged destination remains writable through descriptors held by a
+    # same-user process.  Keep a separately fsynced byte-for-byte rollback copy:
+    # restoring the displaced inode itself could otherwise publish bytes that
+    # were overwritten after the exchange.
+    backup = _prepare_temporary_plan(directory_fd, existing_bytes)
+    backup_primary: BaseException | None = None
+    try:
+        _install_replacement_plan(
+            temporary,
+            backup,
+            directory_fd,
+            name,
+            source,
+            rendered,
+            existing,
+            existing_bytes,
+            final_validation,
+        )
+    except BaseException as exc:
+        backup_primary = exc
+        raise
+    finally:
+        try:
+            _cleanup_temporary_plan(backup, directory_fd)
+        except BaseException:
+            if backup_primary is not None:
+                _add_note_safely(backup_primary, "rollback_copy_cleanup_failed")
+            else:
+                raise
+
+
+def _fsync_replacement_rollback(directory_fd: int, failure: BaseException) -> None:
+    try:
+        os.fsync(directory_fd)
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_rollback_fsync_failed")
+
+
+def _validate_restored_original(
+    descriptor: int,
+    identity: tuple[int, int],
+    expected: bytes,
+    directory_fd: int,
+    name: str,
+) -> None:
+    before = os.fstat(descriptor)
+    _validate_existing_target(before)
+    rendered = _read_descriptor(descriptor)
+    after = os.fstat(descriptor)
+    _validate_existing_target(after)
+    named = _unvalidated_target_stat(directory_fd, name)
+    if (
+        (before.st_dev, before.st_ino) != identity
+        or rendered != expected
+        or not _same_target(before, after)
+        or named is None
+        or not _same_target(after, named)
+    ):
+        raise WeightPlanTargetError("atomic replacement did not restore original bytes")
+
+
+def _record_rollback_publication(
+    state: _RollbackDestinationState,
+    published_identity: tuple[int, int] | None,
+) -> None:
+    """Authorize repair only for the identity confirmed by the mutation itself."""
+
+    state.exchange_identity = published_identity
+
+
+def _exchange_rollback_copy(
+    rollback: _TemporaryPlan,
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    existing_bytes: bytes,
+    failure: BaseException,
+    destination_state: _RollbackDestinationState,
+) -> bool:
+    source = rollback.name
+    if source is None:
+        _add_note_safely(failure, "atomic_replacement_rollback_copy_is_unnamed")
+        return False
+    try:
+        _validate_temporary_contents(
+            rollback,
+            expected=existing_bytes,
+            expected_nlink=1,
+        )
+        _validate_temporary_name(
+            rollback,
+            directory_fd,
+            expected_size=len(existing_bytes),
+        )
+        destination = _unvalidated_target_stat(directory_fd, name)
+        published_identity: tuple[int, int] | None
+        if destination is None:
+            # This observation supersedes any earlier permission to exchange.
+            # If RENAME_NOREPLACE collides, the recreated entry belongs to the
+            # concurrent actor and no later recovery attempt may displace it.
+            destination_state.exchange_identity = None
+            published_identity = _rename_noreplace(directory_fd, source, name)
+            exchanged = False
+        elif (destination.st_dev, destination.st_ino) == (destination_state.exchange_identity):
+            published_identity = _rename_exchange(directory_fd, source, name)
+            exchanged = True
+        else:
+            raise WeightPlanTargetError("atomic replacement rollback destination was recreated")
+        rollback.name = None
+        # Durability must not depend on later bookkeeping or observation. Bind
+        # recovery authority only to the identity confirmed by the successful
+        # mutation, never to a later observation that could see a foreign entry.
+        _fsync_replacement_rollback(directory_fd, failure)
+        _record_rollback_publication(destination_state, published_identity)
+        if exchanged:
+            moved = _unvalidated_target_stat(directory_fd, source)
+            if moved is not None and (moved.st_dev, moved.st_ino) == temporary.identity:
+                temporary.name = source
+        _validate_installed_temporary(
+            rollback,
+            directory_fd,
+            name,
+            expected=existing_bytes,
+        )
+        return True
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_rollback_copy_failed")
+        return False
+
+
+def _restore_from_rollback_copy(
+    backup: _TemporaryPlan,
+    temporary: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    existing_bytes: bytes,
+    failure: BaseException,
+    destination_state: _RollbackDestinationState,
+) -> bool:
+    if _exchange_rollback_copy(
+        backup,
+        temporary,
+        directory_fd,
+        name,
+        existing_bytes,
+        failure,
+        destination_state,
+    ):
+        return True
+
+    recovery: _TemporaryPlan | None = None
+    recovered = False
+    try:
+        recovery = _prepare_temporary_plan(directory_fd, existing_bytes)
+        recovered = _exchange_rollback_copy(
+            recovery,
+            temporary,
+            directory_fd,
+            name,
+            existing_bytes,
+            failure,
+            destination_state,
+        )
+        return recovered
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_rollback_recovery_failed")
+        return False
+    finally:
+        if recovery is not None:
+            if recovered:
+                try:
+                    _cleanup_temporary_plan(recovery, directory_fd)
+                except BaseException:
+                    _add_note_safely(failure, "rollback_recovery_cleanup_failed")
+            else:
+                # A still-named exact recovery copy is more important than
+                # residue-free failure.  Close it without pathname deletion.
+                _close_preserving(
+                    recovery.descriptor,
+                    failure,
+                    "rollback_recovery_descriptor_cleanup_failed",
+                )
+        if not recovered and backup.name is not None:
+            # Likewise preserve a validated, still-linked primary copy when a
+            # hostile namespace prevents canonical restoration.
+            backup.name = None
+
+
+def _rollback_replacement(
+    temporary: _TemporaryPlan,
+    backup: _TemporaryPlan,
+    displaced_descriptor: int,
+    expected_stat: os.stat_result,
+    existing_bytes: bytes,
+    directory_fd: int,
+    source: str,
+    name: str,
+    failure: BaseException,
+    published_identity: tuple[int, int] | None,
+) -> None:
+    restored = False
+    destination_state = _RollbackDestinationState(exchange_identity=published_identity)
+    try:
+        source_stat = _unvalidated_target_stat(directory_fd, source)
+        installed_stat = _unvalidated_target_stat(directory_fd, name)
+        displaced_now = os.fstat(displaced_descriptor)
+        displaced_bytes = _read_descriptor(displaced_descriptor)
+        displaced_after = os.fstat(displaced_descriptor)
+        displaced_intact = (
+            (displaced_now.st_dev, displaced_now.st_ino)
+            == (expected_stat.st_dev, expected_stat.st_ino)
+            and displaced_bytes == existing_bytes
+            and _same_target(displaced_now, displaced_after)
+        )
+        installed_is_temporary = (
+            installed_stat is not None
+            and (installed_stat.st_dev, installed_stat.st_ino) == temporary.identity
+        )
+        installed_is_our_publication = (
+            installed_stat is not None
+            and (
+                installed_stat.st_dev,
+                installed_stat.st_ino,
+            )
+            == destination_state.exchange_identity
+        )
+        source_is_displaced = source_stat is not None and (
+            source_stat.st_dev,
+            source_stat.st_ino,
+        ) == (expected_stat.st_dev, expected_stat.st_ino)
+        temporary_nlink = os.fstat(temporary.descriptor).st_nlink
+        restore_original = (
+            displaced_intact
+            and source_is_displaced
+            and (installed_is_our_publication or (installed_stat is None and temporary_nlink == 0))
+        )
+        if restore_original:
+            assert source_stat is not None
+            if installed_stat is None:
+                destination_state.exchange_identity = None
+                published_identity = _rename_noreplace(directory_fd, source, name)
+                temporary.name = None
+            else:
+                published_identity = _rename_exchange(directory_fd, source, name)
+                temporary.name = source if installed_is_temporary else None
+            # A successful restoring mutation requires a directory durability
+            # attempt even if subsequent publication bookkeeping or validation
+            # fails. Recovery authority comes from the mutation-confirmed
+            # identity, not from a post-fsync pathname observation.
+            _fsync_replacement_rollback(directory_fd, failure)
+            _record_rollback_publication(destination_state, published_identity)
+            _validate_restored_original(
+                displaced_descriptor,
+                (expected_stat.st_dev, expected_stat.st_ino),
+                existing_bytes,
+                directory_fd,
+                name,
+            )
+            restored = True
+    except BaseException:
+        _add_note_safely(failure, "atomic_replacement_direct_rollback_failed")
+
+    if not restored:
+        restored = _restore_from_rollback_copy(
+            backup,
+            temporary,
+            directory_fd,
+            name,
+            existing_bytes,
+            failure,
+            destination_state,
+        )
+    if not restored:
+        _add_note_safely(failure, "atomic_replacement_rollback_failed")
+
+
+def _install_replacement_plan(
+    temporary: _TemporaryPlan,
+    backup: _TemporaryPlan,
+    directory_fd: int,
+    name: str,
+    source: str,
+    rendered: bytes,
+    existing: os.stat_result,
+    existing_bytes: bytes,
+    final_validation: Callable[[], None],
+) -> None:
+    """Exchange one replacement while retaining an independent rollback copy."""
+
+    displaced_descriptor = -1
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        displaced_descriptor = os.open(name, flags, dir_fd=directory_fd)
+        expected_stat = os.fstat(displaced_descriptor)
+        _validate_existing_target(expected_stat)
+        if (
+            not _same_target(existing, expected_stat)
+            or _read_descriptor(displaced_descriptor) != existing_bytes
+            or not _same_target(expected_stat, os.fstat(displaced_descriptor))
+        ):
+            raise WeightPlanTargetError("weight plan target changed before atomic replacement")
+    except OSError as exc:
+        primary = WeightPlanTargetError("weight plan target changed before atomic replacement")
+        if displaced_descriptor >= 0:
+            _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
+        raise primary from exc
+    except BaseException as primary:
+        if displaced_descriptor >= 0:
+            _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
+        raise
+
+    try:
+        observed_publication = _rename_exchange(directory_fd, source, name)
+        # The already validated source inode is authoritative when a test seam
+        # or a non-faulting post-mutation observation returns no identity.
+        published_identity = observed_publication or temporary.identity
+    except BaseException as primary:
+        _close_preserving(displaced_descriptor, primary, "displaced_target_cleanup_failed")
+        raise
+    temporary.name = None
+    failure: BaseException | None = None
+    displaced_stat: os.stat_result | None = None
+    try:
+        displaced_stat = os.fstat(displaced_descriptor)
+        _validate_existing_target(displaced_stat)
+        displaced_bytes = _read_descriptor(displaced_descriptor)
+        displaced_after = os.fstat(displaced_descriptor)
+        mapped = _target_stat(directory_fd, source)
+        installed = _target_stat(directory_fd, name)
+        _validate_installed_temporary(
+            temporary,
+            directory_fd,
+            name,
+            expected=rendered,
+        )
+        if (
+            (displaced_stat.st_dev, displaced_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
+            or displaced_bytes != existing_bytes
+            or not _same_target(displaced_stat, displaced_after)
+            or mapped is None
+            or not _same_target(displaced_stat, mapped)
+            or installed is None
+            or (installed.st_dev, installed.st_ino) != temporary.identity
+        ):
+            raise WeightPlanTargetError("weight plan target changed during atomic replacement")
+    except OSError as exc:
+        failure = WeightPlanTargetError("weight plan target changed during atomic replacement")
+        failure.__cause__ = exc
+    except BaseException as exc:
+        failure = exc
+
+    if failure is None:
+        try:
+            os.fsync(directory_fd)
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
+            )
+        except BaseException as exc:
+            failure = exc
+
+    if failure is None:
+        try:
+            final_validation()
+        except BaseException as exc:
+            failure = exc
+
+    if failure is not None:
+        _rollback_replacement(
+            temporary,
+            backup,
+            displaced_descriptor,
+            expected_stat,
+            existing_bytes,
+            directory_fd,
+            source,
+            name,
+            failure,
+            published_identity,
+        )
+        _close_preserving(displaced_descriptor, failure, "displaced_target_cleanup_failed")
+        raise failure
+
+    assert displaced_descriptor >= 0
+    assert displaced_stat is not None
+    displaced = _TemporaryPlan(
+        descriptor=displaced_descriptor,
+        identity=(displaced_stat.st_dev, displaced_stat.st_ino),
+        name=source,
+    )
+    _cleanup_temporary_plan(displaced, directory_fd)
+
+
+def write_weight_plan_atomic(plan: WeightPlan, path: str | os.PathLike[str]) -> bool:
+    """Durably install a plan with atomic replacement and strict target checks.
+
+    Returns ``False`` when the already-installed canonical bytes are identical.
+    The target's parent must already exist and must not traverse symlinks.
+    """
+
+    parent, name = _secure_file_location(path)
+    chain = _pin_directory_chain(parent)
+    write_lock: _WeightPlanWriteLock | None = None
+    temporary: _TemporaryPlan | None = None
+    primary: BaseException | None = None
+    try:
+        directory_fd = chain.parent_fd
+        rendered = plan.canonical_bytes()
+        if len(rendered) > MAX_WEIGHT_PLAN_BYTES:
+            raise WeightPlanError("canonical weight plan exceeds the size limit")
+        write_lock = _acquire_write_lock(directory_fd, name)
+        _revalidate_pinned_chain(chain)
+        existing = _target_stat(directory_fd, name)
+        existing_bytes: bytes | None = None
+        if existing is not None:
+            existing_bytes = _read_existing(directory_fd, name, existing)
+            if not _same_target(existing, _target_stat(directory_fd, name)):
+                raise WeightPlanTargetError("weight plan target changed during validation")
+            if existing_bytes == rendered:
+                _verify_configured_target(
+                    chain,
+                    name,
+                    identity=(existing.st_dev, existing.st_ino),
+                    rendered=rendered,
+                )
+                return False
+
+        temporary = _prepare_temporary_plan(directory_fd, rendered)
+        _revalidate_pinned_chain(chain)
+        if not _same_target(existing, _target_stat(directory_fd, name)):
+            raise WeightPlanTargetError("weight plan target changed before atomic replacement")
+        _validate_temporary_descriptor(
+            temporary,
+            expected_size=len(rendered),
+            expected_nlink=1,
+        )
+        _validate_temporary_name(temporary, directory_fd, expected_size=len(rendered))
+        assert temporary.name is not None
+
+        def final_validation() -> None:
+            assert temporary is not None
+            _validate_installed_temporary(
+                temporary,
+                directory_fd,
+                name,
+                expected=rendered,
+            )
+            _verify_configured_target(
+                chain,
+                name,
+                identity=temporary.identity,
+                rendered=rendered,
+            )
+
+        _install_temporary_plan(
+            temporary,
+            directory_fd,
+            name,
+            rendered,
+            existing,
+            existing_bytes,
+            final_validation,
+        )
+        return True
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        cleanup_primary: BaseException | None = None
+        try:
+            if temporary is not None:
+                _cleanup_temporary_plan(temporary, chain.parent_fd)
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "temporary_cleanup_failed")
+            else:
+                cleanup_primary = exc
+        try:
+            if write_lock is not None:
+                write_lock.close()
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "write_lock_cleanup_failed")
+            elif cleanup_primary is not None:
+                _add_note_safely(cleanup_primary, "write_lock_cleanup_failed")
+            else:
+                cleanup_primary = exc
+        try:
+            chain.close()
+        except BaseException as exc:
+            if primary is not None:
+                _add_note_safely(primary, "directory_cleanup_failed")
+            elif cleanup_primary is not None:
+                _add_note_safely(cleanup_primary, "directory_cleanup_failed")
+            else:
+                cleanup_primary = exc
+        if primary is None and cleanup_primary is not None:
+            raise cleanup_primary

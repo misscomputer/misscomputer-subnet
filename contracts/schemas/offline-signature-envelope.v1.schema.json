@@ -1,0 +1,63 @@
+{
+  "$comment": "Canonical signature metadata only; cryptographic verification is separate.",
+  "$id": "https://miss.computer/contracts/offline-signature-envelope.v1.schema.json",
+  "additionalProperties": false,
+  "properties": {
+    "algorithm": {
+      "const": "ed25519",
+      "title": "Algorithm",
+      "type": "string"
+    },
+    "expires_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Expires At Epoch",
+      "type": "integer"
+    },
+    "issued_at_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Issued At Epoch",
+      "type": "integer"
+    },
+    "payload_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Payload Digest Sha256",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/offline-signature-envelope",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "signature_base64": {
+      "maxLength": 88,
+      "minLength": 88,
+      "pattern": "^[A-Za-z0-9+/]{86}==$",
+      "title": "Signature Base64",
+      "type": "string"
+    },
+    "signer_key_id": {
+      "pattern": "^[a-z][a-z0-9_]{0,62}[a-z0-9]$|^[a-z]$",
+      "title": "Signer Key Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "signer_key_id",
+    "algorithm",
+    "payload_digest_sha256",
+    "signature_base64",
+    "issued_at_epoch",
+    "expires_at_epoch"
+  ],
+  "title": "Offline signature envelope v1",
+  "type": "object"
+}

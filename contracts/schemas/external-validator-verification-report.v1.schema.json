@@ -1,0 +1,164 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "canonical_score_report_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Canonical Score Report Digest Sha256",
+      "type": "string"
+    },
+    "checkpoint_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Checkpoint Digest Sha256",
+      "type": "string"
+    },
+    "evaluation_epoch": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Evaluation Epoch",
+      "type": "integer"
+    },
+    "input_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Input Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "metagraph_snapshot_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Metagraph Snapshot Digest Sha256",
+      "type": "string"
+    },
+    "next_chain_state_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Next Chain State Digest Sha256",
+      "type": "string"
+    },
+    "normalization_algorithm": {
+      "const": "largest_remainder_score_ppm_to_u16_v1",
+      "title": "Normalization Algorithm",
+      "type": "string"
+    },
+    "normalized_weight_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Normalized Weight Vector Digest Sha256",
+      "type": "string"
+    },
+    "prior_chain_state_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Prior Chain State Digest Sha256",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "external_validator_checkpoint_verification_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "reason_codes": {
+      "items": {
+        "const": "checkpoint_verified",
+        "type": "string"
+      },
+      "maxItems": 1,
+      "minItems": 1,
+      "title": "Reason Codes",
+      "type": "array"
+    },
+    "report_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Report Digest Sha256",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/external-validator-verification-report",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "score_vector_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Score Vector Digest Sha256",
+      "type": "string"
+    },
+    "status": {
+      "const": "verified",
+      "title": "Status",
+      "type": "string"
+    },
+    "trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Trust Policy Digest Sha256",
+      "type": "string"
+    },
+    "validator_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Validator Hotkey",
+      "type": "string"
+    },
+    "validator_uid": {
+      "maximum": 65535,
+      "minimum": 0,
+      "title": "Validator Uid",
+      "type": "integer"
+    },
+    "verification_input_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Verification Input Digest Sha256",
+      "type": "string"
+    },
+    "verified_roles": {
+      "items": {
+        "enum": [
+          "checkpoint_auditor",
+          "checkpoint_issuer",
+          "checkpoint_security"
+        ],
+        "type": "string"
+      },
+      "maxItems": 3,
+      "minItems": 1,
+      "title": "Verified Roles",
+      "type": "array"
+    },
+    "verified_signer_key_ids": {
+      "items": {
+        "maxLength": 64,
+        "minLength": 1,
+        "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+        "type": "string"
+      },
+      "maxItems": 16,
+      "minItems": 1,
+      "title": "Verified Signer Key Ids",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "status",
+    "reason_codes",
+    "evaluation_epoch",
+    "validator_uid",
+    "validator_hotkey",
+    "checkpoint_digest_sha256",
+    "canonical_score_report_digest_sha256",
+    "input_snapshot_digest_sha256",
+    "score_vector_digest_sha256",
+    "metagraph_snapshot_digest_sha256",
+    "trust_policy_digest_sha256",
+    "verification_input_digest_sha256",
+    "prior_chain_state_digest_sha256",
+    "next_chain_state_digest_sha256",
+    "verified_signer_key_ids",
+    "verified_roles",
+    "normalization_algorithm",
+    "normalized_weight_vector_digest_sha256",
+    "report_digest_sha256"
+  ],
+  "title": "ExternalValidatorVerificationReport",
+  "type": "object"
+}
