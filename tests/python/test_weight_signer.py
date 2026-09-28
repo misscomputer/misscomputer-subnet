@@ -506,6 +506,11 @@ class OfflineSubstrate:
             "BlocksSinceLastStep": 100,
         }[name]
 
+    async def query_map(self, module: str, name: str, params: Any, **_: Any) -> list[Any]:
+        del params
+        assert (module, name) == ("SubtensorModule", "TokenSymbol")
+        return []
+
     async def compose(self, call: Any) -> Any:
         return call
 
