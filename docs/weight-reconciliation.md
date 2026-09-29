@@ -2,10 +2,12 @@
 
 This runbook is read-only. None of these commands loads a wallet, connects to
 the signer socket, changes an audit ledger, installs a service, or submits
-weights. Use two genuinely independent websocket providers; two hostnames
-fronting the same upstream are correlated, not redundant. RPC endpoint values
-must be credential-free `ws://` or `wss://` authorities without userinfo,
-queries, or fragments.
+weights. For production, use two genuinely independent websocket providers;
+two hostnames fronting the same upstream are correlated, not redundant. On
+`--subtensor-network test`, one explicitly pinned endpoint is also supported
+for experiments, but it supplies no independent agreement or failover. RPC
+endpoint values must be credential-free `ws://` or `wss://` authorities without
+userinfo, queries, or fragments.
 
 ## Shadow the next plan
 
@@ -102,4 +104,6 @@ Page immediately on `rpc_finalized_rollback`, `rpc_snapshot_disagreement`,
 availability and excessive-lag alerts as fail-closed service degradation. Do
 not retry against only the surviving endpoint. Restore at least two independent
 agreeing finalized views, rerun the shadow command, and investigate provider
-correlation before rearming any one-shot timer.
+correlation before rearming any one-shot timer. For a one-endpoint testnet
+experiment, stop on endpoint failure or inconsistent evidence; do not treat
+that single view as quorum evidence.

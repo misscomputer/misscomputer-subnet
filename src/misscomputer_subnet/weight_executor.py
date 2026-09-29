@@ -1580,7 +1580,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rpc-endpoint",
         action="append",
         default=[],
-        help="independent RPC endpoint; repeat at least twice to require finalized agreement",
+        help="RPC endpoint; repeat twice for finalized agreement, or use one on testnet",
     )
     parser.add_argument(
         "--rpc-max-finalized-lag",

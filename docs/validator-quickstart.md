@@ -78,9 +78,11 @@ Be clear about these boundaries before you plan a deployment:
 - **Accurate time.** The probe schedules requests from the host clock; run
   NTP or equivalent.
 - **Your own chain view.** A finalized block height for every probe run, and
-  RPC access for the window coordinator and executor. For the executor, use
-  two genuinely independent `ws://` or `wss://` providers (see
-  [weight-reconciliation.md](weight-reconciliation.md)).
+  RPC access for the window coordinator and executor. For production executor
+  runs, use two genuinely independent `ws://` or `wss://` providers. An
+  explicitly pinned single provider is supported with
+  `--subtensor-network test` for testnet experiments, without quorum agreement
+  (see [weight-reconciliation.md](weight-reconciliation.md)).
 - The **trust policy file**, its **independently obtained SHA-256**, and the
   **manifest publication location** from the subnet operator.
 
@@ -310,8 +312,11 @@ misscomputer-weight-executor \
   --validator-hotkey "$MC_HOTKEY_SS58"
 ```
 
-Pass either no `--rpc-endpoint` or at least two independent ones. Success
-prints one JSON line with `"mode":"dry-run"` and `"status":"validated"`, plus
+Pass either no `--rpc-endpoint` or at least two independent ones for production.
+With `--subtensor-network test`, one explicitly pinned `--rpc-endpoint` is also
+accepted; omit the second endpoint in the example above. This gives no
+independent RPC agreement or failover. Success prints one JSON line with
+`"mode":"dry-run"` and `"status":"validated"`, plus
 the plan digest, the adjusted execution digest, the block, and
 target/moved/omitted counts. A failure exits `2` with a JSON error on stderr
 (`error_code`, `status`).
@@ -362,7 +367,7 @@ It never prepares or submits weights; the old weight flags
 | --- | --- |
 | `--netuid` | required |
 | `--subtensor-network` | `$BT_NETWORK` or `finney` |
-| `--rpc-endpoint` (repeatable) | none; give none or at least two |
+| `--rpc-endpoint` (repeatable) | none; give none or at least two, or exactly one with `--subtensor-network test` |
 | `--rpc-max-finalized-lag` | `8` |
 | `--wallet-name` / `--wallet-hotkey` / `--wallet-path` | as for the miner |
 | `--bridge-host` / `--bridge-port` | `127.0.0.1` / `9200` |

@@ -308,9 +308,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     try:
-        if len(args.rpc_endpoint) < 2:
+        if len(args.rpc_endpoint) < (1 if args.subtensor_network == "test" else 2):
             raise WeightReconciliationError(
-                "rpc_configuration_invalid", "reconciliation requires at least two RPCs"
+                "rpc_configuration_invalid", "reconciliation requires explicit RPC endpoints"
             )
         try:
             chain = build_chain_query(
