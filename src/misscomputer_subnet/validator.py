@@ -3150,7 +3150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rpc-endpoint",
         action="append",
         default=[],
-        help="independent RPC endpoint; repeat at least twice for finalized agreement",
+        help="RPC endpoint; repeat twice for finalized agreement, or use one on testnet",
     )
     parser.add_argument("--rpc-max-finalized-lag", type=int, default=8)
     parser.add_argument("--wallet-name", default=os.getenv("BT_WALLET", "default"))

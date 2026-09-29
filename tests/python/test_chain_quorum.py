@@ -373,6 +373,22 @@ def test_factory_requires_distinct_redundant_endpoints() -> None:
         )
 
 
+def test_factory_pins_one_explicit_testnet_endpoint() -> None:
+    endpoint = "wss://test.finney.opentensor.ai:443"
+    chain = build_chain_query(network="test", netuid=581, rpc_endpoints=(endpoint,))
+
+    assert isinstance(chain, BittensorChain)
+    assert chain.network == "test"
+    assert chain.rpc_endpoint == endpoint
+
+    with pytest.raises(ValueError, match="invalid"):
+        build_chain_query(
+            network="test",
+            netuid=581,
+            rpc_endpoints=("wss://user:password@example.invalid",),  # noqa: S105
+        )
+
+
 @pytest.mark.parametrize(
     ("first", "second"),
     [

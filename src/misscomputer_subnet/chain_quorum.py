@@ -490,11 +490,15 @@ def build_chain_query(
     max_finalized_lag: int = 8,
     alert_sink: AlertSink | None = None,
 ) -> BittensorChain | FinalizedRpcQuorum:
-    """Build the legacy single read or an explicitly independent RPC quorum."""
+    """Build a default read, a pinned testnet read, or an independent RPC quorum."""
 
     endpoints = tuple(rpc_endpoints)
     if not endpoints:
         return BittensorChain(network=network, netuid=netuid)
+    if len(endpoints) == 1 and network == "test":
+        if _rpc_endpoint_identity(endpoints[0]) is None:
+            raise ValueError("RPC endpoint set is invalid")
+        return BittensorChain(network=network, netuid=netuid, rpc_endpoint=endpoints[0])
     if len(endpoints) < 2:
         raise ValueError("configure at least two RPC endpoints or none")
     endpoint_identities = tuple(_rpc_endpoint_identity(endpoint) for endpoint in endpoints)

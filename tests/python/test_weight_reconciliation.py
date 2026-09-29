@@ -9,7 +9,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from misscomputer_subnet import weight_reconciliation as reconciliation_module
-from misscomputer_subnet.chain import MetagraphSnapshot, NeuronRecord
+from misscomputer_subnet.chain import BittensorChain, MetagraphSnapshot, NeuronRecord
 from misscomputer_subnet.weight_executor import (
     AuditAttempt,
     AuditReceipt,
@@ -358,6 +358,33 @@ def test_reconciliation_cli_rejects_duplicate_rpc_identity_with_exit_two(
     assert first not in captured.err
     assert second not in captured.err
     assert str(tmp_path) not in captured.err
+
+
+def test_reconciliation_cli_accepts_one_pinned_testnet_rpc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    endpoint = "wss://test.finney.opentensor.ai:443"
+
+    async def fake_reconcile(**kwargs: object) -> CliReport:
+        chain = kwargs["chain"]
+        assert isinstance(chain, BittensorChain)
+        assert chain.rpc_endpoint == endpoint
+        return CliReport(alert_required=False)
+
+    monkeypatch.setattr(
+        reconciliation_module.sys,
+        "argv",
+        [*cli_args(tmp_path, endpoint), "--subtensor-network", "test"],
+    )
+    monkeypatch.setattr(reconciliation_module, "reconcile_weight_attempt", fake_reconcile)
+
+    reconciliation_module.main()
+
+    captured = capsys.readouterr()
+    assert captured.out == '{"status":"ok"}\n'
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize(("alert_required", "exit_code"), [(False, None), (True, 3)])

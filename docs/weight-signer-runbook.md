@@ -14,7 +14,7 @@ exits. Read [validator-quickstart.md](validator-quickstart.md) and
  ────────────────────────────                  ─────────────────────────────────
  misscomputer-weight-executor --execute        misscomputer-weight-signer
    loads its own plan copy                       loads its own plan copy (digest-confirmed)
-   finalized preflight + send check              its own finalized reads (RPC quorum)
+   finalized preflight + send check              its own finalized reads (RPC quorum or testnet pin)
    durable executor ledger                       durable signer ledger
         │  weight-signer-request v2 (one line) ─▶ peer UID must equal --executor-uid
         │                                        request must equal its own derivation
@@ -197,6 +197,13 @@ process.
 5. **Read both results.** The signer and executor each print one JSON line.
    Both must report `confirmed` with the same `extrinsic_ref` and
    `execution_digest_sha256`.
+
+For a testnet experiment, set `MC_NETWORK=test` and replace the two
+`--rpc-endpoint` arguments in **both** commands with the same single,
+credential-free `--rpc-endpoint 'wss://test.finney.opentensor.ai:443'`. Set the
+signer's `--submit-endpoint` to that same URL. This is a pinned single-provider
+read, not an RPC quorum; endpoint failure stops the attempt and there is no
+independent agreement check. Keep two independent providers for production.
 
 If the chain moves between preflight and execution (a miner re-registers, a
 UID changes), the derived execution digest changes and both processes refuse.
