@@ -75,6 +75,7 @@ from .organic_manifest import (
     parse_assignment_manifest_v3,
     verify_assignment_manifest_v3,
 )
+from .organic_probe import epoch_index_of
 from .score_checkpoint_relay_cli import InputFile, _normalized_absolute_path
 from .static_crawl import fetch_static_index_documents, send_static_probe
 from .static_evidence import StaticEvidenceJournal
@@ -334,14 +335,22 @@ def load_static_epoch(
     run.verification = verification
     server_name = urlsplit(index_origin).hostname or ""
     deadline = time.monotonic() + STATIC_INDEX_LOAD_BUDGET_SECONDS
-    for target in static_deployment_targets(verification):
+    targets = static_deployment_targets(verification)
+    # A fixed prefix lets slow low-ID indexes consume the budget forever.
+    # Rotate the first opportunity each epoch; scoring still uses the
+    # manifest's canonical target order in finish_static_epoch.
+    start = epoch_index_of(evaluation_epoch) % len(targets) if targets else 0
+    for target in targets[start:] + targets[:start]:
         if time.monotonic() >= deadline:
             run.abstentions.append(
                 StaticIndexAbstention(target.deployment_id, target.site_digest, "index_unavailable")
             )
             continue
         manifest_bytes, release_bytes = fetch_static_index_documents(
-            transport, target, index_origin=index_origin, server_name=server_name,
+            transport,
+            target,
+            index_origin=index_origin,
+            server_name=server_name,
             deadline=deadline,
         )
         result = ingest_static_index(

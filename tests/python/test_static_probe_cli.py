@@ -12,9 +12,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from assignment_probe_context import signer_keys
+from assignment_probe_context import FINALIZED_HEIGHT, signer_keys
 from organic_context import EPOCH_START
 from static_cli_context import (
+    INDEX_ORIGIN,
     STATIC_ID,
     FakeTime,
     alice_signer,
@@ -24,6 +25,7 @@ from static_cli_context import (
     sign_v3,
     write_static_publication,
 )
+from static_context import SERVER, trust_policy
 
 import misscomputer_subnet.assignment_probe_cli as probe_cli
 import misscomputer_subnet.static_runtime as static_runtime
@@ -42,6 +44,7 @@ from misscomputer_subnet.organic_manifest import (
     organic_assignment_manifest_bytes,
 )
 from misscomputer_subnet.static_evidence import StaticEvidenceJournal
+from misscomputer_subnet.static_index import static_deployment_targets
 from misscomputer_subnet.static_scoring import aggregate_static_window, parse_static_epoch_score
 
 
@@ -227,6 +230,50 @@ def test_slow_index_abstains_at_the_bounded_fetch_budget(
     ]
     assert len([kind for kind, _ in publication.world.calls if kind == "index"]) == 1
     assert _static_calls(publication.world) == []
+
+
+def test_index_budget_gives_each_site_a_first_fetch_across_epochs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    prepared = execute(cli_config(publication, tmp_path / "prepared"), publication.world)
+    assert prepared.static is not None and prepared.static.verification is not None
+    first = static_deployment_targets(prepared.static.verification)[0]
+    second = first.model_copy(update={"deployment_id": "site-b"})
+    monkeypatch.setattr(
+        static_runtime, "static_deployment_targets", lambda _verified: [first, second]
+    )
+    monkeypatch.setattr(static_runtime, "STATIC_INDEX_LOAD_BUDGET_SECONDS", 0.02)
+    fetched: list[str] = []
+
+    def slow_index(_transport: Any, target: Any, **_kwargs: Any) -> tuple[None, None]:
+        fetched.append(target.deployment_id)
+        time.sleep(0.04)
+        return None, None
+
+    monkeypatch.setattr(static_runtime, "fetch_static_index_documents", slow_index)
+    first_fetched: list[str] = []
+    for offset in range(2):
+        static = cli_config(publication, tmp_path / f"epoch-{offset}").static_sites
+        assert static is not None
+        run = static_runtime.lock_static_epoch(static, publication.policy)
+        try:
+            static_runtime.load_static_epoch(
+                run,
+                transport=publication.world,
+                policy=publication.policy,
+                release_policy=trust_policy(),
+                server_digest=SERVER,
+                index_origin=INDEX_ORIGIN,
+                evaluation_epoch=int(EPOCH_START) + offset * 300,
+                current_finalized_height=FINALIZED_HEIGHT,
+            )
+        finally:
+            run.close()
+        first_fetched.append(fetched[0])
+        fetched.clear()
+
+    assert set(first_fetched) == {"site-a", "site-b"}
 
 
 def test_unverifiable_v3_manifest_abstains_static_while_organic_scores(
