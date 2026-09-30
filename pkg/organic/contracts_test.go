@@ -32,6 +32,7 @@ var contracts = map[string]func() organic.Validator{
 	"bridge-assign.v3":               func() organic.Validator { return &neuron.BridgeAssignRequestV3{} },
 	"edge-runtime-request.v1":        func() organic.Validator { return &organic.EdgeRuntimeRequest{} },
 	"active-assignment-manifest.v2":  func() organic.Validator { return &organic.ActiveAssignmentManifestV2{} },
+	"active-assignment-manifest.v3":  func() organic.Validator { return &organic.ActiveAssignmentManifestV3{} },
 	"organic-probe-authorization.v1": func() organic.Validator { return &organic.ProbeAuthorization{} },
 	"miner-probe-attestation.v2":     func() organic.Validator { return &organic.ProbeAttestationV2{} },
 }

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Publication and verification of ``active-assignment-manifest`` v2.
+"""Publication and verification of ``active-assignment-manifest`` v2 and v3.
 
-The document itself is the canonical
-:class:`~misscomputer_subnet.organic_contracts.ActiveAssignmentManifestV2`.
+The documents themselves are the canonical
+:class:`~misscomputer_subnet.organic_contracts.ActiveAssignmentManifestV2` and
+:class:`~misscomputer_subnet.organic_contracts.ActiveAssignmentManifestV3`.
 This module is the scoring track's verifier-side pipeline around it
 (contract §17.2): the v2 signing domain, live verification under the
 validator's pinned trust policy with the append-only chain rules, and the
@@ -18,6 +19,16 @@ and the publication *channel* (``active_assignment_manifest_publication_v1``)
 and read only header fields every manifest version shares. Version 2 signs
 under :data:`ORGANIC_MANIFEST_SIGNATURE_DOMAIN_SEPARATOR`, so a signature over
 the retired synthetic v1 domain never verifies as v2.
+
+Version 3 (static-site contract §11.1) keeps the v2 header, trust policy,
+envelope, chain state and lease rules, and adds explicit ``workload_kind``
+deployments: ``oci-image-v1`` exactly as in v2 and ``static-site-v1`` bound to
+``site_digest``, ``release_digest`` and ``server_implementation_digest``. It
+signs under :data:`ASSIGNMENT_MANIFEST_V3_SIGNATURE_DOMAIN_SEPARATOR`, so no v2
+signature verifies as v3 or the reverse. v2 and v3 are separate publication
+series: each has its own sequence and ``previous_manifest_digest_sha256`` link,
+and a validator keeps one chain state per version. v2 keeps listing only OCI
+deployments, byte for byte as before.
 
 Leases
 ------
@@ -39,7 +50,7 @@ chain, randomness, or signing capability.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Final
 
 from .assignment_probe import (
@@ -63,10 +74,13 @@ from .contract_codec import (
 )
 from .organic_contracts import (
     ActiveAssignmentManifestV2,
+    ActiveAssignmentManifestV3,
     Hex64,
     document_bytes,
     parse_canonical_document,
 )
+
+AnyAssignmentManifest = ActiveAssignmentManifestV2 | ActiveAssignmentManifestV3
 
 ORGANIC_MANIFEST_SCHEMA: Final = "miss.computer/misscomputer-subnet/active-assignment-manifest"
 ORGANIC_MANIFEST_PURPOSE: Final = "active_assignment_manifest_publication_v2"
@@ -74,6 +88,10 @@ ORGANIC_MANIFEST_SIGNATURE_DOMAIN_SEPARATOR: Final = (
     b"miss.computer/misscomputer-subnet/active-assignment-manifest/v2/ed25519"
 )
 ORGANIC_ATTESTATION_REQUIREMENT: Final = "miner_service_key_v2"
+ASSIGNMENT_MANIFEST_V3_PURPOSE: Final = "active_assignment_manifest_publication_v3"
+ASSIGNMENT_MANIFEST_V3_SIGNATURE_DOMAIN_SEPARATOR: Final = (
+    b"miss.computer/misscomputer-subnet/active-assignment-manifest/v3/ed25519"
+)
 
 
 class OrganicManifestVerification(StrictFrozenModel):
@@ -88,10 +106,31 @@ class OrganicManifestVerification(StrictFrozenModel):
     trust_policy_digest_sha256: Hex64
 
 
+class AssignmentManifestV3Verification(StrictFrozenModel):
+    """One live verification of one v3 manifest and the chain state it produced."""
+
+    manifest: ActiveAssignmentManifestV3
+    verified_signer_key_ids: list[str]
+    verified_roles: list[ManifestRole]
+    next_chain_state: AssignmentManifestChainState
+    reprobe: bool
+    evaluation_epoch: int
+    trust_policy_digest_sha256: Hex64
+
+
 def verify_organic_manifest_identities(manifest: ActiveAssignmentManifestV2) -> None:
     """Refuse identity reuse the canonical model does not itself forbid."""
 
-    value = revalidate(manifest, ActiveAssignmentManifestV2)
+    _verify_identities(revalidate(manifest, ActiveAssignmentManifestV2))
+
+
+def verify_assignment_manifest_v3_identities(manifest: ActiveAssignmentManifestV3) -> None:
+    """The v2 identity rules across every OCI and static replica of a v3 manifest."""
+
+    _verify_identities(revalidate(manifest, ActiveAssignmentManifestV3))
+
+
+def _verify_identities(value: AnyAssignmentManifest) -> None:
     replicas = [replica for item in value.deployments for replica in item.replicas]
     nonces = [replica.assignment_nonce for replica in replicas]
     if len(set(nonces)) != len(nonces):
@@ -120,7 +159,18 @@ def organic_manifest_signature_message(manifest: ActiveAssignmentManifestV2) -> 
     )
 
 
-def organic_manifest_effective_expires_at_epoch(manifest: ActiveAssignmentManifestV2) -> int:
+def assignment_manifest_v3_signature_message(manifest: ActiveAssignmentManifestV3) -> bytes:
+    """The only domain-separated bytes a central manifest key signs for a v3 manifest."""
+
+    manifest = revalidate(manifest, ActiveAssignmentManifestV3)
+    return (
+        ASSIGNMENT_MANIFEST_V3_SIGNATURE_DOMAIN_SEPARATOR
+        + b"\x00"
+        + canonical_json(model_document(manifest))
+    )
+
+
+def organic_manifest_effective_expires_at_epoch(manifest: AnyAssignmentManifest) -> int:
     """The manifest's own expiry or the earliest published replica lease, whichever is first."""
 
     return min(
@@ -135,7 +185,7 @@ def organic_manifest_effective_expires_at_epoch(manifest: ActiveAssignmentManife
     )
 
 
-def organic_manifest_valid_at(manifest: ActiveAssignmentManifestV2, instant_epoch: int) -> bool:
+def organic_manifest_valid_at(manifest: AnyAssignmentManifest, instant_epoch: int) -> bool:
     """Whether a probe issued at ``instant_epoch`` falls inside the manifest's horizon."""
 
     return (
@@ -147,6 +197,40 @@ def organic_manifest_valid_at(manifest: ActiveAssignmentManifestV2, instant_epoc
 def _bounded(value: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_EPOCH:
         raise ValueError(f"{name}_invalid")
+
+
+def _verify_live(
+    value: AnyAssignmentManifest,
+    message: bytes,
+    signatures: Sequence[AssignmentManifestSignatureEnvelope],
+    policy: AssignmentManifestTrustPolicy,
+    prior_chain_state: AssignmentManifestChainState,
+    *,
+    evaluation_epoch: int,
+    current_finalized_height: int,
+) -> tuple[list[str], list[ManifestRole], AssignmentManifestChainState, bool]:
+    envelopes = [revalidate(item, AssignmentManifestSignatureEnvelope) for item in signatures]
+    if not 1 <= len(envelopes) <= MAX_KEYS:
+        raise AssignmentProbeError("signature_binding_mismatch")
+    verify_manifest_policy_admission(value, policy, evaluation_epoch=evaluation_epoch)
+    _verify_identities(value)
+    if evaluation_epoch >= organic_manifest_effective_expires_at_epoch(value):
+        raise AssignmentProbeError("manifest_expired")
+    if any(
+        replica.expires_at_block <= current_finalized_height
+        for item in value.deployments
+        for replica in item.replicas
+    ):
+        raise AssignmentProbeError("manifest_replica_lease_expired")
+    signer_ids, roles = verify_manifest_signatures(
+        value,
+        message,
+        envelopes,
+        policy,
+        evaluation_epoch=evaluation_epoch,
+    )
+    next_state, reprobe = advance_manifest_header_chain_state(prior_chain_state, value, policy)
+    return signer_ids, roles, next_state, reprobe
 
 
 def verify_organic_assignment_manifest(
@@ -171,28 +255,56 @@ def verify_organic_assignment_manifest(
     _bounded(current_finalized_height, "current_finalized_height")
     policy = revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
     value = revalidate(manifest, ActiveAssignmentManifestV2)
-    envelopes = [revalidate(item, AssignmentManifestSignatureEnvelope) for item in signatures]
-    if not 1 <= len(envelopes) <= MAX_KEYS:
-        raise AssignmentProbeError("signature_binding_mismatch")
-    verify_manifest_policy_admission(value, policy, evaluation_epoch=evaluation_epoch)
-    verify_organic_manifest_identities(value)
-    if evaluation_epoch >= organic_manifest_effective_expires_at_epoch(value):
-        raise AssignmentProbeError("manifest_expired")
-    if any(
-        replica.expires_at_block <= current_finalized_height
-        for item in value.deployments
-        for replica in item.replicas
-    ):
-        raise AssignmentProbeError("manifest_replica_lease_expired")
-    signer_ids, roles = verify_manifest_signatures(
+    signer_ids, roles, next_state, reprobe = _verify_live(
         value,
         organic_manifest_signature_message(value),
-        envelopes,
+        signatures,
         policy,
+        prior_chain_state,
         evaluation_epoch=evaluation_epoch,
+        current_finalized_height=current_finalized_height,
     )
-    next_state, reprobe = advance_manifest_header_chain_state(prior_chain_state, value, policy)
     return OrganicManifestVerification(
+        manifest=value,
+        verified_signer_key_ids=signer_ids,
+        verified_roles=roles,
+        next_chain_state=next_state,
+        reprobe=reprobe,
+        evaluation_epoch=evaluation_epoch,
+        trust_policy_digest_sha256=policy.trust_policy_digest_sha256,
+    )
+
+
+def verify_assignment_manifest_v3(
+    manifest: ActiveAssignmentManifestV3,
+    signatures: Sequence[AssignmentManifestSignatureEnvelope],
+    approved_trust_policy: AssignmentManifestTrustPolicy,
+    prior_chain_state: AssignmentManifestChainState,
+    *,
+    evaluation_epoch: int,
+    current_finalized_height: int,
+) -> AssignmentManifestV3Verification:
+    """Verify one v3 publication live under exactly the v2 rules and the v3 domain.
+
+    ``prior_chain_state`` is the validator's v3 chain state, never its v2 one.
+    A validator that cannot verify the current v3 manifest keeps using v2 for
+    OCI deployments and abstains on static ones.
+    """
+
+    _bounded(evaluation_epoch, "evaluation_epoch")
+    _bounded(current_finalized_height, "current_finalized_height")
+    policy = revalidate(approved_trust_policy, AssignmentManifestTrustPolicy)
+    value = revalidate(manifest, ActiveAssignmentManifestV3)
+    signer_ids, roles, next_state, reprobe = _verify_live(
+        value,
+        assignment_manifest_v3_signature_message(value),
+        signatures,
+        policy,
+        prior_chain_state,
+        evaluation_epoch=evaluation_epoch,
+        current_finalized_height=current_finalized_height,
+    )
+    return AssignmentManifestV3Verification(
         manifest=value,
         verified_signer_key_ids=signer_ids,
         verified_roles=roles,
@@ -221,12 +333,54 @@ def anchor_organic_manifest_chain_state(
     state through the ordinary append-only rules.
     """
 
+    return _anchor(
+        revalidate(manifest, ActiveAssignmentManifestV2),
+        verify_organic_assignment_manifest,
+        signatures,
+        approved_trust_policy,
+        genesis_chain_state,
+        evaluation_epoch=evaluation_epoch,
+        current_finalized_height=current_finalized_height,
+    )
+
+
+def anchor_assignment_manifest_v3_chain_state(
+    manifest: ActiveAssignmentManifestV3,
+    signatures: Sequence[AssignmentManifestSignatureEnvelope],
+    approved_trust_policy: AssignmentManifestTrustPolicy,
+    genesis_chain_state: AssignmentManifestChainState,
+    *,
+    evaluation_epoch: int,
+    current_finalized_height: int,
+) -> AssignmentManifestV3Verification:
+    """Onboard a validator's v3 chain state on the current live v3 head (see the v2 anchor)."""
+
+    return _anchor(
+        revalidate(manifest, ActiveAssignmentManifestV3),
+        verify_assignment_manifest_v3,
+        signatures,
+        approved_trust_policy,
+        genesis_chain_state,
+        evaluation_epoch=evaluation_epoch,
+        current_finalized_height=current_finalized_height,
+    )
+
+
+def _anchor[ManifestT: AnyAssignmentManifest, ResultT: StrictFrozenModel](
+    value: ManifestT,
+    verify: Callable[..., ResultT],
+    signatures: Sequence[AssignmentManifestSignatureEnvelope],
+    approved_trust_policy: AssignmentManifestTrustPolicy,
+    genesis_chain_state: AssignmentManifestChainState,
+    *,
+    evaluation_epoch: int,
+    current_finalized_height: int,
+) -> ResultT:
     state = revalidate(genesis_chain_state, AssignmentManifestChainState)
     if state.accepted_manifest_count != 0:
         raise ValueError("anchor_state_not_genesis")
-    value = revalidate(manifest, ActiveAssignmentManifestV2)
     if value.sequence == 1:
-        return verify_organic_assignment_manifest(
+        return verify(
             value,
             signatures,
             approved_trust_policy,
@@ -248,7 +402,7 @@ def anchor_organic_manifest_chain_state(
     predecessor = AssignmentManifestChainState.model_validate(
         {**unsigned, "state_digest_sha256": digest(unsigned)}
     )
-    result = verify_organic_assignment_manifest(
+    result = verify(
         value,
         signatures,
         approved_trust_policy,
@@ -277,3 +431,11 @@ def organic_assignment_manifest_bytes(value: ActiveAssignmentManifestV2) -> byte
 
 def parse_organic_assignment_manifest(rendered: bytes) -> ActiveAssignmentManifestV2:
     return parse_canonical_document(rendered, ActiveAssignmentManifestV2)
+
+
+def assignment_manifest_v3_bytes(value: ActiveAssignmentManifestV3) -> bytes:
+    return document_bytes(revalidate(value, ActiveAssignmentManifestV3))
+
+
+def parse_assignment_manifest_v3(rendered: bytes) -> ActiveAssignmentManifestV3:
+    return parse_canonical_document(rendered, ActiveAssignmentManifestV3)

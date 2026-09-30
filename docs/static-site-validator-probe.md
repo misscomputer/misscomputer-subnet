@@ -3,16 +3,17 @@
 Status: development baseline behind the operator's `static_sites` flag (default
 off). The validator implements the normative static-site contract (§3 site
 manifest, §4 URL paths, §5 serving semantics, §7 release authority, §10.2
-crawl set and budgets, §11 static index and probes). Manifest v3 parsing,
-evidence and coverage record schemas, and scoring live with their owners.
+crawl set and budgets, §11 manifest v3, static index and probes). The
+evidence and coverage record schemas and scoring live with their owners.
 
 ## Index ingestion
 
 Code: `misscomputer_subnet.static_index`.
 
-For each static deployment in the verified public assignment manifest v3
-(`site_digest`, `release_digest`, `server_implementation_digest`, endpoint
-incarnations), the validator fetches
+For each static deployment of a live-verified public assignment manifest v3
+(`verify_assignment_manifest_v3`, then `static_deployment_targets`, which binds
+`site_digest`, `release_digest`, `server_implementation_digest` and the
+endpoint incarnations), the validator fetches
 `static-sites/v1/manifests/<site hex>.json` and
 `static-sites/v1/releases/<release hex>.json` from the public static index
 and accepts them only if:

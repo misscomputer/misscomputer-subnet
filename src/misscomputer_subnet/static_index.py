@@ -65,11 +65,13 @@ from .organic_contracts import (
     Hostname,
     Hotkey,
     PositiveCount,
+    StaticDeploymentAssignmentV3,
     Timestamp,
     parse_canonical_document,
     response_header_sha256,
 )
 from .organic_contracts import Digest as PrefixedDigest
+from .organic_manifest import AssignmentManifestV3Verification
 from .organic_probe import timestamp_epoch_seconds
 
 STATIC_SITE_MANIFEST_SCHEMA: Final = "miss.computer/misscomputer-subnet/static-site-manifest"
@@ -425,6 +427,42 @@ class StaticDeploymentTarget(StrictFrozenModel):
         if len(set(ids)) != len(ids):
             raise ValueError("static_target_endpoint_duplicate")
         return self
+
+
+def static_deployment_targets(
+    verification: AssignmentManifestV3Verification,
+) -> list[StaticDeploymentTarget]:
+    """The ``static-site-v1`` deployments of one live-verified manifest v3, in order.
+
+    Only a manifest that passed :func:`~misscomputer_subnet.organic_manifest.
+    verify_assignment_manifest_v3` yields targets; ``oci-image-v1`` deployments
+    are left to the existing OCI probe path. Each replica becomes one endpoint
+    incarnation bound to its static ``ticket_digest``.
+    """
+
+    manifest = revalidate(verification, AssignmentManifestV3Verification).manifest
+    return [
+        StaticDeploymentTarget(
+            deployment_id=item.deployment_id,
+            route_host=item.route_host,
+            site_digest=item.site_digest,
+            release_digest=item.release_digest,
+            server_implementation_digest=item.server_implementation_digest,
+            endpoints=[
+                StaticEndpointTarget(
+                    endpoint_id=replica.endpoint_id,
+                    generation=replica.generation,
+                    miner_uid=replica.miner_uid,
+                    miner_hotkey=replica.miner_hotkey,
+                    miner_service_public_key=replica.miner_service_public_key,
+                    ticket_digest=replica.ticket_digest,
+                )
+                for replica in item.replicas
+            ],
+        )
+        for item in manifest.deployments
+        if isinstance(item, StaticDeploymentAssignmentV3)
+    ]
 
 
 # --------------------------------------------------------------------------

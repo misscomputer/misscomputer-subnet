@@ -37,6 +37,7 @@ generator, and commit the regenerated tree. Both suites fail on any drift.
 | `deploy.v3`, `deploy-response.v3`, `status-response.v3`, `bridge-assign.v3` | validator <-> miner (`subnet-synapse.v3`) | `DeploySynapseV3` ... | `neuron.DeploySynapseV3` ... |
 | `edge-runtime-request.v1` | edge -> miner (signed object of `X-Miss-Edge-Authorization`) | `EdgeRuntimeRequest` | `organic.EdgeRuntimeRequest` |
 | `active-assignment-manifest.v2` | central exporter -> public validators | `ActiveAssignmentManifestV2` | `organic.ActiveAssignmentManifestV2` |
+| `active-assignment-manifest.v3` | central exporter -> public validators (OCI and static) | `ActiveAssignmentManifestV3` | `organic.ActiveAssignmentManifestV3` |
 | `organic-probe-authorization.v1` | validator -> edge | `OrganicProbeAuthorization` | `organic.ProbeAuthorization` |
 | `miner-probe-attestation.v2` | miner agent -> validator (via edge) | `MinerProbeAttestationV2` | `organic.ProbeAttestationV2` |
 
@@ -127,10 +128,25 @@ The owner may revise any of them deliberately; implementers must not diverge.
     and each replica publishes `miner_tls_certificate_sha256`,
     `ticket_digest`, `receipt_digest`, `activated_at_epoch`,
     `expires_at_epoch`; attestation requirement `miner_service_key_v2`.
-5. **Probe authorization** `issued_at` is whole-second UTC; the header
+5. **Manifest v3** (static-site contract §11.1) keeps every v2 top-level
+    member and rule with `schema_version` 3, purpose
+    `active_assignment_manifest_publication_v3`, and signing domain
+    `miss.computer/misscomputer-subnet/active-assignment-manifest/v3/ed25519`.
+    The trust policy, signature envelope and chain state v1 are reused
+    unchanged; v2 and v3 are separate publication series, each with its own
+    sequence, previous-digest link and validator chain state. Each deployment
+    adds `workload_kind`, `site_digest`, `release_digest` and
+    `server_implementation_digest`. For `oci-image-v1`, the three static members
+    are `null` and the rest equals the v2 deployment
+    (`oci_deployment_assignment_v2` / `OCIAssignmentV2`). For `static-site-v1`,
+    `artifact_digest` and `health` are `null`, the three static members are
+    bound, and replicas carry static ticket and receipt v1 digests. v2 never
+    carries a static deployment; a new validator that cannot verify v3 uses
+    v2 for OCI and abstains on static.
+6. **Probe authorization** `issued_at` is whole-second UTC; the header
     `X-Miss-Organic-Probe-Authorization` carries base64 of the canonical
     document (the scoring and edge tracks own the transport).
-6. **Attestation v2** signs exactly the twelve members named by the contract
+7. **Attestation v2** signs exactly the twelve members named by the contract
     (not `schema`/`schema_version`); `observed_at` is canonical Go UTC.
 
 ## Open items for the owner

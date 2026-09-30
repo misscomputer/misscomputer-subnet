@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Final, Literal, Self
 
@@ -34,6 +35,7 @@ from misscomputer_subnet.contract_codec import (
     digest,
     model_document,
     parse_model,
+    revalidate,
     verify_model_digest,
 )
 from misscomputer_subnet.protocol import ServiceKeyBinding as ServiceKeyBinding
@@ -753,6 +755,155 @@ class ActiveAssignmentManifestV2(StrictFrozenModel):
         return self
 
 
+#: Workload kinds a manifest v3 deployment may declare (static-site contract §11.1).
+OCI_WORKLOAD_KIND: Final = "oci-image-v1"
+STATIC_WORKLOAD_KIND: Final = "static-site-v1"
+
+
+def _check_assignment_replicas(
+    deployment_id: str, replicas: Sequence[OrganicAssignedReplica]
+) -> None:
+    keys = [(item.miner_uid, item.miner_hotkey) for item in replicas]
+    if keys != sorted(set(keys)):
+        raise ValueError("assignment_replicas_not_canonical")
+    for item in replicas:
+        replica = f"{deployment_id}-{item.miner_hotkey}"
+        endpoint = f"{replica}-g{item.generation}-{item.assignment_nonce}"
+        if item.replica_id != replica or item.endpoint_id != endpoint:
+            raise ValueError("assignment_replica_identity_invalid")
+
+
+class _DeploymentAssignmentV3(StrictFrozenModel):
+    """Members every manifest v3 deployment shares with a v2 deployment."""
+
+    deployment_id: RouteLabel
+    route_host: Hostname
+    attestation_requirement: Literal["miner_service_key_v2"]
+    replicas: list[OrganicAssignedReplica] = Field(min_length=1, max_length=8)
+    assignment_digest_sha256: Hex64
+
+    @model_validator(mode="after")
+    def canonical_assignment(self) -> Self:
+        _check_assignment_replicas(self.deployment_id, self.replicas)
+        verify_model_digest(self, "assignment_digest_sha256")
+        return self
+
+
+class OciDeploymentAssignmentV3(_DeploymentAssignmentV3):
+    """An ``oci-image-v1`` deployment: the v2 deployment plus null static bindings."""
+
+    workload_kind: Literal["oci-image-v1"]
+    artifact_digest: Digest
+    health: OrganicHealthProbe
+    site_digest: None
+    release_digest: None
+    server_implementation_digest: None
+
+
+class StaticDeploymentAssignmentV3(_DeploymentAssignmentV3):
+    """A ``static-site-v1`` deployment; probes derive from its signed site manifest.
+
+    Every replica shares the deployment's ``site_digest``; its ``ticket_digest``
+    and ``receipt_digest`` are the static ticket and receipt v1 digests.
+    """
+
+    workload_kind: Literal["static-site-v1"]
+    artifact_digest: None
+    health: None
+    site_digest: Digest
+    release_digest: Digest
+    server_implementation_digest: Digest
+
+
+DeploymentAssignmentV3 = Annotated[
+    OciDeploymentAssignmentV3 | StaticDeploymentAssignmentV3,
+    Field(discriminator="workload_kind"),
+]
+
+
+class ActiveAssignmentManifestV3(StrictFrozenModel):
+    """Public snapshot of active OCI and static miner routes after verified cutover.
+
+    The v2 header and publication rules with the v3 purpose and signing
+    domain; every deployment names an explicit ``workload_kind`` (static-site
+    contract §11.1). A v2 manifest never carries a static deployment.
+    """
+
+    contract_schema: Literal["miss.computer/misscomputer-subnet/active-assignment-manifest"] = (
+        Field(alias="schema")
+    )
+    schema_version: Literal[3]
+    purpose: Literal["active_assignment_manifest_publication_v3"]
+    network: Literal["finney"]
+    netuid: Literal[24]
+    central_authority_fingerprint_sha256: Hex64
+    trust_policy_digest_sha256: Hex64
+    finalized_height: Count
+    finalized_block_hash: Hex64
+    finalized_epoch: Count
+    sequence: PositiveCount
+    previous_manifest_digest_sha256: Hex64 | None
+    issued_at_epoch: Count
+    expires_at_epoch: PositiveCount
+    route_host_suffix: Hostname
+    probe_scheme: Literal["https"]
+    probe_port: Port
+    deployments: list[DeploymentAssignmentV3] = Field(max_length=4_096)
+    assignment_vector_digest_sha256: Hex64
+    manifest_digest_sha256: Hex64
+
+    @model_validator(mode="after")
+    def canonical_manifest(self) -> Self:
+        if self.expires_at_epoch <= self.issued_at_epoch:
+            raise ValueError("manifest_validity_window_invalid")
+        if (self.sequence == 1) != (self.previous_manifest_digest_sha256 is None):
+            raise ValueError("manifest_previous_link_invalid")
+        ids = [item.deployment_id for item in self.deployments]
+        if ids != sorted(set(ids)):
+            raise ValueError("manifest_deployments_not_canonical")
+        for item in self.deployments:
+            if item.route_host != f"{item.deployment_id}.{self.route_host_suffix}":
+                raise ValueError("manifest_route_host_invalid")
+            for replica in item.replicas:
+                if replica.expires_at_block <= self.finalized_height:
+                    raise ValueError("manifest_replica_block_expired")
+                if replica.expires_at_epoch <= self.issued_at_epoch:
+                    raise ValueError("manifest_replica_expired")
+        endpoints = [r.endpoint_id for item in self.deployments for r in item.replicas]
+        if len(set(endpoints)) != len(endpoints):
+            raise ValueError("manifest_endpoint_duplicate")
+        vector = [model_document(item) for item in self.deployments]
+        if self.assignment_vector_digest_sha256 != digest(vector):
+            raise ValueError("assignment_vector_digest_sha256_mismatch")
+        verify_model_digest(self, "manifest_digest_sha256")
+        return self
+
+
+def oci_deployment_assignment_v2(
+    deployment: OciDeploymentAssignmentV3,
+) -> OrganicDeploymentAssignment:
+    """The v2 deployment an ``oci-image-v1`` v3 deployment corresponds to (OCI v3 = v2).
+
+    Drops ``workload_kind`` and the null static bindings and reseals
+    ``assignment_digest_sha256``. A static deployment has no v2 form.
+    """
+
+    value = revalidate(deployment, OciDeploymentAssignmentV3)
+    unsigned = model_document(
+        value,
+        exclude={
+            "workload_kind",
+            "site_digest",
+            "release_digest",
+            "server_implementation_digest",
+            "assignment_digest_sha256",
+        },
+    )
+    return OrganicDeploymentAssignment.model_validate(
+        {**unsigned, "assignment_digest_sha256": digest(unsigned)}
+    )
+
+
 class OrganicProbeAuthorization(StrictFrozenModel):
     """Validator-hotkey (sr25519) authorization for one targeted hidden probe."""
 
@@ -850,6 +1001,7 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "bridge-assign.v3": BridgeAssignRequestV3,
     "edge-runtime-request.v1": EdgeRuntimeRequest,
     "active-assignment-manifest.v2": ActiveAssignmentManifestV2,
+    "active-assignment-manifest.v3": ActiveAssignmentManifestV3,
     "organic-probe-authorization.v1": OrganicProbeAuthorization,
     "miner-probe-attestation.v2": MinerProbeAttestationV2,
 }

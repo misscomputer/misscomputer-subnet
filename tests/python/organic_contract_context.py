@@ -364,6 +364,218 @@ def active_assignment_manifest() -> dict[str, Any]:
     )
 
 
+#: Static-site contract §3.5 site, §7.1 release and implementation digests.
+STATIC_ROUTE_LABEL = "static-docs-m4p9qx7c2a"
+STATIC_SITE_DIGEST = "sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"
+STATIC_RELEASE_DIGEST = "sha256:9b96232b299069fe8b2dc546f9db0943c43dfefb48f79d15d28ee7b28a031830"
+STATIC_SERVER_DIGEST = "sha256:" + "ab" * 32
+
+
+def _static_replica(uid: int, hotkey: str, public_key: str) -> dict[str, Any]:
+    replica = f"{STATIC_ROUTE_LABEL}-{hotkey}"
+    nonce = label_hex(f"static-nonce-{hotkey}", 32)
+    return {
+        **_manifest_replica(uid, hotkey, nonce, public_key),
+        "replica_id": replica,
+        "endpoint_id": f"{replica}-g1-{nonce}",
+        "ticket_digest": label_digest(f"static-ticket-{hotkey}"),
+        "receipt_digest": label_digest(f"static-receipt-{hotkey}"),
+    }
+
+
+def active_assignment_manifest_v3() -> dict[str, Any]:
+    """One ``oci-image-v1`` deployment equal to the v2 golden's and one static site."""
+
+    v2 = active_assignment_manifest()
+    oci = {
+        key: value
+        for key, value in v2["deployments"][0].items()
+        if key != "assignment_digest_sha256"
+    }
+    oci = sealed(
+        {
+            **oci,
+            "workload_kind": "oci-image-v1",
+            "site_digest": None,
+            "release_digest": None,
+            "server_implementation_digest": None,
+        },
+        "assignment_digest_sha256",
+    )
+    static = sealed(
+        {
+            "deployment_id": STATIC_ROUTE_LABEL,
+            "route_host": f"{STATIC_ROUTE_LABEL}.on.miss.computer",
+            "workload_kind": "static-site-v1",
+            "artifact_digest": None,
+            "health": None,
+            "site_digest": STATIC_SITE_DIGEST,
+            "release_digest": STATIC_RELEASE_DIGEST,
+            "server_implementation_digest": STATIC_SERVER_DIGEST,
+            "attestation_requirement": "miner_service_key_v2",
+            "replicas": [
+                _static_replica(
+                    9,
+                    "5DAAnrj7VHTznn2AWBemMuyBwZWs6FNFjdyVXUeYum3PTXFy",
+                    label_hex("service-dave"),
+                ),
+                _static_replica(17, MINER_HOTKEY, MINER_PUBLIC),
+            ],
+        },
+        "assignment_digest_sha256",
+    )
+    deployments = [oci, static]
+    header = {
+        key: value
+        for key, value in v2.items()
+        if key not in {"deployments", "assignment_vector_digest_sha256", "manifest_digest_sha256"}
+    }
+    return sealed(
+        {
+            **header,
+            "schema_version": 3,
+            "purpose": "active_assignment_manifest_publication_v3",
+            "deployments": deployments,
+            "assignment_vector_digest_sha256": digest(deployments),
+        },
+        "manifest_digest_sha256",
+    )
+
+
+def _v3_case(mutate: Any, *, reseal: bool = True) -> dict[str, Any]:
+    """The v3 golden with ``mutate(document)`` applied, optionally resealed.
+
+    Resealing recomputes the deployment, vector and manifest digests so a
+    model-level case fails only for its pinned reason.
+    """
+
+    document = json.loads(json.dumps(active_assignment_manifest_v3()))
+    mutate(document)
+    if not reseal:
+        return document
+    document["deployments"] = [
+        sealed(item, "assignment_digest_sha256") for item in document["deployments"]
+    ]
+    document["assignment_vector_digest_sha256"] = digest(document["deployments"])
+    return sealed(document, "manifest_digest_sha256")
+
+
+def _set(path: tuple[Any, ...], value: Any) -> Any:
+    def mutate(document: dict[str, Any]) -> None:
+        target: Any = document
+        for key in path[:-1]:
+            target = target[key]
+        if value is _DELETE:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value
+
+    return mutate
+
+
+_DELETE = object()
+
+
+def _static_on_other_route(document: dict[str, Any]) -> None:
+    replica = document["deployments"][1]["replicas"][0]
+    replica["endpoint_id"] = replica["endpoint_id"].replace(STATIC_ROUTE_LABEL, ROUTE_LABEL)
+
+
+def _static_first(document: dict[str, Any]) -> None:
+    document["deployments"].reverse()
+
+
+#: case -> (expect, code, document). Schema cases carry the pydantic error type.
+MANIFEST_V3_NEGATIVE: dict[str, tuple[str, str, Any]] = {
+    "static-artifact-digest-present": (
+        "schema",
+        "none_required",
+        lambda: _v3_case(_set(("deployments", 1, "artifact_digest"), ARTIFACT_DIGEST)),
+    ),
+    "static-health-present": (
+        "schema",
+        "none_required",
+        lambda: _v3_case(
+            _set(
+                ("deployments", 1, "health"),
+                active_assignment_manifest()["deployments"][0]["health"],
+            )
+        ),
+    ),
+    "static-release-digest-null": (
+        "schema",
+        "string_type",
+        lambda: _v3_case(_set(("deployments", 1, "release_digest"), None)),
+    ),
+    "oci-site-digest-present": (
+        "schema",
+        "none_required",
+        lambda: _v3_case(_set(("deployments", 0, "site_digest"), STATIC_SITE_DIGEST)),
+    ),
+    "workload-kind-unknown": (
+        "schema",
+        "union_tag_invalid",
+        lambda: _v3_case(_set(("deployments", 1, "workload_kind"), "static-site-v2")),
+    ),
+    "v2-deployment-shape": (
+        "schema",
+        "union_tag_not_found",
+        lambda: _v3_case(
+            _set(("deployments", 0), dict(active_assignment_manifest()["deployments"][0]))
+        ),
+    ),
+    "unknown-static-member": (
+        "schema",
+        "extra_forbidden",
+        lambda: _v3_case(_set(("deployments", 1, "fallback"), None)),
+    ),
+    "purpose-v2": (
+        "schema",
+        "literal_error",
+        lambda: _v3_case(_set(("purpose",), "active_assignment_manifest_publication_v2")),
+    ),
+    "schema-version-2": (
+        "schema",
+        "literal_error",
+        lambda: _v3_case(_set(("schema_version",), 2)),
+    ),
+    "static-binding-changed-without-reseal": (
+        "model",
+        "assignment_digest_sha256_mismatch",
+        lambda: _v3_case(
+            _set(("deployments", 1, "site_digest"), label_digest("another-site")), reseal=False
+        ),
+    ),
+    "static-replica-identity-invalid": (
+        "model",
+        "assignment_replica_identity_invalid",
+        lambda: _v3_case(_static_on_other_route),
+    ),
+    "static-route-host-mismatch": (
+        "model",
+        "manifest_route_host_invalid",
+        lambda: _v3_case(_set(("deployments", 1, "route_host"), "static.on.miss.computer")),
+    ),
+    "deployments-not-canonical": (
+        "model",
+        "manifest_deployments_not_canonical",
+        lambda: _v3_case(_static_first),
+    ),
+}
+
+
+def negative_v3(case: str) -> dict[str, Any]:
+    expect, code, build = MANIFEST_V3_NEGATIVE[case]
+    return {
+        "case": case,
+        "code": code,
+        "contract": "active-assignment-manifest.v3",
+        "document": build(),
+        "expect": expect,
+        "schema_version": 1,
+    }
+
+
 def unsigned_probe_authorization() -> dict[str, Any]:
     return {
         "schema": "miss.computer/misscomputer-subnet/organic-probe-authorization",
@@ -416,6 +628,7 @@ FIXTURE_BUILDERS: dict[str, Any] = {
     "bridge-assign.v3": bridge_assign,
     "edge-runtime-request.v1": edge_runtime_request,
     "active-assignment-manifest.v2": active_assignment_manifest,
+    "active-assignment-manifest.v3": active_assignment_manifest_v3,
     "organic-probe-authorization.v1": probe_authorization,
     "miner-probe-attestation.v2": probe_attestation,
 }
@@ -475,6 +688,9 @@ def generated_tree() -> dict[str, bytes]:
         tree[f"schemas/{stem}.schema.json"] = schema_bytes(model)
         tree[f"fixtures/{stem}.json"] = canonical_json(FIXTURE_BUILDERS[stem]()) + b"\n"
     tree["fixtures/organic-contract-vectors.v1.json"] = canonical_json(vectors()) + b"\n"
+    for case in MANIFEST_V3_NEGATIVE:
+        path = f"negative/active-assignment-manifest.v3/{case}.json"
+        tree[path] = canonical_json(negative_v3(case)) + b"\n"
     return tree
 
 
