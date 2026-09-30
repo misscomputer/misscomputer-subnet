@@ -30,6 +30,7 @@ import stat
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal, NoReturn, Protocol, cast
 from urllib.parse import urlsplit
@@ -1396,10 +1397,11 @@ def _run_with_static(
     clock: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> tuple[list[OrganicProbeObservation], int]:
-    """Verify the static inputs, then fire the organic and static plans in one schedule.
+    """Verify static inputs, then schedule static sends on an isolated worker.
 
-    Organic probes keep their own instants and order (organic first on a tie),
-    so the organic observations are exactly those the organic-only run makes.
+    The organic clock and send path never wait for a static miner. One static
+    worker serializes journal appends; queued static sends that miss their
+    own fire deadline are skipped instead of borrowing organic time.
     Returns the organic observations and organic skipped count; the static
     evidence lives in ``static_run``.
     """
@@ -1440,13 +1442,38 @@ def _run_with_static(
         epoch_index=epoch_index,
         edge_origin=edge_origin,
     )
-    ordered = sorted(
-        [(item[0], 0, position, item) for position, item in enumerate(organic)]
-        + [(item[0], 1, position, item) for position, item in enumerate(static)]
-    )
-    _fire_schedule(
-        [entry[3] for entry in ordered], epoch_index=epoch_index, clock=clock, sleep=sleep
-    )
+    epoch_end_millis = (epoch_index + 1) * DEFAULT_EPOCH_SECONDS * 1_000
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="static-probes") as worker:
+        jobs = []
+
+        def dispatch_static(fire_at_millis: int, fire: Callable[[int], None]) -> ScheduledProbe:
+            def dispatch(now_millis: int) -> None:
+                submitted = time.monotonic()
+
+                def send() -> None:
+                    # Monotonic elapsed time measures queueing without letting
+                    # a fake or adjusted wall clock mint a stale authorization.
+                    sent_at = now_millis + max(0, int((time.monotonic() - submitted) * 1_000))
+                    if sent_at - fire_at_millis > MAX_FIRE_DELAY_MILLIS or sent_at >= epoch_end_millis:
+                        return
+                    fire(sent_at)
+
+                jobs.append(worker.submit(send))
+
+            return fire_at_millis, dispatch
+
+        ordered = sorted(
+            [(item[0], 0, position, item) for position, item in enumerate(organic)]
+            + [
+                (item[0], 1, position, dispatch_static(*item))
+                for position, item in enumerate(static)
+            ]
+        )
+        _fire_schedule(
+            [entry[3] for entry in ordered], epoch_index=epoch_index, clock=clock, sleep=sleep
+        )
+        for job in jobs:
+            job.result()
     static_run.skipped = len(static) - len(static_run.observations)
     return observations, len(organic) - len(observations)
 

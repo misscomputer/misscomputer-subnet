@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import functools
+import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,6 +25,7 @@ from static_cli_context import (
 )
 
 import misscomputer_subnet.assignment_probe_cli as probe_cli
+import misscomputer_subnet.static_runtime as static_runtime
 from misscomputer_subnet.assignment_probe import parse_assignment_manifest_chain_state
 from misscomputer_subnet.assignment_probe_cli import (
     EXIT_DEGRADED,
@@ -58,6 +61,54 @@ def _cli(world: Any, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _static_calls(world: Any) -> list[str]:
     return [target for kind, target in world.calls if kind == "static"]
+
+
+def test_stalled_static_send_cannot_delay_an_organic_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The static worker may stall, but the organic send keeps its private instant."""
+
+    fake = FakeTime(EPOCH_START)
+    epoch_index = int(EPOCH_START) // 300
+    first = int(EPOCH_START * 1_000) + 10
+    organic_sent = threading.Event()
+    static_completed: list[bool] = []
+    static_run = SimpleNamespace(observations=[], skipped=0)
+
+    def static_fire(_now: int) -> None:
+        static_completed.append(organic_sent.wait(0.5))
+        static_run.observations.append("static")
+
+    def organic_schedule(_manifest: Any, _policy: Any, _transport: Any, observations: list[str], **_kw: Any) -> list[Any]:
+        def organic_fire(_now: int) -> None:
+            organic_sent.set()
+            observations.append("organic")
+
+        return [(first + 10, organic_fire)]
+
+    monkeypatch.setattr(static_runtime, "load_static_epoch", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        static_runtime, "static_probe_schedule", lambda *a, **kw: [(first, static_fire)]
+    )
+    monkeypatch.setattr(probe_cli, "organic_probe_schedule", organic_schedule)
+
+    observed, skipped = probe_cli._run_with_static(
+        static_run,
+        (object(), "server", "index"),
+        object(), object(), object(),
+        seed=b"x" * 32,
+        validator_hotkey="validator",
+        sign=lambda value: value,
+        epoch_index=epoch_index,
+        edge_origin=None,
+        evaluation_epoch=int(EPOCH_START),
+        current_finalized_height=1,
+        clock=fake.clock,
+        sleep=fake.sleep,
+    )
+
+    assert observed == ["organic"]
+    assert skipped == 0 and static_completed == [True]
 
 
 def test_static_epoch_is_scored_separately_and_organic_bytes_are_unchanged(
