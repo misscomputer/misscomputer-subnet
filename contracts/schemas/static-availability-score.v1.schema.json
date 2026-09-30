@@ -1,0 +1,217 @@
+{
+  "$defs": {
+    "StaticEvidenceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        },
+        "observation_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Observation Digest Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "deployment_id",
+        "endpoint_id",
+        "observation_digest_sha256"
+      ],
+      "title": "StaticEvidenceRef",
+      "type": "object"
+    },
+    "StaticMinerAvailability": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_denominator": {
+          "minimum": 1,
+          "title": "Availability Denominator",
+          "type": "integer"
+        },
+        "availability_numerator": {
+          "minimum": 0,
+          "title": "Availability Numerator",
+          "type": "integer"
+        },
+        "content_faults": {
+          "minimum": 0,
+          "title": "Content Faults",
+          "type": "integer"
+        },
+        "eligible_endpoint_epochs": {
+          "maximum": 66060288,
+          "minimum": 1,
+          "title": "Eligible Endpoint Epochs",
+          "type": "integer"
+        },
+        "fraudulent_attestations": {
+          "minimum": 0,
+          "title": "Fraudulent Attestations",
+          "type": "integer"
+        },
+        "miner_hotkey": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_uid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Miner Uid",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "miner_uid",
+        "miner_hotkey",
+        "eligible_endpoint_epochs",
+        "availability_numerator",
+        "availability_denominator",
+        "content_faults",
+        "fraudulent_attestations"
+      ],
+      "title": "StaticMinerAvailability",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "``static-availability-score`` v1: per-miner static availability over a window.",
+  "properties": {
+    "abstained_epochs": {
+      "items": {
+        "maximum": 4611686018427387904,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxItems": 2016,
+      "title": "Abstained Epochs",
+      "type": "array"
+    },
+    "content_fault_evidence": {
+      "items": {
+        "$ref": "#/$defs/StaticEvidenceRef"
+      },
+      "maxItems": 524288,
+      "title": "Content Fault Evidence",
+      "type": "array"
+    },
+    "epoch_indexes": {
+      "items": {
+        "maximum": 4611686018427387904,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "maxItems": 2016,
+      "minItems": 1,
+      "title": "Epoch Indexes",
+      "type": "array"
+    },
+    "epoch_score_digests": {
+      "items": {
+        "pattern": "^[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "maxItems": 2016,
+      "minItems": 1,
+      "title": "Epoch Score Digests",
+      "type": "array"
+    },
+    "epoch_seconds": {
+      "maximum": 3600,
+      "minimum": 60,
+      "title": "Epoch Seconds",
+      "type": "integer"
+    },
+    "fraud_evidence": {
+      "items": {
+        "$ref": "#/$defs/StaticEvidenceRef"
+      },
+      "maxItems": 524288,
+      "title": "Fraud Evidence",
+      "type": "array"
+    },
+    "miners": {
+      "items": {
+        "$ref": "#/$defs/StaticMinerAvailability"
+      },
+      "maxItems": 32768,
+      "title": "Miners",
+      "type": "array"
+    },
+    "netuid": {
+      "const": 24,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "finney",
+      "title": "Network",
+      "type": "string"
+    },
+    "purpose": {
+      "const": "static_availability_scoring_v1",
+      "title": "Purpose",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/static-availability-score",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "score_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Score Digest Sha256",
+      "type": "string"
+    },
+    "validator_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Validator Hotkey",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "purpose",
+    "network",
+    "netuid",
+    "validator_hotkey",
+    "epoch_seconds",
+    "epoch_indexes",
+    "epoch_score_digests",
+    "abstained_epochs",
+    "miners",
+    "content_fault_evidence",
+    "fraud_evidence",
+    "score_digest_sha256"
+  ],
+  "title": "StaticAvailabilityScore",
+  "type": "object"
+}
