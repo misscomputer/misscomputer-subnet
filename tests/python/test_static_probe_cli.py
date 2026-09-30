@@ -13,10 +13,11 @@ from typing import Any
 
 import pytest
 from assignment_probe_context import FINALIZED_HEIGHT, signer_keys
-from organic_context import EPOCH_START
+from organic_context import EPOCH, EPOCH_START
 from static_cli_context import (
     INDEX_ORIGIN,
     STATIC_ID,
+    VALIDATOR,
     FakeTime,
     alice_signer,
     cli_config,
@@ -252,21 +253,29 @@ def test_index_budget_gives_each_site_a_first_fetch_across_epochs(
         return None, None
 
     monkeypatch.setattr(static_runtime, "fetch_static_index_documents", slow_index)
+    monkeypatch.setattr(probe_cli, "organic_probe_schedule", lambda *_args, **_kwargs: [])
     first_fetched: list[str] = []
     for offset in range(2):
         static = cli_config(publication, tmp_path / f"epoch-{offset}").static_sites
         assert static is not None
         run = static_runtime.lock_static_epoch(static, publication.policy)
+        fake = FakeTime(EPOCH_START)
         try:
-            static_runtime.load_static_epoch(
+            probe_cli._run_with_static(
                 run,
-                transport=publication.world,
-                policy=publication.policy,
-                release_policy=trust_policy(),
-                server_digest=SERVER,
-                index_origin=INDEX_ORIGIN,
-                evaluation_epoch=int(EPOCH_START) + offset * 300,
+                (trust_policy(), SERVER, INDEX_ORIGIN),
+                publication.organic,
+                publication.policy,
+                publication.world,
+                seed=b"x" * 32,
+                validator_hotkey=VALIDATOR.ss58_address,
+                sign=lambda value: value,
+                epoch_index=EPOCH + offset,
+                edge_origin=None,
+                evaluation_epoch=int(EPOCH_START),
                 current_finalized_height=FINALIZED_HEIGHT,
+                clock=fake.clock,
+                sleep=fake.sleep,
             )
         finally:
             run.close()

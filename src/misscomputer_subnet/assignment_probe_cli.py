@@ -1461,6 +1461,7 @@ def _run_with_static(
                 release_policy=cast(StaticSiteReleaseTrustPolicy, release_policy),
                 server_digest=server_digest,
                 index_origin=index_origin,
+                epoch_index=epoch_index,
                 evaluation_epoch=evaluation_epoch,
                 current_finalized_height=current_finalized_height,
             )

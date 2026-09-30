@@ -75,7 +75,6 @@ from .organic_manifest import (
     parse_assignment_manifest_v3,
     verify_assignment_manifest_v3,
 )
-from .organic_probe import epoch_index_of
 from .score_checkpoint_relay_cli import InputFile, _normalized_absolute_path
 from .static_crawl import fetch_static_index_documents, send_static_probe
 from .static_evidence import StaticEvidenceJournal
@@ -280,6 +279,7 @@ def load_static_epoch(
     release_policy: StaticSiteReleaseTrustPolicy,
     server_digest: str,
     index_origin: str,
+    epoch_index: int,
     evaluation_epoch: int,
     current_finalized_height: int,
 ) -> None:
@@ -339,7 +339,7 @@ def load_static_epoch(
     # A fixed prefix lets slow low-ID indexes consume the budget forever.
     # Rotate the first opportunity each epoch; scoring still uses the
     # manifest's canonical target order in finish_static_epoch.
-    start = epoch_index_of(evaluation_epoch) % len(targets) if targets else 0
+    start = epoch_index % len(targets) if targets else 0
     for target in targets[start:] + targets[:start]:
         if time.monotonic() >= deadline:
             run.abstentions.append(
