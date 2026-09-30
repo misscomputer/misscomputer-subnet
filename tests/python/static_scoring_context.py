@@ -10,7 +10,7 @@ regenerates the committed static scoring ``contracts/fixtures`` and
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +39,16 @@ from misscomputer_subnet.static_evidence import (
     append_static_evidence,
     seal_static_edge_evidence,
 )
-from misscomputer_subnet.static_index import VerifiedStaticIndex, ingest_static_index
-from misscomputer_subnet.static_probe import StaticProbeObservation, plan_static_hidden_probes
+from misscomputer_subnet.static_index import (
+    VerifiedStaticIndex,
+    expected_static_response,
+    ingest_static_index,
+)
+from misscomputer_subnet.static_probe import (
+    PlannedStaticProbe,
+    StaticProbeObservation,
+    plan_static_hidden_probes,
+)
 from misscomputer_subnet.static_scoring import (
     StaticAvailabilityScore,
     StaticEpochScore,
@@ -113,6 +121,50 @@ def hidden_epoch(
         )
         for planned in plan
     ]
+
+
+def targeted(
+    index: VerifiedStaticIndex,
+    edge: FakeStaticEdge,
+    requests: Sequence[tuple[int, str, Fault | None]],
+) -> list[StaticProbeObservation]:
+    """One GET per ``(endpoint position, path, fault)``, so replicas share requests."""
+
+    observations = []
+    start = EPOCH * EPOCH_SECONDS * 1_000
+    for slot, (position, path, fault) in enumerate(requests):
+        endpoint = index.target.endpoints[position]
+        edge.faults = {} if fault is None else {endpoint.endpoint_id: fault}
+        expected = expected_static_response(index, "GET", path)
+        planned = PlannedStaticProbe(
+            probe_kind="hidden",
+            deployment_id=index.target.deployment_id,
+            site_digest=index.target.site_digest,
+            endpoint_id=endpoint.endpoint_id,
+            generation=endpoint.generation,
+            method="GET",
+            path=path,
+            expected_kind=expected.kind,
+            expected_content_length=expected.content_length,
+            probe_index=slot,
+            fire_at_millis=start + slot * 1_000,
+            nonce=sha(f"targeted-{slot}".encode()),
+        )
+        observations.append(
+            send_static_probe(
+                index,
+                planned,
+                edge,
+                validator_hotkey=VALIDATOR,
+                sign=lambda _message: b"\x01" * 64,
+                issued_at_epoch=(start + slot * 1_000) // 1_000,
+                timeout_millis=TIMEOUT_MILLIS,
+                max_bytes=1_024 * 1_024,
+                probe_port=443,
+                edge_origin=None,
+            )
+        )
+    return observations
 
 
 def score(

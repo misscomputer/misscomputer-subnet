@@ -439,8 +439,7 @@
             "abstain_index",
             "abstain_insufficient_attempts",
             "eligible",
-            "excluded_common_mode",
-            "excluded_index_suspect"
+            "excluded_common_mode"
           ],
           "title": "Disposition",
           "type": "string"
@@ -967,6 +966,39 @@
       ],
       "title": "StaticProbeObservation",
       "type": "object"
+    },
+    "StaticSuspectRequest": {
+      "additionalProperties": false,
+      "description": "A request every replica answered with the same wrong response (index suspect).",
+      "properties": {
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "request_method": {
+          "enum": [
+            "GET",
+            "HEAD"
+          ],
+          "title": "Request Method",
+          "type": "string"
+        },
+        "request_path": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Request Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "deployment_id",
+        "request_method",
+        "request_path"
+      ],
+      "title": "StaticSuspectRequest",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -1054,14 +1086,12 @@
       "title": "Index Abstentions",
       "type": "array"
     },
-    "index_suspect_deployments": {
+    "index_suspect_requests": {
       "items": {
-        "maxLength": 63,
-        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
-        "type": "string"
+        "$ref": "#/$defs/StaticSuspectRequest"
       },
-      "maxItems": 4096,
-      "title": "Index Suspect Deployments",
+      "maxItems": 524288,
+      "title": "Index Suspect Requests",
       "type": "array"
     },
     "min_attempts": {
@@ -1157,7 +1187,7 @@
     "epoch_status",
     "sampled_endpoint_count",
     "path_unavailable_endpoint_count",
-    "index_suspect_deployments",
+    "index_suspect_requests",
     "endpoints",
     "content_fault_evidence",
     "fraud_evidence",

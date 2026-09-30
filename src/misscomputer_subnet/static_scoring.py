@@ -33,11 +33,15 @@ Epoch rules
    re-derives (signature under the manifest service key, nonce, incarnation
    and request binding, time window, attested = observed).
 3. If more than half of the sampled endpoints saw only ``path`` failures the
-   epoch is ``common_mode_unavailable`` and every endpoint abstains.
-4. If two or more distinct miners of one deployment returned the same wrong
-   status, body and header digests to the same request, the expectation
-   itself (index, edge, or handler release) is suspect: the deployment is
-   ``excluded_index_suspect`` and those content faults are not charged.
+   epoch is ``common_mode_unavailable``: every endpoint abstains and no
+   content fault is charged (only proved fraud still acts).
+4. A request is index-suspect only when **every** incarnation of its
+   deployment answered it this epoch and all of them, from at least two
+   distinct miners, returned the same wrong status, body and header digests.
+   Observations of a suspect request are neither charged nor counted toward
+   availability; every other request is judged normally, so replicas that
+   agree with each other but not with a replica serving the indexed bytes
+   are charged (colluding hotkeys cannot suppress their own faults).
 5. An endpoint with fewer than ``min_attempts`` attempts abstains; otherwise
    availability is ``successes / attempts``.
 
@@ -131,7 +135,6 @@ Disposition = Literal[
     "abstain_insufficient_attempts",
     "eligible",
     "excluded_common_mode",
-    "excluded_index_suspect",
 ]
 AlertCode = Literal[
     "static_attestation_fraud",
@@ -254,8 +257,16 @@ class StaticAlert(StrictFrozenModel):
     endpoint_id: EndpointID | None
 
 
+class StaticSuspectRequest(StrictFrozenModel):
+    """A request every replica answered with the same wrong response (index suspect)."""
+
+    deployment_id: DNSLabel
+    request_method: Literal["GET", "HEAD"]
+    request_path: str = Field(min_length=1, max_length=1_024)
+
+
 class _Tally:
-    __slots__ = ("attempts", "counts", "deployment", "endpoint", "faults", "frauds")
+    __slots__ = ("attempts", "counts", "deployment", "endpoint", "faults", "frauds", "seen")
 
     def __init__(self, deployment: StaticDeploymentTarget, endpoint: StaticEndpointTarget) -> None:
         self.deployment = deployment
@@ -264,6 +275,48 @@ class _Tally:
         self.counts: dict[str, int] = defaultdict(int)
         self.faults: list[str] = []
         self.frauds: list[str] = []
+        self.seen: list[StaticProbeObservation] = []
+
+
+_PASS: Final = ("pass",)
+
+
+def _answer(obs: StaticProbeObservation) -> tuple[object, ...]:
+    if obs.outcome == "success":
+        return _PASS
+    if obs.quarantine_candidate:
+        return (obs.response_status, obs.response_body_sha256, obs.response_header_sha256)
+    return ("other", obs.failure_code)
+
+
+def _suspect_requests(tallies: Mapping[str, _Tally]) -> set[tuple[str, str, str]]:
+    """Requests every incarnation of a deployment answered with one wrong response."""
+
+    answers: dict[tuple[str, str, str], dict[str, set[tuple[object, ...]]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    population: dict[str, set[str]] = defaultdict(set)
+    miners: dict[str, set[str]] = defaultdict(set)
+    for endpoint_id, tally in tallies.items():
+        deployment_id = tally.deployment.deployment_id
+        population[deployment_id].add(endpoint_id)
+        miners[deployment_id].add(tally.endpoint.miner_hotkey)
+        for obs in tally.seen:
+            key: tuple[str, str, str] = (deployment_id, obs.request_method, obs.request_path)
+            answers[key][endpoint_id].add(_answer(obs))
+    suspect: set[tuple[str, str, str]] = set()
+    for request, per_endpoint in answers.items():
+        values = {value for seen in per_endpoint.values() for value in seen}
+        (value,) = values if len(values) == 1 else (None,)
+        if (
+            set(per_endpoint) == population[request[0]]
+            and len(miners[request[0]]) >= 2
+            and value is not None
+            and value != _PASS
+            and value[0] != "other"
+        ):
+            suspect.add(request)
+    return suspect
 
 
 def _derive_static_epoch(
@@ -297,7 +350,6 @@ def _derive_static_epoch(
             ):
                 _reject("static_scoring_identity_conflict")
             tallies[endpoint.endpoint_id] = _Tally(deployment, endpoint)
-    wrong: dict[tuple[object, ...], set[str]] = defaultdict(set)
     for obs in observations:
         if epoch_index_of(timestamp_epoch_seconds(obs.issued_at), epoch_seconds) != epoch_index:
             _reject("static_scoring_epoch_mismatch")
@@ -309,23 +361,26 @@ def _derive_static_epoch(
             obs.release_trust_policy_digest_sha256,
         ):
             _reject("static_scoring_index_abstained")
-        tally.attempts += 1
-        if tally.attempts > MAX_ATTEMPTS_PER_ENDPOINT:
+        tally.seen.append(obs)
+        if len(tally.seen) > MAX_ATTEMPTS_PER_ENDPOINT:
             _reject("static_scoring_attempts_overflow")
-        tally.counts[obs.attribution] += 1
-        if obs.failure_code in {"cache_replay", "content_altered_in_transit"}:
-            tally.counts[obs.failure_code] += 1
-        if obs.quarantine_candidate:
-            tally.faults.append(obs.observation_digest_sha256)
-            request = (obs.deployment_id, obs.request_method, obs.request_path)
-            response = (obs.response_status, obs.response_body_sha256, obs.response_header_sha256)
-            wrong[(*request, *response)].add(obs.miner_hotkey)
-        if obs.attestation_status == "fraudulent":
-            tally.frauds.append(obs.observation_digest_sha256)
+    suspect_requests = _suspect_requests(tallies)
+    for tally in tallies.values():
+        for obs in tally.seen:
+            if obs.attestation_status == "fraudulent":
+                tally.frauds.append(obs.observation_digest_sha256)
+            if (obs.deployment_id, obs.request_method, obs.request_path) in suspect_requests:
+                continue  # the index, not the miner, is in question
+            tally.attempts += 1
+            tally.counts[obs.attribution] += 1
+            if obs.failure_code in {"cache_replay", "content_altered_in_transit"}:
+                tally.counts[obs.failure_code] += 1
+            if obs.quarantine_candidate:
+                tally.faults.append(obs.observation_digest_sha256)
     sampled = [tally for tally in tallies.values() if tally.attempts]
     path_down = sum(1 for tally in sampled if tally.counts["path"] == tally.attempts)
     common_mode = bool(sampled) and path_down * 2 > len(sampled)
-    suspect = sorted({str(key[0]) for key, miners in wrong.items() if len(miners) >= 2})
+    suspect = sorted({request[0] for request in suspect_requests})
     endpoints: list[dict[str, object]] = []
     faults: list[dict[str, object]] = []
     frauds: list[dict[str, object]] = []
@@ -341,8 +396,6 @@ def _derive_static_epoch(
             alerts.add((abstained[deployment_id], deployment_id, None))
         elif common_mode:
             disposition = "excluded_common_mode"
-        elif deployment_id in suspect:
-            disposition = "excluded_index_suspect"
         elif tally.attempts < min_attempts:
             disposition = "abstain_insufficient_attempts"
         else:
@@ -353,7 +406,8 @@ def _derive_static_epoch(
             eligible += 1
             ratio = Fraction(tally.counts["none"], tally.attempts)
             numerator, denominator = ratio.numerator, ratio.denominator
-        charged = [] if deployment_id in suspect else sorted(tally.faults)
+        # A shared path outage charges no content fault; proved fraud still acts.
+        charged = [] if common_mode else sorted(tally.faults)
         identity: dict[str, object] = {
             "miner_uid": tally.endpoint.miner_uid,
             "miner_hotkey": tally.endpoint.miner_hotkey,
@@ -421,7 +475,10 @@ def _derive_static_epoch(
         "epoch_status": status,
         "sampled_endpoint_count": len(sampled),
         "path_unavailable_endpoint_count": path_down,
-        "index_suspect_deployments": suspect,
+        "index_suspect_requests": [
+            {"deployment_id": d, "request_method": m, "request_path": p}
+            for d, m, p in sorted(suspect_requests)
+        ],
         "endpoints": endpoints,
         "content_fault_evidence": ordered(faults),
         "fraud_evidence": ordered(frauds),
@@ -482,7 +539,7 @@ class StaticEpochScore(StrictFrozenModel):
     epoch_status: EpochStatus
     sampled_endpoint_count: Count
     path_unavailable_endpoint_count: Count
-    index_suspect_deployments: list[DNSLabel] = Field(max_length=MAX_DEPLOYMENTS)
+    index_suspect_requests: list[StaticSuspectRequest] = Field(max_length=MAX_OBSERVATIONS)
     endpoints: list[StaticEndpointTally] = Field(max_length=MAX_ENDPOINTS)
     content_fault_evidence: list[StaticEvidenceRef] = Field(max_length=MAX_OBSERVATIONS)
     fraud_evidence: list[StaticEvidenceRef] = Field(max_length=MAX_OBSERVATIONS)

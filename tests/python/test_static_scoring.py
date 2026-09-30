@@ -21,6 +21,7 @@ from static_scoring_context import (
     fixture_path,
     hidden_epoch,
     score,
+    targeted,
     verified_site,
     wrong_body,
 )
@@ -207,19 +208,71 @@ def test_faults_become_distinct_evidence_actions_and_alerts(case: str) -> None:
     assert replay_static_epoch_score(record, [index]) == record
 
 
-def test_identical_wrong_bytes_from_two_miners_suspect_the_index_not_the_miners() -> None:
+def _other_bytes(state: dict[str, Any]) -> None:
+    if state["body"]:
+        state["body"] = state["attested_body"] = b"y" * len(state["body"])
+
+
+_WRONG, _PASS = wrong_body, None
+# name -> (requests as (endpoint position, path, fault), charged positions, suspect paths)
+INDEX_CASES: dict[str, tuple[list[tuple[int, str, Any]], list[int], list[str]]] = {
+    "two colluding replicas while the third serves the index": (
+        [(0, "/index.html", _WRONG), (1, "/index.html", _WRONG), (2, "/index.html", _PASS)],
+        [0, 1],
+        [],
+    ),
+    "every replica returns the same wrong response": (
+        [(0, "/index.html", _WRONG), (1, "/index.html", _WRONG), (2, "/index.html", _WRONG)],
+        [],
+        ["/index.html"],
+    ),
+    "suspicion covers only the agreeing request": (
+        [
+            (0, "/index.html", _WRONG),
+            (1, "/index.html", _WRONG),
+            (2, "/index.html", _WRONG),
+            (0, "/assets/app.js", _other_bytes),
+        ],
+        [0],
+        ["/index.html"],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(INDEX_CASES))
+def test_faults_are_charged_unless_every_replica_agrees_on_the_request(case: str) -> None:
+    requests, charged, suspect = INDEX_CASES[case]
     index, edge = verified_site()
-    observations = hidden_epoch(index, edge, faults={0: wrong_body, 1: wrong_body})
+    passes = [(position, "/docs/index.html", None) for position in range(3)]
 
-    record = score(index, observations)
+    record = score(index, targeted(index, edge, [*requests, *passes, *passes]))
 
-    assert record.index_suspect_deployments == ["site-a"]
-    assert {item.disposition for item in record.endpoints} == {"excluded_index_suspect"}
-    assert record.content_fault_evidence == record.endpoint_actions == []
-    assert [(row.code, row.deployment_id) for row in record.alerts] == [
-        ("static_index_suspect", "site-a")
+    endpoints = index.target.endpoints
+    assert [row.endpoint_id for row in record.endpoint_actions] == [
+        endpoints[position].endpoint_id for position in charged
     ]
-    assert aggregate_static_window([record]).miners == []
+    assert [
+        (row.deployment_id, row.request_method, row.request_path)
+        for row in record.index_suspect_requests
+    ] == [("site-a", "GET", path) for path in suspect]
+    assert replay_static_epoch_score(record, [index]) == record
+
+
+def test_a_shared_path_outage_charges_no_content_fault() -> None:
+    index, edge = verified_site()
+    requests = [
+        (0, "/index.html", _timeout),
+        (0, "/docs/index.html", _timeout),
+        (1, "/index.html", _timeout),
+        (1, "/docs/index.html", _timeout),
+        (2, "/index.html", wrong_body),
+        (2, "/docs/index.html", None),
+    ]
+
+    record = score(index, targeted(index, edge, requests))
+
+    assert record.epoch_status == "common_mode_unavailable"
+    assert record.endpoint_actions == [] and record.content_fault_evidence == []
 
 
 def test_shared_path_outage_abstains_instead_of_scoring_miners_down() -> None:

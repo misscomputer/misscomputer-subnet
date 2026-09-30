@@ -51,13 +51,18 @@ key, nonce, incarnation/site/request binding (`artifact_digest` =
 `site_digest`), time window, and attested = observed. A fraud cannot be relabelled as a cache replay, and
 a content fault cannot be relabelled as a pass.
 
+Index suspicion is deliberately narrow. Replicas that agree with each other
+but not with a replica serving the indexed bytes are charged, so two
+colluding hotkeys cannot suppress their own faults with one matching pair.
+The private decision path applies the same rule.
+
 ## Epoch rules
 
 | Condition | Disposition / effect |
 | --- | --- |
 | deployment's index abstained | every endpoint `abstain_index`; never zero; alert `static_index_unavailable` or `static_index_invalid` (§11.2 record code); its observations refuse the epoch |
-| more than half of sampled endpoints saw only path failures | `common_mode_unavailable`; every endpoint `excluded_common_mode` |
-| ≥ 2 distinct miners of one deployment returned the same wrong status, body and header digests to the same request | deployment `excluded_index_suspect`; those faults are **not** charged to miners |
+| more than half of sampled endpoints saw only path failures | `common_mode_unavailable`; every endpoint `excluded_common_mode`; no content fault is charged (proved fraud still acts) |
+| **every** incarnation of a deployment answered one request this epoch, all with the same wrong status, body and header digests (≥ 2 distinct miners) | that request is listed in `index_suspect_requests`; its observations are neither charged nor counted; other requests are judged normally |
 | fewer than `min_attempts` attempts | `abstain_insufficient_attempts` |
 | otherwise | `eligible`, availability = successes / attempts |
 
