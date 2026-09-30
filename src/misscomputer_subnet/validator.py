@@ -64,6 +64,8 @@ from .organic_contracts import (
     parse_document,
 )
 from .protocol import (
+    MINER_REGISTRATION_V3_FEATURE,
+    MINER_REGISTRATION_V3_PROTOCOL,
     SYNAPSE_VERSION,
     BridgeDeactivateRequest,
     CapabilitiesResponse,
@@ -73,9 +75,12 @@ from .protocol import (
     DeactivateResponse,
     DeactivateSynapse,
     MinerRegistration,
+    MinerRegistrationV3,
     MinerSet,
     ServiceKeyBinding,
     SubnetBinding,
+    parse_miner_registration,
+    registration_features,
 )
 from .static_contracts import (
     BridgeStaticAssignRequestV1,
@@ -814,6 +819,8 @@ class ValidatorNeuron:
         self.mock_http_axons = mock_http_axons
         self.dendrite_transport = dendrite_transport
         self.discovery_concurrency = discovery_concurrency
+        # Set from the runtime's control capabilities each block loop.
+        self._registration_v3 = False
         self.discovery_max_attempts = discovery_max_attempts
         self.discovery_attempt_timeout = discovery_attempt_timeout
         self.discovery_refresh_timeout = discovery_refresh_timeout
@@ -947,6 +954,10 @@ class ValidatorNeuron:
                     "GET", "/v1/capabilities", response_model=ControlCapabilities
                 )
                 assert isinstance(capabilities, ControlCapabilities)
+                # Registrations carry capability features only while the
+                # runtime can decode miner-registration.v3; an older runtime
+                # keeps receiving the exact v2 bytes.
+                self._registration_v3 = MINER_REGISTRATION_V3_FEATURE in capabilities.features
                 validator_binding = sign_service_binding(
                     ServiceKeyBinding(
                         role="validator",
@@ -1217,6 +1228,7 @@ class ValidatorNeuron:
                 network=self.network,
                 netuid=self.netuid,
                 bridge_url=self.bridge_url,
+                with_features=self._registration_v3,
             )
             try:
                 await self.bridge.request(
@@ -1354,23 +1366,41 @@ class ValidatorNeuron:
 
     @staticmethod
     def _registration_for(
-        remote: RemoteMiner, *, network: str, netuid: int, bridge_url: str
+        remote: RemoteMiner,
+        *,
+        network: str,
+        netuid: int,
+        bridge_url: str,
+        with_features: bool = False,
     ) -> MinerRegistration:
-        return MinerRegistration(
-            protocol=SYNAPSE_VERSION,
-            network=network,
-            netuid=netuid,
-            hotkey=remote.neuron.hotkey,
-            uid=remote.neuron.uid,
-            axon_url=remote.axon_url,
-            bridge_url=bridge_url,
-            service_binding=remote.binding,
-            transport_certificate_der_base64=(
+        """The exact registration Go receives for one handshake.
+
+        ``with_features`` selects ``miner-registration.v3`` (only while the
+        runtime advertises it); the features are the normalized features of
+        the same capability response that carried the signed binding.
+        """
+
+        fields: dict[str, Any] = {
+            "network": network,
+            "netuid": netuid,
+            "hotkey": remote.neuron.hotkey,
+            "uid": remote.neuron.uid,
+            "axon_url": remote.axon_url,
+            "bridge_url": bridge_url,
+            "service_binding": remote.binding,
+            "transport_certificate_der_base64": (
                 ""
                 if remote.certificate_der is None
                 else base64.b64encode(remote.certificate_der).decode("ascii")
             ),
-        )
+        }
+        if with_features:
+            return MinerRegistrationV3(
+                protocol=MINER_REGISTRATION_V3_PROTOCOL,
+                features=registration_features(remote.features),
+                **fields,
+            )
+        return MinerRegistration(protocol=SYNAPSE_VERSION, **fields)
 
     def _new_publication_lane(
         self,
@@ -1440,6 +1470,7 @@ class ValidatorNeuron:
                 network=self.network,
                 netuid=self.netuid,
                 bridge_url=self.bridge_url,
+                with_features=self._registration_v3,
             )
             for _, remote in ordered
         ]
@@ -1489,6 +1520,7 @@ class ValidatorNeuron:
                     "neuron": self._neuron_payload(remote.neuron),
                     "axon_url": remote.axon_url,
                     "binding": remote.binding.model_dump(mode="json"),
+                    "features": registration_features(remote.features),
                     "certificate_der_base64": (
                         None
                         if remote.certificate_der is None
@@ -1619,11 +1651,19 @@ class ValidatorNeuron:
             remote_neuron = self._neuron_from_payload(item.get("neuron"))
             if remote_neuron.hotkey != hotkey:
                 raise RuntimeError("durable publication miner hotkey conflicts")
+            raw_features = item.get("features", [])
+            if not isinstance(raw_features, list) or any(
+                not isinstance(feature, str) for feature in raw_features
+            ):
+                raise RuntimeError("durable publication miner features are malformed")
+            if raw_features != registration_features(raw_features):
+                raise RuntimeError("durable publication miner features are not canonical")
             remotes[hotkey] = RemoteMiner(
                 neuron=remote_neuron,
                 axon_url=axon_url,
                 binding=binding,
                 certificate_der=certificate_der,
+                features=frozenset(raw_features),
             )
         lane = self._new_publication_lane(
             snapshot,
@@ -2070,6 +2110,7 @@ class ValidatorNeuron:
                 network=self.network,
                 netuid=self.netuid,
                 bridge_url=self.bridge_url,
+                with_features=self._registration_v3,
             )
             for remote in stage.values()
         ]
@@ -2117,7 +2158,7 @@ class ValidatorNeuron:
             actual = {
                 registration.hotkey: registration
                 for item in raw_miners
-                for registration in (MinerRegistration.model_validate(item),)
+                for registration in (parse_miner_registration(item),)
             }
         except ValidationError:
             return False
@@ -2156,7 +2197,7 @@ class ValidatorNeuron:
         ):
             return None
         try:
-            registrations = [MinerRegistration.model_validate(item) for item in value["miners"]]
+            registrations = [parse_miner_registration(item) for item in value["miners"]]
         except ValidationError:
             return None
         if len({registration.hotkey for registration in registrations}) != len(
@@ -2246,6 +2287,13 @@ class ValidatorNeuron:
                     axon_url=retained.axon_url,
                     binding=binding,
                     certificate_der=retained.certificate_der,
+                    # Go's committed v3 features are the handshake features
+                    # this validator itself registered.
+                    features=(
+                        frozenset(registration.features)
+                        if isinstance(registration, MinerRegistrationV3)
+                        else retained.features
+                    ),
                 )
             validator_binding = self._validator_binding
             if validator_binding is None:
@@ -2274,7 +2322,7 @@ class ValidatorNeuron:
         self, registration: MinerRegistration, remote: RemoteMiner
     ) -> bool:
         return (
-            registration.protocol == SYNAPSE_VERSION
+            registration.protocol in {SYNAPSE_VERSION, MINER_REGISTRATION_V3_PROTOCOL}
             and registration.network == self.network
             and registration.netuid == self.netuid
             and registration.bridge_url == self.bridge_url
@@ -2290,7 +2338,7 @@ class ValidatorNeuron:
     async def _registration_is_published(self, expected: MinerRegistration) -> bool:
         """Reconcile an acknowledgement lost after Go's atomic registration commit."""
         payload = await self.bridge.request("GET", "/v1/miners/" + quote(expected.hotkey, safe=""))
-        registration = MinerRegistration.model_validate(payload)
+        registration = parse_miner_registration(payload)
         return registration == expected
 
     def _remote_matches_candidate(self, remote: RemoteMiner, candidate: DiscoveryCandidate) -> bool:

@@ -146,6 +146,10 @@ type MinerRegistration struct {
 	BridgeURL                     string            `json:"bridge_url"`
 	TransportCertificateDERBase64 string            `json:"transport_certificate_der_base64"`
 	ServiceBinding                ServiceKeyBinding `json:"service_binding"`
+	// Features is present exactly in miner-registration.v3 (protocol
+	// subnet-synapse.v3): the normalized capability features of the same
+	// handshake response that carried ServiceBinding. v2 omits it.
+	Features *[]string `json:"features,omitempty"`
 }
 
 type MinerSet struct {

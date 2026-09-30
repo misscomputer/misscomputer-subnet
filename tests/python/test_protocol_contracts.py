@@ -18,10 +18,13 @@ from misscomputer_subnet.protocol import (
     DeactivateSynapse,
     HealthObservation,
     MinerRegistration,
+    MinerRegistrationV3,
     MinerSet,
     RecoveryResponse,
     ServiceKeyBinding,
     StatusSynapse,
+    parse_miner_registration,
+    registration_features,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +39,7 @@ DEPLOY_V3 = ROOT / "contracts" / "fixtures" / "deploy.v3.json"
         ("deactivate.v2.json", DeactivateSynapse),
         ("capabilities-response.v2.json", CapabilitiesResponse),
         ("miner-registration.v2.json", MinerRegistration),
+        ("miner-registration.v3.json", MinerRegistrationV3),
         ("miner-set.v2.json", MinerSet),
         ("chain-state.v2.json", ChainState),
         ("health-observation.v3.json", HealthObservation),
@@ -49,10 +53,41 @@ def test_shared_go_python_contract_fixtures(fixture: str, model: type[object]) -
     original = json.loads(payload)
     encoded = parsed.model_dump(mode="json", exclude_unset=True)  # type: ignore[attr-defined]
     expected_protocol = (
-        "subnet-synapse.v3" if fixture == "health-observation.v3.json" else "subnet-synapse.v2"
+        "subnet-synapse.v3"
+        if fixture in {"health-observation.v3.json", "miner-registration.v3.json"}
+        else "subnet-synapse.v2"
     )
     assert encoded["protocol"] == expected_protocol
     assert encoded == original
+
+
+def test_miner_registration_v3_schema_and_canonical_features() -> None:
+    schema = json.loads(
+        (ROOT / "contracts" / "schemas" / "miner-registration.v3.schema.json").read_text()
+    )
+    assert MinerRegistrationV3.model_json_schema() == schema
+    base = json.loads((ROOT / "contracts" / "fixtures" / "miner-registration.v3.json").read_text())
+    for features in (
+        ["status", "deploy"],
+        ["deploy", "deploy"],
+        ["Organic-OCI-v1"],
+        [f"feature-{index:02d}" for index in range(33)],
+    ):
+        with pytest.raises(ValidationError):
+            MinerRegistrationV3.model_validate({**base, "features": features})
+    with pytest.raises(ValidationError):
+        MinerRegistrationV3.model_validate(
+            {key: value for key, value in base.items() if key != "features"}
+        )
+    # v2 never carries features, so an older runtime keeps its exact bytes.
+    with pytest.raises(ValidationError):
+        MinerRegistration.model_validate({**base, "protocol": "subnet-synapse.v2"})
+    assert parse_miner_registration(base) == MinerRegistrationV3.model_validate(base)
+    assert registration_features(["b", "a", "a", "BAD", "x" * 65, "organic-static-v1"]) == [
+        "a",
+        "b",
+        "organic-static-v1",
+    ]
 
 
 def test_health_v3_schema_requires_exact_endpoint_incarnation() -> None:
