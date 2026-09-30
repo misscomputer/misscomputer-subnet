@@ -48,7 +48,7 @@ type organicProbe struct {
 func (a *Agent) proxyOrganic(w http.ResponseWriter, req *http.Request, endpointID, rawURL string, ticket protocol.TicketV4) {
 	var probe *organicProbe
 	if values := req.Header.Values(organic.OrganicProbeAuthorizationHeader); len(values) > 0 {
-		authorization, err := a.admitOrganicProbe(req.Context(), values, req.Method, req.URL.EscapedPath(), req.URL.RawQuery, endpointID, ticket)
+		authorization, err := a.admitOrganicProbe(req.Context(), values, req.Method, req.URL.EscapedPath(), req.URL.RawQuery, endpointID, ticket.Generation)
 		if err != nil {
 			http.Error(w, "probe authorization rejected", http.StatusUnauthorized)
 			return
@@ -96,7 +96,7 @@ func (a *Agent) proxyOrganic(w http.ResponseWriter, req *http.Request, endpointI
 // validator hotkey signature and validator membership before forwarding; the
 // miner binds the authorization it attests to the edge-signed request, the
 // endpoint, freshness and a one-time nonce.
-func (a *Agent) admitOrganicProbe(ctx context.Context, values []string, method, appPath, query, endpointID string, ticket protocol.TicketV4) (organic.ProbeAuthorization, error) {
+func (a *Agent) admitOrganicProbe(ctx context.Context, values []string, method, appPath, query, endpointID string, generation uint64) (organic.ProbeAuthorization, error) {
 	if len(values) != 1 || len(values[0]) > maxProbeAuthorizationHeader {
 		return organic.ProbeAuthorization{}, errors.New("probe authorization must appear exactly once")
 	}
@@ -110,7 +110,7 @@ func (a *Agent) admitOrganicProbe(ctx context.Context, values []string, method, 
 	if err := organic.DecodeCanonical(append(document, '\n'), &authorization); err != nil {
 		return organic.ProbeAuthorization{}, err
 	}
-	if authorization.EndpointID != endpointID || uint64(authorization.Generation) != ticket.Generation ||
+	if authorization.EndpointID != endpointID || uint64(authorization.Generation) != generation ||
 		authorization.Method != method || authorization.Path != appPath || query != "" {
 		return organic.ProbeAuthorization{}, errors.New("probe authorization does not name this request")
 	}

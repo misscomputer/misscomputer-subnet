@@ -170,23 +170,31 @@ func (a *Agent) authorizeEdgeRuntimeRequest(req *http.Request, endpointID string
 	if err := protocol.VerifyTicketSignature(ticket, ed25519.PublicKey(validatorKey)); err != nil {
 		return unauthorized("runtime assignment ticket signature is invalid")
 	}
+	if err := a.verifyEdgeRequest(req, endpointID, headers[0], ed25519.PublicKey(validatorKey)); err != nil {
+		return unauthorized(err.Error())
+	}
+	return ticket, 0, nil
+}
+
+// verifyEdgeRequest checks one edge-runtime-request v1 authorization for the
+// request actually received (method, escaped path, raw query, body digest)
+// under the addressed endpoint's validator service key, and consumes its
+// nonce. Every workload kind shares it.
+func (a *Agent) verifyEdgeRequest(req *http.Request, endpointID, header string, validatorKey ed25519.PublicKey) error {
 	body, err := readRuntimeRequestBody(req)
 	if err != nil {
-		return unauthorized("runtime request body is unreadable or exceeds the limit")
+		return errors.New("runtime request body is unreadable or exceeds the limit")
 	}
 	now := time.Now()
 	digest := sha256.Sum256(body)
 	authorization, err := organic.VerifyEdgeRuntimeRequest(organic.EdgeRuntimeRequest{
 		BodySHA256: hex.EncodeToString(digest[:]), EndpointID: endpointID, Method: req.Method,
 		Path: req.URL.EscapedPath(), Query: req.URL.RawQuery,
-	}, headers[0], ed25519.PublicKey(validatorKey), now)
+	}, header, validatorKey, now)
 	if err != nil {
-		return unauthorized(err.Error())
+		return err
 	}
-	if err := a.edgeReplay.claim(authorization, now); err != nil {
-		return unauthorized(err.Error())
-	}
-	return ticket, 0, nil
+	return a.edgeReplay.claim(authorization, now)
 }
 
 func readRuntimeRequestBody(req *http.Request) ([]byte, error) {
