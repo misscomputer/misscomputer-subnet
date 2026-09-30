@@ -85,21 +85,28 @@ def fetch_static_index_documents(
     *,
     index_origin: str,
     server_name: str,
+    deadline: float | None = None,
 ) -> tuple[bytes | None, bytes | None]:
     """Fetch one deployment's manifest and release from the public static index.
 
     ``index_origin`` is the operator-configured HTTPS origin of the §1 public
     index (``static-sites/v1/...``). Any failure is ``None``; authenticity
     comes only from :func:`~misscomputer_subnet.static_index.ingest_static_index`,
-    which abstains on ``None``.
+    which abstains on ``None``. A caller may provide a shared monotonic deadline
+    so many slow deployments cannot extend one validator epoch indefinitely.
     """
 
     def fetch(key: str, max_bytes: int) -> bytes | None:
+        timeout = INDEX_FETCH_TIMEOUT_SECONDS
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                return None
         result = transport.fetch(
             url=f"{index_origin.rstrip('/')}/{key}",
             server_name=server_name,
             headers={"accept": "application/json", "accept-encoding": "identity"},
-            timeout_seconds=INDEX_FETCH_TIMEOUT_SECONDS,
+            timeout_seconds=timeout,
             max_bytes=max_bytes,
         )
         if not isinstance(result, ProbeResponse) or result.status != 200:

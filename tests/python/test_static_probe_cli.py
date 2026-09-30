@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -200,6 +201,32 @@ def test_missing_or_invalid_index_abstains_without_a_probe_or_a_zero(
     # No static probe was sent and no dynamic predicate stood in for one.
     assert _static_calls(publication.world) == []
     assert aggregate_static_window([static.epoch]).miners == []
+
+
+def test_slow_index_abstains_at_the_bounded_fetch_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    config = cli_config(publication, tmp_path / "run")
+    original_fetch = publication.world.fetch
+
+    def slow_fetch(**kwargs: Any) -> Any:
+        if "/manifests/" in kwargs["url"]:
+            time.sleep(0.04)
+        return original_fetch(**kwargs)
+
+    monkeypatch.setattr(publication.world, "fetch", slow_fetch)
+    monkeypatch.setattr(static_runtime, "STATIC_INDEX_LOAD_BUDGET_SECONDS", 0.02, raising=False)
+
+    result = execute(config, publication.world)
+
+    assert result.epoch.epoch_status == "scored"
+    assert result.static is not None and result.static.epoch is not None
+    assert [item.record_code for item in result.static.epoch.index_abstentions] == [
+        "static_index_unavailable"
+    ]
+    assert len([kind for kind, _ in publication.world.calls if kind == "index"]) == 1
+    assert _static_calls(publication.world) == []
 
 
 def test_unverifiable_v3_manifest_abstains_static_while_organic_scores(

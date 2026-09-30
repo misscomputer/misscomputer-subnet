@@ -12,10 +12,10 @@ Off by default. When enabled, one probe run additionally:
    path **abstain** for the epoch (no probe, no record, never a zero and never
    a dynamic probe) while the organic path runs unchanged;
 3. archives the verified v3 manifest, then advances the v3 state;
-4. authenticates every ``static-site-v1`` deployment's public index (stored
-   site manifest and signed release) under the pinned static release trust
-   policy and implementation digest; a deployment whose index is unavailable
-   or invalid abstains with its §11.2 record code;
+4. authenticates ``static-site-v1`` deployment indexes (stored site manifest
+   and signed release) within a whole-epoch fetch budget under the pinned
+   static release trust policy and implementation digest; a deployment whose
+   index is unfetched, unavailable or invalid abstains with its §11.2 record code;
 5. interleaves the static hidden plan (seed-derived instants and paths,
    GET only within the trust policy's response ceiling, HEAD above it) with
    the organic plan in one time-ordered schedule, appending every sealed
@@ -30,6 +30,7 @@ scoring-policy digest combines them.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Final, cast
@@ -94,6 +95,9 @@ from .static_probe import (
 from .static_scoring import StaticEpochScore, score_static_epoch, static_epoch_score_bytes
 
 MAX_RELEASE_TRUST_POLICY_BYTES: Final = 256 * 1_024
+# A slow index origin must not keep the static-state lock across later epochs.
+# Targets not fetched within this wall-clock budget abstain, never score zero.
+STATIC_INDEX_LOAD_BUDGET_SECONDS: Final = 30.0
 _PREFIXED_DIGEST_HEX: Final = frozenset("0123456789abcdef")
 
 
@@ -278,7 +282,7 @@ def load_static_epoch(
     evaluation_epoch: int,
     current_finalized_height: int,
 ) -> None:
-    """Verify v3, archive, advance the v3 state, and authenticate every static index.
+    """Verify v3, archive, advance the v3 state, and authenticate bounded indexes.
 
     A stale anchor or unsafe archive of the validator's own state refuses the
     run. An unavailable or unverifiable v3 publication only makes the static
@@ -329,9 +333,16 @@ def load_static_epoch(
         root.replace_state(assignment_manifest_chain_state_bytes(verification.next_chain_state))
     run.verification = verification
     server_name = urlsplit(index_origin).hostname or ""
+    deadline = time.monotonic() + STATIC_INDEX_LOAD_BUDGET_SECONDS
     for target in static_deployment_targets(verification):
+        if time.monotonic() >= deadline:
+            run.abstentions.append(
+                StaticIndexAbstention(target.deployment_id, target.site_digest, "index_unavailable")
+            )
+            continue
         manifest_bytes, release_bytes = fetch_static_index_documents(
-            transport, target, index_origin=index_origin, server_name=server_name
+            transport, target, index_origin=index_origin, server_name=server_name,
+            deadline=deadline,
         )
         result = ingest_static_index(
             target,
