@@ -635,7 +635,8 @@ def _hidden_choice(
     if lane in {0, 1}:
         synthetic = _synthetic_path(index, selector[16:], ".absent" if lane == 0 else "")
         if synthetic is not None:
-            return "GET", synthetic
+            expected = expected_static_response(index, "GET", synthetic)
+            return ("GET" if expected.content_length <= ceiling_bytes else "HEAD"), synthetic
     routes = sorted(index.routes)
     path = routes[int.from_bytes(selector[1:9], "big") % len(routes)]
     return ("GET" if index.routes[path].content_length <= ceiling_bytes else "HEAD"), path

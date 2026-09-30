@@ -768,6 +768,7 @@ def _fetch(
     elapsed_seconds: float,
     budget_seconds: float = 0.1,
     max_bytes: int = 4_096,
+    method: str = "GET",
 ) -> probe_cli.ProbeResponse | probe_cli.ProbeTransportFailure:
     transport = probe_cli.HttpsProbeTransport(
         ssl.create_default_context(),
@@ -780,7 +781,20 @@ def _fetch(
         headers={"host": "shop-k3j9x0q2ab.mock.local"},
         timeout_seconds=budget_seconds,
         max_bytes=max_bytes,
+        method=method,
     )
+
+
+def test_head_declared_file_length_is_not_a_body_budget() -> None:
+    def head_response(request: httpx.Request) -> httpx.Response:
+        assert request.method == "HEAD"
+        return httpx.Response(
+            200, headers={"Content-Length": "16777216"}, stream=httpx.ByteStream(b"")
+        )
+
+    observed = _fetch(head_response, elapsed_seconds=0.05, max_bytes=1_024, method="HEAD")
+    assert isinstance(observed, probe_cli.ProbeResponse)
+    assert observed.status == 200 and observed.body == b""
 
 
 def _budget_context(

@@ -386,7 +386,9 @@ class HttpsProbeTransport:
                             if declared.isascii() and declared.isdigit()
                             else MAX_RESPONSE_BYTES_CEILING + 1
                         )
-                    if declared_bytes is not None and declared_bytes > max_bytes:
+                    # HEAD declares the file length but has no response body.
+                    # The cap protects bytes actually received, not metadata.
+                    if method == "GET" and declared_bytes is not None and declared_bytes > max_bytes:
                         return response_derived(
                             functools.partial(
                                 _oversized,

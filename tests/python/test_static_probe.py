@@ -359,6 +359,20 @@ def test_hidden_probes_are_seed_derived_and_get_only_within_the_ceiling() -> Non
         assert (kind == "not_found") == path.endswith(".absent")
 
 
+def test_oversized_spa_fallback_is_probed_with_head_without_refusing_epoch() -> None:
+    files = {**FILES, "/index.html": (b"x" * 2_048, "text/html; charset=utf-8")}
+    index, _ = site(files)
+
+    plan = _hidden(index, SEED, range(6_000_000, 6_000_060), ceiling_bytes=1_024)
+
+    synthetic = [p for p in plan if p.path not in index.routes]
+    assert any(p.expected_kind == "navigation_fallback" for p in synthetic)
+    assert all(
+        p.method == ("HEAD" if p.expected_kind == "navigation_fallback" else "GET")
+        for p in synthetic
+    )
+
+
 def test_hidden_probes_stay_inside_the_manifest_horizon() -> None:
     index, _ = site()
     epoch = 6_000_000
