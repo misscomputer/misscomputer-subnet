@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Shared builders and an independent fake static replica for static-site tests.
 
-The fake replica implements the v1 serving rules on its own (exact path,
-``/index.html`` directory index, extension-less navigation fallback, fixed
-404) so tests never take their expected responses from the code under test.
+The default site is the static-site contract §3.5 worked example, released as
+in §7.1. The fake replica implements the handler rules on its own (exact
+route, ``/index.html`` directory index, fallback for a last segment without
+``.``, fixed 404, normative headers) so tests never take their expected
+responses from the code under test.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import threading
 import time
@@ -31,32 +32,41 @@ from misscomputer_subnet.static_index import (
     StaticDeploymentTarget,
     StaticEndpointTarget,
     StaticReleaseKey,
-    StaticServerProfile,
-    StaticSiteTrustPolicy,
-    build_static_site_trust_policy,
+    StaticSiteReleaseTrustPolicy,
+    build_static_site_release_trust_policy,
 )
 
-NOW = 1_800_000_000
-SERVER = "sha256:" + hashlib.sha256(b"pinned-static-handler").hexdigest()
-PRODUCER = "railpack-static-v1"
-NOT_FOUND_BODY = b"404 page not found\n"
+#: §7.1 example: seed 0x07 * 32, key id, implementation digest, issue time.
+RELEASE_KEY = Ed25519PrivateKey.from_private_bytes(b"\x07" * 32)
+RELEASE_KEY_ID = "static-release-example"
+SERVER = "sha256:" + "ab" * 32
+ISSUED_AT = "2026-09-30T00:00:00Z"
+ISSUED_EPOCH = 1_790_726_400
+PRODUCER = "static-producer-policy.v1"
+NOT_FOUND = (b"Not Found\n", "text/plain; charset=utf-8")
 VALIDATOR = "5ValidatorHotkey"
 SEED = bytes(range(32))
+HTML = "text/html; charset=utf-8"
 
+#: §3.5 file set.
 FILES: dict[str, tuple[bytes, str]] = {
-    "/index.html": (b"<!doctype html><title>home</title>", "text/html; charset=utf-8"),
-    "/docs/index.html": (b"<!doctype html><title>docs</title>", "text/html; charset=utf-8"),
-    "/app.js": (b"console.log('app');\n", "text/javascript; charset=utf-8"),
-    "/logo.png": (b"\x89PNG\r\n\x1a\n" + b"\x00" * 64, "image/png"),
+    "/index.html": (
+        b'<!doctype html><title>hello</title><script src="/assets/app.js"></script>\n',
+        HTML,
+    ),
+    "/assets/app.js": (b'console.log("hello");\n', "text/javascript; charset=utf-8"),
+    "/docs/index.html": (b"<!doctype html><title>docs</title>\n", HTML),
+    "/empty.txt": (b"", "text/plain; charset=utf-8"),
 }
+SPA = {"kind": "spa-html-v1", "target": "/index.html"}
 
 
 def sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def key(label: str) -> Ed25519PrivateKey:
-    return Ed25519PrivateKey.from_private_bytes(sha(label.encode()).encode()[:32])
+def stored(document: Mapping[str, Any]) -> bytes:
+    return canonical_json(dict(document)) + b"\n"
 
 
 def raw_public(private: Ed25519PrivateKey) -> bytes:
@@ -65,99 +75,82 @@ def raw_public(private: Ed25519PrivateKey) -> bytes:
     )
 
 
-RELEASE_KEY = key("release-authority")
+def key(label: str) -> Ed25519PrivateKey:
+    return Ed25519PrivateKey.from_private_bytes(hashlib.sha256(label.encode()).digest())
+
+
 MINER_KEYS = {hotkey: key(hotkey) for hotkey in ("5MinerA", "5MinerB", "5MinerC")}
-
-
-def release_key(
-    label: str = "release-a", private: Ed25519PrivateKey = RELEASE_KEY, **overrides: Any
-) -> StaticReleaseKey:
-    public = raw_public(private)
-    return StaticReleaseKey.model_validate(
-        {
-            "key_id": label,
-            "algorithm": "ed25519",
-            "public_key_base64": base64.b64encode(public).decode(),
-            "public_key_sha256": sha(public),
-            "valid_from_epoch": NOW - 1_000,
-            "valid_until_epoch": NOW + 100_000,
-            "revoked_at_epoch": None,
-            **overrides,
-        }
-    )
-
-
-def trust_policy(**overrides: Any) -> StaticSiteTrustPolicy:
-    fields: dict[str, Any] = {
-        "threshold": 1,
-        "release_keys": [release_key()],
-        "approved_producer_policy_versions": [PRODUCER],
-        "server_profiles": [
-            StaticServerProfile(
-                server_implementation_digest=SERVER,
-                not_found_content_type="text/plain; charset=utf-8",
-                not_found_size_bytes=len(NOT_FOUND_BODY),
-                not_found_sha256=sha(NOT_FOUND_BODY),
-            )
-        ],
-        "valid_from_epoch": NOW - 1_000,
-        "valid_until_epoch": NOW + 100_000,
-    }
-    fields.update(overrides)
-    return build_static_site_trust_policy(**fields)
 
 
 def manifest_document(
     files: Mapping[str, tuple[bytes, str]] = FILES,
     *,
-    fallback: str | None = "/index.html",
+    fallback: Mapping[str, str] | None = SPA,
     **overrides: Any,
 ) -> dict[str, Any]:
     return {
+        "fallback": None if fallback is None else dict(fallback),
+        "files": [
+            {
+                "body_sha256": sha(body),
+                "content_length": len(body),
+                "content_type": content_type,
+                "path": path,
+            }
+            for path, (body, content_type) in sorted(files.items())
+        ],
+        "handler": "static-handler.v1",
         "schema": "miss.computer/misscomputer-subnet/static-site-manifest",
         "schema_version": 1,
-        "workload_kind": "static-site-v1",
-        "producer_policy_version": PRODUCER,
-        "files": [
-            {"path": path, "size_bytes": len(body), "sha256": sha(body), "content_type": kind}
-            for path, (body, kind) in sorted(files.items())
-        ],
-        "navigation_fallback_path": fallback,
         **overrides,
     }
 
 
-def canonical_bytes(document: Mapping[str, Any]) -> bytes:
-    return canonical_json(dict(document)) + b"\n"
+def site_digest(manifest: bytes) -> str:
+    return "sha256:" + sha(manifest)
 
 
 def release_bytes(
-    site_digest: str,
+    site: str,
     *,
-    signers: tuple[tuple[str, Ed25519PrivateKey], ...] = (("release-a", RELEASE_KEY),),
-    producer: str = PRODUCER,
-    server: str = SERVER,
+    private: Ed25519PrivateKey = RELEASE_KEY,
+    key_id: str = RELEASE_KEY_ID,
+    **overrides: Any,
 ) -> bytes:
-    signed = {
+    unsigned = {
+        "issued_at": ISSUED_AT,
+        "producer_policy_version": PRODUCER,
         "schema": "miss.computer/misscomputer-subnet/static-site-release",
         "schema_version": 1,
-        "purpose": "static_site_release_v1",
-        "site_digest": site_digest,
-        "producer_policy_version": producer,
-        "server_implementation_digest": server,
+        "server_implementation_digest": SERVER,
+        "signer_key_id": key_id,
+        "site_digest": site,
+        **overrides,
     }
     message = (
         b"miss.computer/misscomputer-subnet/static-site-release/v1/ed25519\x00"
-        + canonical_json(signed)
+        + canonical_json(unsigned)
     )
-    signatures = [
+    return stored({**unsigned, "signature": private.sign(message).hex()})
+
+
+def release_key(**overrides: Any) -> StaticReleaseKey:
+    return StaticReleaseKey.model_validate(
         {
-            "signer_key_id": key_id,
-            "signature_base64": base64.b64encode(private.sign(message)).decode(),
+            "key_id": RELEASE_KEY_ID,
+            "algorithm": "ed25519",
+            "public_key_hex": raw_public(RELEASE_KEY).hex(),
+            "valid_from_epoch": ISSUED_EPOCH - 86_400,
+            "valid_until_epoch": ISSUED_EPOCH + 86_400,
+            **overrides,
         }
-        for key_id, private in sorted(signers, key=lambda item: item[0])
-    ]
-    return canonical_bytes({**signed, "signatures": signatures})
+    )
+
+
+def trust_policy(*keys: StaticReleaseKey) -> StaticSiteReleaseTrustPolicy:
+    return build_static_site_release_trust_policy(
+        policy_id="static-release-test", trusted_keys=list(keys) or [release_key()]
+    )
 
 
 def endpoint(hotkey: str, *, uid: int, generation: int = 1) -> StaticEndpointTarget:
@@ -172,11 +165,15 @@ def endpoint(hotkey: str, *, uid: int, generation: int = 1) -> StaticEndpointTar
     )
 
 
-def target(site_digest: str) -> StaticDeploymentTarget:
+def target(
+    site: str, release: bytes, *, server: str = SERVER, release_digest: str | None = None
+) -> StaticDeploymentTarget:
     return StaticDeploymentTarget(
         deployment_id="site-a",
         route_host="site-a.on.miss.computer",
-        site_digest=site_digest,
+        site_digest=site,
+        release_digest=release_digest or "sha256:" + sha(release),
+        server_implementation_digest=server,
         endpoints=[
             endpoint(hotkey, uid=uid) for uid, hotkey in enumerate(sorted(MINER_KEYS), start=1)
         ],
@@ -189,19 +186,19 @@ def timestamp(epoch: int) -> str:
 
 @dataclass
 class FakeStaticEdge:
-    """Serves every endpoint of one site through the pinned-handler rules.
+    """Serves every endpoint of one site through the static handler rules.
 
     ``faults`` maps an endpoint id to a callable that may rewrite the honest
-    ``(status, headers, body, attested_status, attested_body, nonce)`` tuple,
-    or return a transport failure.
+    response ``state`` in place or return a transport failure.
     """
 
-    site_digest: str
+    site: str
     files: Mapping[str, tuple[bytes, str]] = field(default_factory=lambda: FILES)
     fallback: str | None = "/index.html"
     faults: dict[str, Callable[..., Any]] = field(default_factory=dict)
     hold_seconds: float = 0.0
     calls: list[tuple[str, str, str]] = field(default_factory=list)
+    endpoints: tuple[StaticEndpointTarget, ...] = ()
     active: int = 0
     max_active: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -212,12 +209,12 @@ class FakeStaticEdge:
             if name.endswith("/index.html"):
                 routes[name[: -len("index.html")]] = value
         if path in routes:
-            body, kind = routes[path]
-            return 200, body, kind
+            body, content_type = routes[path]
+            return 200, body, content_type
         if self.fallback is not None and "." not in path.rsplit("/", 1)[-1]:
-            body, kind = self.files[self.fallback]
-            return 200, body, kind
-        return 404, NOT_FOUND_BODY, "text/plain; charset=utf-8"
+            body, content_type = self.files[self.fallback]
+            return 200, body, content_type
+        return 404, *NOT_FOUND
 
     def fetch(
         self,
@@ -247,20 +244,22 @@ class FakeStaticEdge:
             headers[oc.ORGANIC_PROBE_AUTHORIZATION_HEADER]
         )
         self.calls.append((authorization.endpoint_id, method, authorization.path))
-        status, body, kind = self._serve(authorization.path)
-        response_headers = [
-            ("content-type", kind),
-            ("content-length", str(len(body))),
-            ("x-content-type-options", "nosniff"),
-            ("cache-control", "private, no-store"),
+        status, body, content_type = self._serve(authorization.path)
+        normative = [
+            ("Cache-Control", "private, no-store"),
+            ("Content-Length", str(len(body))),
+            ("Content-Type", content_type),
+            ("X-Content-Type-Options", "nosniff"),
         ]
         wire = body if method == "GET" else b""
         state: dict[str, Any] = {
             "status": status,
-            "headers": response_headers,
+            "headers": normative,
+            "extra_headers": [("Date", "Wed, 30 Sep 2026 00:00:00 GMT")],
             "body": wire,
             "attested_status": status,
             "attested_body": wire,
+            "attested_headers": normative,
             "nonce": authorization.nonce,
             "ticket_digest": None,
             "attest": True,
@@ -272,46 +271,40 @@ class FakeStaticEdge:
             outcome = fault(state)
             if isinstance(outcome, ProbeTransportFailure):
                 return outcome
-        endpoint_target = next(
-            item
-            for item in target(self.site_digest).endpoints
-            if item.endpoint_id == authorization.endpoint_id
+        replica = next(
+            item for item in self.endpoints if item.endpoint_id == authorization.endpoint_id
         )
-        extra: list[tuple[str, str]] = []
+        hop: list[tuple[str, str]] = []
         if state["upstream"]:
-            extra.append(("x-miss-edge-upstream", "replica"))
+            hop.append(("X-Miss-Edge-Upstream", "replica"))
         if state["upstream"] and state["attest"]:
             document = {
                 "schema": "miss.computer/misscomputer-subnet/miner-probe-attestation",
                 "schema_version": 2,
-                "endpoint_id": endpoint_target.endpoint_id,
-                "generation": endpoint_target.generation,
-                "ticket_digest": state["ticket_digest"] or endpoint_target.ticket_digest,
-                "artifact_digest": f"sha256:{self.site_digest}",
+                "endpoint_id": replica.endpoint_id,
+                "generation": replica.generation,
+                "ticket_digest": state["ticket_digest"] or replica.ticket_digest,
+                "artifact_digest": self.site,
                 "validator_hotkey": authorization.validator_hotkey,
                 "probe_nonce": state["nonce"],
                 "request_method": method,
                 "request_path": authorization.path,
                 "response_status": state["attested_status"],
                 "response_body_sha256": sha(state["attested_body"]),
-                "response_header_sha256": oc.response_header_sha256(state["headers"]),
+                "response_header_sha256": oc.response_header_sha256(state["attested_headers"]),
                 "observed_at": authorization.issued_at,
                 "signature_hex": "00" * 64,
             }
             unsigned = oc.MinerProbeAttestationV2.model_validate(document)
-            private = state["signing_key"] or MINER_KEYS[endpoint_target.miner_hotkey]
+            private = state["signing_key"] or MINER_KEYS[replica.miner_hotkey]
+            signature = private.sign(oc.miner_probe_attestation_v2_message(unsigned)).hex()
             signed = oc.MinerProbeAttestationV2.model_validate(
-                {
-                    **document,
-                    "signature_hex": private.sign(
-                        oc.miner_probe_attestation_v2_message(unsigned)
-                    ).hex(),
-                }
+                {**document, "signature_hex": signature}
             )
-            extra.append(("x-miss-probe-attestation", attestation_v2_header(signed)))
+            hop.append(("X-Miss-Probe-Attestation", attestation_v2_header(signed)))
         return ProbeResponse(
             status=state["status"],
-            headers=tuple(state["headers"]) + tuple(extra),
+            headers=tuple(state["headers"]) + tuple(state["extra_headers"]) + tuple(hop),
             body=state["body"],
             latency_millis=5,
             tls_leaf_certificate_sha256=None,

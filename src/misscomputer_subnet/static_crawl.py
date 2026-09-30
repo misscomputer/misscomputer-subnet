@@ -40,6 +40,7 @@ from .contract_codec import (
 from .organic_contracts import (
     ORGANIC_PROBE_AUTHORIZATION_HEADER,
     UID,
+    Digest,
     DNSLabel,
     EndpointID,
     Hex64,
@@ -47,7 +48,14 @@ from .organic_contracts import (
     PositiveCount,
 )
 from .organic_probe import build_probe_authorization, probe_authorization_header
-from .static_index import MAX_MANIFEST_BYTES, MAX_RELEASE_BYTES, VerifiedStaticIndex
+from .static_index import (
+    MAX_MANIFEST_BYTES,
+    MAX_RELEASE_BYTES,
+    StaticDeploymentTarget,
+    VerifiedStaticIndex,
+    static_index_manifest_key,
+    static_index_release_key,
+)
 from .static_probe import (
     HIDDEN_PROBE_CEILING_BYTES,
     MAX_ADMISSION_REQUESTS,
@@ -73,21 +81,22 @@ Signer = Callable[[bytes], bytes]
 
 def fetch_static_index_documents(
     transport: ProbeTransport,
+    target: StaticDeploymentTarget,
     *,
-    manifest_url: str,
-    release_url: str,
+    index_origin: str,
     server_name: str,
 ) -> tuple[bytes | None, bytes | None]:
-    """Fetch the site manifest and release documents; any failure is ``None``.
+    """Fetch one deployment's manifest and release from the public static index.
 
-    The URLs are operator-configured content locations. Authenticity comes
-    only from :func:`~misscomputer_subnet.static_index.ingest_static_index`,
+    ``index_origin`` is the operator-configured HTTPS origin of the §1 public
+    index (``static-sites/v1/...``). Any failure is ``None``; authenticity
+    comes only from :func:`~misscomputer_subnet.static_index.ingest_static_index`,
     which abstains on ``None``.
     """
 
-    def fetch(url: str, max_bytes: int) -> bytes | None:
+    def fetch(key: str, max_bytes: int) -> bytes | None:
         result = transport.fetch(
-            url=url,
+            url=f"{index_origin.rstrip('/')}/{key}",
             server_name=server_name,
             headers={"accept": "application/json", "accept-encoding": "identity"},
             timeout_seconds=INDEX_FETCH_TIMEOUT_SECONDS,
@@ -97,7 +106,10 @@ def fetch_static_index_documents(
             return None
         return result.body
 
-    return fetch(manifest_url, MAX_MANIFEST_BYTES), fetch(release_url, MAX_RELEASE_BYTES)
+    return (
+        fetch(static_index_manifest_key(target.site_digest), MAX_MANIFEST_BYTES),
+        fetch(static_index_release_key(target.release_digest), MAX_RELEASE_BYTES),
+    )
 
 
 def static_probe_url(
@@ -174,8 +186,8 @@ class StaticAdmissionRecord(StrictFrozenModel):
     schema_version: Literal[1]
     validator_hotkey: Hotkey
     deployment_id: DNSLabel
-    site_digest: Hex64
-    release_digest_sha256: Hex64
+    site_digest: Digest
+    release_digest: Digest
     endpoint_id: EndpointID
     generation: PositiveCount
     miner_uid: UID
@@ -223,7 +235,7 @@ def _admission_record(
         "validator_hotkey": validator_hotkey,
         "deployment_id": index.target.deployment_id,
         "site_digest": index.target.site_digest,
-        "release_digest_sha256": index.release_digest_sha256,
+        "release_digest": index.target.release_digest,
         "endpoint_id": endpoint.endpoint_id,
         "generation": endpoint.generation,
         "miner_uid": endpoint.miner_uid,

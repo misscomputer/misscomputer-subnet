@@ -3,42 +3,41 @@
 
 Every request here is addressed to one endpoint incarnation through the public
 route host with a fresh ``organic-probe-authorization`` v1 (validator hotkey,
-one-time nonce, no query), and is judged against a
-:class:`~misscomputer_subnet.static_index.VerifiedStaticIndex`: the validator
-checks the bytes against the release-signed expected digest, never against the
-miner's attestation alone. The miner's ``miner-probe-attestation`` v2 still
-binds the response to the miner; for a static incarnation its
-``artifact_digest`` is ``sha256:<site_digest>`` and its ``ticket_digest`` is the
-static ticket digest the manifest v3 publishes.
+one-time nonce, no query) and is judged against a
+:class:`~misscomputer_subnet.static_index.VerifiedStaticIndex`: status,
+normative header digest, length and body SHA-256 must equal the contract's
+``expected(...)`` (§5.5), never merely the miner's attestation. The miner's
+``miner-probe-attestation`` v2 still binds the response to the miner (§11.4):
+for a static incarnation its ``artifact_digest`` is the ``site_digest``, its
+``ticket_digest`` the static ticket digest, and its ``response_header_sha256``
+covers exactly the normative header set, so the validator recomputes it.
 
 Two plans share one evaluator:
 
-* :func:`plan_static_admission_crawl` requests **every** indexed response of
-  one incarnation (plus the navigation-fallback and missing-asset 404 vectors)
-  in an unpredictable order, under an explicit request/byte budget. A plan
-  that does not fit the budget is refused as a whole: bounded failure means no
-  admission, never partial admission.
-* :func:`plan_static_hidden_probes` samples each epoch within the 1 MiB
-  per-probe ceiling at seed-derived times, choosing seed-derived paths,
-  including synthetic never-published paths, so neither time nor target is
-  predictable from the public manifest. :func:`static_probe_coverage` states
-  which responses the ceiling leaves to admission and edge verification.
+* :func:`plan_static_admission_crawl` requests every §4.4 route with GET, plus
+  ``HEAD /``, ``GET /<32 hex>.absent`` and ``GET /<32 hex>`` (§10.2 crawl set),
+  in an unpredictable order under explicit budgets. A plan that does not fit
+  its budget is refused as a whole: no partial admission.
+* :func:`plan_static_hidden_probes` samples each epoch at seed-derived times
+  and seed-derived targets (routes and synthetic paths), GET only when the
+  route's ``content_length`` is within the 1 MiB ceiling, otherwise HEAD
+  (§11.3). :func:`static_probe_coverage` reports routes and bytes covered.
 
-Attribution
------------
-``path`` (never the miner): transport failures, certificate-pin mismatch, an
-edge-generated response, an oversized transfer without headers, a correctly
-signed attestation for a *different* probe of the same incarnation (a replay
-or cache hit), or bytes that differ from both the expected and the attested
-ones while the attestation names the expected bytes (altered in transit).
+Attribution (§11.4)
+-------------------
+``path``: no response, timeout, TLS failure or pin mismatch, no
+``X-Miss-Edge-Upstream: replica``, an attestation for another nonce (replay or
+cache), an attestation whose status/body/header digests differ from what was
+observed (tampering between miner and validator), and a forbidden header,
+which the attestation does not cover.
 
-``miner``: a missing or unverifiable attestation; a verified attestation for
-this very probe whose status or body differs from the release-signed
-expectation (a *verified content fault*, flagged ``quarantine_candidate``);
-wrong normative headers under a verified attestation; and, as the only
-``attestation_fraud``, a verified attestation for this probe's nonce that
-names another incarnation, ticket, site, or request. Wrong bytes alone are
-never fraud; trust-zero decisions stay with scoring.
+``miner``: a missing attestation or an invalid signature on a replica-marked
+response; an attestation whose digests equal the observation while the
+observation differs from ``expected`` (a content fault, flagged
+``quarantine_candidate``); and, as the only ``attestation_fraud``, a validly
+signed attestation for this nonce naming another ticket, endpoint,
+generation, site or request. Wrong bytes alone are never fraud; trust
+decisions stay with scoring.
 
 This module is pure: no clock, network, file, process, environment, wallet,
 chain, or randomness. Signing is delegated to the caller.
@@ -71,6 +70,7 @@ from .contract_codec import (
 )
 from .organic_contracts import (
     UID,
+    Digest,
     DNSLabel,
     EndpointID,
     HealthPath,
@@ -79,6 +79,7 @@ from .organic_contracts import (
     MinerProbeAttestationV2,
     OrganicProbeAuthorization,
     PositiveCount,
+    response_header_sha256,
     verify_miner_probe_attestation_v2,
 )
 from .organic_probe import (
@@ -95,23 +96,43 @@ from .protocol import _rfc3339nano_instant
 from .static_index import (
     MAX_FILE_BYTES,
     MAX_FILES,
-    MAX_TOTAL_BYTES,
-    REQUIRED_CACHE_CONTROL,
-    REQUIRED_NOSNIFF,
-    ExpectedStaticResponse,
     StaticEndpointTarget,
     VerifiedStaticIndex,
     expected_static_response,
 )
 
 STATIC_OBSERVATION_SCHEMA: Final = "miss.computer/misscomputer-subnet/static-probe-observation"
-#: Hidden probes stay within the public validator per-probe body ceiling.
+#: §1/§11.3 validator probe body ceiling per GET.
 HIDDEN_PROBE_CEILING_BYTES: Final = MAX_RESPONSE_BYTES_CEILING
-#: Admission may carry any v1-legal response.
-ADMISSION_RESPONSE_CEILING_BYTES: Final = MAX_FILE_BYTES
-#: Synthetic vectors added to every admission crawl (fallback/404, HEAD of ``/``).
+#: §10.2 crawl set beyond the routes: ``HEAD /`` and two synthetic GETs.
 ADMISSION_SYNTHETIC_REQUESTS: Final = 3
 MAX_ADMISSION_REQUESTS: Final = 2 * MAX_FILES + ADMISSION_SYNTHETIC_REQUESTS
+#: §10.2 per-incarnation byte budget: routes plus 64 KiB, never above 512 MiB.
+ADMISSION_BYTE_SLACK: Final = 64 * 1_024
+MAX_ADMISSION_BYTES: Final = 512 * 1_024 * 1_024
+DEFAULT_REQUEST_TIMEOUT_MILLIS: Final = 30_000
+DEFAULT_CRAWL_DURATION_MILLIS: Final = 15 * 60 * 1_000
+#: §5.2: names covered by ``response_header_sha256``.
+NORMATIVE_HEADER_NAMES: Final = frozenset(
+    {"allow", "cache-control", "content-length", "content-type", "x-content-type-options"}
+)
+#: §5.2: a static response carries none of these; ``Date`` is permitted.
+FORBIDDEN_HEADER_NAMES: Final = frozenset(
+    {
+        "accept-ranges",
+        "content-disposition",
+        "content-encoding",
+        "content-range",
+        "etag",
+        "last-modified",
+        "location",
+        "refresh",
+        "set-cookie",
+        "transfer-encoding",
+        "vary",
+    }
+)
+_HOP_HEADERS: Final = frozenset({ATTESTATION_HEADER, UPSTREAM_RESPONSE_HEADER})
 _ADMISSION_DOMAIN: Final = b"miss.computer/misscomputer-subnet/static-admission-crawl/v1"
 _HIDDEN_DOMAIN: Final = b"miss.computer/misscomputer-subnet/static-hidden-probe/v1"
 _MAX_EPOCH_MILLIS: Final = 253_402_300_799_999
@@ -119,6 +140,7 @@ _MAX_EPOCH_MILLIS: Final = 253_402_300_799_999
 ProbeKind = Literal["admission", "hidden"]
 Attribution = Literal["miner", "none", "path"]
 AttestationStatus = Literal["fraudulent", "not_presented", "rejected", "replayed", "verified"]
+ExpectedKind = Literal["directory_index", "file", "navigation_fallback", "not_found"]
 StaticFailureCode = Literal[
     "attestation_fraud",
     "attestation_invalid",
@@ -128,6 +150,7 @@ StaticFailureCode = Literal[
     "connection_failed",
     "content_altered_in_transit",
     "edge_generated",
+    "forbidden_header",
     "header_mismatch",
     "response_oversized",
     "status_mismatch",
@@ -146,6 +169,7 @@ _ATTRIBUTION: Final[dict[str, Attribution]] = {
     "connection_failed": "path",
     "content_altered_in_transit": "path",
     "edge_generated": "path",
+    "forbidden_header": "path",
     "header_mismatch": "miner",
     "response_oversized": "path",
     "status_mismatch": "miner",
@@ -155,18 +179,30 @@ _ATTRIBUTION: Final[dict[str, Attribution]] = {
     "tls_pin_mismatch": "path",
     "transport_error": "path",
 }
-#: Faults a verified attestation for this very probe proves the miner served.
-_VERIFIED_CONTENT_FAULTS: Final = frozenset({"body_mismatch", "status_mismatch"})
+#: §11.4 miner content faults: attested = observed ≠ expected.
+_CONTENT_FAULTS: Final = frozenset({"body_mismatch", "header_mismatch", "status_mismatch"})
 
 
 def static_failure_attribution(code: str | None) -> Attribution:
     return "none" if code is None else _ATTRIBUTION[code]
 
 
-def static_attestation_artifact_digest(site_digest: str) -> str:
-    """The ``artifact_digest`` a static incarnation's attestation v2 must bind."""
+def observed_header_sha256(headers: Sequence[tuple[str, str]]) -> str:
+    """``response_header_sha256`` over the observed headers of the normative set."""
 
-    return f"sha256:{site_digest}"
+    return response_header_sha256(
+        [(name.lower(), value) for name, value in headers if name.lower() in NORMATIVE_HEADER_NAMES]
+    )
+
+
+def _has_forbidden_header(headers: Sequence[tuple[str, str]]) -> bool:
+    for name, _value in headers:
+        lowered = name.lower()
+        if lowered in FORBIDDEN_HEADER_NAMES or (
+            lowered.startswith("x-miss-") and lowered not in _HOP_HEADERS
+        ):
+            return True
+    return False
 
 
 class StaticProbeObservation(StrictFrozenModel):
@@ -179,9 +215,9 @@ class StaticProbeObservation(StrictFrozenModel):
     probe_kind: Literal["admission", "hidden"]
     validator_hotkey: Hotkey
     deployment_id: DNSLabel
-    site_digest: Hex64
-    release_digest_sha256: Hex64
-    static_trust_policy_digest_sha256: Hex64
+    site_digest: Digest
+    release_digest: Digest
+    release_trust_policy_digest_sha256: Hex64
     endpoint_id: EndpointID
     generation: PositiveCount
     miner_uid: UID
@@ -190,10 +226,11 @@ class StaticProbeObservation(StrictFrozenModel):
     issued_at: SecondsTimestamp
     request_method: Literal["GET", "HEAD"]
     request_path: HealthPath
-    expected_kind: Literal["directory_index", "file", "navigation_fallback", "not_found"]
+    expected_kind: ExpectedKind
     expected_status: int = Field(ge=100, le=599)
     expected_content_length: int = Field(ge=0, le=MAX_FILE_BYTES)
     expected_body_sha256: Hex64
+    expected_header_sha256: Hex64
     latency_millis: int = Field(ge=0, le=MAX_LATENCY_MILLIS)
     outcome: Literal["failure", "success"]
     failure_code: StaticFailureCode | None
@@ -203,6 +240,7 @@ class StaticProbeObservation(StrictFrozenModel):
     response_status: int | None = Field(ge=100, le=599)
     response_bytes: int = Field(ge=0, le=MAX_FILE_BYTES + 1)
     response_body_sha256: Hex64 | None
+    response_header_sha256: Hex64 | None
     tls_leaf_certificate_sha256: Hex64 | None
     attestation_status: AttestationStatus
     attestation: MinerProbeAttestationV2 | None
@@ -214,12 +252,13 @@ class StaticProbeObservation(StrictFrozenModel):
             raise ValueError("observation_outcome_invalid")
         if self.attribution != static_failure_attribution(self.failure_code):
             raise ValueError("observation_attribution_invalid")
-        if self.quarantine_candidate != (self.failure_code in _VERIFIED_CONTENT_FAULTS):
+        if self.quarantine_candidate != (self.failure_code in _CONTENT_FAULTS):
             raise ValueError("observation_quarantine_invalid")
         if self.outcome == "success" and (
             not self.upstream_marker
             or self.response_status != self.expected_status
             or self.response_body_sha256 != self.expected_body_sha256
+            or self.response_header_sha256 != self.expected_header_sha256
             or self.attestation_status != "verified"
         ):
             raise ValueError("observation_success_invalid")
@@ -237,6 +276,7 @@ class StaticProbeObservation(StrictFrozenModel):
                 or self.attestation.probe_nonce != self.probe_nonce
                 or self.attestation.response_status != self.response_status
                 or self.attestation.response_body_sha256 != self.response_body_sha256
+                or self.attestation.response_header_sha256 != self.response_header_sha256
             )
         ):
             raise ValueError("observation_attestation_binding_invalid")
@@ -248,20 +288,6 @@ class StaticProbeObservation(StrictFrozenModel):
 
 def _header_values(headers: Sequence[tuple[str, str]], name: str) -> list[str]:
     return [value for key, value in headers if key.lower() == name]
-
-
-def _headers_conform(headers: Sequence[tuple[str, str]], expected: ExpectedStaticResponse) -> bool:
-    """The normative v1 header set: exact type/length, nosniff, no-store, identity only."""
-
-    if (
-        _header_values(headers, "content-type") != [expected.content_type]
-        or _header_values(headers, "content-length") != [str(expected.content_length)]
-        or _header_values(headers, "x-content-type-options") != [REQUIRED_NOSNIFF]
-        or _header_values(headers, "cache-control") != [REQUIRED_CACHE_CONTROL]
-    ):
-        return False
-    forbidden = ("content-encoding", "content-range", "location", "set-cookie", "transfer-encoding")
-    return not any(_header_values(headers, name) for name in forbidden)
 
 
 def find_static_endpoint(index: VerifiedStaticIndex, endpoint_id: str) -> StaticEndpointTarget:
@@ -286,23 +312,23 @@ def evaluate_static_probe(
     timeout_millis: int,
     pinned_edge_leaf_certificate_sha256: Sequence[str] = (),
 ) -> StaticProbeObservation:
-    """Judge one observed static response against the release-signed expectation."""
+    """Judge one observed static response against ``expected(...)`` (§11.4)."""
 
     request = revalidate(authorization, OrganicProbeAuthorization)
     endpoint = find_static_endpoint(index, request.endpoint_id)
     if request.generation != endpoint.generation:
         raise ValueError("authorization_request_mismatch")
     expected = expected_static_response(index, request.method, request.path)
-    site = index.target.site_digest
+    target = index.target
     document: dict[str, object] = {
         "schema": STATIC_OBSERVATION_SCHEMA,
         "schema_version": 1,
         "probe_kind": probe_kind,
         "validator_hotkey": request.validator_hotkey,
-        "deployment_id": index.target.deployment_id,
-        "site_digest": site,
-        "release_digest_sha256": index.release_digest_sha256,
-        "static_trust_policy_digest_sha256": index.trust_policy_digest_sha256,
+        "deployment_id": target.deployment_id,
+        "site_digest": target.site_digest,
+        "release_digest": target.release_digest,
+        "release_trust_policy_digest_sha256": index.trust_policy_digest_sha256,
         "endpoint_id": endpoint.endpoint_id,
         "generation": endpoint.generation,
         "miner_uid": endpoint.miner_uid,
@@ -315,6 +341,7 @@ def evaluate_static_probe(
         "expected_status": expected.status,
         "expected_content_length": expected.content_length,
         "expected_body_sha256": expected.body_sha256,
+        "expected_header_sha256": expected.header_sha256,
         "latency_millis": min(max(result.latency_millis, 0), MAX_LATENCY_MILLIS),
         "outcome": "failure",
         "failure_code": None,
@@ -324,6 +351,7 @@ def evaluate_static_probe(
         "response_status": None,
         "response_bytes": 0,
         "response_body_sha256": None,
+        "response_header_sha256": None,
         "tls_leaf_certificate_sha256": result.tls_leaf_certificate_sha256,
         "attestation_status": "not_presented",
         "attestation": None,
@@ -332,7 +360,7 @@ def evaluate_static_probe(
     def fail(code: StaticFailureCode) -> StaticProbeObservation:
         document["failure_code"] = code
         document["attribution"] = static_failure_attribution(code)
-        document["quarantine_candidate"] = code in _VERIFIED_CONTENT_FAULTS
+        document["quarantine_candidate"] = code in _CONTENT_FAULTS
         return _seal(document)
 
     if result.latency_millis > timeout_millis:
@@ -343,9 +371,11 @@ def evaluate_static_probe(
     if not 100 <= result.status <= 599:
         return fail("transport_error")
     body_digest = hashlib.sha256(result.body).hexdigest()
+    header_digest = observed_header_sha256(result.headers)
     document["response_status"] = result.status
     document["response_bytes"] = min(len(result.body), MAX_FILE_BYTES + 1)
     document["response_body_sha256"] = body_digest
+    document["response_header_sha256"] = header_digest
     pins = tuple(pinned_edge_leaf_certificate_sha256)
     if pins and result.tls_leaf_certificate_sha256 not in pins:
         return fail("tls_pin_mismatch")
@@ -363,23 +393,17 @@ def evaluate_static_probe(
     except ValueError:
         document["attestation_status"] = "rejected"
         return fail("attestation_invalid")
-    incarnation_bound = (
-        attestation.endpoint_id == endpoint.endpoint_id
-        and attestation.generation == endpoint.generation
-        and attestation.ticket_digest == endpoint.ticket_digest
-        and attestation.artifact_digest == static_attestation_artifact_digest(site)
-    )
     if attestation.probe_nonce != request.nonce:
-        if incarnation_bound:
-            # The miner signed this for some other probe; something on the
-            # path replayed or cached it. Never the miner's fault.
-            document["attestation_status"] = "replayed"
-            document["attestation"] = model_document(attestation)
-            return fail("cache_replay")
-        document["attestation_status"] = "rejected"
-        return fail("attestation_invalid")
+        # A validly signed statement about some other probe: replayed or
+        # cached somewhere on the path. Never the miner's fault.
+        document["attestation_status"] = "replayed"
+        document["attestation"] = model_document(attestation)
+        return fail("cache_replay")
     if (
-        not incarnation_bound
+        attestation.endpoint_id != endpoint.endpoint_id
+        or attestation.generation != endpoint.generation
+        or attestation.ticket_digest != endpoint.ticket_digest
+        or attestation.artifact_digest != target.site_digest
         or attestation.validator_hotkey != request.validator_hotkey
         or attestation.request_method != request.method
         or attestation.request_path != request.path
@@ -396,26 +420,23 @@ def evaluate_static_probe(
     ):
         document["attestation_status"] = "rejected"
         return fail("attestation_invalid")
-    received_expected = result.status == expected.status and body_digest == expected.body_sha256
     if (
         attestation.response_status != result.status
         or attestation.response_body_sha256 != body_digest
+        or attestation.response_header_sha256 != header_digest
     ):
         document["attestation_status"] = "rejected"
-        if not received_expected and (
-            attestation.response_status == expected.status
-            and attestation.response_body_sha256 == expected.body_sha256
-        ):
-            return fail("content_altered_in_transit")
-        return fail("attestation_invalid")
+        return fail("content_altered_in_transit")
     document["attestation_status"] = "verified"
     document["attestation"] = model_document(attestation)
     if result.status != expected.status:
         return fail("status_mismatch")
     if body_digest != expected.body_sha256:
         return fail("body_mismatch")
-    if not _headers_conform(result.headers, expected):
+    if header_digest != expected.header_sha256:
         return fail("header_mismatch")
+    if _has_forbidden_header(result.headers):
+        return fail("forbidden_header")
     document["outcome"] = "success"
     return _seal(document)
 
@@ -430,12 +451,12 @@ class PlannedStaticProbe(StrictFrozenModel):
 
     probe_kind: Literal["admission", "hidden"]
     deployment_id: DNSLabel
-    site_digest: Hex64
+    site_digest: Digest
     endpoint_id: EndpointID
     generation: PositiveCount
     method: Literal["GET", "HEAD"]
     path: HealthPath
-    expected_kind: Literal["directory_index", "file", "navigation_fallback", "not_found"]
+    expected_kind: ExpectedKind
     expected_content_length: int = Field(ge=0, le=MAX_FILE_BYTES)
     #: Position within the crawl, or the probe's slice within the epoch.
     probe_index: int = Field(ge=0, le=MAX_ADMISSION_REQUESTS)
@@ -445,15 +466,31 @@ class PlannedStaticProbe(StrictFrozenModel):
 
 
 class StaticCrawlBudget(StrictFrozenModel):
-    """Explicit bounds on one admission crawl of one incarnation."""
+    """Explicit bounds on one admission crawl of one incarnation (§10.2)."""
 
     max_requests: int = Field(ge=1, le=MAX_ADMISSION_REQUESTS)
-    max_total_bytes: int = Field(ge=1, le=2 * MAX_TOTAL_BYTES)
-    max_response_bytes: int = Field(ge=1, le=ADMISSION_RESPONSE_CEILING_BYTES)
-    request_timeout_millis: int = Field(ge=100, le=60_000)
-    max_duration_millis: int = Field(ge=1_000, le=3_600_000)
-    #: Incarnations crawled at once; the integration contract allows at most 3.
+    max_total_bytes: int = Field(ge=1, le=MAX_ADMISSION_BYTES)
+    max_response_bytes: int = Field(ge=1, le=MAX_FILE_BYTES)
+    request_timeout_millis: int = Field(ge=100, le=DEFAULT_REQUEST_TIMEOUT_MILLIS)
+    max_duration_millis: int = Field(ge=1_000, le=DEFAULT_CRAWL_DURATION_MILLIS)
+    #: Incarnations crawled at once; §10.2 allows at most 3.
     max_concurrent_endpoints: int = Field(ge=1, le=3)
+
+
+def default_static_crawl_budget(index: VerifiedStaticIndex) -> StaticCrawlBudget:
+    """The §10.2 default budget for one site."""
+
+    return StaticCrawlBudget(
+        max_requests=len(index.routes) + ADMISSION_SYNTHETIC_REQUESTS,
+        max_total_bytes=min(
+            sum(item.content_length for item in index.routes.values()) + ADMISSION_BYTE_SLACK,
+            MAX_ADMISSION_BYTES,
+        ),
+        max_response_bytes=MAX_FILE_BYTES,
+        request_timeout_millis=DEFAULT_REQUEST_TIMEOUT_MILLIS,
+        max_duration_millis=DEFAULT_CRAWL_DURATION_MILLIS,
+        max_concurrent_endpoints=3,
+    )
 
 
 class StaticCrawlRefusal(StrictFrozenModel):
@@ -476,9 +513,9 @@ def _validate_seed(seed: bytes) -> None:
 
 
 def _synthetic_path(index: VerifiedStaticIndex, token: bytes, suffix: str) -> str | None:
-    """A never-published path; ``None`` on the (negligible) chance it is published."""
+    """§10.2 ``/<32 hex>`` or ``/<32 hex>.absent``; ``None`` if it is a route."""
 
-    path = f"/{token[:12].hex()}{suffix}"
+    path = f"/{token[:16].hex()}{suffix}"
     return None if path in index.routes else path
 
 
@@ -519,11 +556,10 @@ def plan_static_admission_crawl(
     validator_hotkey: str,
     crawl_id: int,
 ) -> list[PlannedStaticProbe] | StaticCrawlRefusal:
-    """Every indexed response of one incarnation, or a refusal; never a subset.
+    """The §10.2 crawl set of one incarnation, or a refusal; never a subset.
 
-    The crawl requests each manifest-listed GET response, a HEAD of ``/``, a
-    never-published navigation path (fallback or 404) and a never-published
-    asset path (always 404), in a seed-derived order with seed-derived nonces.
+    GET of every route, ``HEAD /``, ``GET /<32 hex>.absent`` and
+    ``GET /<32 hex>``, in a seed-derived order with seed-derived nonces.
     ``crawl_id`` distinguishes repeated admissions of the same incarnation.
     """
 
@@ -537,15 +573,20 @@ def plan_static_admission_crawl(
         "site_digest": index.target.site_digest,
         "validator_hotkey": validator_hotkey,
     }
-    token = _hmac(seed, _ADMISSION_DOMAIN, {**base, "purpose": "synthetic"})
     requests: list[tuple[Literal["GET", "HEAD"], str]] = [
-        ("GET", item.path) for item in index.responses
+        ("GET", path) for path in sorted(index.routes)
     ]
     requests.append(("HEAD", "/"))
-    for suffix, offset in (("", 0), (".js", 12)):
-        synthetic = _synthetic_path(index, token[offset:], suffix)
-        if synthetic is not None:
-            requests.append(("GET", synthetic))
+    for suffix in (".absent", ""):
+        attempt = 0
+        synthetic: str | None = None
+        while synthetic is None:
+            token = _hmac(
+                seed, _ADMISSION_DOMAIN, {**base, "attempt": attempt, "synthetic": suffix}
+            )
+            synthetic = _synthetic_path(index, token, suffix)
+            attempt += 1
+        requests.append(("GET", synthetic))
     sizes = [
         expected_static_response(index, method, path).content_length if method == "GET" else 0
         for method, path in requests
@@ -588,23 +629,16 @@ def plan_static_admission_crawl(
 def _hidden_choice(
     index: VerifiedStaticIndex, selector: bytes, ceiling_bytes: int
 ) -> tuple[Literal["GET", "HEAD"], str]:
-    """Seed-derived request: mostly a GET within the ceiling, sometimes HEAD or synthetic."""
+    """Seed-derived target: usually a route, sometimes a synthetic path (§11.3)."""
 
-    eligible = [item.path for item in index.responses if item.content_length <= ceiling_bytes]
-    every = [item.path for item in index.responses]
-    lane = selector[0] % 16
-    pick = int.from_bytes(selector[1:9], "big")
-    if lane == 0:
-        synthetic = _synthetic_path(index, selector[9:21], "")
+    lane = selector[0] % 8
+    if lane in {0, 1}:
+        synthetic = _synthetic_path(index, selector[16:], ".absent" if lane == 0 else "")
         if synthetic is not None:
             return "GET", synthetic
-    if lane == 1:
-        synthetic = _synthetic_path(index, selector[9:21], ".js")
-        if synthetic is not None:
-            return "GET", synthetic
-    if lane == 2 or not eligible:
-        return "HEAD", every[pick % len(every)]
-    return "GET", eligible[pick % len(eligible)]
+    routes = sorted(index.routes)
+    path = routes[int.from_bytes(selector[1:9], "big") % len(routes)]
+    return ("GET" if index.routes[path].content_length <= ceiling_bytes else "HEAD"), path
 
 
 def plan_static_hidden_probes(
@@ -621,10 +655,11 @@ def plan_static_hidden_probes(
 ) -> list[PlannedStaticProbe]:
     """One epoch's hidden static probes for every incarnation of every verified index.
 
-    As for organic probes, each endpoint gets one probe per equal slice of the
-    epoch at an HMAC-derived instant; here the request itself (method and
-    path, including synthetic never-published paths) is HMAC-derived too.
-    Every GET stays within ``ceiling_bytes``. Probes outside the manifest's
+    Each endpoint gets one probe per equal slice of the epoch at an
+    HMAC-derived instant; the target (a route or a synthetic path) is
+    HMAC-derived too, so neither is predictable from public data. A route is
+    probed with GET only when its ``content_length`` is within
+    ``ceiling_bytes``, otherwise with HEAD. Probes outside the manifest's
     validity horizon ``[horizon_start_epoch, horizon_end_epoch)`` are omitted.
     Only verified indexes can be planned: an abstained deployment has none.
     """
@@ -679,31 +714,42 @@ def plan_static_hidden_probes(
 
 
 class StaticProbeCoverage(StrictFrozenModel):
-    """What hidden probes can and cannot byte-check for one verified site."""
+    """§11.3 coverage of one site: routes total/probed, bytes total/GET-eligible."""
 
     deployment_id: DNSLabel
-    site_digest: Hex64
+    site_digest: Digest
     ceiling_bytes: int = Field(ge=1, le=HIDDEN_PROBE_CEILING_BYTES)
-    indexed_responses: int = Field(ge=1)
-    hidden_byte_checked_responses: int = Field(ge=0)
-    #: Responses above the ceiling: only HEAD-checked by hidden probes; their
-    #: bytes rest on admission, complete miner verification, and edge checks.
-    hidden_head_only_responses: int = Field(ge=0)
-    hidden_head_only_bytes: int = Field(ge=0)
+    routes_total: int = Field(ge=1)
+    routes_probed: int = Field(ge=0)
+    bytes_total: int = Field(ge=0)
+    bytes_get_eligible: int = Field(ge=0)
 
 
 def static_probe_coverage(
-    index: VerifiedStaticIndex, ceiling_bytes: int = HIDDEN_PROBE_CEILING_BYTES
+    index: VerifiedStaticIndex,
+    planned: Sequence[PlannedStaticProbe] = (),
+    ceiling_bytes: int = HIDDEN_PROBE_CEILING_BYTES,
 ) -> StaticProbeCoverage:
-    over = [item for item in index.responses if item.content_length > ceiling_bytes]
+    """Coverage of ``index`` by ``planned`` (probes of other sites are ignored).
+
+    Routes above the ceiling are only HEAD-checked by hidden probes; their
+    bytes rest on admission, complete miner verification and edge checks.
+    """
+
+    sizes = [item.content_length for item in index.routes.values()]
+    probed = {
+        probe.path
+        for probe in planned
+        if probe.site_digest == index.target.site_digest and probe.path in index.routes
+    }
     return StaticProbeCoverage(
         deployment_id=index.target.deployment_id,
         site_digest=index.target.site_digest,
         ceiling_bytes=ceiling_bytes,
-        indexed_responses=len(index.responses),
-        hidden_byte_checked_responses=len(index.responses) - len(over),
-        hidden_head_only_responses=len(over),
-        hidden_head_only_bytes=sum(item.content_length for item in over),
+        routes_total=len(sizes),
+        routes_probed=len(probed),
+        bytes_total=sum(sizes),
+        bytes_get_eligible=sum(size for size in sizes if size <= ceiling_bytes),
     )
 
 

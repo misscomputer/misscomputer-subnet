@@ -1,88 +1,99 @@
 # Static-site validator probes (`static-site-v1`, development)
 
 Status: development baseline behind the operator's `static_sites` flag (default
-off). The document shapes below are provisional until the normative static
-contract lands; the validator code keeps each assumption in one place so it can
-be reconciled without redesign.
+off). The validator implements the normative static-site contract (§3 site
+manifest, §4 URL paths, §5 serving semantics, §7 release authority, §10.2
+crawl set and budgets, §11 static index and probes). Manifest v3 parsing,
+evidence and coverage record schemas, and scoring live with their owners.
 
-## What a validator checks
+## Index ingestion
 
-A static deployment is a content-addressed file bundle served by a pinned
-platform handler. No customer code runs, so every static fault is attributed
-either to the **miner** or to the **path** (edge, tunnel, cache, network),
-never to an application.
+Code: `misscomputer_subnet.static_index`.
 
-1. **Index ingestion** (`misscomputer_subnet.static_index`). For each static
-   deployment in the verified public assignment manifest, the validator
-   fetches the `static-site-manifest` v1 and the `static-site-release` v1
-   itself and accepts them only if:
-   - SHA-256 of the exact canonical manifest bytes equals the bound
-     `site_digest`;
-   - the manifest is canonical and within the v1 caps (4,096 files, 256 MiB
-     total, 16 MiB per file, 1 MiB manifest, path ≤ 1,024 bytes, segment ≤ 255
-     bytes, depth ≤ 32), has no case-fold path collisions, and includes `/`;
-   - every URL path is canonical: no dot segments, empty segments, queries,
-     fragments, backslashes, controls, or ambiguous percent-encoding;
-   - the release binds the same site digest and producer policy version and
-     carries a threshold of valid signatures from keys pinned in the
-     validator's `static-site-trust-policy` v1;
-   - the producer policy version is approved and the release's pinned server
-     implementation digest has a pinned server profile (its fixed 404).
+For each static deployment in the verified public assignment manifest v3
+(`site_digest`, `release_digest`, `server_implementation_digest`, endpoint
+incarnations), the validator fetches
+`static-sites/v1/manifests/<site hex>.json` and
+`static-sites/v1/releases/<release hex>.json` from the public static index
+and accepts them only if:
 
-   Anything else, including a failed fetch, is an **abstention** with a
-   stable code. An abstained deployment is not probed, not scored as zero, and
-   never falls back to the dynamic health probe.
+- SHA-256 of the stored manifest bytes, prefixed `sha256:`, equals
+  `site_digest`, and the stored release bytes hash to `release_digest`;
+- the manifest decodes canonically as `static-site-manifest` v1
+  (`fallback`, `files[{body_sha256, content_length, content_type, path}]`,
+  `handler: static-handler.v1`, `schema`, `schema_version`). Files must be
+  strictly ascending, use §4.2 file paths and the §3.4 content type for each
+  extension, and have no ASCII case-fold or file/directory collision. `/index.html`
+  must be present, and a fallback must target an HTML file. Every §1 limit applies;
+- the release decodes canonically as `static-site-release` v1, names the same
+  `site_digest`, is signed by a key in the pinned
+  `static-site-release-trust-policy` v1 whose window contains `issued_at`
+  (Ed25519 over the `static-site-release/v1/ed25519` domain, NUL, and the
+  release without `signature`), uses a producer policy this validator
+  implements, and names the server implementation the validator pins for
+  `static-handler.v1`, which the manifest v3 deployment also names.
 
-2. **Admission crawl** (`plan_static_admission_crawl`,
-   `run_static_admission_crawl`). Before a validator treats a new endpoint
-   incarnation as admitted, it requests every indexed response (every file and
-   every directory index), a `HEAD /`, a never-published navigation path
-   (fallback or 404), and a never-published asset path (404), in a
-   seed-derived order. Budgets are explicit: requests, total bytes,
-   per-response bytes (≤ 16 MiB), per-request timeout, wall-clock duration,
-   and at most three incarnations at once. A crawl that does not fit its
-   budget is `refused` before any request; one that runs out of time is
-   `incomplete`; the first failed response makes it `rejected`. Only
-   `admitted` admits. A replacement incarnation is crawled again.
+Anything else, including an unavailable object, is an **abstention**. The
+record code is `static_index_unavailable` or `static_index_invalid`, and a
+finer stable reason is also kept. An abstained deployment is not probed, not
+scored as zero, and never falls back to the dynamic health probe.
 
-3. **Hidden probes** (`plan_static_hidden_probes`). Each epoch, each
-   incarnation receives probes at HMAC-derived instants from a
-   validator-private seed. The request itself is also seed-derived: usually a
-   GET of an indexed response within the 1 MiB per-probe ceiling, sometimes a
-   HEAD of any response, or a synthetic never-published path. Neither timing
-   nor target is predictable from public data. `static_probe_coverage`
-   reports which responses exceed the ceiling and are therefore only
-   HEAD-checked by hidden probes; their bytes rest on admission, complete
-   miner verification, and edge checks.
+## Admission crawl
 
-## Request shape
+Code: `plan_static_admission_crawl`, `run_static_admission_crawl`.
 
-Every request is addressed to one incarnation through the public route host
-with a fresh `organic-probe-authorization` v1 (validator hotkey, one-time
-nonce, method, path, no query), `Accept-Encoding: identity`, and
-`Cache-Control: no-cache`. The miner's `miner-probe-attestation` v2 binds the
-response; for a static incarnation its `artifact_digest` is
-`sha256:<site_digest>`.
+Before the validator treats a new incarnation as admitted, it sends the §10.2
+crawl set in an unpredictable order:
 
-## Judgement and attribution
+- `GET` of every §4.4 route;
+- `HEAD /`;
+- `GET /<32 hex>.absent`;
+- `GET /<32 hex>`.
 
-The response is compared with the release-signed expectation (status,
-`Content-Type`, `Content-Length`, `X-Content-Type-Options: nosniff`,
-`Cache-Control: private, no-store`, no encoding, range, redirect, or cookie,
-and the body digest), not with the attestation alone.
+Budgets are explicit. The default is at most 3 incarnations at once, 30 s per
+request, 15 min per incarnation, and bytes equal to the sum of route
+`content_length` plus 64 KiB, capped at 512 MiB. The outcomes are:
 
-| Observation | Code | Attribution |
+- `refused`: the crawl does not fit its budget, and nothing is sent;
+- `incomplete`: the crawl runs out of time;
+- `rejected`: the first failed response ends the crawl.
+
+Only `admitted` admits. A replacement incarnation is crawled again.
+
+## Hidden probes
+
+Code: `plan_static_hidden_probes`.
+
+Each epoch, each incarnation receives probes at instants derived from a
+validator-private seed. Targets are also seed-derived: routes, plus synthetic
+`/<32 hex>.absent` and `/<32 hex>` paths. A route is probed with `GET` only
+when its `content_length` is at most 1 MiB, otherwise with `HEAD`.
+`static_probe_coverage` reports routes total and probed, and bytes total and
+GET-eligible.
+
+## Request and judgement
+
+Every request targets one incarnation through the public route host. It
+carries a fresh `organic-probe-authorization` v1, no query,
+`Accept-Encoding: identity` and `Cache-Control: no-cache`. The response is
+compared with `expected(...)` (§5.5): status, the normative header digest
+(`organic.ResponseHeaderSHA256` over `Cache-Control`, `Content-Length`,
+`Content-Type` and `X-Content-Type-Options`), length and body SHA-256. It must
+also carry none of the forbidden §5.2 headers. The miner's
+`miner-probe-attestation` v2 binds `artifact_digest = site_digest` and the
+static `ticket_digest`.
+
+| Observation (§11.4) | Code | Attribution |
 | --- | --- | --- |
-| Transport failure, timeout, certificate-pin mismatch | transport code | path |
-| Response without the edge upstream marker | `edge_generated` | path |
-| Valid attestation for another probe of this incarnation | `cache_replay` | path |
-| Bytes differ from both expected and attested; attestation names the expected bytes | `content_altered_in_transit` | path |
-| Missing attestation, or one not signed by the service key | `attestation_missing` / `attestation_invalid` | miner |
-| Attested status or body differs from the release | `status_mismatch` / `body_mismatch` | miner, quarantine candidate |
-| Normative header wrong under a valid attestation | `header_mismatch` | miner |
-| Valid attestation for this nonce naming another incarnation, ticket, site, or request | `attestation_fraud` | miner (evidence) |
+| No response, timeout, TLS failure or pin mismatch | transport code | path |
+| No `X-Miss-Edge-Upstream: replica` | `edge_generated` | path |
+| Attestation `probe_nonce` differs from the sent nonce | `cache_replay` | path |
+| Attested status, body or header digest differs from the observation | `content_altered_in_transit` | path |
+| Forbidden header, which is outside the attested set | `forbidden_header` | path |
+| Attestation missing or signature invalid | `attestation_missing` / `attestation_invalid` | miner |
+| Attested = observed, but differs from expected | `status_mismatch` / `body_mismatch` / `header_mismatch` | miner, quarantine candidate |
+| Fresh attestation naming another ticket, endpoint, generation, site or request | `attestation_fraud` | miner (evidence) |
 
 Wrong bytes alone are never fraud. Each attempt is sealed as a
-`static-probe-observation` v1 and each crawl as a `static-admission-record` v1;
-scoring consumes these records and decides common-mode faults, quarantine,
-and trust.
+`static-probe-observation` v1 and each crawl as a `static-admission-record` v1.
+Both are validator-local evidence for scoring.
