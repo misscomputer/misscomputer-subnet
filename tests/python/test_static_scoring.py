@@ -62,7 +62,8 @@ def _replayed(state: dict[str, Any]) -> None:
 
 
 def _altered(state: dict[str, Any]) -> None:
-    state["body"] = b"altered-in-transit"
+    if state["body"]:
+        state["body"] = b"y" * len(state["body"])
 
 
 def _other_ticket(state: dict[str, Any]) -> None:
@@ -70,7 +71,8 @@ def _other_ticket(state: dict[str, Any]) -> None:
 
 
 def _no_nosniff(state: dict[str, Any]) -> None:
-    state["headers"] = [item for item in state["headers"] if item[0] != "x-content-type-options"]
+    headers = [item for item in state["headers"] if item[0].lower() != "x-content-type-options"]
+    state["headers"] = state["attested_headers"] = headers
 
 
 def _timeout(_state: dict[str, Any]) -> ProbeTransportFailure:
@@ -158,7 +160,14 @@ FAULTS: dict[str, tuple[Callable[[dict[str, Any]], Any], str, str, bool, bool, s
         True,
         "static_attestation_fraud",
     ),
-    "wrong normative header": (_no_nosniff, "header_mismatch", "miner", False, False, None),
+    "attested wrong normative header": (
+        _no_nosniff,
+        "header_mismatch",
+        "miner",
+        True,
+        False,
+        "static_content_fault",
+    ),
 }
 
 
@@ -232,6 +241,7 @@ def _other_target(site_digest: str) -> StaticDeploymentTarget:
     document["deployment_id"] = "site-b"
     document["route_host"] = "site-b.on.miss.computer"
     document["site_digest"] = site_digest
+    document["release_digest"] = "sha256:" + sha(b"unpublished release")
     for endpoint in document["endpoints"]:  # type: ignore[attr-defined]
         endpoint["endpoint_id"] = endpoint["endpoint_id"].replace("site-a-", "site-b-", 1)
     return StaticDeploymentTarget.model_validate(document)
@@ -240,7 +250,7 @@ def _other_target(site_digest: str) -> StaticDeploymentTarget:
 def test_unavailable_index_abstains_and_is_never_scored_zero() -> None:
     index, edge = verified_site()
     observations = hidden_epoch(index, edge)
-    other = _other_target(sha(b"unpublished site"))
+    other = _other_target("sha256:" + sha(b"unpublished site"))
     abstention = StaticIndexAbstention("site-b", other.site_digest, "index_unavailable")
 
     record = score_static_epoch(
@@ -254,8 +264,10 @@ def test_unavailable_index_abstains_and_is_never_scored_zero() -> None:
 
     abstained = [item for item in record.endpoints if item.deployment_id == "site-b"]
     assert [item.disposition for item in abstained] == ["abstain_index"] * 3
-    assert [row.code for row in record.index_abstentions] == ["index_unavailable"]
-    assert ("static_index_abstained", "site-b") in {
+    assert [(row.code, row.record_code) for row in record.index_abstentions] == [
+        ("index_unavailable", "static_index_unavailable")
+    ]
+    assert ("static_index_unavailable", "site-b") in {
         (row.code, row.deployment_id) for row in record.alerts
     }
     availability = {
@@ -315,23 +327,23 @@ def test_hidden_probes_above_the_ceiling_are_refused() -> None:
 
 
 def test_coverage_reports_what_the_ceiling_leaves_to_head_and_edge_checks() -> None:
-    index, edge = verified_site({**FILES, "/video.bin": (b"v" * 2_048, "application/octet-stream")})
+    index, edge = verified_site({**FILES, "/video.mp4": (b"v" * 2_048, "video/mp4")})
     observations = hidden_epoch(index, edge, ceiling_bytes=1_024)
 
     (row,) = score(index, observations, probe_body_ceiling=1_024).coverage
 
-    assert (row.indexed_responses, row.hidden_head_only_responses, row.hidden_head_only_bytes) == (
-        7,
-        1,
-        2_048,
-    )
+    sizes = [item.content_length for item in index.routes.values()]
+    assert (row.routes_total, row.bytes_total) == (len(sizes), sum(sizes))
+    assert row.bytes_get_eligible == row.bytes_total - 2_048
+    indexed = {"file", "directory_index"}
+    probed = {item.request_path for item in observations if item.expected_kind in indexed}
     get_paths = {
         item.request_path
         for item in observations
-        if item.request_method == "GET" and item.expected_kind in {"file", "directory_index"}
+        if item.request_method == "GET" and item.expected_kind in indexed
     }
-    assert row.body_verified_indexed_paths == len(get_paths)
-    assert "/video.bin" not in get_paths
+    assert (row.routes_probed, row.routes_body_verified) == (len(probed), len(get_paths))
+    assert "/video.mp4" not in get_paths
 
 
 def test_record_whose_numbers_do_not_follow_from_evidence_is_rejected() -> None:
@@ -371,7 +383,9 @@ def test_window_is_the_mean_of_eligible_endpoint_epochs() -> None:
         / 2
     )
     assert Fraction(miner_b.availability_numerator, miner_b.availability_denominator) == expected
-    assert (miner_b.eligible_endpoint_epochs, miner_b.content_faults) == (2, 1)
+    faults = sum(item.content_faults for item in first.endpoints if item.miner_hotkey == "5MinerB")
+    assert faults > 0
+    assert (miner_b.eligible_endpoint_epochs, miner_b.content_faults) == (2, faults)
     assert window.epoch_indexes == [EPOCH, second_epoch]
 
 

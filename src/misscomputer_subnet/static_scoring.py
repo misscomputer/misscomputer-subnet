@@ -22,28 +22,30 @@ Inputs
 
 Epoch rules
 -----------
-1. Endpoints of an abstained deployment **abstain** (``abstain_index``): never
-   zero, never judged by a dynamic predicate; observations of them refuse the
-   epoch.
+1. Endpoints of an abstained deployment **abstain** (``abstain_index``, alert
+   ``static_index_unavailable`` / ``static_index_invalid``): never zero, never
+   judged by a dynamic predicate; observations of them refuse the epoch.
 2. Every observation must be a hidden probe by this validator of a published
-   incarnation, carry exactly the index's release and trust-policy digests and
-   the ``expected_static_response`` of its method and path, stay inside the
-   probe body ceiling, and embed an attestation whose status re-derives
-   (signature under the manifest service key, nonce, incarnation binding).
+   incarnation, carry exactly the target's release digest and the index's
+   release trust-policy digest, the ``expected_static_response`` (status,
+   length, body and normative header digests) of its method and path, stay
+   inside the probe body ceiling, and embed an attestation whose status
+   re-derives (signature under the manifest service key, nonce, incarnation
+   and request binding, time window, attested = observed).
 3. If more than half of the sampled endpoints saw only ``path`` failures the
    epoch is ``common_mode_unavailable`` and every endpoint abstains.
 4. If two or more distinct miners of one deployment returned the same wrong
-   status and body to the same request, the expectation itself (index, edge,
-   or handler release) is suspect: the deployment is ``excluded_index_suspect``
-   and those content faults are not charged to miners.
+   status, body and header digests to the same request, the expectation
+   itself (index, edge, or handler release) is suspect: the deployment is
+   ``excluded_index_suspect`` and those content faults are not charged.
 5. An endpoint with fewer than ``min_attempts`` attempts abstains; otherwise
    availability is ``successes / attempts``.
 
 Content faults, fraud, alerts
 -----------------------------
-A verified content fault (``quarantine_candidate``: a fresh verified
-attestation over a wrong status or body) fails the probe, is listed as
-evidence, and recommends removal, replacement and **quarantine** of that
+A verified content fault (``quarantine_candidate``: attested = observed, but
+status, body or normative headers differ from ``expected``) fails the probe,
+is listed as evidence, and recommends removal, replacement and **quarantine** of that
 incarnation, never trust-zero. Only ``attestation_fraud`` recommends
 trust-zero. Cache replays and in-transit alteration are path faults that raise
 alerts. Every record reports per-deployment coverage: indexed responses,
@@ -79,6 +81,7 @@ from .contract_codec import (
 )
 from .organic_contracts import (
     UID,
+    Digest,
     DNSLabel,
     EndpointID,
     Hex64,
@@ -95,6 +98,7 @@ from .organic_probe import (
 from .protocol import _rfc3339nano_instant
 from .static_index import (
     AbstentionCode,
+    AbstentionRecordCode,
     StaticDeploymentTarget,
     StaticEndpointTarget,
     StaticIndexAbstention,
@@ -105,7 +109,6 @@ from .static_index import (
 from .static_probe import (
     HIDDEN_PROBE_CEILING_BYTES,
     StaticProbeObservation,
-    static_attestation_artifact_digest,
     static_probe_coverage,
 )
 
@@ -134,8 +137,9 @@ AlertCode = Literal[
     "static_attestation_fraud",
     "static_common_mode",
     "static_content_fault",
-    "static_index_abstained",
+    "static_index_invalid",
     "static_index_suspect",
+    "static_index_unavailable",
     "static_path_tampering",
     "static_replay_observed",
 ]
@@ -175,7 +179,7 @@ def _reject(code: StaticScoringRejectionCode) -> NoReturn:
 class StaticEndpointTally(StrictFrozenModel):
     deployment_id: DNSLabel
     endpoint_id: EndpointID
-    site_digest: Hex64
+    site_digest: Digest
     miner_uid: UID
     miner_hotkey: Hotkey
     attempts: Count
@@ -192,26 +196,33 @@ class StaticEndpointTally(StrictFrozenModel):
 
 
 class StaticDeploymentCoverage(StrictFrozenModel):
-    """What hidden probes of one authenticated site can byte-check, and what was probed."""
+    """§11.3 coverage of one authenticated site: totals, GET-eligible bytes, what was probed."""
 
     deployment_id: DNSLabel
-    site_digest: Hex64
-    release_digest_sha256: Hex64
-    static_trust_policy_digest_sha256: Hex64
+    site_digest: Digest
+    release_digest: Digest
+    release_trust_policy_digest_sha256: Hex64
     ceiling_bytes: int = Field(ge=1, le=HIDDEN_PROBE_CEILING_BYTES)
-    indexed_responses: int = Field(ge=1, le=8_192)
-    hidden_byte_checked_responses: int = Field(ge=0, le=8_192)
-    hidden_head_only_responses: int = Field(ge=0, le=8_192)
-    hidden_head_only_bytes: ByteCount
-    probed_indexed_paths: int = Field(ge=0, le=8_192)
-    body_verified_indexed_paths: int = Field(ge=0, le=8_192)
+    routes_total: int = Field(ge=1, le=8_192)
+    bytes_total: ByteCount
+    bytes_get_eligible: ByteCount
+    routes_probed: int = Field(ge=0, le=8_192)
+    routes_body_verified: int = Field(ge=0, le=8_192)
     unlisted_path_probes: Count
 
 
 class StaticIndexAbstentionRow(StrictFrozenModel):
     deployment_id: DNSLabel
-    site_digest: Hex64
+    site_digest: Digest
     code: AbstentionCode
+    record_code: AbstentionRecordCode
+
+    @model_validator(mode="after")
+    def record_code_follows(self) -> Self:
+        abstention = StaticIndexAbstention(self.deployment_id, self.site_digest, self.code)
+        if abstention.record_code != self.record_code:
+            raise ValueError("static_abstention_record_code_mismatch")
+        return self
 
 
 class StaticEvidenceRef(StrictFrozenModel):
@@ -258,6 +269,7 @@ class _Tally:
 def _derive_static_epoch(
     targets: Sequence[StaticDeploymentTarget],
     indexed: Mapping[str, tuple[str, str]],
+    abstained: Mapping[str, str],
     observations: Sequence[StaticProbeObservation],
     *,
     epoch_seconds: int,
@@ -266,8 +278,9 @@ def _derive_static_epoch(
 ) -> dict[str, object]:
     """Every evidence-derived field of a static epoch record.
 
-    ``indexed`` maps each authenticated deployment id to its (release, static
-    trust policy) digests; every other target is abstained.
+    ``indexed`` maps each authenticated deployment id to its (release, release
+    trust policy) digests; ``abstained`` maps every other target to its §11.2
+    abstention record code.
     """
 
     tallies: dict[str, _Tally] = {}
@@ -292,8 +305,8 @@ def _derive_static_epoch(
         if tally is None:
             _reject("static_scoring_observation_unpublished")
         if indexed.get(obs.deployment_id) != (
-            obs.release_digest_sha256,
-            obs.static_trust_policy_digest_sha256,
+            obs.release_digest,
+            obs.release_trust_policy_digest_sha256,
         ):
             _reject("static_scoring_index_abstained")
         tally.attempts += 1
@@ -305,7 +318,8 @@ def _derive_static_epoch(
         if obs.quarantine_candidate:
             tally.faults.append(obs.observation_digest_sha256)
             request = (obs.deployment_id, obs.request_method, obs.request_path)
-            wrong[(*request, obs.response_status, obs.response_body_sha256)].add(obs.miner_hotkey)
+            response = (obs.response_status, obs.response_body_sha256, obs.response_header_sha256)
+            wrong[(*request, *response)].add(obs.miner_hotkey)
         if obs.attestation_status == "fraudulent":
             tally.frauds.append(obs.observation_digest_sha256)
     sampled = [tally for tally in tallies.values() if tally.attempts]
@@ -324,7 +338,7 @@ def _derive_static_epoch(
         disposition: Disposition
         if deployment_id not in indexed:
             disposition = "abstain_index"
-            alerts.add(("static_index_abstained", deployment_id, None))
+            alerts.add((abstained[deployment_id], deployment_id, None))
         elif common_mode:
             disposition = "excluded_common_mode"
         elif deployment_id in suspect:
@@ -509,26 +523,23 @@ class StaticEpochScore(StrictFrozenModel):
         probed = _probed(self.observations)
         for row in self.coverage:
             if (
-                row.probed_indexed_paths,
-                row.body_verified_indexed_paths,
+                row.routes_probed,
+                row.routes_body_verified,
                 row.unlisted_path_probes,
             ) != probed.get(row.deployment_id, (0, 0, 0)) or (
-                row.hidden_byte_checked_responses + row.hidden_head_only_responses
-                != row.indexed_responses
-                or row.ceiling_bytes != self.probe_body_ceiling
-                or row.probed_indexed_paths > row.indexed_responses
-                or row.body_verified_indexed_paths > row.hidden_byte_checked_responses
+                row.ceiling_bytes != self.probe_body_ceiling
+                or row.bytes_get_eligible > row.bytes_total
+                or row.routes_probed > row.routes_total
+                or row.routes_body_verified > row.routes_probed
             ):
                 raise ValueError("static_epoch_coverage_mismatch")
         derived = _derive_static_epoch(
             self.targets,
             {
-                row.deployment_id: (
-                    row.release_digest_sha256,
-                    row.static_trust_policy_digest_sha256,
-                )
+                row.deployment_id: (row.release_digest, row.release_trust_policy_digest_sha256)
                 for row in self.coverage
             },
+            {row.deployment_id: row.record_code for row in self.index_abstentions},
             self.observations,
             epoch_seconds=self.epoch_seconds,
             epoch_index=self.epoch_index,
@@ -550,8 +561,14 @@ class StaticEpochScore(StrictFrozenModel):
         return self
 
 
-def _attestation_status(obs: StaticProbeObservation, endpoint: StaticEndpointTarget) -> str:
-    """Re-derive the recorded attestation status from the embedded attestation."""
+def _attestation_status(
+    obs: StaticProbeObservation, target: StaticDeploymentTarget, endpoint: StaticEndpointTarget
+) -> str:
+    """Re-derive the recorded attestation status from the embedded attestation (§11.4).
+
+    Only ``verified``, ``replayed`` and ``fraudulent`` observations embed their
+    attestation; the order mirrors the validator evaluator exactly.
+    """
 
     attestation = obs.attestation
     if attestation is None:
@@ -560,16 +577,13 @@ def _attestation_status(obs: StaticProbeObservation, endpoint: StaticEndpointTar
         verify_miner_probe_attestation_v2(attestation, endpoint.miner_service_public_key)
     except ValueError:
         return "rejected"
-    bound = (
-        attestation.endpoint_id == endpoint.endpoint_id
-        and attestation.generation == endpoint.generation
-        and attestation.ticket_digest == endpoint.ticket_digest
-        and attestation.artifact_digest == static_attestation_artifact_digest(obs.site_digest)
-    )
     if attestation.probe_nonce != obs.probe_nonce:
-        return "replayed" if bound else "rejected"
+        return "replayed"
     if (
-        not bound
+        attestation.endpoint_id != endpoint.endpoint_id
+        or attestation.generation != endpoint.generation
+        or attestation.ticket_digest != endpoint.ticket_digest
+        or attestation.artifact_digest != target.site_digest
         or attestation.validator_hotkey != obs.validator_hotkey
         or attestation.request_method != obs.request_method
         or attestation.request_path != obs.request_path
@@ -581,7 +595,11 @@ def _attestation_status(obs: StaticProbeObservation, endpoint: StaticEndpointTar
         issued - ATTESTATION_CLOCK_SKEW_NANOS
         <= observed
         <= issued + PROBE_AUTHORIZATION_VALIDITY_NANOS + ATTESTATION_CLOCK_SKEW_NANOS
-    ):
+    ) or (
+        attestation.response_status,
+        attestation.response_body_sha256,
+        attestation.response_header_sha256,
+    ) != (obs.response_status, obs.response_body_sha256, obs.response_header_sha256):
         return "rejected"
     return "verified"
 
@@ -603,8 +621,8 @@ def _verify_observation(
         obs.miner_hotkey,
     ) != (index.target.site_digest, endpoint.generation, endpoint.miner_uid, endpoint.miner_hotkey):
         _reject("static_scoring_observation_unpublished")
-    if (obs.release_digest_sha256, obs.static_trust_policy_digest_sha256) != (
-        index.release_digest_sha256,
+    if (obs.release_digest, obs.release_trust_policy_digest_sha256) != (
+        index.target.release_digest,
         index.trust_policy_digest_sha256,
     ):
         _reject("static_scoring_expectation_mismatch")
@@ -617,12 +635,19 @@ def _verify_observation(
         obs.expected_status,
         obs.expected_content_length,
         obs.expected_body_sha256,
-    ) != (expected.kind, expected.status, expected.content_length, expected.body_sha256):
+        obs.expected_header_sha256,
+    ) != (
+        expected.kind,
+        expected.status,
+        expected.content_length,
+        expected.body_sha256,
+        expected.header_sha256,
+    ):
         _reject("static_scoring_expectation_mismatch")
     body_length = expected.content_length if obs.request_method == "GET" else 0
     if body_length > probe_body_ceiling or obs.response_bytes > probe_body_ceiling + 1:
         _reject("static_scoring_body_over_ceiling")
-    if _attestation_status(obs, endpoint) != obs.attestation_status:
+    if _attestation_status(obs, index.target, endpoint) != obs.attestation_status:
         _reject("static_scoring_attestation_unverified")
 
 
@@ -702,30 +727,30 @@ def score_static_epoch(
     coverage: list[dict[str, object]] = []
     for key in sorted(verified):
         index = verified[key]
-        base = static_probe_coverage(index, probe_body_ceiling)
-        indexed_paths, verified_paths, unlisted = probed.get(key, (0, 0, 0))
+        base = static_probe_coverage(index, (), probe_body_ceiling)
+        routes_probed, routes_verified, unlisted = probed.get(key, (0, 0, 0))
         coverage.append(
             {
                 "deployment_id": key,
                 "site_digest": index.target.site_digest,
-                "release_digest_sha256": index.release_digest_sha256,
-                "static_trust_policy_digest_sha256": index.trust_policy_digest_sha256,
+                "release_digest": index.target.release_digest,
+                "release_trust_policy_digest_sha256": index.trust_policy_digest_sha256,
                 "ceiling_bytes": base.ceiling_bytes,
-                "indexed_responses": base.indexed_responses,
-                "hidden_byte_checked_responses": base.hidden_byte_checked_responses,
-                "hidden_head_only_responses": base.hidden_head_only_responses,
-                "hidden_head_only_bytes": base.hidden_head_only_bytes,
-                "probed_indexed_paths": indexed_paths,
-                "body_verified_indexed_paths": verified_paths,
+                "routes_total": base.routes_total,
+                "bytes_total": base.bytes_total,
+                "bytes_get_eligible": base.bytes_get_eligible,
+                "routes_probed": routes_probed,
+                "routes_body_verified": routes_verified,
                 "unlisted_path_probes": unlisted,
             }
         )
     derived = _derive_static_epoch(
         ordered_targets,
         {
-            key: (index.release_digest_sha256, index.trust_policy_digest_sha256)
+            key: (index.target.release_digest, index.trust_policy_digest_sha256)
             for key, index in verified.items()
         },
+        {key: row.record_code for key, row in abstained.items()},
         values,
         epoch_seconds=epoch_seconds,
         epoch_index=epoch_index,
@@ -750,6 +775,7 @@ def score_static_epoch(
                 "deployment_id": key,
                 "site_digest": abstained[key].site_digest,
                 "code": abstained[key].code,
+                "record_code": abstained[key].record_code,
             }
             for key in sorted(abstained)
         ],

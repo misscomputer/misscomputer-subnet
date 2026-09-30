@@ -17,14 +17,16 @@ from typing import Any
 from pydantic import BaseModel
 from static_context import (
     FILES,
-    NOW,
+    ISSUED_EPOCH,
     SEED,
+    SERVER,
     VALIDATOR,
     FakeStaticEdge,
-    canonical_bytes,
     manifest_document,
     release_bytes,
     sha,
+    site_digest,
+    stored,
     target,
     trust_policy,
 )
@@ -48,7 +50,7 @@ from misscomputer_subnet.static_scoring import (
 
 ROOT = Path(__file__).resolve().parents[2]
 EPOCH_SECONDS = 300
-EPOCH = NOW // EPOCH_SECONDS
+EPOCH = ISSUED_EPOCH // EPOCH_SECONDS
 TIMEOUT_MILLIS = 5_000
 
 Fault = Callable[[dict[str, Any]], Any]
@@ -57,13 +59,18 @@ Fault = Callable[[dict[str, Any]], Any]
 def verified_site(
     files: Mapping[str, tuple[bytes, str]] = FILES,
 ) -> tuple[VerifiedStaticIndex, FakeStaticEdge]:
-    manifest = canonical_bytes(manifest_document(files))
-    digest = sha(manifest)
+    manifest = stored(manifest_document(files))
+    site = site_digest(manifest)
+    release = release_bytes(site)
     index = ingest_static_index(
-        target(digest), manifest, release_bytes(digest), trust_policy(), evaluation_epoch=NOW
+        target(site, release),
+        manifest,
+        release,
+        trust_policy(),
+        pinned_server_implementation_digest=SERVER,
     )
     assert isinstance(index, VerifiedStaticIndex)
-    return index, FakeStaticEdge(digest, files=dict(files))
+    return index, FakeStaticEdge(site, files=dict(files), endpoints=tuple(index.target.endpoints))
 
 
 def hidden_epoch(
@@ -87,7 +94,7 @@ def hidden_epoch(
         indexes=[index],
         epoch_index=epoch,
         horizon_start_epoch=0,
-        horizon_end_epoch=NOW * 2,
+        horizon_end_epoch=ISSUED_EPOCH * 2,
         epoch_seconds=EPOCH_SECONDS,
         **extra,
     )
@@ -129,11 +136,11 @@ def score(
 
 def wrong_body(state: dict[str, Any]) -> None:
     if state["body"]:
-        state["body"] = state["attested_body"] = b"defaced"
+        state["body"] = state["attested_body"] = b"x" * len(state["body"])
 
 
 def edge_evidence(**overrides: Any) -> StaticEdgeEvidence:
-    body = FILES["/app.js"][0]
+    body = FILES["/assets/app.js"][0]
     document: dict[str, Any] = {
         "schema": "miss.computer/misscomputer-subnet/static-edge-evidence",
         "schema_version": 1,
@@ -147,7 +154,7 @@ def edge_evidence(**overrides: Any) -> StaticEdgeEvidence:
         "ticket_digest": "sha256:" + sha(b"ticket"),
         "receipt_digest": "sha256:" + sha(b"receipt"),
         "request_method": "GET",
-        "request_path": "/app.js",
+        "request_path": "/assets/app.js",
         "expected_status": 200,
         "expected_header_sha256": sha(b"headers"),
         "expected_body_length": len(body),

@@ -39,33 +39,36 @@ them from real validator probes against an independent fake replica.
   refused (admission gates routing, it is not a score).
 
 Each observation is re-bound before it counts: published incarnation and
-miner identity; the index's release and static trust-policy digests; the
-exact `expected_static_response` of its method and path (so expected bytes
+miner identity; the target's `sha256:` release digest and the index's release
+trust-policy digest; the
+exact `expected_static_response` of its method and path — status, length,
+body and normative header digests (so expected bytes
 come only from the authenticated index, never from a miner or from the
 observation itself); the probe body ceiling (≤ 1 MiB GET); and the embedded
 attestation, whose status (`verified`, `replayed`, `fraudulent`) is
-re-derived from its signature under the manifest service key, its nonce and
-its incarnation binding. A fraud cannot be relabelled as a cache replay, and
+re-derived in the evaluator's order: signature under the manifest service
+key, nonce, incarnation/site/request binding (`artifact_digest` =
+`site_digest`), time window, and attested = observed. A fraud cannot be relabelled as a cache replay, and
 a content fault cannot be relabelled as a pass.
 
 ## Epoch rules
 
 | Condition | Disposition / effect |
 | --- | --- |
-| deployment's index abstained | every endpoint `abstain_index`; never zero; its observations refuse the epoch |
+| deployment's index abstained | every endpoint `abstain_index`; never zero; alert `static_index_unavailable` or `static_index_invalid` (§11.2 record code); its observations refuse the epoch |
 | more than half of sampled endpoints saw only path failures | `common_mode_unavailable`; every endpoint `excluded_common_mode` |
-| ≥ 2 distinct miners of one deployment returned the same wrong status and body to the same request | deployment `excluded_index_suspect`; those faults are **not** charged to miners |
+| ≥ 2 distinct miners of one deployment returned the same wrong status, body and header digests to the same request | deployment `excluded_index_suspect`; those faults are **not** charged to miners |
 | fewer than `min_attempts` attempts | `abstain_insufficient_attempts` |
 | otherwise | `eligible`, availability = successes / attempts |
 
 | Observation | Attribution | Evidence / action | Alert |
 | --- | --- | --- | --- |
-| verified attestation over wrong status or body (`quarantine_candidate`) | miner | content-fault evidence; remove, replace, **quarantine**; `trust_zero: false` | `static_content_fault` |
+| attested = observed ≠ expected status, body or normative headers (`quarantine_candidate`) | miner | content-fault evidence; remove, replace, **quarantine**; `trust_zero: false` | `static_content_fault` |
 | fresh attestation naming another incarnation, ticket, site or request | miner | fraud evidence; remove, replace, quarantine, `trust_zero: true` | `static_attestation_fraud` |
 | attestation for another probe (`cache_replay`) | path | none | `static_replay_observed` |
-| attested expected bytes, received other bytes (`content_altered_in_transit`) | path | none | `static_path_tampering` |
-| missing/invalid attestation, wrong normative header | miner | failed probe only | — |
-| transport, TLS, edge-generated | path | failed probe only | — |
+| attested ≠ observed (`content_altered_in_transit`) | path | none | `static_path_tampering` |
+| missing or invalid attestation | miner | failed probe only | — |
+| transport, TLS, edge-generated, forbidden header | path | failed probe only | — |
 
 `endpoint_actions` mirror the runtime health policy's action shape so the
 private runtime can apply them; wrong bytes alone never recommend
@@ -76,10 +79,10 @@ re-authenticated indexes byte for byte.
 
 ## Coverage
 
-Each authenticated deployment has a coverage row: indexed responses, how
-many the ceiling can byte-check, how many (and how many bytes) only HEAD can
-reach, and, for the epoch, distinct indexed paths probed, of them
-body-verified by GET, and probes of unlisted paths (fallback/404 vectors).
+Each authenticated deployment has a §11.3 coverage row: routes and bytes in
+total, bytes GET-eligible under the ceiling, and, for the epoch, distinct
+routes probed, of them body-verified by GET, and probes of unlisted paths
+(synthetic `.absent`/navigation vectors).
 Responses above the ceiling rest on admission, miner verify-then-serve and
 edge checks; the row states that explicitly.
 

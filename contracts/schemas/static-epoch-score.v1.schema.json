@@ -115,8 +115,9 @@
             "static_attestation_fraud",
             "static_common_mode",
             "static_content_fault",
-            "static_index_abstained",
+            "static_index_invalid",
             "static_index_suspect",
+            "static_index_unavailable",
             "static_path_tampering",
             "static_replay_observed"
           ],
@@ -160,12 +161,18 @@
     },
     "StaticDeploymentCoverage": {
       "additionalProperties": false,
-      "description": "What hidden probes of one authenticated site can byte-check, and what was probed.",
+      "description": "\u00a711.3 coverage of one authenticated site: totals, GET-eligible bytes, what was probed.",
       "properties": {
-        "body_verified_indexed_paths": {
-          "maximum": 8192,
+        "bytes_get_eligible": {
+          "maximum": 1099511627776,
           "minimum": 0,
-          "title": "Body Verified Indexed Paths",
+          "title": "Bytes Get Eligible",
+          "type": "integer"
+        },
+        "bytes_total": {
+          "maximum": 1099511627776,
+          "minimum": 0,
+          "title": "Bytes Total",
           "type": "integer"
         },
         "ceiling_bytes": {
@@ -180,49 +187,37 @@
           "title": "Deployment Id",
           "type": "string"
         },
-        "hidden_byte_checked_responses": {
+        "release_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Release Digest",
+          "type": "string"
+        },
+        "release_trust_policy_digest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Release Trust Policy Digest Sha256",
+          "type": "string"
+        },
+        "routes_body_verified": {
           "maximum": 8192,
           "minimum": 0,
-          "title": "Hidden Byte Checked Responses",
+          "title": "Routes Body Verified",
           "type": "integer"
         },
-        "hidden_head_only_bytes": {
-          "maximum": 1099511627776,
-          "minimum": 0,
-          "title": "Hidden Head Only Bytes",
-          "type": "integer"
-        },
-        "hidden_head_only_responses": {
+        "routes_probed": {
           "maximum": 8192,
           "minimum": 0,
-          "title": "Hidden Head Only Responses",
+          "title": "Routes Probed",
           "type": "integer"
         },
-        "indexed_responses": {
+        "routes_total": {
           "maximum": 8192,
           "minimum": 1,
-          "title": "Indexed Responses",
+          "title": "Routes Total",
           "type": "integer"
-        },
-        "probed_indexed_paths": {
-          "maximum": 8192,
-          "minimum": 0,
-          "title": "Probed Indexed Paths",
-          "type": "integer"
-        },
-        "release_digest_sha256": {
-          "pattern": "^[0-9a-f]{64}$",
-          "title": "Release Digest Sha256",
-          "type": "string"
         },
         "site_digest": {
-          "pattern": "^[0-9a-f]{64}$",
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Site Digest",
-          "type": "string"
-        },
-        "static_trust_policy_digest_sha256": {
-          "pattern": "^[0-9a-f]{64}$",
-          "title": "Static Trust Policy Digest Sha256",
           "type": "string"
         },
         "unlisted_path_probes": {
@@ -235,15 +230,14 @@
       "required": [
         "deployment_id",
         "site_digest",
-        "release_digest_sha256",
-        "static_trust_policy_digest_sha256",
+        "release_digest",
+        "release_trust_policy_digest_sha256",
         "ceiling_bytes",
-        "indexed_responses",
-        "hidden_byte_checked_responses",
-        "hidden_head_only_responses",
-        "hidden_head_only_bytes",
-        "probed_indexed_paths",
-        "body_verified_indexed_paths",
+        "routes_total",
+        "bytes_total",
+        "bytes_get_eligible",
+        "routes_probed",
+        "routes_body_verified",
         "unlisted_path_probes"
       ],
       "title": "StaticDeploymentCoverage",
@@ -251,7 +245,7 @@
     },
     "StaticDeploymentTarget": {
       "additionalProperties": false,
-      "description": "One static deployment of a verified manifest v3: site binding and incarnations.\n\nThe manifest v3 verifier owns the authenticity of these fields; this\nmodule only refuses shapes it could not probe safely.",
+      "description": "The static bindings of one manifest v3 deployment and its incarnations.\n\nThe manifest v3 verifier owns the authenticity of these fields.",
       "properties": {
         "deployment_id": {
           "maxLength": 63,
@@ -268,14 +262,24 @@
           "title": "Endpoints",
           "type": "array"
         },
+        "release_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Release Digest",
+          "type": "string"
+        },
         "route_host": {
           "maxLength": 253,
           "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
           "title": "Route Host",
           "type": "string"
         },
+        "server_implementation_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Server Implementation Digest",
+          "type": "string"
+        },
         "site_digest": {
-          "pattern": "^[0-9a-f]{64}$",
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Site Digest",
           "type": "string"
         }
@@ -284,6 +288,8 @@
         "deployment_id",
         "route_host",
         "site_digest",
+        "release_digest",
+        "server_implementation_digest",
         "endpoints"
       ],
       "title": "StaticDeploymentTarget",
@@ -475,7 +481,7 @@
           "type": "integer"
         },
         "site_digest": {
-          "pattern": "^[0-9a-f]{64}$",
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Site Digest",
           "type": "string"
         },
@@ -509,7 +515,7 @@
     },
     "StaticEndpointTarget": {
       "additionalProperties": false,
-      "description": "One published static endpoint incarnation, as bound by a verified manifest v3.",
+      "description": "One published static endpoint incarnation of a verified manifest v3.",
       "properties": {
         "endpoint_id": {
           "maxLength": 320,
@@ -603,26 +609,22 @@
       "properties": {
         "code": {
           "enum": [
-            "index_caps_exceeded",
+            "handler_unsupported",
             "index_invalid",
+            "index_limits_exceeded",
             "index_not_canonical",
             "index_oversized",
             "index_unavailable",
-            "producer_policy_unapproved",
+            "producer_policy_unsupported",
             "release_binding_mismatch",
+            "release_digest_mismatch",
             "release_invalid",
             "release_unavailable",
-            "root_response_missing",
-            "server_implementation_unpinned",
+            "server_implementation_mismatch",
             "signature_invalid",
-            "signer_expired",
-            "signer_not_yet_valid",
-            "signer_revoked",
+            "signer_outside_validity",
             "signer_untrusted",
-            "site_digest_mismatch",
-            "threshold_not_met",
-            "trust_policy_expired",
-            "trust_policy_not_yet_valid"
+            "site_digest_mismatch"
           ],
           "title": "Code",
           "type": "string"
@@ -633,8 +635,16 @@
           "title": "Deployment Id",
           "type": "string"
         },
+        "record_code": {
+          "enum": [
+            "static_index_invalid",
+            "static_index_unavailable"
+          ],
+          "title": "Record Code",
+          "type": "string"
+        },
         "site_digest": {
-          "pattern": "^[0-9a-f]{64}$",
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Site Digest",
           "type": "string"
         }
@@ -642,7 +652,8 @@
       "required": [
         "deployment_id",
         "site_digest",
-        "code"
+        "code",
+        "record_code"
       ],
       "title": "StaticIndexAbstentionRow",
       "type": "object"
@@ -704,6 +715,11 @@
           "title": "Expected Content Length",
           "type": "integer"
         },
+        "expected_header_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Expected Header Sha256",
+          "type": "string"
+        },
         "expected_kind": {
           "enum": [
             "directory_index",
@@ -732,6 +748,7 @@
                 "connection_failed",
                 "content_altered_in_transit",
                 "edge_generated",
+                "forbidden_header",
                 "header_mismatch",
                 "response_oversized",
                 "status_mismatch",
@@ -807,9 +824,14 @@
           "title": "Quarantine Candidate",
           "type": "boolean"
         },
-        "release_digest_sha256": {
+        "release_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Release Digest",
+          "type": "string"
+        },
+        "release_trust_policy_digest_sha256": {
           "pattern": "^[0-9a-f]{64}$",
-          "title": "Release Digest Sha256",
+          "title": "Release Trust Policy Digest Sha256",
           "type": "string"
         },
         "request_method": {
@@ -844,6 +866,18 @@
           "title": "Response Bytes",
           "type": "integer"
         },
+        "response_header_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Header Sha256"
+        },
         "response_status": {
           "anyOf": [
             {
@@ -868,13 +902,8 @@
           "type": "integer"
         },
         "site_digest": {
-          "pattern": "^[0-9a-f]{64}$",
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Site Digest",
-          "type": "string"
-        },
-        "static_trust_policy_digest_sha256": {
-          "pattern": "^[0-9a-f]{64}$",
-          "title": "Static Trust Policy Digest Sha256",
           "type": "string"
         },
         "tls_leaf_certificate_sha256": {
@@ -906,8 +935,8 @@
         "validator_hotkey",
         "deployment_id",
         "site_digest",
-        "release_digest_sha256",
-        "static_trust_policy_digest_sha256",
+        "release_digest",
+        "release_trust_policy_digest_sha256",
         "endpoint_id",
         "generation",
         "miner_uid",
@@ -920,6 +949,7 @@
         "expected_status",
         "expected_content_length",
         "expected_body_sha256",
+        "expected_header_sha256",
         "latency_millis",
         "outcome",
         "failure_code",
@@ -929,6 +959,7 @@
         "response_status",
         "response_bytes",
         "response_body_sha256",
+        "response_header_sha256",
         "tls_leaf_certificate_sha256",
         "attestation_status",
         "attestation",

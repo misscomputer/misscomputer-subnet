@@ -164,6 +164,11 @@
           "title": "Expected Content Length",
           "type": "integer"
         },
+        "expected_header_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Expected Header Sha256",
+          "type": "string"
+        },
         "expected_kind": {
           "enum": [
             "directory_index",
@@ -192,6 +197,7 @@
                 "connection_failed",
                 "content_altered_in_transit",
                 "edge_generated",
+                "forbidden_header",
                 "header_mismatch",
                 "response_oversized",
                 "status_mismatch",
@@ -267,9 +273,14 @@
           "title": "Quarantine Candidate",
           "type": "boolean"
         },
-        "release_digest_sha256": {
+        "release_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Release Digest",
+          "type": "string"
+        },
+        "release_trust_policy_digest_sha256": {
           "pattern": "^[0-9a-f]{64}$",
-          "title": "Release Digest Sha256",
+          "title": "Release Trust Policy Digest Sha256",
           "type": "string"
         },
         "request_method": {
@@ -304,6 +315,18 @@
           "title": "Response Bytes",
           "type": "integer"
         },
+        "response_header_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Response Header Sha256"
+        },
         "response_status": {
           "anyOf": [
             {
@@ -328,13 +351,8 @@
           "type": "integer"
         },
         "site_digest": {
-          "pattern": "^[0-9a-f]{64}$",
+          "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Site Digest",
-          "type": "string"
-        },
-        "static_trust_policy_digest_sha256": {
-          "pattern": "^[0-9a-f]{64}$",
-          "title": "Static Trust Policy Digest Sha256",
           "type": "string"
         },
         "tls_leaf_certificate_sha256": {
@@ -366,8 +384,8 @@
         "validator_hotkey",
         "deployment_id",
         "site_digest",
-        "release_digest_sha256",
-        "static_trust_policy_digest_sha256",
+        "release_digest",
+        "release_trust_policy_digest_sha256",
         "endpoint_id",
         "generation",
         "miner_uid",
@@ -380,6 +398,7 @@
         "expected_status",
         "expected_content_length",
         "expected_body_sha256",
+        "expected_header_sha256",
         "latency_millis",
         "outcome",
         "failure_code",
@@ -389,6 +408,7 @@
         "response_status",
         "response_bytes",
         "response_body_sha256",
+        "response_header_sha256",
         "tls_leaf_certificate_sha256",
         "attestation_status",
         "attestation",
