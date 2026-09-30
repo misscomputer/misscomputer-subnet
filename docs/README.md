@@ -34,6 +34,7 @@ deployment.
 | Wire protocol, identity binding, TLS pinning, loopback bridge | [protocol.md](protocol.md) |
 | How the miner agent runs an assignment (OCI, isolation, cleanup) | [miner-oci-runtime.md](miner-oci-runtime.md) |
 | Static sites on the miner (verify-then-serve, shared handler; off by default) | [miner-static-sites.md](miner-static-sites.md) |
+| Static temporary origin: verify-then-listen process contract (development) | [static-origin.md](static-origin.md) |
 | Organic deployment contracts and sources of truth | [organic-contracts.md](organic-contracts.md) |
 | What the score measures and how probes are attributed | [organic-availability-scoring.md](organic-availability-scoring.md) |
 | Hidden-probe design | [public-validator-live-probe.md](public-validator-live-probe.md) |

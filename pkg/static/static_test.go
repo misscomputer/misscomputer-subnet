@@ -3,53 +3,31 @@
 package static_test
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
 	"github.com/misscomputer/misscomputer-subnet/pkg/organic"
 	"github.com/misscomputer/misscomputer-subnet/pkg/static"
+	"github.com/misscomputer/misscomputer-subnet/pkg/static/statictest"
 )
 
-func sha(body []byte) string {
-	sum := sha256.Sum256(body)
-	return hex.EncodeToString(sum[:])
-}
+func sha(body []byte) string { return statictest.SHA256(body) }
 
 // The static-site contract §3.5 worked example.
-var exampleBodies = map[string][]byte{
-	"/index.html":      []byte("<!doctype html><title>hello</title><script src=\"/assets/app.js\"></script>\n"),
-	"/assets/app.js":   []byte("console.log(\"hello\");\n"),
-	"/docs/index.html": []byte("<!doctype html><title>docs</title>\n"),
-	"/empty.txt":       {},
-}
+var exampleBodies = statictest.ExampleBodies
 
-func exampleManifest(fallback bool) static.Manifest {
-	m := static.Manifest{Handler: static.HandlerVersion, Schema: static.ManifestSchema, SchemaVersion: 1}
-	for _, path := range []string{"/assets/app.js", "/docs/index.html", "/empty.txt", "/index.html"} {
-		body := exampleBodies[path]
-		m.Files = append(m.Files, static.File{
-			BodySHA256: sha(body), ContentLength: int64(len(body)), ContentType: static.ContentTypeFor(path), Path: path,
-		})
-	}
-	if fallback {
-		m.Fallback = &static.Fallback{Kind: static.FallbackKind, Target: "/index.html"}
-	}
-	return m
-}
+func exampleManifest(fallback bool) static.Manifest { return statictest.ExampleManifest(fallback) }
 
 type memoryBodies map[string][]byte
 
@@ -88,126 +66,17 @@ func TestContractWorkedExampleIdentity(t *testing.T) {
 	}
 }
 
-type rawResponse struct {
-	status int
-	header http.Header
-	body   []byte
-}
-
-// rawRequest writes target byte-exact, bypassing client URL normalization.
-func rawRequest(t *testing.T, address, method, target, host, headers, payload string) rawResponse {
-	t.Helper()
-	conn, err := net.Dial("tcp", address)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if _, err := io.WriteString(conn, method+" "+target+" HTTP/1.1\r\nHost: "+host+"\r\nConnection: close\r\n"+headers+"\r\n"+payload); err != nil {
-		t.Fatal(err)
-	}
-	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: method})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return rawResponse{status: response.StatusCode, header: response.Header, body: body}
-}
-
 // The §6 vectors, executed over a real socket against the reusable origin
 // adapter. Every row also checks the exact §5.2 header set.
 func TestHandlerServesContractVectors(t *testing.T) {
-	const host = "hello-k3j9x0q2ab.on.miss.computer"
-	idx := exampleBodies["/index.html"]
-	doc := exampleBodies["/docs/index.html"]
-	js := exampleBodies["/assets/app.js"]
-	notFound, badRequest := []byte("Not Found\n"), []byte("Bad Request\n")
-	const html, text = "text/html; charset=utf-8", "text/plain; charset=utf-8"
-	long := "/" + strings.TrimSuffix(strings.Repeat(strings.Repeat("a", 204)+"/", 5), "/")
-	type vector struct {
-		name, method, target, host, extra, payload string
-		fallback                                   bool
-		status                                     int
-		contentType                                string
-		body                                       []byte
-		length                                     int
-	}
-	bad := func(name, target string) vector {
-		return vector{name: name, method: "GET", target: target, fallback: true, status: 400, contentType: text, body: badRequest, length: 12}
-	}
-	vectors := []vector{
-		{name: "V01", method: "GET", target: "/", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V02", method: "HEAD", target: "/", fallback: true, status: 200, contentType: html, body: nil, length: 74},
-		{name: "V03", method: "GET", target: "/index.html", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V04", method: "GET", target: "/assets/app.js", fallback: true, status: 200, contentType: "text/javascript; charset=utf-8", body: js, length: 22},
-		{name: "V05", method: "GET", target: "/docs/", fallback: true, status: 200, contentType: html, body: doc, length: 35},
-		{name: "V06", method: "GET", target: "/docs/index.html", fallback: true, status: 200, contentType: html, body: doc, length: 35},
-		{name: "V07", method: "GET", target: "/empty.txt", fallback: true, status: 200, contentType: text, body: nil, length: 0},
-		{name: "V08", method: "GET", target: "/docs", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V08-nofb", method: "GET", target: "/docs", status: 404, contentType: text, body: notFound, length: 10},
-		{name: "V09", method: "GET", target: "/about/team", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V09-nofb", method: "GET", target: "/about/team", status: 404, contentType: text, body: notFound, length: 10},
-		{name: "V10", method: "GET", target: "/assets/", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V10-nofb", method: "GET", target: "/assets/", status: 404, contentType: text, body: notFound, length: 10},
-		{name: "V11", method: "GET", target: "/missing.js", fallback: true, status: 404, contentType: text, body: notFound, length: 10},
-		{name: "V12", method: "GET", target: "/Index.html", fallback: true, status: 404, contentType: text, body: notFound, length: 10},
-		{name: "V13", method: "GET", target: "/caf%C3%A9", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V13-nofb", method: "GET", target: "/caf%C3%A9", status: 404, contentType: text, body: notFound, length: 10},
-		{name: "V14", method: "GET", target: "/?q=1", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V15", method: "GET", target: "/index.html?v=2", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V16", method: "HEAD", target: "/missing.js", fallback: true, status: 404, contentType: text, body: nil, length: 10},
-		{name: "V17", method: "POST", target: "/", fallback: true, status: 405, contentType: text, body: []byte("Method Not Allowed\n"), length: 19},
-		{name: "V17-OPTIONS", method: "OPTIONS", target: "/", fallback: true, status: 405, contentType: text, body: []byte("Method Not Allowed\n"), length: 19},
-		bad("V18", "/%69ndex.html"), bad("V19", "/a%2Fb"), bad("V20", "/a%2fb"), bad("V21", "/../index.html"),
-		bad("V22", "/./index.html"), bad("V23", "/%2E%2E/"), bad("V24", "//index.html"), bad("V25", "/a%5Cb"),
-		bad("V26-00", "/%00"), bad("V26-7F", "/%7F"), bad("V27", "/a|b"), bad("V28", "/caf%c3%a9"),
-		bad("V30", long), bad("V31", strings.Repeat("/a", 33)),
-		{name: "V30-at-limit", method: "GET", target: long[:len(long)-1], fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V32", method: "GET", target: "/", extra: "Content-Length: 1\r\n", payload: "x", fallback: true, status: 400, contentType: text, body: badRequest, length: 12},
-		{name: "V33", method: "GET", target: "/", host: "other.on.miss.computer", fallback: true, status: 421, contentType: text, body: []byte("Misdirected Request\n"), length: 20},
-		{name: "V33-port", method: "GET", target: "/", host: "HELLO-k3j9x0q2ab.on.miss.computer:443", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V34", method: "GET", target: "/", extra: "Range: bytes=0-0\r\n", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V35", method: "GET", target: "/", extra: "Accept-Encoding: gzip\r\n", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V36", method: "GET", target: "/", extra: "If-None-Match: *\r\n", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V37", method: "GET", target: "/index.html/", fallback: true, status: 200, contentType: html, body: idx, length: 74},
-		{name: "V37-nofb", method: "GET", target: "/index.html/", status: 404, contentType: text, body: notFound, length: 10},
-	}
 	servers := map[bool]*httptest.Server{}
 	for _, fallback := range []bool{false, true} {
-		handler := static.NewHandler(static.NewIndex(exampleManifest(fallback)), exampleBodySource(), host, 0)
+		handler := static.NewHandler(static.NewIndex(exampleManifest(fallback)), exampleBodySource(), statictest.RouteHost, 0)
 		servers[fallback] = httptest.NewServer(handler)
 		defer servers[fallback].Close()
 	}
-	for _, v := range vectors {
-		t.Run(v.name, func(t *testing.T) {
-			requestHost := v.host
-			if requestHost == "" {
-				requestHost = host
-			}
-			got := rawRequest(t, servers[v.fallback].Listener.Addr().String(), v.method, v.target, requestHost, v.extra, v.payload)
-			if got.status != v.status || !bytes.Equal(got.body, v.body) {
-				t.Fatalf("status %d body %q, want %d %q", got.status, got.body, v.status, v.body)
-			}
-			want := http.Header{
-				"Cache-Control": {"private, no-store"}, "Content-Type": {v.contentType},
-				"Content-Length": {strconv.Itoa(v.length)}, "X-Content-Type-Options": {"nosniff"},
-			}
-			if v.status == 405 {
-				want["Allow"] = []string{"GET, HEAD"}
-			}
-			got.header.Del("Connection")
-			if len(got.header) != len(want) {
-				t.Fatalf("headers %v, want exactly %v", got.header, want)
-			}
-			for name, values := range want {
-				if strings.Join(got.header.Values(name), ",") != strings.Join(values, ",") {
-					t.Fatalf("header %s = %q, want %q", name, got.header.Values(name), values)
-				}
-			}
-		})
+	for _, v := range statictest.Vectors() {
+		t.Run(v.Name, func(t *testing.T) { statictest.Check(t, servers[v.Fallback].Listener.Addr().String(), v) })
 	}
 	// V29: net/http refuses a bare "%" before any handler runs, so the
 	// rule is enforced by the shared table itself (the edge answers it).
@@ -441,9 +310,9 @@ func TestReleaseKeepsBlobsReferencedByAnotherSite(t *testing.T) {
 	}
 	server := httptest.NewServer(static.NewHandler(two.Index(), two, "", 0))
 	defer server.Close()
-	got := rawRequest(t, server.Listener.Addr().String(), "GET", "/", "x", "", "")
-	if got.status != 200 || !bytes.Equal(got.body, exampleBodies["/index.html"]) {
-		t.Fatalf("second site after first release: %d %q", got.status, got.body)
+	got := statictest.RawRequest(t, server.Listener.Addr().String(), "GET", "/", "x", "", "")
+	if got.Status != 200 || !bytes.Equal(got.Body, exampleBodies["/index.html"]) {
+		t.Fatalf("second site after first release: %d %q", got.Status, got.Body)
 	}
 	two.Release()
 	if blobCount(t, cacheRoot) != 0 || cache.Occupancy() != 0 {
