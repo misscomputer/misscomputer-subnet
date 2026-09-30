@@ -219,6 +219,33 @@ func TestStaticAssignmentVerifiesEverySiteByteBeforeReadyAndServing(t *testing.T
 	}
 }
 
+// An open failure changes the wire response to 502; it must not carry an
+// attestation signed for the expected 200 response.
+func TestStaticBodyOpenFailureClearsProbeAttestation(t *testing.T) {
+	h := newStaticHarness(t, nil)
+	result, err := h.assignStatic(h.staticTicket(t, nonceHex(t), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(h.cacheRoot, "misscomputer-static-v1", "blobs", bodySHA(staticBodies["/app.js"]))
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	authorization := organic.ProbeAuthorization{
+		Schema: organic.SchemaPrefix + "organic-probe-authorization", SchemaVersion: 1,
+		ValidatorHotkey: testValidatorHotkey, EndpointID: result.EndpointID, Generation: 1,
+		Method: "GET", Path: "/app.js", Nonce: nonceHex(t) + nonceHex(t),
+		IssuedAt:  time.Now().UTC().Truncate(time.Second).Format(time.RFC3339),
+		Signature: strings.Repeat("0", 128),
+	}
+	response := h.request(t, result.EndpointID, edgeRequest{
+		method: http.MethodGet, path: "/app.js", probe: probeHeader(t, authorization),
+	}, true)
+	if response.Code != http.StatusBadGateway || response.Header().Get(organic.ProbeAttestationHeader) != "" {
+		t.Fatalf("open failure: status %d, headers %v", response.Code, response.Header())
+	}
+}
+
 // Every admitted failure is a signed, attributed failed receipt, and the
 // endpoint never serves a byte.
 func TestStaticAssignmentFailuresSignAttributedReceiptsAndNeverServe(t *testing.T) {

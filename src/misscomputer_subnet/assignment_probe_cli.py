@@ -389,7 +389,11 @@ class HttpsProbeTransport:
                         )
                     # HEAD declares the file length but has no response body.
                     # The cap protects bytes actually received, not metadata.
-                    if method == "GET" and declared_bytes is not None and declared_bytes > max_bytes:
+                    if (
+                        method == "GET"
+                        and declared_bytes is not None
+                        and declared_bytes > max_bytes
+                    ):
                         return response_derived(
                             functools.partial(
                                 _oversized,
@@ -1301,7 +1305,7 @@ def execute_assignment_probe(
             if config.static_sites is not None:
                 from .static_runtime import lock_static_epoch
 
-                static_run = lock_static_epoch(config.static_sites)
+                static_run = lock_static_epoch(config.static_sites, policy)
             manifest, signatures = _load_publication(
                 config.manifest, config.signatures, transport, policy
             )
@@ -1317,6 +1321,22 @@ def execute_assignment_probe(
                 root.replace_state(
                     assignment_manifest_chain_state_bytes(verification.next_chain_state)
                 )
+
+            def seal_organic(observations: list[OrganicProbeObservation]) -> OrganicEpochScore:
+                epoch = score_organic_epoch(
+                    [verification.manifest],
+                    observations,
+                    validator_hotkey=config.validator_hotkey,
+                    epoch_index=config.epoch_index,
+                    min_attempts=DEFAULT_MIN_ATTEMPTS,
+                )
+                _write_output(
+                    config.epoch_output,
+                    organic_epoch_score_bytes(epoch),
+                    state_root=root.path,
+                )
+                return epoch
+
             if static_run is None:
                 observations, skipped = run_hidden_probe_epoch(
                     verification.manifest,
@@ -1330,7 +1350,13 @@ def execute_assignment_probe(
                     clock=clock,
                     sleep=sleep,
                 )
+                epoch = seal_organic(observations)
             else:
+                organic_epochs: list[OrganicEpochScore] = []
+
+                def finish_organic(observations: list[OrganicProbeObservation]) -> None:
+                    organic_epochs.append(seal_organic(observations))
+
                 observations, skipped = _run_with_static(
                     static_run,
                     cast(tuple[object, str, str], static_pins),
@@ -1346,28 +1372,25 @@ def execute_assignment_probe(
                     current_finalized_height=config.current_finalized_height,
                     clock=clock,
                     sleep=sleep,
+                    on_organic_complete=finish_organic,
                 )
-            epoch = score_organic_epoch(
-                [verification.manifest],
-                observations,
-                validator_hotkey=config.validator_hotkey,
-                epoch_index=config.epoch_index,
-                min_attempts=DEFAULT_MIN_ATTEMPTS,
-            )
-            _write_output(
-                config.epoch_output,
-                organic_epoch_score_bytes(epoch),
-                state_root=root.path,
-            )
+                epoch = organic_epochs[0]
             if static_run is not None:
-                from .static_runtime import finish_static_epoch, static_probe_ceiling
-
-                finish_static_epoch(
-                    static_run,
-                    validator_hotkey=config.validator_hotkey,
-                    epoch_index=config.epoch_index,
-                    probe_ceiling=static_probe_ceiling(policy),
+                from .static_runtime import (
+                    abstain_static_epoch,
+                    finish_static_epoch,
+                    static_probe_ceiling,
                 )
+
+                try:
+                    finish_static_epoch(
+                        static_run,
+                        validator_hotkey=config.validator_hotkey,
+                        epoch_index=config.epoch_index,
+                        probe_ceiling=static_probe_ceiling(policy),
+                    )
+                except Exception as exc:
+                    abstain_static_epoch(static_run, exc)
         finally:
             if static_run is not None:
                 static_run.close()
@@ -1396,30 +1419,26 @@ def _run_with_static(
     current_finalized_height: int,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
+    on_organic_complete: Callable[[list[OrganicProbeObservation]], None] | None = None,
 ) -> tuple[list[OrganicProbeObservation], int]:
-    """Verify static inputs, then schedule static sends on an isolated worker.
+    """Run static loading and sends on an isolated worker alongside organic probes.
 
-    The organic clock and send path never wait for a static miner. One static
-    worker serializes journal appends; queued static sends that miss their
-    own fire deadline are skipped instead of borrowing organic time.
+    A slow static index origin cannot delay an organic fire. One static worker
+    serializes journal appends; static sends that miss their own fire deadline
+    are skipped instead of borrowing organic time. Static-only failures abstain
+    without losing the organic epoch record.
     Returns the organic observations and organic skipped count; the static
     evidence lives in ``static_run``.
     """
 
     from .static_index import StaticSiteReleaseTrustPolicy
-    from .static_runtime import load_static_epoch, static_probe_schedule
+    from .static_runtime import (
+        abstain_static_epoch,
+        load_static_epoch,
+        static_probe_schedule,
+    )
 
     release_policy, server_digest, index_origin = pins
-    load_static_epoch(
-        static_run,
-        transport=transport,
-        policy=policy,
-        release_policy=cast(StaticSiteReleaseTrustPolicy, release_policy),
-        server_digest=server_digest,
-        index_origin=index_origin,
-        evaluation_epoch=evaluation_epoch,
-        current_finalized_height=current_finalized_height,
-    )
     observations: list[OrganicProbeObservation] = []
     organic = organic_probe_schedule(
         manifest,
@@ -1432,49 +1451,41 @@ def _run_with_static(
         epoch_index=epoch_index,
         edge_origin=edge_origin,
     )
-    static = static_probe_schedule(
-        static_run,
-        transport,
-        policy,
-        seed=seed,
-        validator_hotkey=validator_hotkey,
-        sign=sign,
-        epoch_index=epoch_index,
-        edge_origin=edge_origin,
-    )
-    epoch_end_millis = (epoch_index + 1) * DEFAULT_EPOCH_SECONDS * 1_000
+
+    def run_static() -> None:
+        try:
+            load_static_epoch(
+                static_run,
+                transport=transport,
+                policy=policy,
+                release_policy=cast(StaticSiteReleaseTrustPolicy, release_policy),
+                server_digest=server_digest,
+                index_origin=index_origin,
+                evaluation_epoch=evaluation_epoch,
+                current_finalized_height=current_finalized_height,
+            )
+            static = static_probe_schedule(
+                static_run,
+                transport,
+                policy,
+                seed=seed,
+                validator_hotkey=validator_hotkey,
+                sign=sign,
+                epoch_index=epoch_index,
+                edge_origin=edge_origin,
+            )
+            static_run.skipped = _fire_schedule(
+                static, epoch_index=epoch_index, clock=clock, sleep=sleep
+            )
+        except Exception as exc:
+            abstain_static_epoch(static_run, exc)
+
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="static-probes") as worker:
-        jobs = []
-
-        def dispatch_static(fire_at_millis: int, fire: Callable[[int], None]) -> ScheduledProbe:
-            def dispatch(now_millis: int) -> None:
-                submitted = time.monotonic()
-
-                def send() -> None:
-                    # Monotonic elapsed time measures queueing without letting
-                    # a fake or adjusted wall clock mint a stale authorization.
-                    sent_at = now_millis + max(0, int((time.monotonic() - submitted) * 1_000))
-                    if sent_at - fire_at_millis > MAX_FIRE_DELAY_MILLIS or sent_at >= epoch_end_millis:
-                        return
-                    fire(sent_at)
-
-                jobs.append(worker.submit(send))
-
-            return fire_at_millis, dispatch
-
-        ordered = sorted(
-            [(item[0], 0, position, item) for position, item in enumerate(organic)]
-            + [
-                (item[0], 1, position, dispatch_static(*item))
-                for position, item in enumerate(static)
-            ]
-        )
-        _fire_schedule(
-            [entry[3] for entry in ordered], epoch_index=epoch_index, clock=clock, sleep=sleep
-        )
-        for job in jobs:
-            job.result()
-    static_run.skipped = len(static) - len(static_run.observations)
+        job = worker.submit(run_static)
+        _fire_schedule(organic, epoch_index=epoch_index, clock=clock, sleep=sleep)
+        if on_organic_complete is not None:
+            on_organic_complete(observations)
+        job.result()
     return observations, len(organic) - len(observations)
 
 

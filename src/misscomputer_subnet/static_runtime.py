@@ -40,6 +40,7 @@ from pydantic import ValidationError
 from .assignment_probe import (
     MAX_DOCUMENT_BYTES,
     MAX_KEYS,
+    AssignmentManifestChainState,
     AssignmentManifestSignatureEnvelope,
     AssignmentManifestTrustPolicy,
     AssignmentProbeError,
@@ -120,6 +121,7 @@ class StaticEpochRun:
 
     config: StaticSitesConfig
     root: _StateRoot | None
+    prior_state: AssignmentManifestChainState | None = None
     #: Set when the static path abstains for the whole epoch (no v3 manifest).
     abstained_code: str | None = None
     verification: AssignmentManifestV3Verification | None = None
@@ -243,12 +245,14 @@ def preflight_static(
     return _load_release_policy(config.release_trust_policy), server_digest, index_origin
 
 
-def lock_static_epoch(config: StaticSitesConfig) -> StaticEpochRun:
+def lock_static_epoch(
+    config: StaticSitesConfig, policy: AssignmentManifestTrustPolicy
+) -> StaticEpochRun:
     """Take the static state root lock, preflight the output and open the journal.
 
     Runs before the organic manifest is loaded, so a busy or unsafe static
-    root, an unsafe output, or an unsafe or tampered journal refuses the whole
-    run before any state advances or any probe is sent.
+    root, stale anchor, unsafe output, or unsafe or tampered journal refuses
+    the whole run before any state advances or any probe is sent.
     """
 
     root = _StateRoot(config.state_root)
@@ -256,6 +260,7 @@ def lock_static_epoch(config: StaticSitesConfig) -> StaticEpochRun:
     try:
         _preflight_output(config.epoch_output, state_root=root.path)
         run.journal = _open_journal(config.journal)
+        run.prior_state = _resolve_prior_state(root, policy, config.trusted_state_anchor)
     except BaseException:
         run.close()
         raise
@@ -283,7 +288,9 @@ def load_static_epoch(
 
     config = run.config
     root = cast(_StateRoot, run.root)
-    prior = _resolve_prior_state(root, policy, config.trusted_state_anchor)
+    prior = run.prior_state
+    if prior is None:
+        _fail("static_state_unavailable")
     try:
         manifest, signatures = _load_v3_publication(
             config, transport, policy.probe_timeout_millis / 1000
@@ -350,6 +357,23 @@ def _open_journal(path: str) -> StaticEvidenceJournal:
         raise AssignmentProbeCLIError(
             code if code.startswith("static_evidence_") else "static_journal_invalid"
         ) from exc
+
+
+def abstain_static_epoch(run: StaticEpochRun, exc: Exception) -> None:
+    """Keep a static-only runtime fault from invalidating an organic record.
+
+    The journal may contain partial static evidence, but no partial static
+    score is published. The error code is intentionally bounded and contains
+    no exception message or index-origin data.
+    """
+
+    code = getattr(exc, "code", None)
+    run.abstained_code = (
+        (code if code.startswith("static_") else f"static_{code}")[:64]
+        if isinstance(code, str) and code
+        else "static_internal_error"
+    )
+    run.verification = None
 
 
 def static_probe_ceiling(policy: AssignmentManifestTrustPolicy) -> int:

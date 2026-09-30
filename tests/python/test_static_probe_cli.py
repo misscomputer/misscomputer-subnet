@@ -79,7 +79,9 @@ def test_stalled_static_send_cannot_delay_an_organic_probe(
         static_completed.append(organic_sent.wait(0.5))
         static_run.observations.append("static")
 
-    def organic_schedule(_manifest: Any, _policy: Any, _transport: Any, observations: list[str], **_kw: Any) -> list[Any]:
+    def organic_schedule(
+        _manifest: Any, _policy: Any, _transport: Any, observations: list[str], **_kw: Any
+    ) -> list[Any]:
         def organic_fire(_now: int) -> None:
             organic_sent.set()
             observations.append("organic")
@@ -95,7 +97,9 @@ def test_stalled_static_send_cannot_delay_an_organic_probe(
     observed, skipped = probe_cli._run_with_static(
         static_run,
         (object(), "server", "index"),
-        object(), object(), object(),
+        object(),
+        object(),
+        object(),
         seed=b"x" * 32,
         validator_hotkey="validator",
         sign=lambda value: value,
@@ -278,6 +282,105 @@ def test_a_tampered_journal_refuses_the_run_before_any_state_or_probe(tmp_path: 
     assert error.value.code == "static_evidence_journal_invalid"
     assert publication.world.calls == []
     assert not (Path(later.state_root) / "state.json").exists()
+
+
+def test_stale_static_anchor_refuses_before_organic_state_advances(tmp_path: Path) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    first = cli_config(publication, tmp_path / "first")
+    execute(first, publication.world)
+    assert first.static_sites is not None
+    later = cli_config(publication, tmp_path / "later")
+    assert later.static_sites is not None
+    later = replace(
+        later,
+        static_sites=replace(
+            later.static_sites,
+            state_root=first.static_sites.state_root,
+            trusted_state_anchor="genesis",
+        ),
+    )
+    publication.world.calls.clear()
+
+    with pytest.raises(AssignmentProbeCLIError) as error:
+        execute(later, publication.world)
+
+    assert error.value.code == "state_anchor_stale"
+    assert publication.world.calls == []
+    assert not (Path(later.state_root) / "state.json").exists()
+    assert not Path(later.epoch_output).exists()
+
+
+def test_static_worker_failure_abstains_without_losing_organic_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    off = cli_config(publication, tmp_path / "off", static=False)
+    execute(off, publication.world)
+    on = cli_config(publication, tmp_path / "on")
+
+    def fail_index(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("index unavailable")
+
+    monkeypatch.setattr(static_runtime, "fetch_static_index_documents", fail_index)
+    result = execute(on, publication.world)
+
+    assert len(result.epoch.observations) == 18 and result.skipped_probes == 0
+    assert Path(on.epoch_output).read_bytes() == Path(off.epoch_output).read_bytes()
+    assert result.static is not None
+    assert result.static.epoch is None
+    assert result.static.abstained_code == "static_internal_error"
+    assert on.static_sites is not None
+    assert not Path(on.static_sites.epoch_output).exists()
+
+
+def test_slow_static_index_does_not_delay_organic_output_or_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    off = cli_config(publication, tmp_path / "off", static=False)
+    execute(off, publication.world)
+    on = cli_config(publication, tmp_path / "on")
+    started = threading.Event()
+    unblock = threading.Event()
+    organic_written = threading.Event()
+    original_fetch = static_runtime.fetch_static_index_documents
+    original_write = probe_cli._write_output
+
+    def slow_index(*args: Any, **kwargs: Any) -> Any:
+        started.set()
+        if not unblock.wait(3):
+            raise AssertionError("test index was not released")
+        return original_fetch(*args, **kwargs)
+
+    def watch_output(path: str, rendered: bytes, *, state_root: str) -> None:
+        original_write(path, rendered, state_root=state_root)
+        if path == on.epoch_output:
+            organic_written.set()
+
+    monkeypatch.setattr(static_runtime, "fetch_static_index_documents", slow_index)
+    monkeypatch.setattr(probe_cli, "_write_output", watch_output)
+    results: list[Any] = []
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(execute(on, publication.world))
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert started.wait(2)
+        assert organic_written.wait(2)
+        assert thread.is_alive()  # still blocked solely on the static index
+    finally:
+        unblock.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive() and not failures
+    assert len(results) == 1
+    assert results[0].skipped_probes == 0
+    assert Path(on.epoch_output).read_bytes() == Path(off.epoch_output).read_bytes()
 
 
 def test_static_state_root_may_not_alias_the_organic_root(tmp_path: Path) -> None:

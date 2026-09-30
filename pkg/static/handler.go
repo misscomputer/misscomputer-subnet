@@ -3,6 +3,7 @@
 package static
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -165,8 +166,8 @@ func (x *Index) Resolve(method, rawPath string, hasBody bool) Response {
 }
 
 // implementationSources are the handler-package files that define the
-// static-handler.v1 semantics. Origin and miner compile the same files, so
-// they derive the same ServerImplementationDigest.
+// static-handler.v1 semantics. The public and staged private copies differ
+// only in Go module import paths, which are normalized in the descriptor.
 //
 //go:embed handler.go manifest.go path.go serve.go
 var implementationSources embed.FS
@@ -201,6 +202,14 @@ func implementationDigest() string {
 		if err != nil {
 			panic(err)
 		}
+		// Staging rewrites this module path without changing handler semantics.
+		// Split the string literals so the staging rewrite cannot rewrite the
+		// normalizer itself and make the two compiled pins diverge.
+		source = bytes.ReplaceAll(
+			source,
+			[]byte("github.com/misscomputer/misscomputer-"+"infra/pkg/"),
+			[]byte("github.com/misscomputer/misscomputer-"+"subnet/pkg/"),
+		)
 		sum := sha256.Sum256(source)
 		descriptor.Files = append(descriptor.Files, implementationFile{Path: "pkg/static/" + name, SHA256: hex.EncodeToString(sum[:])})
 	}

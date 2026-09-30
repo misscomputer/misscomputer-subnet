@@ -113,7 +113,9 @@ func TestParseRejectsManifestsWithAttributedCodes(t *testing.T) {
 	many = append(many, index)
 	big := make([]static.File, 0, 17)
 	for i := 0; i < 16; i++ {
-		big = append(big, file("/b"+fmt.Sprintf("%02d", i)+".bin", static.MaxFileBytes))
+		entry := file("/b"+fmt.Sprintf("%02d", i)+".bin", static.MaxFileBytes)
+		entry.BodySHA256 = sha([]byte(fmt.Sprintf("big-%d", i)))
+		big = append(big, entry)
 	}
 	big = append(big, file("/c.bin", 1), index)
 	cases := []struct {
@@ -317,6 +319,56 @@ func TestReleaseKeepsBlobsReferencedByAnotherSite(t *testing.T) {
 	two.Release()
 	if blobCount(t, cacheRoot) != 0 || cache.Occupancy() != 0 {
 		t.Fatalf("blobs %d occupancy %d after both releases", blobCount(t, cacheRoot), cache.Occupancy())
+	}
+}
+
+// A failed pin cannot evict the verified bytes of a different pinned site,
+// even when its signed manifest names the same digest with a false length.
+func TestInconsistentDigestLengthCannotEvictAnotherSite(t *testing.T) {
+	store := newSiteStore(t)
+	for _, body := range exampleBodyList() {
+		store.put(t, body)
+	}
+	cacheRoot := t.TempDir()
+	cache, err := static.OpenCache(cacheRoot, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := exampleManifest(true)
+	_, firstDigest, _ := static.Encode(first)
+	one, err := cache.Pin(context.Background(), store.store, firstDigest, first, static.PinOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.Release()
+	before := cache.Occupancy()
+	second := exampleManifest(false)
+	second.Files = []static.File{first.Files[3]} // /index.html
+	second.Files[0].ContentLength -= 3
+	_, secondDigest, err := static.Encode(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := cache.Pin(context.Background(), store.store, secondDigest, second, static.PinOptions{})
+	if two != nil || static.CodeOf(err) != static.CodeManifestInvalid {
+		t.Fatalf("inconsistent pin: site %v code %q (%v)", two, static.CodeOf(err), err)
+	}
+	if cache.Occupancy() != before || blobCount(t, cacheRoot) != 4 {
+		t.Fatalf("failed pin changed occupancy %d or blobs %d", cache.Occupancy(), blobCount(t, cacheRoot))
+	}
+	server := httptest.NewServer(static.NewHandler(one.Index(), one, "", 0))
+	defer server.Close()
+	got := statictest.RawRequest(t, server.Listener.Addr().String(), "GET", "/", "x", "", "")
+	if got.Status != 200 || !bytes.Equal(got.Body, exampleBodies["/index.html"]) {
+		t.Fatalf("first site after failed pin: %d %q", got.Status, got.Body)
+	}
+}
+
+func TestManifestRejectsOneDigestWithTwoLengths(t *testing.T) {
+	m := exampleManifest(true)
+	m.Files[1].BodySHA256 = m.Files[0].BodySHA256
+	if static.CodeOf(m.Validate()) != static.CodeManifestInvalid {
+		t.Fatal("manifest accepted one digest with inconsistent lengths")
 	}
 }
 

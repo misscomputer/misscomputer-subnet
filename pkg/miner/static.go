@@ -369,6 +369,12 @@ func (a *Agent) serveStatic(w http.ResponseWriter, req *http.Request, endpointID
 		if headerSent {
 			panic(http.ErrAbortHandler)
 		}
+		// WriteResponse prepared the expected 200 headers before opening the
+		// body. None of them, especially the signed probe attestation, belongs
+		// on the actual 502 response.
+		for name := range w.Header() {
+			delete(w.Header(), name)
+		}
 		http.Error(w, "static endpoint unavailable", http.StatusBadGateway)
 	}
 }

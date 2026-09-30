@@ -155,6 +155,9 @@ func (c *Cache) reserve(unique map[string]int64) error {
 	defer c.mu.Unlock()
 	var added int64
 	for sha, size := range unique {
+		if c.refs[sha] > 0 && c.sizes[sha] != size {
+			return failf(CodeManifestInvalid, "static_digest_length_inconsistent: cached digest")
+		}
 		if c.refs[sha] == 0 {
 			added += size
 		}
@@ -171,7 +174,9 @@ func (c *Cache) reserve(unique map[string]int64) error {
 	}
 	for sha, size := range unique {
 		c.refs[sha]++
-		c.sizes[sha] = size
+		if c.refs[sha] == 1 {
+			c.sizes[sha] = size
+		}
 	}
 	c.occupancy += added
 	return nil
@@ -227,8 +232,17 @@ func (c *Cache) ensure(ctx context.Context, blobs artifact.BlobOpener, sha strin
 		if verifyErr == nil {
 			return nil
 		}
-		if err := os.Remove(path); err != nil {
-			return Fail(CodeInternal, err)
+		// A different pinned site may still be serving this blob. A new
+		// requester's verification failure must never delete its bytes.
+		c.mu.Lock()
+		if c.refs[sha] > 1 {
+			c.mu.Unlock()
+			return Fail(CodeVerifyFailed, verifyErr)
+		}
+		removeErr := os.Remove(path)
+		c.mu.Unlock()
+		if removeErr != nil {
+			return Fail(CodeInternal, removeErr)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Fail(CodeInternal, err)

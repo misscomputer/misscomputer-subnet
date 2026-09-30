@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -456,16 +457,17 @@ def config_argv(config: AssignmentProbeCLIConfig) -> list[str]:
 
 
 class FakeTime:
-    """Wall clock that only advances when the CLI sleeps."""
+    """Fast-forward each concurrent scheduler's clock independently."""
 
     def __init__(self, start: float) -> None:
-        self.now = start
+        self.start = start
+        self.local = threading.local()
 
     def clock(self) -> float:
-        return self.now
+        return getattr(self.local, "now", self.start)
 
     def sleep(self, seconds: float) -> None:
-        self.now += seconds
+        self.local.now = self.clock() + seconds
 
 
 def alice_signer(_wallet: WalletSelector) -> tuple[Callable[[bytes], bytes], str]:

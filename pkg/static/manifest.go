@@ -178,6 +178,7 @@ func (m Manifest) Validate() error {
 	var total int64
 	folded := make(map[string]bool, len(m.Files))
 	directories := make(map[string]bool)
+	lengths := make(map[string]int64, len(m.Files))
 	for index, file := range m.Files {
 		if index > 0 && file.Path <= m.Files[index-1].Path {
 			return failf(CodeManifestInvalid, "static_paths_not_ascending")
@@ -200,6 +201,10 @@ func (m Manifest) Validate() error {
 			len(file.ContentType) > MaxContentTypeLen || file.ContentType != ContentTypeFor(file.Path) {
 			return failf(CodeManifestInvalid, "static_content_type_invalid: path %d has an invalid length, digest or content type", index)
 		}
+		if size, seen := lengths[file.BodySHA256]; seen && size != file.ContentLength {
+			return failf(CodeManifestInvalid, "static_digest_length_inconsistent: path %d", index)
+		}
+		lengths[file.BodySHA256] = file.ContentLength
 		key := strings.ToLower(file.Path)
 		if folded[key] {
 			return failf(CodeManifestInvalid, "static_case_fold_collision: path %d", index)
