@@ -42,6 +42,14 @@ type LocalStaticAssignRequestV1 struct {
 	Ticket           protocol.StaticTicketV1 `json:"ticket"`
 }
 
+// BridgeStaticAssignRequestV1 is the scheduler-to-validator loopback request
+// that places one static ticket on one miner.
+type BridgeStaticAssignRequestV1 struct {
+	Protocol  string                  `json:"protocol"`
+	RequestID string                  `json:"request_id"`
+	Ticket    protocol.StaticTicketV1 `json:"ticket"`
+}
+
 // StaticDeployResponseV1 answers one static assignment with its signed
 // receipt, including failed receipts so their error_code reaches the
 // assigning validator.
@@ -98,6 +106,13 @@ func (r LocalStaticAssignRequestV1) Validate() error {
 	}
 	if !organic.ValidHotkey(r.CallerHotkey) {
 		return errors.New("caller_hotkey is invalid")
+	}
+	return r.Ticket.Validate()
+}
+
+func (r BridgeStaticAssignRequestV1) Validate() error {
+	if err := validStaticEnvelope(r.Protocol, r.RequestID); err != nil {
+		return err
 	}
 	return r.Ticket.Validate()
 }

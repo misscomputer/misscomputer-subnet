@@ -1,0 +1,42 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "caller_hotkey": {
+      "pattern": "^[A-Za-z0-9]{1,128}$",
+      "title": "Caller Hotkey",
+      "type": "string"
+    },
+    "current_block": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Current Block",
+      "type": "integer"
+    },
+    "endpoint_id": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "Endpoint Id",
+      "type": "string"
+    },
+    "protocol": {
+      "const": "subnet-static-synapse.v1",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "request_id",
+    "current_block",
+    "caller_hotkey",
+    "endpoint_id"
+  ],
+  "title": "StaticStatusSynapseV1",
+  "type": "object"
+}

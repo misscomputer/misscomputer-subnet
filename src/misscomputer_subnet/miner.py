@@ -24,10 +24,11 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import organic_contracts
+from . import organic_contracts, static_contracts
 from .auth import (
     BRIDGE_MAX_BODY,
     BridgeClient,
+    BridgeError,
     HotkeySigningFacade,
     SQLiteNonceStore,
     bridge_headers,
@@ -60,6 +61,14 @@ from .protocol import (
     LocalCapabilities,
     ServiceKeyBinding,
     StatusSynapse,
+    SubnetBinding,
+)
+from .static_contracts import (
+    LocalStaticAssignRequestV1,
+    StaticDeployResponseV1,
+    StaticDeploySynapseV1,
+    StaticStatusResponseV1,
+    StaticStatusSynapseV1,
 )
 from .tls import MinerTLSConfig, validate_miner_tls_files
 
@@ -371,6 +380,80 @@ class MinerNeuron:
             raise HTTPException(status_code=409, detail="request block is stale or from the future")
         return snapshot
 
+    async def _verify_assignment_identity(
+        self,
+        caller_hotkey: str,
+        current_block: int,
+        validator_binding: ServiceKeyBinding,
+        binding: SubnetBinding,
+    ) -> None:
+        """Bind a validator assignment to btauth, the metagraph and this miner.
+
+        Every assignment kind (deployment.v4 and static-deployment v1) shares
+        these checks before anything reaches the Go agent.
+        """
+
+        snapshot = await self._snapshot_for(current_block)
+        expected_challenge = "validator-service:" + validator_binding.service_public_key
+        try:
+            verify_service_binding(
+                validator_binding,
+                expected_hotkey=caller_hotkey,
+                expected_role="validator",
+                expected_network=self.network,
+                expected_netuid=self.netuid,
+                expected_challenge=expected_challenge,
+                expected_transport="local",
+                expected_transport_certificate_sha256=None,
+                # The signed request block is authoritative after
+                # _snapshot_for has bounded it to the local metagraph by
+                # two blocks. A miner one block behind must not reject a
+                # binding whose valid_from_block is the validator's block.
+                current_block=current_block,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        validator = snapshot.by_hotkey(caller_hotkey)
+        if (
+            validator is None
+            or validator_binding.uid != validator.uid
+            or binding.validator_hotkey != caller_hotkey
+            or binding.miner_hotkey != self.hotkey
+            or binding.miner_uid != self.uid
+            or binding.network != self.network
+            or binding.netuid != self.netuid
+            or binding.miner_transport != ("http" if self.mock_http else "https")
+            or binding.miner_tls_certificate_sha256
+            != (None if self.tls_config is None else self.tls_config.fingerprint_sha256)
+            or binding.validator_service_public_key != validator_binding.service_public_key
+            or binding.epoch != binding.chain_block // max(snapshot.tempo, 1)
+            or binding.chain_block > snapshot.block + 2
+            or snapshot.block >= binding.expires_at_block
+        ):
+            raise HTTPException(status_code=403, detail="ticket Bittensor identity mismatch")
+
+    async def _static_bridge(
+        self,
+        path: str,
+        value: LocalStaticAssignRequestV1 | StaticStatusSynapseV1,
+        response_model: type[StaticDeployResponseV1] | type[StaticStatusResponseV1],
+    ) -> StaticDeployResponseV1 | StaticStatusResponseV1:
+        """Forward one static request to Go, keeping its stable error code.
+
+        A miner whose agent runs with ``--static-sites off`` answers
+        ``static_disabled``; the validator treats that as ineligibility
+        (capability misreport), never as a fault.
+        """
+
+        try:
+            result = await self.bridge.request(
+                "POST", path, value=value, response_model=response_model
+            )
+        except BridgeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+        assert isinstance(result, (StaticDeployResponseV1, StaticStatusResponseV1))
+        return result
+
     def _routes(self) -> None:
         @self.app.get("/healthz")
         async def health() -> Response:
@@ -455,46 +538,12 @@ class MinerNeuron:
                 raise HTTPException(
                     status_code=403, detail="body caller differs from btauth caller"
                 )
-            snapshot = await self._snapshot_for(synapse.current_block)
-            expected_challenge = "validator-service:" + synapse.validator_binding.service_public_key
-            try:
-                verify_service_binding(
-                    synapse.validator_binding,
-                    expected_hotkey=caller.hotkey,
-                    expected_role="validator",
-                    expected_network=self.network,
-                    expected_netuid=self.netuid,
-                    expected_challenge=expected_challenge,
-                    expected_transport="local",
-                    expected_transport_certificate_sha256=None,
-                    # The signed request block is authoritative after
-                    # _snapshot_for has bounded it to the local metagraph by
-                    # two blocks. A miner one block behind must not reject a
-                    # binding whose valid_from_block is the validator's block.
-                    current_block=synapse.current_block,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=403, detail=str(exc)) from exc
-            binding = synapse.ticket.subnet
-            validator = snapshot.by_hotkey(caller.hotkey)
-            if (
-                validator is None
-                or synapse.validator_binding.uid != validator.uid
-                or binding.validator_hotkey != caller.hotkey
-                or binding.miner_hotkey != self.hotkey
-                or binding.miner_uid != self.uid
-                or binding.network != self.network
-                or binding.netuid != self.netuid
-                or binding.miner_transport != ("http" if self.mock_http else "https")
-                or binding.miner_tls_certificate_sha256
-                != (None if self.tls_config is None else self.tls_config.fingerprint_sha256)
-                or binding.validator_service_public_key
-                != synapse.validator_binding.service_public_key
-                or binding.epoch != binding.chain_block // max(snapshot.tempo, 1)
-                or binding.chain_block > snapshot.block + 2
-                or snapshot.block >= binding.expires_at_block
-            ):
-                raise HTTPException(status_code=403, detail="ticket Bittensor identity mismatch")
+            await self._verify_assignment_identity(
+                caller.hotkey,
+                synapse.current_block,
+                synapse.validator_binding,
+                synapse.ticket.subnet,
+            )
             local_request = {
                 "protocol": ORGANIC_SYNAPSE_VERSION,
                 "request_id": synapse.request_id,
@@ -533,6 +582,64 @@ class MinerNeuron:
             )
             assert isinstance(payload, StatusResponseV3)
             return payload
+
+        @self.app.post("/api/v1/static/deploy", response_model=None)
+        async def static_deploy(request: Request) -> StaticDeployResponseV1:
+            body = await self._body(request)
+            caller = await self._authenticated(request, body)
+            # Static tickets travel only in subnet-static-synapse.v1; the
+            # organic route above never accepts one and this route never
+            # accepts a deployment.v4 ticket.
+            if _envelope_protocol(body) != static_contracts.SYNAPSE_VERSION:
+                raise HTTPException(
+                    status_code=422,
+                    detail="only subnet-static-synapse.v1 static assignments are accepted",
+                )
+            try:
+                synapse = parse_document(body, StaticDeploySynapseV1)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if synapse.caller_hotkey != caller.hotkey:
+                raise HTTPException(
+                    status_code=403, detail="body caller differs from btauth caller"
+                )
+            await self._verify_assignment_identity(
+                caller.hotkey,
+                synapse.current_block,
+                synapse.validator_binding,
+                synapse.ticket.subnet,
+            )
+            local = LocalStaticAssignRequestV1(
+                protocol=static_contracts.SYNAPSE_VERSION,
+                request_id=synapse.request_id,
+                current_block=synapse.current_block,
+                caller_hotkey=caller.hotkey,
+                binding_verified=True,
+                validator_binding=synapse.validator_binding,
+                ticket=synapse.ticket,
+            )
+            async with self.gate.slot(caller.priority):
+                result = await self._static_bridge(
+                    "/v1/static/assignments", local, StaticDeployResponseV1
+                )
+            assert isinstance(result, StaticDeployResponseV1)
+            return result
+
+        @self.app.post("/api/v1/static/status", response_model=None)
+        async def static_status(request: Request) -> StaticStatusResponseV1:
+            body = await self._body(request)
+            caller = await self._authenticated(request, body)
+            try:
+                synapse = parse_document(body, StaticStatusSynapseV1)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if synapse.caller_hotkey != caller.hotkey:
+                raise HTTPException(status_code=403, detail="caller mismatch")
+            snapshot = await self._snapshot_for(synapse.current_block)
+            local = synapse.model_copy(update={"current_block": snapshot.block})
+            result = await self._static_bridge("/v1/static/status", local, StaticStatusResponseV1)
+            assert isinstance(result, StaticStatusResponseV1)
+            return result
 
         @self.app.post("/api/v1/deactivate", response_model=DeactivateResponse)
         async def deactivate(request: Request) -> DeactivateResponse:

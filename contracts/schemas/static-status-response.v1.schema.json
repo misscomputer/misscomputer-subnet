@@ -1,0 +1,420 @@
+{
+  "$defs": {
+    "StaticDeploymentReceiptV1": {
+      "additionalProperties": false,
+      "properties": {
+        "assignment_nonce": {
+          "pattern": "^[0-9a-f]{32}$",
+          "title": "Assignment Nonce",
+          "type": "string"
+        },
+        "assignment_seen": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Assignment Seen"
+        },
+        "deployment_id": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Deployment Id",
+          "type": "string"
+        },
+        "endpoint_id": {
+          "maxLength": 320,
+          "minLength": 3,
+          "title": "Endpoint Id",
+          "type": "string"
+        },
+        "error": {
+          "maxLength": 512,
+          "pattern": "^[\\x20-\\x7e]*$",
+          "title": "Error",
+          "type": "string"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "enum": [
+                "static_fetch_failed",
+                "static_verify_failed",
+                "static_storage_exhausted",
+                "static_server_implementation_mismatch",
+                "static_manifest_invalid",
+                "static_limits_exceeded",
+                "deactivated",
+                "internal"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error Code"
+        },
+        "fetch_completed": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Fetch Completed"
+        },
+        "fetch_started": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Fetch Started"
+        },
+        "generation": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "miner_id": {
+          "pattern": "^[A-Za-z0-9]{1,128}$",
+          "title": "Miner Id",
+          "type": "string"
+        },
+        "release_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Release Digest",
+          "type": "string"
+        },
+        "replica_id": {
+          "maxLength": 256,
+          "minLength": 3,
+          "title": "Replica Id",
+          "type": "string"
+        },
+        "route_host": {
+          "maxLength": 253,
+          "title": "Route Host",
+          "type": "string"
+        },
+        "schema": {
+          "const": "miss.computer/misscomputer-subnet/static-deployment-receipt",
+          "title": "Schema",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "server_implementation_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Server Implementation Digest",
+          "type": "string"
+        },
+        "serving_started": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Serving Started"
+        },
+        "signature": {
+          "pattern": "^[0-9a-f]{128}$",
+          "title": "Signature",
+          "type": "string"
+        },
+        "site_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Site Digest",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "accepted",
+            "ready",
+            "failed"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "subnet": {
+          "$ref": "#/$defs/StaticSubnetBinding"
+        },
+        "ticket_digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Ticket Digest",
+          "type": "string"
+        },
+        "verified_file_count": {
+          "anyOf": [
+            {
+              "maximum": 4096,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Verified File Count"
+        },
+        "verified_total_bytes": {
+          "anyOf": [
+            {
+              "maximum": 268435456,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Verified Total Bytes"
+        }
+      },
+      "required": [
+        "assignment_nonce",
+        "assignment_seen",
+        "deployment_id",
+        "endpoint_id",
+        "error",
+        "error_code",
+        "fetch_completed",
+        "fetch_started",
+        "generation",
+        "miner_id",
+        "release_digest",
+        "replica_id",
+        "route_host",
+        "schema",
+        "schema_version",
+        "server_implementation_digest",
+        "serving_started",
+        "signature",
+        "site_digest",
+        "stage",
+        "subnet",
+        "ticket_digest",
+        "verified_file_count",
+        "verified_total_bytes"
+      ],
+      "title": "StaticDeploymentReceiptV1",
+      "type": "object"
+    },
+    "StaticSubnetBinding": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "miner_transport": {
+                "const": "https"
+              }
+            },
+            "required": [
+              "miner_transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "miner_tls_certificate_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "miner_transport": {
+                "const": "http"
+              }
+            },
+            "required": [
+              "miner_transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "miner_tls_certificate_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "description": "The deployment.v4 subnet binding with ``miner_uid`` always present.",
+      "properties": {
+        "chain_block": {
+          "minimum": 0,
+          "title": "Chain Block",
+          "type": "integer"
+        },
+        "epoch": {
+          "minimum": 0,
+          "title": "Epoch",
+          "type": "integer"
+        },
+        "expires_at_block": {
+          "minimum": 1,
+          "title": "Expires At Block",
+          "type": "integer"
+        },
+        "miner_axon_url": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Axon Url",
+          "type": "string"
+        },
+        "miner_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Miner Hotkey",
+          "type": "string"
+        },
+        "miner_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Miner Service Public Key",
+          "type": "string"
+        },
+        "miner_tls_certificate_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Miner Tls Certificate Sha256"
+        },
+        "miner_transport": {
+          "enum": [
+            "https",
+            "http"
+          ],
+          "title": "Miner Transport",
+          "type": "string"
+        },
+        "miner_uid": {
+          "anyOf": [
+            {
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Miner Uid"
+        },
+        "netuid": {
+          "maximum": 65535,
+          "minimum": 0,
+          "title": "Netuid",
+          "type": "integer"
+        },
+        "network": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Network",
+          "type": "string"
+        },
+        "validator_hotkey": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Validator Hotkey",
+          "type": "string"
+        },
+        "validator_service_public_key": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Validator Service Public Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "network",
+        "netuid",
+        "validator_hotkey",
+        "miner_hotkey",
+        "miner_uid",
+        "miner_axon_url",
+        "miner_transport",
+        "miner_tls_certificate_sha256",
+        "chain_block",
+        "epoch",
+        "expires_at_block",
+        "validator_service_public_key",
+        "miner_service_public_key"
+      ],
+      "title": "StaticSubnetBinding",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "subnet-static-synapse.v1",
+      "title": "Protocol",
+      "type": "string"
+    },
+    "receipt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StaticDeploymentReceiptV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request_id": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "absent",
+        "processing",
+        "accepted",
+        "ready",
+        "failed",
+        "deactivated"
+      ],
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol",
+    "request_id",
+    "status",
+    "receipt"
+  ],
+  "title": "StaticStatusResponseV1",
+  "type": "object"
+}

@@ -1,0 +1,108 @@
+{
+  "$defs": {
+    "StaticFallback": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "spa-html-v1",
+          "title": "Kind",
+          "type": "string"
+        },
+        "target": {
+          "maxLength": 1024,
+          "minLength": 2,
+          "title": "Target",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "target"
+      ],
+      "title": "StaticFallback",
+      "type": "object"
+    },
+    "StaticFile": {
+      "additionalProperties": false,
+      "properties": {
+        "body_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Body Sha256",
+          "type": "string"
+        },
+        "content_length": {
+          "maximum": 16777216,
+          "minimum": 0,
+          "title": "Content Length",
+          "type": "integer"
+        },
+        "content_type": {
+          "maxLength": 128,
+          "title": "Content Type",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 1024,
+          "minLength": 2,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "body_sha256",
+        "content_length",
+        "content_type",
+        "path"
+      ],
+      "title": "StaticFile",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "``static-site-manifest`` v1; its identity is ``site_digest`` of the stored bytes.",
+  "properties": {
+    "fallback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StaticFallback"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/StaticFile"
+      },
+      "maxItems": 4096,
+      "minItems": 1,
+      "title": "Files",
+      "type": "array"
+    },
+    "handler": {
+      "const": "static-handler.v1",
+      "title": "Handler",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/static-site-manifest",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "fallback",
+    "files",
+    "handler",
+    "schema",
+    "schema_version"
+  ],
+  "title": "StaticSiteManifest",
+  "type": "object"
+}

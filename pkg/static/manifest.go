@@ -180,7 +180,7 @@ func (m Manifest) Validate() error {
 	directories := make(map[string]bool)
 	for index, file := range m.Files {
 		if index > 0 && file.Path <= m.Files[index-1].Path {
-			return failf(CodeManifestInvalid, "site manifest paths must be strictly ascending")
+			return failf(CodeManifestInvalid, "static_paths_not_ascending")
 		}
 		if len(file.Path) > MaxPathBytes || strings.Count(file.Path, "/") > MaxDepth {
 			return failf(CodeLimitsExceeded, "site manifest path %d exceeds the path limits", index)
@@ -191,18 +191,18 @@ func (m Manifest) Validate() error {
 			}
 		}
 		if !ValidFilePath(file.Path) {
-			return failf(CodeManifestInvalid, "site manifest path %d is not a canonical file path", index)
+			return failf(CodeManifestInvalid, "static_path_invalid: path %d", index)
 		}
 		if file.ContentLength > MaxFileBytes {
 			return failf(CodeLimitsExceeded, "site manifest path %d exceeds %d bytes", index, MaxFileBytes)
 		}
 		if file.ContentLength < 0 || !organic.ValidHex64(file.BodySHA256) ||
 			len(file.ContentType) > MaxContentTypeLen || file.ContentType != ContentTypeFor(file.Path) {
-			return failf(CodeManifestInvalid, "site manifest path %d has an invalid length, digest or content type", index)
+			return failf(CodeManifestInvalid, "static_content_type_invalid: path %d has an invalid length, digest or content type", index)
 		}
 		key := strings.ToLower(file.Path)
 		if folded[key] {
-			return failf(CodeManifestInvalid, "site manifest path %d collides under ASCII case folding", index)
+			return failf(CodeManifestInvalid, "static_case_fold_collision: path %d", index)
 		}
 		folded[key] = true
 		for cut := strings.LastIndexByte(key, '/'); cut > 0; cut = strings.LastIndexByte(key[:cut], '/') {
@@ -212,17 +212,17 @@ func (m Manifest) Validate() error {
 	}
 	for key := range folded {
 		if directories[key] {
-			return failf(CodeManifestInvalid, "site manifest path is both a file and a directory")
+			return failf(CodeManifestInvalid, "static_file_directory_collision")
 		}
 	}
 	if total > MaxTotalBytes {
-		return failf(CodeLimitsExceeded, "site files exceed %d bytes in total", MaxTotalBytes)
+		return failf(CodeLimitsExceeded, "static_total_bytes_exceeded: more than %d bytes", MaxTotalBytes)
 	}
 	if !m.lists(IndexPath, htmlType) {
-		return failf(CodeManifestInvalid, "site manifest must list %s as HTML", IndexPath)
+		return failf(CodeManifestInvalid, "static_index_missing: %s must be listed as HTML", IndexPath)
 	}
 	if m.Fallback != nil && (m.Fallback.Kind != FallbackKind || !m.lists(m.Fallback.Target, htmlType)) {
-		return failf(CodeManifestInvalid, "site manifest fallback must be %s naming a listed HTML file", FallbackKind)
+		return failf(CodeManifestInvalid, "static_fallback_invalid: must be %s naming a listed HTML file", FallbackKind)
 	}
 	return nil
 }

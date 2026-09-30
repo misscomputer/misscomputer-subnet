@@ -143,10 +143,12 @@ func (t StaticTicketV1) validateUnsigned() error {
 		return errors.New("static ticket schema or workload kind is invalid")
 	}
 	if !organic.ValidRouteLabel(t.DeploymentID) || t.Generation < 1 || !lowercaseHex(t.AssignmentNonce, 32) ||
-		!organic.ValidHotkey(t.MinerID) || t.RouteHost != organic.RouteHost(t.DeploymentID) ||
-		!organic.ValidDigest(t.SiteDigest) || !organic.ValidDigest(t.ReleaseDigest) ||
+		!organic.ValidHotkey(t.MinerID) || !organic.ValidDigest(t.SiteDigest) || !organic.ValidDigest(t.ReleaseDigest) ||
 		!organic.ValidDigest(t.ServerImplementationDigest) {
 		return errors.New("static ticket identity is invalid")
+	}
+	if t.RouteHost != organic.RouteHost(t.DeploymentID) {
+		return errors.New("route_host_mismatch")
 	}
 	if t.SiteManifestKey != static.ManifestKey(t.SiteDigest) {
 		return errors.New("site_manifest_key_mismatch")
@@ -209,7 +211,7 @@ func (r StaticReceiptV1) validateUnsigned() error {
 		return errors.New("receipt stage is invalid")
 	}
 	if ready != (r.VerifiedFileCount != nil) || ready != (r.VerifiedTotalBytes != nil) {
-		return errors.New("verified counts must be present exactly on ready")
+		return errors.New("verified_counts_invalid")
 	}
 	if ready && (r.Error != "" || *r.VerifiedFileCount < 1 || *r.VerifiedFileCount > static.MaxFiles ||
 		*r.VerifiedTotalBytes < 0 || *r.VerifiedTotalBytes > static.MaxTotalBytes) {
