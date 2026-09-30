@@ -31,7 +31,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final, Literal, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Final, Literal, NoReturn, Protocol, cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -66,6 +66,7 @@ from .organic_probe import (
     DEFAULT_EPOCH_SECONDS,
     PROBE_SEED_BYTES,
     OrganicProbeObservation,
+    PlannedProbe,
     build_probe_authorization,
     epoch_index_of,
     evaluate_organic_probe,
@@ -90,6 +91,9 @@ from .score_checkpoint_relay_cli import (
     _load_input_bytes,
     _normalized_absolute_path,
 )
+
+if TYPE_CHECKING:
+    from .static_runtime import StaticEpochRun, StaticSitesConfig
 
 EXIT_OK: Final = 0
 EXIT_REJECTED: Final = 2
@@ -195,6 +199,8 @@ class AssignmentProbeCLIConfig:
     manifest_archive_dir: str
     edge_origin: str | None = None
     tls_ca_file: str | None = None
+    #: ``--static-sites on``: the static-site-v1 path (default off, ``None``).
+    static_sites: StaticSitesConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +209,8 @@ class AssignmentProbeCLIResult:
     next_chain_state: AssignmentManifestChainState
     state_advanced: bool
     skipped_probes: int
+    #: The static epoch when ``--static-sites on``; never mixed into ``epoch``.
+    static: StaticEpochRun | None = None
 
 
 class ProbeTransport(Protocol):
@@ -997,9 +1005,19 @@ def archive_verified_manifest(
 ) -> None:
     """Install ``<digest>.json`` once; an existing entry must hold the exact same bytes."""
 
-    rendered = organic_assignment_manifest_bytes(manifest)
+    _archive_document(
+        directory,
+        manifest.manifest_digest_sha256,
+        organic_assignment_manifest_bytes(manifest),
+        state_root=state_root,
+    )
+
+
+def _archive_document(directory: str, name: str, rendered: bytes, *, state_root: str) -> None:
+    if _DIGEST.fullmatch(name) is None:
+        _fail("manifest_archive_unsafe")
     directory_path = _normalized_absolute_path(directory, code="manifest_archive_unsafe")
-    target = f"{directory_path}/{manifest.manifest_digest_sha256}.json"
+    target = f"{directory_path}/{name}.json"
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         directory_fd = os.open(directory_path, flags)
@@ -1011,7 +1029,7 @@ def archive_verified_manifest(
             _fail("manifest_archive_unsafe")
         try:
             existing = os.open(
-                f"{manifest.manifest_digest_sha256}.json",
+                f"{name}.json",
                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                 dir_fd=directory_fd,
             )
@@ -1047,6 +1065,98 @@ def _probe_url(
     return f"{manifest.probe_scheme}://{route_host}:{manifest.probe_port}{path}"
 
 
+#: One scheduled probe: fire instant, then a callable that sends it at ``now_millis``.
+ScheduledProbe = tuple[int, Callable[[int], None]]
+
+
+def _fire_schedule(
+    schedule: Sequence[ScheduledProbe],
+    *,
+    epoch_index: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> int:
+    """Wait for each private instant in order and fire; return the skipped count.
+
+    A probe whose instant already lies more than :data:`MAX_FIRE_DELAY_MILLIS`
+    in the past, or whose send time has left the epoch, is skipped (counted,
+    never sent late).
+    """
+
+    epoch_end_millis = (epoch_index + 1) * DEFAULT_EPOCH_SECONDS * 1_000
+    skipped = 0
+    for fire_at_millis, fire in schedule:
+        now_millis = int(clock() * 1_000)
+        if fire_at_millis > now_millis:
+            sleep((fire_at_millis - now_millis) / 1_000)
+            now_millis = int(clock() * 1_000)
+        if (
+            now_millis - fire_at_millis > MAX_FIRE_DELAY_MILLIS
+            or now_millis >= epoch_end_millis
+            or epoch_index_of(now_millis // 1_000) != epoch_index
+        ):
+            skipped += 1
+            continue
+        fire(now_millis)
+    return skipped
+
+
+def organic_probe_schedule(
+    manifest: ActiveAssignmentManifestV2,
+    policy: AssignmentManifestTrustPolicy,
+    transport: ProbeTransport,
+    observations: list[OrganicProbeObservation],
+    *,
+    seed: bytes,
+    validator_hotkey: str,
+    sign: Callable[[bytes], bytes],
+    epoch_index: int,
+    edge_origin: str | None,
+) -> list[ScheduledProbe]:
+    """The epoch's organic hidden schedule; each fired probe appends its observation."""
+
+    plan = plan_hidden_probes(
+        seed=seed,
+        validator_hotkey=validator_hotkey,
+        manifest=manifest,
+        epoch_index=epoch_index,
+    )
+
+    def firing(planned: PlannedProbe) -> Callable[[int], None]:
+        def fire(now_millis: int) -> None:
+            deployment, _ = find_replica(manifest, planned.endpoint_id)
+            authorization = build_probe_authorization(
+                validator_hotkey=validator_hotkey,
+                endpoint_id=planned.endpoint_id,
+                generation=planned.generation,
+                method=planned.method,
+                path=planned.path,
+                nonce=planned.nonce,
+                issued_at_epoch=now_millis // 1_000,
+                sign=sign,
+            )
+            result = transport.fetch(
+                url=_probe_url(manifest, deployment.route_host, planned.path, edge_origin),
+                server_name=deployment.route_host,
+                headers={
+                    "host": deployment.route_host,
+                    "accept": "*/*",
+                    "accept-encoding": "identity",
+                    "cache-control": "no-cache",
+                    "user-agent": USER_AGENT,
+                    ORGANIC_PROBE_AUTHORIZATION_HEADER: probe_authorization_header(authorization),
+                },
+                timeout_seconds=policy.probe_timeout_millis / 1000,
+                max_bytes=policy.max_response_bytes,
+                method=planned.method,
+            )
+            observations.append(evaluate_organic_probe(manifest, policy, authorization, result))
+
+        return fire
+
+    return [(planned.fire_at_millis, firing(planned)) for planned in plan]
+
+
 def run_hidden_probe_epoch(
     manifest: ActiveAssignmentManifestV2,
     policy: AssignmentManifestTrustPolicy,
@@ -1069,54 +1179,19 @@ def run_hidden_probe_epoch(
     epoch, is skipped (counted, never sent late).
     """
 
-    plan = plan_hidden_probes(
+    observations: list[OrganicProbeObservation] = []
+    schedule = organic_probe_schedule(
+        manifest,
+        policy,
+        transport,
+        observations,
         seed=seed,
         validator_hotkey=validator_hotkey,
-        manifest=manifest,
+        sign=sign,
         epoch_index=epoch_index,
+        edge_origin=edge_origin,
     )
-    epoch_end_millis = (epoch_index + 1) * DEFAULT_EPOCH_SECONDS * 1_000
-    observations: list[OrganicProbeObservation] = []
-    skipped = 0
-    for planned in plan:
-        now_millis = int(clock() * 1_000)
-        if planned.fire_at_millis > now_millis:
-            sleep((planned.fire_at_millis - now_millis) / 1_000)
-            now_millis = int(clock() * 1_000)
-        if (
-            now_millis - planned.fire_at_millis > MAX_FIRE_DELAY_MILLIS
-            or now_millis >= epoch_end_millis
-            or epoch_index_of(now_millis // 1_000) != epoch_index
-        ):
-            skipped += 1
-            continue
-        deployment, _ = find_replica(manifest, planned.endpoint_id)
-        authorization = build_probe_authorization(
-            validator_hotkey=validator_hotkey,
-            endpoint_id=planned.endpoint_id,
-            generation=planned.generation,
-            method=planned.method,
-            path=planned.path,
-            nonce=planned.nonce,
-            issued_at_epoch=now_millis // 1_000,
-            sign=sign,
-        )
-        result = transport.fetch(
-            url=_probe_url(manifest, deployment.route_host, planned.path, edge_origin),
-            server_name=deployment.route_host,
-            headers={
-                "host": deployment.route_host,
-                "accept": "*/*",
-                "accept-encoding": "identity",
-                "cache-control": "no-cache",
-                "user-agent": USER_AGENT,
-                ORGANIC_PROBE_AUTHORIZATION_HEADER: probe_authorization_header(authorization),
-            },
-            timeout_seconds=policy.probe_timeout_millis / 1000,
-            max_bytes=policy.max_response_bytes,
-            method=planned.method,
-        )
-        observations.append(evaluate_organic_probe(manifest, policy, authorization, result))
+    skipped = _fire_schedule(schedule, epoch_index=epoch_index, clock=clock, sleep=sleep)
     return observations, skipped
 
 
@@ -1197,56 +1272,181 @@ def execute_assignment_probe(
     input_paths = {
         _normalized_absolute_path(item.path, code="input_path_unsafe") for item in file_inputs
     }
+    static_pins = None
+    if config.static_sites is not None:
+        from .static_runtime import preflight_static
+
+        static_pins = preflight_static(
+            config.static_sites,
+            organic_state_root=_normalized_absolute_path(
+                config.state_root, code="state_root_path_unsafe"
+            ),
+            organic_inputs=input_paths
+            | {_normalized_absolute_path(config.epoch_output, code="output_path_unsafe")},
+        )
     sign, signer_hotkey = signer_factory(config.wallet)
     if signer_hotkey != config.validator_hotkey:
         _fail("wallet_hotkey_mismatch")
+    static_run: StaticEpochRun | None = None
     with _StateRoot(config.state_root) as root:
-        if _normalized_absolute_path(config.epoch_output, code="output_path_unsafe") in (
-            input_paths
-        ):
-            _fail("output_path_alias")
-        _preflight_output(config.epoch_output, state_root=root.path)
-        manifest, signatures = _load_publication(
-            config.manifest, config.signatures, transport, policy
-        )
-        verification = _verify_head(root, config, policy, manifest, signatures, evaluation_epoch)
-        # Archive before the state advances: a refused archive leaves no trace.
-        archive_verified_manifest(
-            config.manifest_archive_dir, verification.manifest, state_root=root.path
-        )
-        state_advanced = not verification.reprobe
-        if state_advanced:
-            root.replace_state(assignment_manifest_chain_state_bytes(verification.next_chain_state))
-        observations, skipped = run_hidden_probe_epoch(
-            verification.manifest,
-            policy,
-            transport,
-            seed=seed,
-            validator_hotkey=config.validator_hotkey,
-            sign=sign,
-            epoch_index=config.epoch_index,
-            edge_origin=edge_origin,
-            clock=clock,
-            sleep=sleep,
-        )
-        epoch = score_organic_epoch(
-            [verification.manifest],
-            observations,
-            validator_hotkey=config.validator_hotkey,
-            epoch_index=config.epoch_index,
-            min_attempts=DEFAULT_MIN_ATTEMPTS,
-        )
-        _write_output(
-            config.epoch_output,
-            organic_epoch_score_bytes(epoch),
-            state_root=root.path,
-        )
+        try:
+            if _normalized_absolute_path(config.epoch_output, code="output_path_unsafe") in (
+                input_paths
+            ):
+                _fail("output_path_alias")
+            _preflight_output(config.epoch_output, state_root=root.path)
+            if config.static_sites is not None:
+                from .static_runtime import lock_static_epoch
+
+                static_run = lock_static_epoch(config.static_sites)
+            manifest, signatures = _load_publication(
+                config.manifest, config.signatures, transport, policy
+            )
+            verification = _verify_head(
+                root, config, policy, manifest, signatures, evaluation_epoch
+            )
+            # Archive before the state advances: a refused archive leaves no trace.
+            archive_verified_manifest(
+                config.manifest_archive_dir, verification.manifest, state_root=root.path
+            )
+            state_advanced = not verification.reprobe
+            if state_advanced:
+                root.replace_state(
+                    assignment_manifest_chain_state_bytes(verification.next_chain_state)
+                )
+            if static_run is None:
+                observations, skipped = run_hidden_probe_epoch(
+                    verification.manifest,
+                    policy,
+                    transport,
+                    seed=seed,
+                    validator_hotkey=config.validator_hotkey,
+                    sign=sign,
+                    epoch_index=config.epoch_index,
+                    edge_origin=edge_origin,
+                    clock=clock,
+                    sleep=sleep,
+                )
+            else:
+                observations, skipped = _run_with_static(
+                    static_run,
+                    cast(tuple[object, str, str], static_pins),
+                    verification.manifest,
+                    policy,
+                    transport,
+                    seed=seed,
+                    validator_hotkey=config.validator_hotkey,
+                    sign=sign,
+                    epoch_index=config.epoch_index,
+                    edge_origin=edge_origin,
+                    evaluation_epoch=evaluation_epoch,
+                    current_finalized_height=config.current_finalized_height,
+                    clock=clock,
+                    sleep=sleep,
+                )
+            epoch = score_organic_epoch(
+                [verification.manifest],
+                observations,
+                validator_hotkey=config.validator_hotkey,
+                epoch_index=config.epoch_index,
+                min_attempts=DEFAULT_MIN_ATTEMPTS,
+            )
+            _write_output(
+                config.epoch_output,
+                organic_epoch_score_bytes(epoch),
+                state_root=root.path,
+            )
+            if static_run is not None:
+                from .static_runtime import finish_static_epoch, static_probe_ceiling
+
+                finish_static_epoch(
+                    static_run,
+                    validator_hotkey=config.validator_hotkey,
+                    epoch_index=config.epoch_index,
+                    probe_ceiling=static_probe_ceiling(policy),
+                )
+        finally:
+            if static_run is not None:
+                static_run.close()
     return AssignmentProbeCLIResult(
         epoch=epoch,
         next_chain_state=verification.next_chain_state,
         state_advanced=state_advanced,
         skipped_probes=skipped,
+        static=static_run,
     )
+
+
+def _run_with_static(
+    static_run: StaticEpochRun,
+    pins: tuple[object, str, str],
+    manifest: ActiveAssignmentManifestV2,
+    policy: AssignmentManifestTrustPolicy,
+    transport: ProbeTransport,
+    *,
+    seed: bytes,
+    validator_hotkey: str,
+    sign: Callable[[bytes], bytes],
+    epoch_index: int,
+    edge_origin: str | None,
+    evaluation_epoch: int,
+    current_finalized_height: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> tuple[list[OrganicProbeObservation], int]:
+    """Verify the static inputs, then fire the organic and static plans in one schedule.
+
+    Organic probes keep their own instants and order (organic first on a tie),
+    so the organic observations are exactly those the organic-only run makes.
+    Returns the organic observations and organic skipped count; the static
+    evidence lives in ``static_run``.
+    """
+
+    from .static_index import StaticSiteReleaseTrustPolicy
+    from .static_runtime import load_static_epoch, static_probe_schedule
+
+    release_policy, server_digest, index_origin = pins
+    load_static_epoch(
+        static_run,
+        transport=transport,
+        policy=policy,
+        release_policy=cast(StaticSiteReleaseTrustPolicy, release_policy),
+        server_digest=server_digest,
+        index_origin=index_origin,
+        evaluation_epoch=evaluation_epoch,
+        current_finalized_height=current_finalized_height,
+    )
+    observations: list[OrganicProbeObservation] = []
+    organic = organic_probe_schedule(
+        manifest,
+        policy,
+        transport,
+        observations,
+        seed=seed,
+        validator_hotkey=validator_hotkey,
+        sign=sign,
+        epoch_index=epoch_index,
+        edge_origin=edge_origin,
+    )
+    static = static_probe_schedule(
+        static_run,
+        transport,
+        policy,
+        seed=seed,
+        validator_hotkey=validator_hotkey,
+        sign=sign,
+        epoch_index=epoch_index,
+        edge_origin=edge_origin,
+    )
+    ordered = sorted(
+        [(item[0], 0, position, item) for position, item in enumerate(organic)]
+        + [(item[0], 1, position, item) for position, item in enumerate(static)]
+    )
+    _fire_schedule(
+        [entry[3] for entry in ordered], epoch_index=epoch_index, clock=clock, sleep=sleep
+    )
+    static_run.skipped = len(static) - len(static_run.observations)
+    return observations, len(organic) - len(observations)
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -1299,7 +1499,99 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-archive-dir", required=True)
     parser.add_argument("--edge-origin")
     parser.add_argument("--tls-ca-file")
+    parser.add_argument("--static-sites", choices=("off", "on"), default="off")
+    for name in _STATIC_SINGLE_OPTIONS:
+        parser.add_argument(f"--{name}")
+    parser.add_argument("--static-signature-file", action="append", default=[])
+    parser.add_argument("--static-signature-sha256", action="append", default=[])
+    parser.add_argument("--static-signature-url", action="append", default=[])
     return parser
+
+
+_STATIC_SINGLE_OPTIONS: Final = (
+    "static-manifest-file",
+    "static-manifest-sha256",
+    "static-manifest-url",
+    "static-state-root",
+    "static-trusted-state-anchor",
+    "static-release-trust-policy",
+    "static-release-trust-policy-sha256",
+    "static-server-implementation-digest",
+    "static-index-origin",
+    "static-manifest-archive-dir",
+    "static-epoch-output",
+    "static-journal",
+)
+_STATIC_REQUIRED: Final = (
+    "static_state_root",
+    "static_trusted_state_anchor",
+    "static_release_trust_policy",
+    "static_release_trust_policy_sha256",
+    "static_server_implementation_digest",
+    "static_index_origin",
+    "static_manifest_archive_dir",
+    "static_epoch_output",
+    "static_journal",
+)
+
+
+def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesConfig | None:
+    """``None`` unless ``--static-sites on``; any static option while off is a usage error."""
+
+    values = {
+        name.replace("-", "_"): getattr(arguments, name.replace("-", "_"))
+        for name in (
+            *_STATIC_SINGLE_OPTIONS,
+            "static-signature-file",
+            "static-signature-sha256",
+            "static-signature-url",
+        )
+    }
+    if arguments.static_sites == "off":
+        if any(value not in (None, []) for value in values.values()):
+            _fail("usage")
+        return None
+    from .static_runtime import StaticSitesConfig, static_signature_sources
+
+    if any(values[name] is None for name in _STATIC_REQUIRED):
+        _fail("usage")
+    manifest_file = cast(str | None, values["static_manifest_file"])
+    manifest_digest = cast(str | None, values["static_manifest_sha256"])
+    manifest_url = cast(str | None, values["static_manifest_url"])
+    if (manifest_file is None) != (manifest_digest is None) or (manifest_file is None) == (
+        manifest_url is None
+    ):
+        _fail("usage")
+    signature_files = cast(list[str], values["static_signature_file"])
+    signature_digests = cast(list[str], values["static_signature_sha256"])
+    if len(signature_files) != len(signature_digests):
+        _fail("signature_count_invalid")
+    signatures = static_signature_sources(
+        [
+            InputFile(path, digest)
+            for path, digest in zip(signature_files, signature_digests, strict=True)
+        ],
+        cast(list[str], values["static_signature_url"]),
+    )
+    if not signatures:
+        _fail("usage")
+    return StaticSitesConfig(
+        manifest=ManifestSource(file=InputFile(manifest_file, cast(str, manifest_digest)))
+        if manifest_file is not None
+        else ManifestSource(url=manifest_url),
+        signatures=signatures,
+        state_root=cast(str, values["static_state_root"]),
+        trusted_state_anchor=cast(str, values["static_trusted_state_anchor"]),
+        release_trust_policy=InputFile(
+            cast(str, values["static_release_trust_policy"]),
+            cast(str, values["static_release_trust_policy_sha256"]),
+        ),
+        server_implementation_digest=cast(str, values["static_server_implementation_digest"]),
+        index_origin=cast(str, values["static_index_origin"]),
+        manifest_archive_dir=cast(str, values["static_manifest_archive_dir"]),
+        epoch_output=cast(str, values["static_epoch_output"]),
+        journal=cast(str, values["static_journal"]),
+    )
 
 
 def _config_from_arguments(arguments: argparse.Namespace) -> AssignmentProbeCLIConfig:
@@ -1349,6 +1641,7 @@ def _config_from_arguments(arguments: argparse.Namespace) -> AssignmentProbeCLIC
         manifest_archive_dir=cast(str, arguments.manifest_archive_dir),
         edge_origin=cast(str | None, arguments.edge_origin),
         tls_ca_file=cast(str | None, arguments.tls_ca_file),
+        static_sites=_static_config_from_arguments(arguments),
     )
 
 
@@ -1365,7 +1658,14 @@ def run_cli(argv: Sequence[str]) -> int:
             f"observations={len(epoch.observations)} skipped={result.skipped_probes} "
             f"next_state_sha256={result.next_chain_state.state_digest_sha256}\n"
         )
-        return EXIT_OK if epoch.epoch_status == "scored" else EXIT_DEGRADED
+        degraded = epoch.epoch_status != "scored"
+        if result.static is not None:
+            from .static_runtime import static_summary
+
+            sys.stdout.write(static_summary(result.static))
+            static_epoch = result.static.epoch
+            degraded = degraded or static_epoch is None or static_epoch.epoch_status != "scored"
+        return EXIT_DEGRADED if degraded else EXIT_OK
     except AssignmentProbeError as exc:
         sys.stderr.write(f"REJECTED {exc.code}\n")
         return EXIT_REJECTED
