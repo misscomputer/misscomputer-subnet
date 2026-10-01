@@ -112,7 +112,8 @@ btcli subnets register --netuid '<NETUID>' --network finney \
 
 Add stake per your own policy with `btcli`, then confirm with the
 [read-only chain check](getting-started.md#read-only-chain-check) that your
-hotkey shows `active=True` and `validator_permit=True`. Copy only the hotkey
+hotkey has a unique UID and `validator_permit=True`. The `active` bit reflects
+weight-update freshness, not registration or serving eligibility. Copy only the hotkey
 to the server.
 
 ## Step 2: set variables and create the layout

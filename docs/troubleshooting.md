@@ -13,7 +13,7 @@ Start with the health checks, then find the exact message.
 | Miner TLS pin | `sudo scripts/manage-miner-tls.sh check /etc/misscomputer-miner/tls` | `leaf sha256` equals the agent's `--tls-certificate-sha256` |
 | Organic network | `docker network inspect misscomputer-organic --format '{{.Internal}}'` | `true` |
 | Host isolation rule | `sudo iptables -C INPUT -i miss-organic0 -m conntrack --ctstate NEW -j DROP` | exit `0` |
-| Chain registration | [read-only chain check](getting-started.md#read-only-chain-check) | your UID, `active=True`, expected `axon=` |
+| Chain registration | [read-only chain check](getting-started.md#read-only-chain-check) | unique UID/hotkey, expected `axon=` (`active` is weight-update freshness) |
 | Validator CLI result | exit status plus the one-line stdout/stderr | `0` (or `3` for recorded-but-not-scored) |
 
 ## Miner
@@ -37,7 +37,8 @@ Start with the health checks, then find the exact message.
 
 | Log message | Cause and fix |
 | --- | --- |
-| `miner hotkey is not registered` | The hotkey is missing from the metagraph of `--netuid` on `--subtensor-network`, **or** the chain reports it with `active=False`; the miner treats both the same. Run the read-only chain check to see which. Fix the wallet, network, or netuid, or register. |
+| `miner hotkey is not uniquely registered` | The hotkey is missing or duplicated in the metagraph of `--netuid` on `--subtensor-network`. Check wallet, network, and netuid, then register if absent. `active=False` alone does not make the miner unready. |
+| `miner UID identity conflicts` | Another metagraph record has the same UID. Resolve the chain identity conflict before serving. |
 | `configured UID differs from metagraph` | `--uid` is stale (for example after re-registration). Set it to the UID shown by the chain check, on both processes. |
 | `metagraph synchronization failed` (with exception) | The chain read failed. Check network access to the chain endpoint and the `--subtensor-network` value. |
 
