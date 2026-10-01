@@ -59,10 +59,10 @@ CONTRACT_MANIFEST = (
 CONTRACT_SITE = "sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"
 CONTRACT_RELEASE_PUBLIC_KEY = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
 CONTRACT_RELEASE_SIGNATURE = (
-    "863218e208d2059d71bcfca2105c946b1755c8209f1a53f00343be4fabdcdebf"
-    "002349fa0b331f4147c424fb2916d1d403eff7216b984db678b858bbd164b208"
+    "5bab1ba140424869a6c97d61b28364253cd278aae288108abd82dba2cc6e8ac81f"
+    "809edab150ae2d8acddc498715953a8b57a5cd19f5ef5bc2d3eaafb83f170c"
 )
-CONTRACT_RELEASE_DIGEST = "sha256:9b96232b299069fe8b2dc546f9db0943c43dfefb48f79d15d28ee7b28a031830"
+CONTRACT_RELEASE_DIGEST = "sha256:a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c"
 CONTRACT_GET_ROOT_HEADER_SHA256 = "b830308c459ff241874e1e9b218a44b7161985c4005cdd824573f3a4677eed05"
 EMPTY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 NOT_FOUND_SHA256 = "7515bf959b73b956ceb967351c7e299cbb3668a53d35f9c770eb72e00d93ced6"
@@ -110,7 +110,7 @@ def test_contract_worked_examples_are_reproduced_byte_for_byte() -> None:
     )
     assert static_index_release_key(CONTRACT_RELEASE_DIGEST) == (
         "static-sites/v1/releases/"
-        "9b96232b299069fe8b2dc546f9db0943c43dfefb48f79d15d28ee7b28a031830.json"
+        "a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c.json"
     )
 
 
@@ -321,7 +321,7 @@ ABSTENTIONS: dict[str, tuple[Callable[[], Any], str, str]] = {
         "static_index_invalid",
     ),
     "release bytes differ from release_digest": (
-        lambda: ingest(release_digest=CONTRACT_RELEASE_DIGEST.replace("9b", "00", 1)),
+        lambda: ingest(release_digest=CONTRACT_RELEASE_DIGEST.replace("a3", "00", 1)),
         "release_digest_mismatch",
         "static_index_invalid",
     ),
@@ -345,10 +345,10 @@ ABSTENTIONS: dict[str, tuple[Callable[[], Any], str, str]] = {
         "signer_outside_validity",
         "static_index_invalid",
     ),
-    "unimplemented producer policy": (
+    "legacy producer policy": (
         lambda: ingest(
             release=release_bytes(
-                CONTRACT_SITE, producer_policy_version="static-producer-policy.v2"
+                CONTRACT_SITE, producer_policy_version="static-producer-policy.v1"
             )
         ),
         "producer_policy_unsupported",

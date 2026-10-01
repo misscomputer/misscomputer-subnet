@@ -54,7 +54,7 @@ from misscomputer_subnet.static_index import (
 
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
 #: SHA-256 of the golden v3 signature message; the Go suite pins the same value.
-GOLDEN_V3_MESSAGE_SHA256 = "12826b5a697478cb31b6f2e8e9512dd6c4cdcf06dbf89ad3f278015b87605d28"
+GOLDEN_V3_MESSAGE_SHA256 = "2c4da6974a9361648dc0c95b0bcc6c7ba4f4db5397d8d2ae8ab671c77568ffbb"
 STATIC = "docs-q8w2e4r6t0"
 SITE_MANIFEST = stored(manifest_document())
 SITE = site_digest(SITE_MANIFEST)
@@ -185,7 +185,7 @@ def test_golden_v3_oci_deployment_is_the_golden_v2_deployment() -> None:
     assert isinstance(static, StaticDeploymentAssignmentV3)
     assert (static.site_digest, static.release_digest) == (
         "sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f",
-        "sha256:9b96232b299069fe8b2dc546f9db0943c43dfefb48f79d15d28ee7b28a031830",
+        "sha256:a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c",
     )
 
 

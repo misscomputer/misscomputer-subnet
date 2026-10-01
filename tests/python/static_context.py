@@ -42,7 +42,7 @@ RELEASE_KEY_ID = "static-release-example"
 SERVER = "sha256:" + "ab" * 32
 ISSUED_AT = "2026-09-30T00:00:00Z"
 ISSUED_EPOCH = 1_790_726_400
-PRODUCER = "static-producer-policy.v1"
+PRODUCER = "static-producer-policy.v2"
 NOT_FOUND = (b"Not Found\n", "text/plain; charset=utf-8")
 VALIDATOR = "5ValidatorHotkey"
 SEED = bytes(range(32))

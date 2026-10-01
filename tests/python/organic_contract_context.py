@@ -367,7 +367,7 @@ def active_assignment_manifest() -> dict[str, Any]:
 #: Static-site contract §3.5 site, §7.1 release and implementation digests.
 STATIC_ROUTE_LABEL = "static-docs-m4p9qx7c2a"
 STATIC_SITE_DIGEST = "sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"
-STATIC_RELEASE_DIGEST = "sha256:9b96232b299069fe8b2dc546f9db0943c43dfefb48f79d15d28ee7b28a031830"
+STATIC_RELEASE_DIGEST = "sha256:a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c"
 STATIC_SERVER_DIGEST = "sha256:" + "ab" * 32
 
 

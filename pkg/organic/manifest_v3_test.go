@@ -14,7 +14,7 @@ import (
 )
 
 // Pinned by tests/python/test_assignment_manifest_v3.py over the same golden.
-const goldenManifestV3MessageSHA256 = "12826b5a697478cb31b6f2e8e9512dd6c4cdcf06dbf89ad3f278015b87605d28"
+const goldenManifestV3MessageSHA256 = "2c4da6974a9361648dc0c95b0bcc6c7ba4f4db5397d8d2ae8ab671c77568ffbb"
 
 func TestManifestV3SignatureMessageMatchesPython(t *testing.T) {
 	manifest := *decodeFixture(t, "active-assignment-manifest.v3", &organic.ActiveAssignmentManifestV3{})
