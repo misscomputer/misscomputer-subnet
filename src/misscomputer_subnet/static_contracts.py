@@ -71,7 +71,7 @@ MAX_DEPTH: Final = 32
 INDEX_PATH: Final = "/index.html"
 HTML_TYPE: Final = "text/html; charset=utf-8"
 
-#: ``static-producer-policy.v2`` content types (§3.4), keyed by extension.
+#: ``static-producer-policy.v3`` content types (§3.4), keyed by extension.
 CONTENT_TYPES: Final[dict[str, str]] = {
     "html": HTML_TYPE,
     "htm": HTML_TYPE,

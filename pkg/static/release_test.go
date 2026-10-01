@@ -14,10 +14,10 @@ import (
 
 // contractRelease is the static-site contract §7.1 example: seed 32 × 0x07,
 // §3.5 site, implementation digest sha256:abab…ab.
-const contractRelease = `{"issued_at":"2026-09-30T00:00:00Z","producer_policy_version":"static-producer-policy.v2","schema":"miss.computer/misscomputer-subnet/static-site-release","schema_version":1,"server_implementation_digest":"sha256:abababababababababababababababababababababababababababababababab","signature":"5bab1ba140424869a6c97d61b28364253cd278aae288108abd82dba2cc6e8ac81f809edab150ae2d8acddc498715953a8b57a5cd19f5ef5bc2d3eaafb83f170c","signer_key_id":"static-release-example","site_digest":"sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"}` + "\n"
+const contractRelease = `{"issued_at":"2026-09-30T00:00:00Z","producer_policy_version":"static-producer-policy.v3","schema":"miss.computer/misscomputer-subnet/static-site-release","schema_version":1,"server_implementation_digest":"sha256:abababababababababababababababababababababababababababababababab","signature":"f44b77fd41fadf5f3904cba2ca875de7a1021761f591b249e02a706407febb5f178ff2c828fc9108007ddaaffcbf68f3f46d32912809b16aea5d3f10dd250a0c","signer_key_id":"static-release-example","site_digest":"sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"}` + "\n"
 
 const (
-	contractReleaseDigest = "sha256:a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c"
+	contractReleaseDigest = "sha256:9b03cbef4e0731b17c1a6bc81a1942e9cab32ca96445a4c48a3efcb65fbdbc9e"
 	exampleSiteDigest     = "sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"
 )
 
@@ -104,7 +104,7 @@ func TestVerifyReleaseRefusals(t *testing.T) {
 			r.ServerImplementationDigest = "sha256:" + string(bytes.Repeat([]byte("c"), 64))
 			return r
 		}(), exampleSiteDigest, static.ReleaseSignatureInvalid},
-		{"legacy producer policy", mutate(func(r *static.Release) { r.ProducerPolicyVersion = "static-producer-policy.v1" }), exampleSiteDigest, static.ReleaseProducerPolicyUnsupported},
+		{"legacy producer policy", mutate(func(r *static.Release) { r.ProducerPolicyVersion = "static-producer-policy.v2" }), exampleSiteDigest, static.ReleaseProducerPolicyUnsupported},
 		{"other handler", mutate(func(r *static.Release) {
 			r.ServerImplementationDigest = "sha256:" + string(bytes.Repeat([]byte("c"), 64))
 		}), exampleSiteDigest, static.ReleaseServerImplementationMismatch},

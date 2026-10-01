@@ -41,7 +41,7 @@ CONTRACTS = ROOT / "contracts"
 ROUTE_LABEL = "hello-world-k3j9x0q2ab"
 ROUTE_HOST = f"{ROUTE_LABEL}.on.miss.computer"
 #: §7.1 example release digest and implementation digest placeholder.
-RELEASE_DIGEST = "sha256:a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c"
+RELEASE_DIGEST = "sha256:9b03cbef4e0731b17c1a6bc81a1942e9cab32ca96445a4c48a3efcb65fbdbc9e"
 SERVER_IMPLEMENTATION_DIGEST = "sha256:" + "ab" * 32
 REQUEST_ID = "0123456789abcdef0123456789abcdef"
 

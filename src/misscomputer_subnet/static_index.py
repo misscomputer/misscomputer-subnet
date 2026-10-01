@@ -86,7 +86,7 @@ WORKLOAD_KIND: Final = "static-site-v1"
 HANDLER: Final = "static-handler.v1"
 FALLBACK_KIND: Final = "spa-html-v1"
 #: Producer policy versions this validator implements (§3.4, §3.6).
-IMPLEMENTED_PRODUCER_POLICY_VERSIONS: Final = frozenset({"static-producer-policy.v2"})
+IMPLEMENTED_PRODUCER_POLICY_VERSIONS: Final = frozenset({"static-producer-policy.v3"})
 
 #: §1 hard limits.
 MAX_FILES: Final = 4_096
@@ -109,7 +109,7 @@ EMPTY_SHA256: Final = hashlib.sha256(b"").hexdigest()
 REQUIRED_CACHE_CONTROL: Final = "private, no-store"
 REQUIRED_NOSNIFF: Final = "nosniff"
 
-#: §3.4 ``static-producer-policy.v2`` content types by lowercased extension.
+#: §3.4 ``static-producer-policy.v3`` content types by lowercased extension.
 CONTENT_TYPES: Final[Mapping[str, str]] = MappingProxyType(
     {
         "html": HTML_CONTENT_TYPE,

@@ -59,10 +59,10 @@ CONTRACT_MANIFEST = (
 CONTRACT_SITE = "sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"
 CONTRACT_RELEASE_PUBLIC_KEY = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
 CONTRACT_RELEASE_SIGNATURE = (
-    "5bab1ba140424869a6c97d61b28364253cd278aae288108abd82dba2cc6e8ac81f"
-    "809edab150ae2d8acddc498715953a8b57a5cd19f5ef5bc2d3eaafb83f170c"
+    "f44b77fd41fadf5f3904cba2ca875de7a1021761f591b249e02a706407febb5f"
+    "178ff2c828fc9108007ddaaffcbf68f3f46d32912809b16aea5d3f10dd250a0c"
 )
-CONTRACT_RELEASE_DIGEST = "sha256:a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c"
+CONTRACT_RELEASE_DIGEST = "sha256:9b03cbef4e0731b17c1a6bc81a1942e9cab32ca96445a4c48a3efcb65fbdbc9e"
 CONTRACT_GET_ROOT_HEADER_SHA256 = "b830308c459ff241874e1e9b218a44b7161985c4005cdd824573f3a4677eed05"
 EMPTY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 NOT_FOUND_SHA256 = "7515bf959b73b956ceb967351c7e299cbb3668a53d35f9c770eb72e00d93ced6"
@@ -110,7 +110,7 @@ def test_contract_worked_examples_are_reproduced_byte_for_byte() -> None:
     )
     assert static_index_release_key(CONTRACT_RELEASE_DIGEST) == (
         "static-sites/v1/releases/"
-        "a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c.json"
+        "9b03cbef4e0731b17c1a6bc81a1942e9cab32ca96445a4c48a3efcb65fbdbc9e.json"
     )
 
 
@@ -348,7 +348,7 @@ ABSTENTIONS: dict[str, tuple[Callable[[], Any], str, str]] = {
     "legacy producer policy": (
         lambda: ingest(
             release=release_bytes(
-                CONTRACT_SITE, producer_policy_version="static-producer-policy.v1"
+                CONTRACT_SITE, producer_policy_version="static-producer-policy.v2"
             )
         ),
         "producer_policy_unsupported",
