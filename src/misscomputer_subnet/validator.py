@@ -1040,22 +1040,23 @@ class ValidatorNeuron:
         """
         if snapshot.network != self.network or snapshot.netuid != self.netuid:
             raise RuntimeError("metagraph identity differs from configured subnet")
-        active = tuple(neuron for neuron in snapshot.neurons if neuron.active)
-        hotkey_counts = Counter(neuron.hotkey for neuron in active)
-        uid_counts = Counter(neuron.uid for neuron in active)
-        validator_matches = tuple(neuron for neuron in active if neuron.hotkey == self.hotkey)
+        # Metagraph active tracks weight-update freshness, not registration.
+        registered = snapshot.neurons
+        hotkey_counts = Counter(neuron.hotkey for neuron in registered)
+        uid_counts = Counter(neuron.uid for neuron in registered)
+        validator_matches = tuple(neuron for neuron in registered if neuron.hotkey == self.hotkey)
         if len(validator_matches) != 1:
             raise RuntimeError("validator hotkey identity is missing or duplicated")
         validator = validator_matches[0]
         if not validator.validator_permit:
-            raise RuntimeError("validator hotkey is not active with a validator permit")
+            raise RuntimeError("validator hotkey lacks a validator permit")
         if not 0 <= validator.uid <= 65_535 or uid_counts[validator.uid] != 1:
             raise RuntimeError("validator UID identity conflicts in metagraph")
 
         normalized: list[DiscoveryCandidate] = []
         axon_counts: Counter[str] = Counter()
         invalid_axon = 0
-        for neuron in active:
+        for neuron in registered:
             if not neuron.axon:
                 if neuron.hotkey != self.hotkey:
                     invalid_axon += 1
@@ -2382,8 +2383,8 @@ class ValidatorNeuron:
         """Resolve one exact chain identity for deactivate-only authority.
 
         Cleanup admission is intentionally independent of schedule admission.
-        It requires exactly one active record for the retained hotkey, an
-        assignment-matching UID that is unique across active records, and the
+        It requires exactly one registered record for the retained hotkey, an
+        assignment-matching UID that is unique across registered records, and the
         same canonical axon. Axon uniqueness and ``validator_permit`` do not
         participate: a third party copying the victim's axon can quarantine
         new scheduling but cannot suppress cleanup to the unchanged victim.
@@ -2395,15 +2396,15 @@ class ValidatorNeuron:
             or uid is None
         ):
             return None
-        active = tuple(neuron for neuron in snapshot.neurons if neuron.active)
-        matches = tuple(neuron for neuron in active if neuron.hotkey == hotkey)
+        registered = snapshot.neurons
+        matches = tuple(neuron for neuron in registered if neuron.hotkey == hotkey)
         if len(matches) != 1:
             return None
         current = matches[0]
         if (
             current.uid != uid
             or not 0 <= current.uid <= 65_535
-            or sum(neuron.uid == uid for neuron in active) != 1
+            or sum(neuron.uid == uid for neuron in registered) != 1
             or not current.axon
         ):
             return None
@@ -3006,10 +3007,10 @@ class ValidatorNeuron:
             axon_url=local.axon_url,
         )
         if current is None:
-            active_matches = tuple(
-                neuron for neuron in snapshot.neurons if neuron.active and neuron.hotkey == hotkey
+            registered_matches = tuple(
+                neuron for neuron in snapshot.neurons if neuron.hotkey == hotkey
             )
-            if not active_matches:
+            if not registered_matches:
                 raise HTTPException(
                     status_code=404, detail="miner is no longer registered on this subnet"
                 )
@@ -3082,13 +3083,11 @@ class ValidatorNeuron:
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail="metagraph is not ready") from exc
         matches = [
-            neuron
-            for neuron in snapshot.neurons
-            if neuron.active and neuron.hotkey == authorization.validator_hotkey
+            neuron for neuron in snapshot.neurons if neuron.hotkey == authorization.validator_hotkey
         ]
         if len(matches) != 1 or not matches[0].validator_permit:
             raise HTTPException(
-                status_code=403, detail="signer is not an active permitted validator"
+                status_code=403, detail="signer is not a uniquely registered permitted validator"
             )
         message = organic_contracts.organic_probe_message(authorization)
         try:

@@ -9,6 +9,7 @@ bridge; freshness, nonce and routing stay in the edge.
 from __future__ import annotations
 
 import secrets
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -102,3 +103,19 @@ async def test_bridge_authorizes_only_permitted_validator_signatures(tmp_path: P
         transport=httpx.ASGITransport(app=validator.app), base_url="http://127.0.0.1"
     ) as client:
         assert (await client.post(TARGET, content=unsigned)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_registered_validator_can_authorize_probe_after_weight_inactivity(
+    tmp_path: Path,
+) -> None:
+    validator, chain = neuron(tmp_path)
+    snapshot = await chain.sync()
+    await validator.state.set(
+        replace(
+            snapshot,
+            neurons=tuple(replace(record, active=False) for record in snapshot.neurons),
+        )
+    )
+    response = await post(validator, authorization(PEER_VALIDATOR))
+    assert response.status_code == 200, response.text

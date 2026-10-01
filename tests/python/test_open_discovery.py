@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -567,6 +568,17 @@ def test_configured_validator_still_requires_unique_permitted_identity(tmp_path:
     )
     with pytest.raises(RuntimeError, match="validator permit"):
         neuron._admit_snapshot(invalid)
+
+
+def test_registered_inactive_peers_remain_discoverable(tmp_path: Path) -> None:
+    snapshot = metagraph([miner(1)])
+    stale_weights = replace(
+        snapshot,
+        neurons=tuple(replace(record, active=False) for record in snapshot.neurons),
+    )
+    _, candidates, admission = validator(tmp_path, RecordingBridge())._admit_snapshot(stale_weights)
+    assert [candidate.neuron.uid for candidate in candidates] == [1]
+    assert admission.candidate_count == 1
 
 
 @pytest.mark.asyncio

@@ -181,9 +181,13 @@ class AuthorizationPolicy:
 
     async def authorize(self, hotkey: str) -> Caller:
         snapshot = await self.state.get()
-        neuron = snapshot.by_hotkey(hotkey)
-        if neuron is None or not neuron.active:
-            raise HTTPException(status_code=403, detail="caller is not active on this subnet")
+        # Metagraph active tracks recent weight updates, not registration.
+        matches = tuple(neuron for neuron in snapshot.neurons if neuron.hotkey == hotkey)
+        if len(matches) != 1:
+            raise HTTPException(
+                status_code=403, detail="caller is not uniquely registered on this subnet"
+            )
+        neuron = matches[0]
         if not neuron.validator_permit:
             raise HTTPException(status_code=403, detail="caller lacks a validator permit")
         if neuron.tao_stake < self.min_validator_stake:
@@ -321,17 +325,26 @@ class MinerNeuron:
         while not self.stop.is_set():
             try:
                 snapshot = await self.chain.sync()
-                own = snapshot.by_hotkey(self.hotkey)
-                if own is None or not own.active:
+                # Weight-update inactivity must not take a registered miner offline.
+                own_matches = tuple(
+                    neuron for neuron in snapshot.neurons if neuron.hotkey == self.hotkey
+                )
+                if len(own_matches) != 1:
                     self.ready.clear()
-                    LOGGER.error("miner hotkey is not registered", extra={"hotkey": self.hotkey})
-                elif self.uid is not None and own.uid != self.uid:
+                    LOGGER.error(
+                        "miner hotkey is not uniquely registered", extra={"hotkey": self.hotkey}
+                    )
+                elif sum(neuron.uid == own_matches[0].uid for neuron in snapshot.neurons) != 1:
+                    self.ready.clear()
+                    LOGGER.error("miner UID identity conflicts", extra={"hotkey": self.hotkey})
+                elif self.uid is not None and own_matches[0].uid != self.uid:
                     self.ready.clear()
                     LOGGER.error(
                         "configured UID differs from metagraph",
                         extra={"hotkey": self.hotkey, "block": snapshot.block},
                     )
                 else:
+                    own = own_matches[0]
                     self.uid = own.uid
                     await self.state.set(snapshot)
                     self.ready.set()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,13 @@ from misscomputer_subnet.auth import (
     sign_service_binding,
     verify_bridge_headers,
 )
-from misscomputer_subnet.chain import MockChain, MockPeer
-from misscomputer_subnet.miner import RUNTIME_MAX_RESPONSE, MinerNeuron, PriorityGate
+from misscomputer_subnet.chain import MetagraphSnapshot, MockChain, MockPeer
+from misscomputer_subnet.miner import (
+    RUNTIME_MAX_RESPONSE,
+    AuthorizationPolicy,
+    MinerNeuron,
+    PriorityGate,
+)
 from misscomputer_subnet.protocol import LocalCapabilities, ServiceKeyBinding
 
 
@@ -95,6 +101,46 @@ MINER = bt.sp_core.Keypair.create_from_uri("//Miner1")
 UNAUTHORIZED = bt.sp_core.Keypair.create_from_uri("//Unpermitted")
 FIXTURES = Path(__file__).resolve().parents[2] / "contracts/fixtures"
 DEPLOY_FIXTURE = json.loads((FIXTURES / "deploy.v3.json").read_text())["ticket"]
+
+
+@pytest.mark.asyncio
+async def test_registered_inactive_miner_and_validator_keep_serving(tmp_path: Path) -> None:
+    peers = (
+        MockPeer("//Validator", 0, None, True, 2_000),
+        MockPeer("//Miner1", 1, "http://miner.invalid", False, 10),
+    )
+    chain = MockChain(network="local", netuid=24, own_uri="//Miner1", peers=peers)
+    neuron = MinerNeuron(
+        chain=chain,
+        hotkey_signer=chain.hotkey_signer,
+        network="local",
+        netuid=24,
+        configured_uid=1,
+        bridge=FakeBridge(),  # type: ignore[arg-type]
+        nonce_store=SQLiteNonceStore(str(tmp_path / "state.db")),
+        min_validator_stake=1_000,
+        sync_interval=10,
+        max_concurrency=1,
+        mock_http=True,
+        tls_config=None,
+    )
+    snapshot = await chain.sync()
+    stale_weights = replace(
+        snapshot,
+        neurons=tuple(replace(record, active=False) for record in snapshot.neurons),
+    )
+
+    async def one_sync() -> MetagraphSnapshot:
+        neuron.stop.set()
+        return stale_weights
+
+    chain.sync = one_sync  # type: ignore[method-assign]
+    await neuron._sync_loop()
+    assert neuron.ready.is_set()
+    caller = await AuthorizationPolicy(neuron.state, min_validator_stake=1_000).authorize(
+        VALIDATOR.ss58_address
+    )
+    assert caller.hotkey == VALIDATOR.ss58_address
 
 
 @pytest.mark.asyncio
