@@ -249,11 +249,17 @@ func VerifyBoundTicket(t TicketV4, key ed25519.PublicKey, now time.Time, current
 	if err := VerifyTicketV4(t, key, now); err != nil {
 		return err
 	}
-	b := t.Subnet
+	return verifyRequestBinding(t.Subnet, t.MinerID, currentBlock, network, netuid, callerHotkey, minerHotkey, minerUID)
+}
+
+// verifyRequestBinding checks a signed subnet binding against the
+// request-local network, hotkeys, UID and chain block. Every assignment
+// document version shares it.
+func verifyRequestBinding(b *SubnetBinding, minerID string, currentBlock uint64, network string, netuid uint16, callerHotkey, minerHotkey string, minerUID *uint16) error {
 	if b.Network != network || b.NetUID != netuid {
 		return errors.New("ticket targets another Bittensor network or netuid")
 	}
-	if b.ValidatorHotkey != callerHotkey || b.MinerHotkey != minerHotkey || t.MinerID != minerHotkey {
+	if b.ValidatorHotkey != callerHotkey || b.MinerHotkey != minerHotkey || minerID != minerHotkey {
 		return errors.New("ticket hotkey identity mismatch")
 	}
 	if (minerUID == nil) != (b.MinerUID == nil) || (minerUID != nil && *minerUID != *b.MinerUID) {

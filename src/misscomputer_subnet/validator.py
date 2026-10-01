@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from . import organic_contracts
+from . import organic_contracts, static_contracts
 from .auth import (
     BRIDGE_MAX_BODY,
     BridgeClient,
@@ -64,6 +64,8 @@ from .organic_contracts import (
     parse_document,
 )
 from .protocol import (
+    MINER_REGISTRATION_V3_FEATURE,
+    MINER_REGISTRATION_V3_PROTOCOL,
     SYNAPSE_VERSION,
     BridgeDeactivateRequest,
     CapabilitiesResponse,
@@ -73,9 +75,17 @@ from .protocol import (
     DeactivateResponse,
     DeactivateSynapse,
     MinerRegistration,
+    MinerRegistrationV3,
     MinerSet,
     ServiceKeyBinding,
     SubnetBinding,
+    parse_miner_registration,
+    registration_features,
+)
+from .static_contracts import (
+    BridgeStaticAssignRequestV1,
+    StaticDeployResponseV1,
+    StaticDeploySynapseV1,
 )
 from .tls import MAX_CERTIFICATE_BYTES, pinned_client_context, tls_leaf_preflight
 
@@ -84,6 +94,12 @@ DISCOVERY_FAILURE_LOG_LIMIT = 8
 # A miner that does not advertise the organic OCI runtime is never eligible
 # for a deployment.v4 assignment (fail closed).
 ORGANIC_OCI_FEATURE = organic_contracts.CAPABILITY_FEATURE
+ORGANIC_STATIC_FEATURE = static_contracts.CAPABILITY_FEATURE
+#: Stable bridge detail for a static ticket the validator refused to send
+#: because the miner does not advertise organic-static-v1. The ticket never
+#: reached the miner; the scheduler treats the miner as ineligible for static
+#: work, never as faulty.
+STATIC_CAPABILITY_UNSUPPORTED = "static_capability_unsupported"
 PUBLICATION_LANE_SCHEMA_VERSION = 1
 PUBLICATION_RECORD_MAC_DOMAIN = "miss.computer/misscomputer-subnet/publication-record/v1"
 MAX_HISTORICAL_PUBLICATIONS = 512
@@ -803,6 +819,8 @@ class ValidatorNeuron:
         self.mock_http_axons = mock_http_axons
         self.dendrite_transport = dendrite_transport
         self.discovery_concurrency = discovery_concurrency
+        # Set from the runtime's control capabilities each block loop.
+        self._registration_v3 = False
         self.discovery_max_attempts = discovery_max_attempts
         self.discovery_attempt_timeout = discovery_attempt_timeout
         self.discovery_refresh_timeout = discovery_refresh_timeout
@@ -882,7 +900,13 @@ class ValidatorNeuron:
             status_code=exc.status_code,
             content={
                 "error": {
-                    "code": codes.get(exc.status_code, "bridge_error"),
+                    # The static capability refusal keeps its own stable code
+                    # so the scheduler never mistakes it for a stale ticket.
+                    "code": (
+                        STATIC_CAPABILITY_UNSUPPORTED
+                        if message == STATIC_CAPABILITY_UNSUPPORTED
+                        else codes.get(exc.status_code, "bridge_error")
+                    ),
                     "message": message,
                     "retryable": exc.status_code in {429, 502, 503, 504},
                 }
@@ -930,6 +954,10 @@ class ValidatorNeuron:
                     "GET", "/v1/capabilities", response_model=ControlCapabilities
                 )
                 assert isinstance(capabilities, ControlCapabilities)
+                # Registrations carry capability features only while the
+                # runtime can decode miner-registration.v3; an older runtime
+                # keeps receiving the exact v2 bytes.
+                self._registration_v3 = MINER_REGISTRATION_V3_FEATURE in capabilities.features
                 validator_binding = sign_service_binding(
                     ServiceKeyBinding(
                         role="validator",
@@ -1200,6 +1228,7 @@ class ValidatorNeuron:
                 network=self.network,
                 netuid=self.netuid,
                 bridge_url=self.bridge_url,
+                with_features=self._registration_v3,
             )
             try:
                 await self.bridge.request(
@@ -1337,23 +1366,41 @@ class ValidatorNeuron:
 
     @staticmethod
     def _registration_for(
-        remote: RemoteMiner, *, network: str, netuid: int, bridge_url: str
+        remote: RemoteMiner,
+        *,
+        network: str,
+        netuid: int,
+        bridge_url: str,
+        with_features: bool = False,
     ) -> MinerRegistration:
-        return MinerRegistration(
-            protocol=SYNAPSE_VERSION,
-            network=network,
-            netuid=netuid,
-            hotkey=remote.neuron.hotkey,
-            uid=remote.neuron.uid,
-            axon_url=remote.axon_url,
-            bridge_url=bridge_url,
-            service_binding=remote.binding,
-            transport_certificate_der_base64=(
+        """The exact registration Go receives for one handshake.
+
+        ``with_features`` selects ``miner-registration.v3`` (only while the
+        runtime advertises it); the features are the normalized features of
+        the same capability response that carried the signed binding.
+        """
+
+        fields: dict[str, Any] = {
+            "network": network,
+            "netuid": netuid,
+            "hotkey": remote.neuron.hotkey,
+            "uid": remote.neuron.uid,
+            "axon_url": remote.axon_url,
+            "bridge_url": bridge_url,
+            "service_binding": remote.binding,
+            "transport_certificate_der_base64": (
                 ""
                 if remote.certificate_der is None
                 else base64.b64encode(remote.certificate_der).decode("ascii")
             ),
-        )
+        }
+        if with_features:
+            return MinerRegistrationV3(
+                protocol=MINER_REGISTRATION_V3_PROTOCOL,
+                features=registration_features(remote.features),
+                **fields,
+            )
+        return MinerRegistration(protocol=SYNAPSE_VERSION, **fields)
 
     def _new_publication_lane(
         self,
@@ -1423,6 +1470,7 @@ class ValidatorNeuron:
                 network=self.network,
                 netuid=self.netuid,
                 bridge_url=self.bridge_url,
+                with_features=self._registration_v3,
             )
             for _, remote in ordered
         ]
@@ -1472,6 +1520,7 @@ class ValidatorNeuron:
                     "neuron": self._neuron_payload(remote.neuron),
                     "axon_url": remote.axon_url,
                     "binding": remote.binding.model_dump(mode="json"),
+                    "features": registration_features(remote.features),
                     "certificate_der_base64": (
                         None
                         if remote.certificate_der is None
@@ -1602,11 +1651,19 @@ class ValidatorNeuron:
             remote_neuron = self._neuron_from_payload(item.get("neuron"))
             if remote_neuron.hotkey != hotkey:
                 raise RuntimeError("durable publication miner hotkey conflicts")
+            raw_features = item.get("features", [])
+            if not isinstance(raw_features, list) or any(
+                not isinstance(feature, str) for feature in raw_features
+            ):
+                raise RuntimeError("durable publication miner features are malformed")
+            if raw_features != registration_features(raw_features):
+                raise RuntimeError("durable publication miner features are not canonical")
             remotes[hotkey] = RemoteMiner(
                 neuron=remote_neuron,
                 axon_url=axon_url,
                 binding=binding,
                 certificate_der=certificate_der,
+                features=frozenset(raw_features),
             )
         lane = self._new_publication_lane(
             snapshot,
@@ -2053,6 +2110,7 @@ class ValidatorNeuron:
                 network=self.network,
                 netuid=self.netuid,
                 bridge_url=self.bridge_url,
+                with_features=self._registration_v3,
             )
             for remote in stage.values()
         ]
@@ -2100,7 +2158,7 @@ class ValidatorNeuron:
             actual = {
                 registration.hotkey: registration
                 for item in raw_miners
-                for registration in (MinerRegistration.model_validate(item),)
+                for registration in (parse_miner_registration(item),)
             }
         except ValidationError:
             return False
@@ -2139,7 +2197,7 @@ class ValidatorNeuron:
         ):
             return None
         try:
-            registrations = [MinerRegistration.model_validate(item) for item in value["miners"]]
+            registrations = [parse_miner_registration(item) for item in value["miners"]]
         except ValidationError:
             return None
         if len({registration.hotkey for registration in registrations}) != len(
@@ -2229,6 +2287,13 @@ class ValidatorNeuron:
                     axon_url=retained.axon_url,
                     binding=binding,
                     certificate_der=retained.certificate_der,
+                    # Go's committed v3 features are the handshake features
+                    # this validator itself registered.
+                    features=(
+                        frozenset(registration.features)
+                        if isinstance(registration, MinerRegistrationV3)
+                        else retained.features
+                    ),
                 )
             validator_binding = self._validator_binding
             if validator_binding is None:
@@ -2257,7 +2322,7 @@ class ValidatorNeuron:
         self, registration: MinerRegistration, remote: RemoteMiner
     ) -> bool:
         return (
-            registration.protocol == SYNAPSE_VERSION
+            registration.protocol in {SYNAPSE_VERSION, MINER_REGISTRATION_V3_PROTOCOL}
             and registration.network == self.network
             and registration.netuid == self.netuid
             and registration.bridge_url == self.bridge_url
@@ -2273,7 +2338,7 @@ class ValidatorNeuron:
     async def _registration_is_published(self, expected: MinerRegistration) -> bool:
         """Reconcile an acknowledgement lost after Go's atomic registration commit."""
         payload = await self.bridge.request("GET", "/v1/miners/" + quote(expected.hotkey, safe=""))
-        registration = MinerRegistration.model_validate(payload)
+        registration = parse_miner_registration(payload)
         return registration == expected
 
     def _remote_matches_candidate(self, remote: RemoteMiner, candidate: DiscoveryCandidate) -> bool:
@@ -2845,6 +2910,62 @@ class ValidatorNeuron:
             raise HTTPException(status_code=409, detail="ticket publication lane is ambiguous")
         return selected.remote, selected.validator_binding, selected.snapshot
 
+    async def _remote_has_feature(
+        self, snapshot: MetagraphSnapshot, remote: RemoteMiner, feature: str
+    ) -> bool:
+        """Whether the exact selected miner advertises ``feature``.
+
+        Reconstructed publication handles have no capability cache, so a
+        missing feature is re-checked by a fresh handshake bound to the exact
+        signed endpoint and service identity already selected.
+        """
+
+        if feature in remote.features:
+            return True
+        checked = await self._handshake(snapshot, remote.neuron)
+        return (
+            feature in checked.features
+            and checked.axon_url == remote.axon_url
+            and checked.neuron.uid == remote.neuron.uid
+            and checked.binding.service_public_key == remote.binding.service_public_key
+            and checked.binding.transport == remote.binding.transport
+            and checked.binding.transport_certificate_sha256
+            == remote.binding.transport_certificate_sha256
+        )
+
+    def _ticket_binding_differs(
+        self,
+        hotkey: str,
+        miner_id: str,
+        ticket_binding: SubnetBinding,
+        remote: RemoteMiner,
+        validator_binding: ServiceKeyBinding,
+        snapshot: MetagraphSnapshot,
+    ) -> bool:
+        """Whether a Go-signed ticket binding differs from the handshake."""
+
+        return (
+            miner_id != hotkey
+            or ticket_binding.miner_hotkey != hotkey
+            or ticket_binding.miner_uid != remote.neuron.uid
+            # The signed assignment-time axon must be the handshake axon
+            # that will receive this work; a legacy ticket without it
+            # fails closed. This keeps later exact-identity cleanup and
+            # restart recovery bound to the axon that ran the workload.
+            or ticket_binding.miner_axon_url != remote.axon_url
+            or ticket_binding.miner_transport != remote.binding.transport
+            or ticket_binding.miner_tls_certificate_sha256
+            != remote.binding.transport_certificate_sha256
+            or ticket_binding.network != self.network
+            or ticket_binding.netuid != self.netuid
+            or ticket_binding.miner_service_public_key != remote.binding.service_public_key
+            or ticket_binding.validator_hotkey != self.hotkey
+            or ticket_binding.validator_service_public_key != validator_binding.service_public_key
+            or ticket_binding.epoch != ticket_binding.chain_block // max(snapshot.tempo, 1)
+            or ticket_binding.chain_block > snapshot.block + 2
+            or snapshot.block >= ticket_binding.expires_at_block
+        )
+
     async def _cleanup_remote(
         self, hotkey: str, local: BridgeDeactivateRequest
     ) -> tuple[RemoteMiner, ServiceKeyBinding, MetagraphSnapshot]:
@@ -3002,44 +3123,10 @@ class ValidatorNeuron:
             remote, validator_binding, snapshot = await self._remote_for_ticket(
                 hotkey, ticket_binding
             )
-            if ORGANIC_OCI_FEATURE not in remote.features:
-                # Reconstructed publication handles have no capability cache.
-                # Re-handshake before v4 assignment, binding the answer to the
-                # exact signed endpoint and service identity already selected.
-                checked = await self._handshake(snapshot, remote.neuron)
-                if (
-                    ORGANIC_OCI_FEATURE not in checked.features
-                    or checked.axon_url != remote.axon_url
-                    or checked.neuron.uid != remote.neuron.uid
-                    or checked.binding.service_public_key != remote.binding.service_public_key
-                    or checked.binding.transport != remote.binding.transport
-                    or checked.binding.transport_certificate_sha256
-                    != remote.binding.transport_certificate_sha256
-                ):
-                    raise HTTPException(
-                        status_code=403, detail="miner lacks organic OCI capability"
-                    )
-            if (
-                local.ticket.miner_id != hotkey
-                or ticket_binding.miner_hotkey != hotkey
-                or ticket_binding.miner_uid != remote.neuron.uid
-                # The signed assignment-time axon must be the handshake axon
-                # that will receive this work; a legacy ticket without it
-                # fails closed. This keeps later exact-identity cleanup and
-                # restart recovery bound to the axon that ran the workload.
-                or ticket_binding.miner_axon_url != remote.axon_url
-                or ticket_binding.miner_transport != remote.binding.transport
-                or ticket_binding.miner_tls_certificate_sha256
-                != remote.binding.transport_certificate_sha256
-                or ticket_binding.network != self.network
-                or ticket_binding.netuid != self.netuid
-                or ticket_binding.miner_service_public_key != remote.binding.service_public_key
-                or ticket_binding.validator_hotkey != self.hotkey
-                or ticket_binding.validator_service_public_key
-                != validator_binding.service_public_key
-                or ticket_binding.epoch != ticket_binding.chain_block // max(snapshot.tempo, 1)
-                or ticket_binding.chain_block > snapshot.block + 2
-                or snapshot.block >= ticket_binding.expires_at_block
+            if not await self._remote_has_feature(snapshot, remote, ORGANIC_OCI_FEATURE):
+                raise HTTPException(status_code=403, detail="miner lacks organic OCI capability")
+            if self._ticket_binding_differs(
+                hotkey, local.ticket.miner_id, ticket_binding, remote, validator_binding, snapshot
             ):
                 raise HTTPException(
                     status_code=403, detail="Go ticket binding differs from handshake"
@@ -3058,6 +3145,46 @@ class ValidatorNeuron:
                 "/api/v1/deploy",
                 synapse,
                 DeployResponseV3,
+                certificate_der=remote.certificate_der,
+            )
+
+        @self.app.post("/v1/miners/{hotkey}/static-deploy", response_model=None)
+        async def static_deploy_bridge(hotkey: str, request: Request) -> StaticDeployResponseV1:
+            body = await self._verify_local_bridge(request)
+            # Only subnet-static-synapse.v1 carries a static ticket; the
+            # organic deploy route never does.
+            try:
+                local = parse_document(body, BridgeStaticAssignRequestV1)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            ticket_binding = local.ticket.subnet
+            remote, validator_binding, snapshot = await self._remote_for_ticket(
+                hotkey, ticket_binding
+            )
+            if not await self._remote_has_feature(snapshot, remote, ORGANIC_STATIC_FEATURE):
+                # Refused before any miner contact: an old or static-disabled
+                # miner is ineligible, never penalized.
+                raise HTTPException(status_code=409, detail=STATIC_CAPABILITY_UNSUPPORTED)
+            if self._ticket_binding_differs(
+                hotkey, local.ticket.miner_id, ticket_binding, remote, validator_binding, snapshot
+            ):
+                raise HTTPException(
+                    status_code=403, detail="Go ticket binding differs from handshake"
+                )
+            synapse = StaticDeploySynapseV1(
+                protocol=static_contracts.SYNAPSE_VERSION,
+                request_id=local.request_id,
+                current_block=snapshot.block,
+                caller_hotkey=self.hotkey,
+                validator_binding=validator_binding,
+                ticket=local.ticket,
+            )
+            return await self._forward_signed_post(
+                remote.axon_url,
+                hotkey,
+                "/api/v1/static/deploy",
+                synapse,
+                StaticDeployResponseV1,
                 certificate_der=remote.certificate_der,
             )
 

@@ -8,6 +8,7 @@ import binascii
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Annotated, Final, Literal
 
@@ -464,6 +465,53 @@ class MinerRegistration(StrictModel):
         elif self.transport_certificate_der_base64:
             raise ValueError("HTTP miner registration must not carry certificate material")
         return self
+
+
+#: Control-plane capability: the runtime accepts ``miner-registration.v3``.
+MINER_REGISTRATION_V3_FEATURE: Final = "miner-registration-v3"
+MINER_REGISTRATION_V3_PROTOCOL: Final = "subnet-synapse.v3"
+MAX_REGISTRATION_FEATURES = 32
+_FEATURE_TOKEN = re.compile(r"^[a-z0-9][a-z0-9.-]{0,63}$")
+
+
+def registration_features(advertised: Iterable[str]) -> list[str]:
+    """The deterministic feature set a v3 registration carries.
+
+    Only well-formed tokens from the miner's capability response are kept,
+    sorted and de-duplicated, at most ``MAX_REGISTRATION_FEATURES``. A miner
+    whose list is malformed therefore only loses capabilities; it can never
+    make its registration (and so its organic work) invalid.
+    """
+
+    tokens = sorted({item for item in advertised if _FEATURE_TOKEN.fullmatch(item)})
+    return tokens[:MAX_REGISTRATION_FEATURES]
+
+
+class MinerRegistrationV3(MinerRegistration):
+    """``miner-registration.v3``: v2 plus the capability features.
+
+    ``features`` are exactly the (normalized) ``features`` of the capability
+    response that carried this registration's hotkey-signed service binding,
+    received over the connection pinned to that binding's TLS leaf. Absent
+    features mean "not capable"; there is no default capability.
+    """
+
+    protocol: Literal["subnet-synapse.v3"]  # type: ignore[assignment]
+    features: list[str] = Field(max_length=MAX_REGISTRATION_FEATURES)
+
+    @model_validator(mode="after")
+    def canonical_features(self) -> MinerRegistrationV3:
+        if self.features != registration_features(self.features):
+            raise ValueError("registration features must be sorted, unique feature tokens")
+        return self
+
+
+def parse_miner_registration(value: object) -> MinerRegistration:
+    """Parse a v2 or v3 registration by its ``protocol``."""
+
+    if isinstance(value, dict) and value.get("protocol") == MINER_REGISTRATION_V3_PROTOCOL:
+        return MinerRegistrationV3.model_validate(value)
+    return MinerRegistration.model_validate(value)
 
 
 class MinerSet(StrictModel):

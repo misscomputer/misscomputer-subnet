@@ -217,6 +217,11 @@ func validateDescriptor(name string, descriptor Descriptor, mediaType string, ma
 	return nil
 }
 
+// IsOversize reports whether err is a store refusal of an object larger than
+// the caller's bound. Content that exceeds its signed size is a verification
+// failure, not store unavailability.
+func IsOversize(err error) bool { return isOversize(err) }
+
 func isOversize(err error) bool {
 	var s3Err *S3Error
 	return errors.Is(err, errObjectTooLarge) || (errors.As(err, &s3Err) && s3Err.Kind == S3ErrorResponseTooBig)

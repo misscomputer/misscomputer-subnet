@@ -77,6 +77,11 @@ func run() error {
 		minerTransport        = flag.String("miner-transport", "https", "advertised miner transport: https, or explicit mock http")
 		tlsCertificateSHA256  = flag.String("tls-certificate-sha256", "", "SHA-256 fingerprint of the configured public TLS leaf certificate")
 		allowInsecureMockHTTP = flag.Bool("allow-insecure-mock-http", false, "allow pinless HTTP tickets only on an explicit local/mock network")
+		staticSites           = flag.String("static-sites", "off", "static-site-v1 workload: off (default) or on")
+		staticCacheDir        = flag.String("static-cache-dir", "", "private directory for verified static site files (required with --static-sites on)")
+		staticCacheMaxBytes   = flag.Int64("static-cache-max-bytes", 8<<30, "byte quota of pinned static site files")
+		staticFetchTimeout    = flag.Duration("static-fetch-timeout", miner.DefaultStaticFetchTimeout, "bound on fetching and verifying one static site")
+		staticConcurrency     = flag.Int("static-request-concurrency", miner.DefaultStaticRequestConcurrency, "in-flight requests per static endpoint")
 	)
 	flag.Parse()
 	if err := service.ValidateBind(*bind, *allowNonLoopback); err != nil {
@@ -127,6 +132,9 @@ func run() error {
 	agent.State = store
 	agent.MinerTransport = *minerTransport
 	agent.MinerTLSCertificateSHA256 = *tlsCertificateSHA256
+	if agent.Static, err = openStaticSites(*staticSites, *staticCacheDir, *staticCacheMaxBytes, *staticFetchTimeout, *staticConcurrency); err != nil {
+		return err
+	}
 	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	if err := agent.RecoverCleanup(recoveryCtx); err != nil {
 		recoveryCancel()
@@ -147,6 +155,8 @@ func run() error {
 	protected.HandleFunc("POST /v1/assignments", serviceAPI.assign)
 	protected.HandleFunc("POST /v1/status", serviceAPI.status)
 	protected.HandleFunc("POST /v1/deactivate", serviceAPI.deactivate)
+	protected.HandleFunc("POST /v1/static/assignments", serviceAPI.assignStatic)
+	protected.HandleFunc("POST /v1/static/status", serviceAPI.staticStatus)
 	authenticator := bridge.Authenticator{Secret: secret, Store: store}
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
@@ -249,6 +259,9 @@ func (a *api) features() []string {
 	if a.agent.OCI != nil {
 		features = append(features, neuron.FeatureOrganicOCIV1)
 	}
+	if a.agent.Static != nil {
+		features = append(features, neuron.FeatureOrganicStaticV1)
+	}
 	return features
 }
 
@@ -324,32 +337,15 @@ func (a *api) assignBound(req *http.Request, requestID string, currentBlock uint
 	if requestID == "" {
 		return miner.Result{}, &bridgeError{http.StatusForbidden, "binding_unverified", errors.New("request_id is required")}
 	}
-	if binding.Protocol != neuron.ServiceBindingVersion || binding.Role != "validator" || binding.Network != a.network || binding.NetUID != a.netuid || binding.Hotkey != callerHotkey || binding.ServicePublicKey == "" {
-		return miner.Result{}, &bridgeError{http.StatusForbidden, "identity_mismatch", errors.New("validator binding does not match the authenticated caller")}
-	}
-	if err := neuron.ValidateServiceBindingTransport(binding, false); err != nil {
-		return miner.Result{}, &bridgeError{http.StatusForbidden, "identity_mismatch", err}
-	}
-	keyBytes, err := hex.DecodeString(binding.ServicePublicKey)
-	if err != nil || len(keyBytes) != ed25519.PublicKeySize {
-		return miner.Result{}, &bridgeError{http.StatusBadRequest, "invalid_service_key", errors.New("validator service key is invalid")}
-	}
-	if currentBlock < binding.ValidFromBlock || currentBlock >= binding.ExpiresAtBlock {
-		return miner.Result{}, &bridgeError{http.StatusGone, "expired_binding", errors.New("validator service binding is not current")}
-	}
-	if err := a.store.UpsertServiceBinding(req.Context(), durable.ServiceBinding{
-		Role: binding.Role, Network: binding.Network, NetUID: binding.NetUID, Hotkey: binding.Hotkey, UID: binding.UID,
-		ServicePublicKey: binding.ServicePublicKey, Generation: binding.Generation, ExpiresAtBlock: binding.ExpiresAtBlock,
-		Transport: binding.Transport, TransportCertificateSHA256: optionalString(binding.TransportCertificateSHA256),
-		BindingJSON: neuron.BindingJSON(binding),
-	}); err != nil {
-		return miner.Result{}, &bridgeError{http.StatusConflict, "binding_rollback", err}
+	key, err := a.acceptValidatorBinding(req, currentBlock, callerHotkey, binding)
+	if err != nil {
+		return miner.Result{}, err
 	}
 	v4, err := ticket.V4()
 	if err != nil {
 		return miner.Result{}, err
 	}
-	result, err := a.agent.AssignBoundV4(req.Context(), v4, ed25519.PublicKey(keyBytes), currentBlock, a.network, a.netuid, callerHotkey, a.hotkey, a.uid)
+	result, err := a.agent.AssignBoundV4(req.Context(), v4, key, currentBlock, a.network, a.netuid, callerHotkey, a.hotkey, a.uid)
 	return miner.Result{Receipt: protocol.ReceiptFromV4(result.Receipt), EndpointID: result.EndpointID, Idempotent: result.Idempotent}, err
 }
 
@@ -361,6 +357,13 @@ func (a *api) status(w http.ResponseWriter, req *http.Request) {
 	}
 	if input.Protocol != neuron.SynapseVersion || input.RequestID == "" {
 		bridge.WriteError(w, http.StatusBadRequest, "version_mismatch", "unsupported status contract", false)
+		return
+	}
+	if _, static, err := a.agent.StaticRecord(req.Context(), input.EndpointID); err != nil {
+		bridge.WriteError(w, http.StatusInternalServerError, "state_error", err.Error(), true)
+		return
+	} else if static {
+		bridge.WriteError(w, http.StatusConflict, "static_endpoint", "static endpoints answer only subnet-static-synapse.v1 status", false)
 		return
 	}
 	ticket, status, exists, err := a.store.AssignmentTicket(req.Context(), input.EndpointID)
@@ -406,6 +409,9 @@ func (a *api) deactivate(w http.ResponseWriter, req *http.Request) {
 	}
 	if input.Protocol != neuron.SynapseVersion || input.RequestID == "" {
 		bridge.WriteError(w, http.StatusBadRequest, "version_mismatch", "unsupported deactivation contract", false)
+		return
+	}
+	if handled := a.deactivateStatic(w, req, input); handled {
 		return
 	}
 	ticket, _, exists, err := a.store.AssignmentTicket(req.Context(), input.EndpointID)

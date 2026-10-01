@@ -89,6 +89,12 @@ binding. Deactivation remains bound to the exact signed miner identity of the
 original assignment; a rebound or ambiguous identity cannot authorize new
 work or redirect cleanup.
 
+Registrations reach the Go control plane as `miner-registration.v2`, or as
+`miner-registration.v3` (protocol `subnet-synapse.v3`, adding the
+handshake's normalized capability `features`) when the runtime advertises
+the control feature `miner-registration-v3`. Capability-gated placement (for
+example `organic-static-v1`) reads only v3 features; v2 grants none.
+
 ## Hotkey-signed service binding
 
 A capability response signs canonical JSON with the Bittensor hotkey. The binding includes:

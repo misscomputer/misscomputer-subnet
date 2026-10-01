@@ -57,7 +57,10 @@ type Agent struct {
 	SigningKey ed25519.PrivateKey
 	Artifacts  artifact.Store
 	// OCI runs organic deployment.v4 assignments (AssignBoundV4).
-	OCI        deployruntime.OCIRuntime
+	OCI deployruntime.OCIRuntime
+	// Static serves static-site-v1 assignments (AssignBoundStaticV1); nil
+	// disables the workload and its capability.
+	Static     *StaticSites
 	Tunnels    tunnel.Registry
 	HTTPClient *http.Client
 	mu         sync.Mutex
@@ -147,6 +150,9 @@ func canonicalSHA256(value string) bool {
 // Deactivate resolves a scheduler-derived endpoint identity through private
 // agent state. The scheduler never supplies or trusts a miner runtime ID.
 func (a *Agent) Deactivate(ctx context.Context, endpointID string) error {
+	if handled, err := a.deactivateStatic(ctx, endpointID); handled || err != nil {
+		return err
+	}
 	a.mu.Lock()
 	a.deactivationRequested[endpointID] = true
 	a.mu.Unlock()
@@ -349,6 +355,9 @@ func (a *Agent) RecoverCleanup(ctx context.Context) error {
 	if a.State == nil {
 		return nil
 	}
+	if err := a.recoverStatic(ctx); err != nil {
+		return err
+	}
 	endpoints, err := a.State.ActiveEndpoints(ctx)
 	if err != nil {
 		return err
@@ -387,6 +396,12 @@ func (a *Agent) RecoverCleanup(ctx context.Context) error {
 // incarnation leaves with exactly one miner-signed miner-probe-attestation
 // v2; the application can never supply one.
 func (a *Agent) ProxyRuntime(w http.ResponseWriter, req *http.Request, endpointID string) {
+	if a.Static != nil {
+		if endpoint := a.Static.lookup(endpointID); endpoint != nil {
+			a.serveStatic(w, req, endpointID, endpoint)
+			return
+		}
+	}
 	if _, status, err := a.authorizeEdgeRuntimeRequest(req, endpointID); err != nil {
 		http.Error(w, err.Error(), status)
 		return
