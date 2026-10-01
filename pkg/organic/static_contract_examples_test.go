@@ -21,8 +21,8 @@ const (
 	staticContractManifest         = `{"fallback":{"kind":"spa-html-v1","target":"/index.html"},"files":[{"body_sha256":"f9444510dc7403e41049deb133f6892aa6a63c05591b2b59e4ee5b234d7bbd99","content_length":22,"content_type":"text/javascript; charset=utf-8","path":"/assets/app.js"},{"body_sha256":"4ada0f02c1764cbf47214c80ddc1f17d4eafc571f4c82fe71774b70fb65f87d9","content_length":35,"content_type":"text/html; charset=utf-8","path":"/docs/index.html"},{"body_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","content_length":0,"content_type":"text/plain; charset=utf-8","path":"/empty.txt"},{"body_sha256":"d628d86f44c331c490330a6c091d656e960ce76f429eaa739196e598a75796c5","content_length":74,"content_type":"text/html; charset=utf-8","path":"/index.html"}],"handler":"static-handler.v1","schema":"miss.computer/misscomputer-subnet/static-site-manifest","schema_version":1}` + "\n"
 	staticContractSite             = "sha256:9db3b2a4b3f18c1d31fd7d3348f83e1dfde21163d5aca540fd2f63d6b88ab77f"
 	staticContractReleasePublicKey = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
-	staticContractReleaseSignature = "5bab1ba140424869a6c97d61b28364253cd278aae288108abd82dba2cc6e8ac81f809edab150ae2d8acddc498715953a8b57a5cd19f5ef5bc2d3eaafb83f170c"
-	staticContractReleaseDigest    = "sha256:a3ea17b8d08367ae5e971b7ee495cfae6d6bbaff9483f4396fe21189086ae19c"
+	staticContractReleaseSignature = "f44b77fd41fadf5f3904cba2ca875de7a1021761f591b249e02a706407febb5f178ff2c828fc9108007ddaaffcbf68f3f46d32912809b16aea5d3f10dd250a0c"
+	staticContractReleaseDigest    = "sha256:9b03cbef4e0731b17c1a6bc81a1942e9cab32ca96445a4c48a3efcb65fbdbc9e"
 	staticContractGetRootHeaders   = "b830308c459ff241874e1e9b218a44b7161985c4005cdd824573f3a4677eed05"
 )
 
@@ -74,7 +74,7 @@ func TestStaticContractWorkedExamplesMatchGoCanonicalBytes(t *testing.T) {
 	}
 	release := map[string]any{
 		"issued_at":                    "2026-09-30T00:00:00Z",
-		"producer_policy_version":      "static-producer-policy.v2",
+		"producer_policy_version":      "static-producer-policy.v3",
 		"schema":                       "miss.computer/misscomputer-subnet/static-site-release",
 		"schema_version":               1,
 		"server_implementation_digest": "sha256:" + string(bytes.Repeat([]byte("ab"), 32)),

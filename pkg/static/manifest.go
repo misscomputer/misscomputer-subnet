@@ -50,7 +50,7 @@ const (
 	htmlType  = "text/html; charset=utf-8"
 )
 
-// contentTypes is static-producer-policy.v2 (§3.4): extension to type.
+// contentTypes is static-producer-policy.v3 (§3.4): extension to type.
 var contentTypes = map[string]string{
 	"html": htmlType, "htm": htmlType,
 	"css": "text/css; charset=utf-8",

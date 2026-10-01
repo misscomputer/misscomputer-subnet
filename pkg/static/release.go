@@ -22,7 +22,7 @@ const (
 	ReleaseSchema     = organic.SchemaPrefix + "static-site-release"
 	TrustPolicySchema = organic.SchemaPrefix + "static-site-release-trust-policy"
 	// ProducerPolicyVersion is the only producer policy this build implements.
-	ProducerPolicyVersion = "static-producer-policy.v2"
+	ProducerPolicyVersion = "static-producer-policy.v3"
 
 	MaxReleaseBytes     = 16 << 10
 	MaxTrustPolicyBytes = 256 << 10
