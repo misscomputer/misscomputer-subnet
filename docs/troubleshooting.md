@@ -50,7 +50,7 @@ Look at the status codes in the axon's access log (`uvicorn.access` lines):
 | --- | --- |
 | `503 metagraph is not ready` | See the `503` table above. |
 | `401` | btauth signature, nonce, or freshness failure. Usually the caller's problem; if every request fails, check the host clock. |
-| `403 caller is not active on this subnet` / `caller lacks a validator permit` / `caller stake is below policy minimum` | Normal filtering of non-validators or low-stake callers (`--min-validator-stake`, default `1000`). |
+| `403 caller is not uniquely registered on this subnet` / `caller lacks a validator permit` / `caller stake is below policy minimum` | Normal filtering of absent or ambiguous hotkeys, non-validators, or low-stake callers (`--min-validator-stake`, default `1000`). |
 | `429 validator request rate exceeded` | One caller exceeded 120 requests per 60 seconds. |
 | `409 request block is stale or from the future` | Your chain view and the validator's differ by more than two blocks. Check sync logs and `--sync-interval`. |
 | `500 local Go identity is misconfigured` | The axon and agent disagree on network, netuid, hotkey, UID, transport, or TLS pin. Compare every row of [Values that must match](miner-quickstart.md#values-that-must-match). A common cause is starting the agent without `--uid` or with the default `--network local`. |
