@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -274,6 +275,23 @@ async def test_transiently_omitted_miner_still_supports_exact_cleanup(tmp_path: 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "deactivated"
     assert sim.deactivations == [("miner-a", "assignment-a")]
+
+
+@pytest.mark.asyncio
+async def test_registered_inactive_miner_retains_exact_cleanup(tmp_path: Path) -> None:
+    neuron, chain, sim = make_harness(tmp_path)
+    await refresh(neuron, chain, sim)
+    snapshot = await neuron.state.get()
+    await neuron.state.set(
+        replace(
+            snapshot,
+            block=snapshot.block + 1,
+            neurons=tuple(replace(record, active=False) for record in snapshot.neurons),
+        )
+    )
+    response = await bridge_deactivate(neuron, MINER_A.hotkey, endpoint_id="inactive-cleanup")
+    assert response.status_code == 200, response.text
+    assert sim.deactivations == [("miner-a", "inactive-cleanup")]
 
 
 @pytest.mark.asyncio

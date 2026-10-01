@@ -257,10 +257,11 @@ Health, from the host:
 curl -sk -o /dev/null -w '%{http_code}\n' "https://127.0.0.1:$MC_AXON_PORT/healthz"   # 204
 ```
 
-`/healthz` returns `204` once the hotkey is in the metagraph with the chain's
-`active` flag set and the expected UID, and `503` before that. Validators
-likewise only consider metagraph records whose `active` flag is set, so check
-it with the [read-only chain check](getting-started.md#read-only-chain-check)
+`/healthz` returns `204` once the hotkey is uniquely registered in the
+metagraph with the expected UID, and `503` before that. Validators also
+discover uniquely registered miner records with valid axons even when their
+weight-update `active` flag is false. Check membership and UID with the
+[read-only chain check](getting-started.md#read-only-chain-check)
 if the miner never becomes ready. `-k` is needed because the
 certificate is self-signed; validators pin it instead.
 

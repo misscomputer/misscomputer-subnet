@@ -35,7 +35,7 @@ its verified OCI runtime is configured. The retired `probe-attestation-v1`
 feature is neither advertised nor required: the miner agent signs
 `miner-probe-attestation` v2 for validator-authorized organic probes only.
 
-Remote requests use the SDK’s `bittensor.http_auth` btauth/1 signatures. The signed material binds the sender hotkey, receiver hotkey, nonce/timestamp, HTTP method, path, and exact body. Miners additionally require an active metagraph record, validator permit, configured minimum TAO stake, and rate/priority admission. HTTP is available only when both sides explicitly select the local/mock policy; live startup never silently downgrades.
+Remote requests use the SDK’s `bittensor.http_auth` btauth/1 signatures. The signed material binds the sender hotkey, receiver hotkey, nonce/timestamp, HTTP method, path, and exact body. Miners additionally require a uniquely registered metagraph hotkey, validator permit, configured minimum TAO stake, and rate/priority admission. The metagraph `active` bit tracks weight-update freshness, not registration, so it is not a serving-authentication gate. HTTP is available only when both sides explicitly select the local/mock policy; live startup never silently downgrades.
 
 Transport retries are bounded. A retry obtains a fresh btauth nonce while preserving the semantic request/ticket identity. Redirects and environment proxies are disabled. The Go agent returns a cached signed ready result only for the same durable endpoint incarnation; a different assignment nonce cannot reuse it.
 
@@ -65,7 +65,7 @@ miner.
 ## Open miner snapshot admission
 
 Miner discovery is permissionless: candidate admission uses only the configured
-network/netuid and the current metagraph. Every active record other than the
+network/netuid and the current metagraph. Every registered record other than the
 configured validator's own hotkey, with a unique hotkey, UID, and normalized
 valid public axon, is eligible; a chain-assigned validator permit is not a
 miner-role filter. There is no allowlist, owner-selected set, or miner stake

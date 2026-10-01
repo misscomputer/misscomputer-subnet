@@ -145,7 +145,7 @@ Expected: `204`. The miner logs one JSON object per line on stderr, including:
 
 Stop it with Ctrl+C. If you change `--mock-uri` to a key that is not in
 `peers.json` (for example `//Charlie`), `/healthz` returns `503` and the log
-shows `miner hotkey is not registered`; that is the same signal a live miner
+shows `miner hotkey is not uniquely registered`; that is the same signal a live miner
 gives before its hotkey is registered.
 
 Mock mode is a local development aid only. `--allow-insecure-mock-http`
@@ -194,8 +194,9 @@ EOF
 
 Expected output looks like `block=<n> finalized=True tempo=<n>` followed by
 either your UID line or `hotkey is not registered on this subnet`. `active`
-is the chain's own flag for the record; the miner, validator discovery, and
-the window coordinator only accept records where it is `True`. The
+tracks weight-update freshness; the miner and validator discovery accept
+uniquely registered records even when it is `False`. The window coordinator
+still requires `True` for scoring. The
 `block` value is also a convenient source for the validator probe's
 `--finalized-height` when `finalized=True`.
 
