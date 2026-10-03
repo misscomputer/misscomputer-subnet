@@ -4,7 +4,6 @@
       "additionalProperties": false,
       "properties": {
         "active": {
-          "const": true,
           "title": "Active",
           "type": "boolean"
         },
