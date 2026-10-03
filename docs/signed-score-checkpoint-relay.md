@@ -116,7 +116,10 @@ steps:
 7. Require the exact finalized metagraph height, block hash, epoch, external
    validator identity, and complete UID-to-hotkey miner mapping. The mapping
    must have no duplicates, omissions, extras, or churn relative to the score
-   vector.
+   vector. For a `test/581` trial snapshot, a permitted validator may carry
+   `active=false` because that chain bit tracks weight-update freshness, not
+   registration or serving eligibility. `finney/24` still requires
+   `active=true`; `validator_permit=true` remains mandatory on both.
 8. Normalize only the central canonical integer scores. policy-ineligible or
    zero-score miners receive exactly zero. Positive scores are projected into
    the existing u16 weight domain (`65,535` total) using integer division and

@@ -394,7 +394,7 @@ class MetagraphMinerMapping(_StrictFrozenModel):
 class ExternalValidatorIdentity(_StrictFrozenModel):
     uid: UID
     hotkey: Hotkey
-    active: Literal[True]
+    active: bool
     validator_permit: Literal[True]
 
 
@@ -419,6 +419,10 @@ class RelayFinalizedMetagraphSnapshot(_StrictFrozenModel):
     def canonical_metagraph(self) -> Self:
         if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
             raise ValueError("finalized_metagraph_subnet_invalid")
+        # The test/581 trial metagraph can report a permitted validator as
+        # inactive. Mainnet keeps its active-validator requirement unchanged.
+        if self.network == "finney" and not self.validator.active:
+            raise ValueError("validator_inactive")
         keys = [(item.uid, item.hotkey) for item in self.miner_mappings]
         if keys != sorted(set(keys)):
             raise ValueError("metagraph_mappings_not_canonical")

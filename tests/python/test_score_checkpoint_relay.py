@@ -716,6 +716,26 @@ def test_finalized_metagraph_accepts_only_the_matched_testnet_pair() -> None:
         parse_relay_finalized_metagraph_snapshot(relay_finalized_metagraph_snapshot_bytes(testnet))
         == testnet
     )
+    inactive_validator = ExternalValidatorIdentity(
+        uid=context.validator.uid,
+        hotkey=context.validator.hotkey,
+        active=False,
+        validator_permit=True,
+    )
+    inactive_testnet = build_relay_finalized_metagraph_snapshot(
+        **{**arguments, "validator": inactive_validator}, network="test", netuid=581
+    )
+    assert inactive_testnet.validator.active is False
+    assert (
+        parse_relay_finalized_metagraph_snapshot(
+            relay_finalized_metagraph_snapshot_bytes(inactive_testnet)
+        )
+        == inactive_testnet
+    )
+    with pytest.raises(ValidationError, match="validator_inactive"):
+        build_relay_finalized_metagraph_snapshot(
+            **{**arguments, "validator": inactive_validator}, network="finney", netuid=24
+        )
     for network, netuid in (("test", 24), ("finney", 581)):
         with pytest.raises(ValidationError, match="subnet"):
             build_relay_finalized_metagraph_snapshot(**arguments, network=network, netuid=netuid)
