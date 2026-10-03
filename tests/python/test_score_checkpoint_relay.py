@@ -699,6 +699,32 @@ def test_metagraph_uid_hotkey_coverage_validator_and_finality_are_exact() -> Non
     )
 
 
+def test_finalized_metagraph_accepts_only_the_matched_testnet_pair() -> None:
+    """A real test/581 chain capture must not masquerade as finney/24."""
+
+    context = make_context()
+    arguments = {
+        "finalized_height": context.checkpoint.finalized_height,
+        "finalized_block_hash": context.checkpoint.finalized_block_hash,
+        "finalized_epoch": context.checkpoint.finalized_epoch,
+        "validator": context.validator,
+        "miner_mappings": context.metagraph.miner_mappings,
+    }
+    testnet = build_relay_finalized_metagraph_snapshot(**arguments, network="test", netuid=581)
+    assert (testnet.network, testnet.netuid) == ("test", 581)
+    assert (
+        parse_relay_finalized_metagraph_snapshot(relay_finalized_metagraph_snapshot_bytes(testnet))
+        == testnet
+    )
+    for network, netuid in (("test", 24), ("finney", 581)):
+        with pytest.raises(ValidationError, match="subnet"):
+            build_relay_finalized_metagraph_snapshot(**arguments, network=network, netuid=netuid)
+    value = rebuild_input(context, finalized_metagraph=testnet)
+    assert_rejected(
+        "metagraph_binding_mismatch", verify_checkpoint_and_build_relay, value, context.policy
+    )
+
+
 def test_ineligible_miners_are_zero_and_largest_remainder_ties_are_stable() -> None:
     context = make_context(report=ineligible_report(load_report()))
     result = verify_checkpoint_and_build_relay(context.verification_input, context.policy)

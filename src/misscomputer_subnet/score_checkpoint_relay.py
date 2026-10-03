@@ -404,8 +404,8 @@ class RelayFinalizedMetagraphSnapshot(_StrictFrozenModel):
     ] = Field(alias="schema")
     schema_version: Literal[1]
     purpose: Literal["external_validator_checkpoint_verification_v1"]
-    network: Literal["finney"]
-    netuid: Literal[24]
+    network: Literal["finney", "test"]
+    netuid: Literal[24, 581]
     finalized: Literal[True]
     finalized_height: Epoch
     finalized_block_hash: Digest
@@ -417,6 +417,8 @@ class RelayFinalizedMetagraphSnapshot(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_metagraph(self) -> Self:
+        if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
+            raise ValueError("finalized_metagraph_subnet_invalid")
         keys = [(item.uid, item.hotkey) for item in self.miner_mappings]
         if keys != sorted(set(keys)):
             raise ValueError("metagraph_mappings_not_canonical")
@@ -659,6 +661,8 @@ def build_relay_finalized_metagraph_snapshot(
     finalized_epoch: int,
     validator: ExternalValidatorIdentity,
     miner_mappings: Sequence[MetagraphMinerMapping],
+    network: Literal["finney", "test"] = MAINNET_NETWORK,
+    netuid: Literal[24, 581] = MAINNET_NETUID,
 ) -> RelayFinalizedMetagraphSnapshot:
     validator = _revalidate(validator, ExternalValidatorIdentity)
     mappings = sorted(
@@ -670,8 +674,8 @@ def build_relay_finalized_metagraph_snapshot(
         "schema": RELAY_METAGRAPH_SCHEMA,
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "purpose": VERIFICATION_PURPOSE,
-        "network": MAINNET_NETWORK,
-        "netuid": MAINNET_NETUID,
+        "network": network,
+        "netuid": netuid,
         "finalized": True,
         "finalized_height": finalized_height,
         "finalized_block_hash": finalized_block_hash,
