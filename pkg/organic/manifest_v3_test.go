@@ -35,6 +35,39 @@ func TestManifestV3SignatureMessageMatchesPython(t *testing.T) {
 	}
 }
 
+func TestManifestV3TestnetNetworkPair(t *testing.T) {
+	manifest := *decodeFixture(t, "active-assignment-manifest.v3", &organic.ActiveAssignmentManifestV3{})
+	manifest.Network = "test"
+	manifest.NetUID = 581
+	digest, err := organic.DigestWithout(manifest, "manifest_digest_sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.ManifestDigestSHA256 = digest
+	if _, err := organic.ManifestV3SignatureMessage(manifest); err != nil {
+		t.Fatalf("test/581 v3 manifest was refused: %v", err)
+	}
+
+	for _, pair := range []struct {
+		network string
+		netuid  int
+	}{
+		{"test", 24},
+		{"finney", 581},
+	} {
+		invalid := manifest
+		invalid.Network = pair.network
+		invalid.NetUID = pair.netuid
+		invalid.ManifestDigestSHA256, err = organic.DigestWithout(invalid, "manifest_digest_sha256")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := organic.ManifestV3SignatureMessage(invalid); err == nil {
+			t.Fatalf("mismatched network pair %s/%d was accepted", pair.network, pair.netuid)
+		}
+	}
+}
+
 func TestManifestV3OCIDeploymentIsTheV2Deployment(t *testing.T) {
 	v2 := *decodeFixture(t, "active-assignment-manifest.v2", &organic.ActiveAssignmentManifestV2{})
 	v3 := *decodeFixture(t, "active-assignment-manifest.v3", &organic.ActiveAssignmentManifestV3{})

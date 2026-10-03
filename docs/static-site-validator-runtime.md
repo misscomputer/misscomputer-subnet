@@ -72,5 +72,6 @@ static path abstained, or the static epoch is not scored.
   (`STATIC status=abstained`) and the organic path is unaffected.
 - The manifest `purpose` is `active_assignment_manifest_publication_v3`; the
   frozen signature envelope keeps the channel purpose, as for v2.
-- Records remain `finney`/`24`; testnet drills of this path need a
-  network/netuid decision.
+- The static v3 path accepts only `finney`/`24` or `test`/`581`, bound to its
+  pinned manifest trust policy. The testnet `test`/`581` pair is carried into
+  static epoch/window records; organic v2 and organic scoring stay unchanged.

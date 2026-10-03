@@ -834,8 +834,8 @@ class ActiveAssignmentManifestV3(StrictFrozenModel):
     )
     schema_version: Literal[3]
     purpose: Literal["active_assignment_manifest_publication_v3"]
-    network: Literal["finney"]
-    netuid: Literal[24]
+    network: Literal["finney", "test"]
+    netuid: Literal[24, 581]
     central_authority_fingerprint_sha256: Hex64
     trust_policy_digest_sha256: Hex64
     finalized_height: Count
@@ -854,6 +854,8 @@ class ActiveAssignmentManifestV3(StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_manifest(self) -> Self:
+        if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
+            raise ValueError("static_subnet_invalid")
         if self.expires_at_epoch <= self.issued_at_epoch:
             raise ValueError("manifest_validity_window_invalid")
         if (self.sequence == 1) != (self.previous_manifest_digest_sha256 is None):

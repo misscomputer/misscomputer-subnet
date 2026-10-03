@@ -116,8 +116,10 @@ Callers serialize access under the probe CLI's state-root lock.
   whether content faults make a miner ineligible for a window, need an owner
   decision, a new scoring-policy digest, a mirrored private implementation
   and a reissued checkpoint trust policy.
-- Records pin `finney`/`24` like the organic path; testnet drills of the
-  public pipeline need a network/netuid decision.
+- Static records accept only the explicit `finney`/`24` and `test`/`581`
+  pairs. Builders still default to `finney`/`24`; the testnet validator must
+  carry the verified v3 manifest pair into its epoch and window records.
+  A mixed-network window is refused. Organic v1 scoring is unchanged.
 - The private runtime (quarantine store, replacement, alert delivery) and
   edge (producing `static-edge-evidence`) mirror these public contracts
   across the split; nothing here links private code.

@@ -275,8 +275,8 @@ class AssignmentManifestTrustPolicy(_StrictFrozenModel):
     schema_version: Literal[1]
     policy_id: Literal["miss-computer-active-assignment-manifest-trust-v1"]
     purpose: Literal["active_assignment_manifest_publication_v1"]
-    network: Literal["finney"]
-    netuid: Literal[24]
+    network: Literal["finney", "test"]
+    netuid: Literal[24, 581]
     central_authority_fingerprint_sha256: Digest
     threshold: int = Field(ge=1, le=MAX_KEYS)
     required_roles: list[ManifestRole] = Field(min_length=1, max_length=3)
@@ -299,6 +299,8 @@ class AssignmentManifestTrustPolicy(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_policy(self) -> Self:
+        if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
+            raise ValueError("static_subnet_invalid")
         if self.valid_until_epoch <= self.valid_from_epoch:
             raise ValueError("trust_policy_validity_window_invalid")
         if self.required_roles != sorted(set(self.required_roles)):
@@ -350,8 +352,8 @@ class AssignmentManifestChainState(_StrictFrozenModel):
     ] = Field(alias="schema")
     schema_version: Literal[1]
     purpose: Literal["active_assignment_manifest_publication_v1"]
-    network: Literal["finney"]
-    netuid: Literal[24]
+    network: Literal["finney", "test"]
+    netuid: Literal[24, 581]
     central_authority_fingerprint_sha256: Digest
     trust_policy_digest_sha256: Digest
     accepted_manifest_count: Epoch
@@ -369,6 +371,8 @@ class AssignmentManifestChainState(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_state(self) -> Self:
+        if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
+            raise ValueError("static_subnet_invalid")
         tail = (
             self.last_finalized_height,
             self.last_finalized_block_hash,
@@ -431,6 +435,8 @@ def build_assignment_manifest_trust_policy(
     probe_timeout_millis: int,
     max_response_bytes: int,
     pinned_edge_leaf_certificate_sha256: Sequence[str] = (),
+    network: Literal["finney", "test"] = MAINNET_NETWORK,
+    netuid: Literal[24, 581] = MAINNET_NETUID,
 ) -> AssignmentManifestTrustPolicy:
     """Seal a local public-key trust policy; no secret key material is accepted."""
 
@@ -443,8 +449,8 @@ def build_assignment_manifest_trust_policy(
         "schema_version": PROBE_SCHEMA_VERSION,
         "policy_id": MANIFEST_TRUST_POLICY_ID,
         "purpose": MANIFEST_PURPOSE,
-        "network": MAINNET_NETWORK,
-        "netuid": MAINNET_NETUID,
+        "network": network,
+        "netuid": netuid,
         "central_authority_fingerprint_sha256": central_authority_fingerprint_sha256,
         "threshold": threshold,
         "required_roles": sorted(required_roles),

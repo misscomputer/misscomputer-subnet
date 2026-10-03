@@ -119,6 +119,24 @@ def test_honest_epoch_is_scored_bound_and_replayable() -> None:
     assert replay_static_epoch_score(record, [index]) == record
 
 
+def test_testnet_static_epoch_and_window_keep_the_testnet_pair() -> None:
+    index, edge = verified_site()
+    observations = hidden_epoch(index, edge)
+
+    epoch = score(index, observations, network="test", netuid=581)
+    window = aggregate_static_window([epoch])
+
+    assert (epoch.network, epoch.netuid) == ("test", 581)
+    assert (window.network, window.netuid) == ("test", 581)
+    assert replay_static_epoch_score(epoch, [index]) == epoch
+    assert parse_static_epoch_score(static_epoch_score_bytes(epoch)) == epoch
+    with pytest.raises(ValueError, match="static_subnet_invalid"):
+        score(index, observations, network="test", netuid=24)
+    mainnet_next = score(index, hidden_epoch(index, edge, epoch=EPOCH + 1), epoch=EPOCH + 1)
+    with pytest.raises(StaticScoringError, match="static_scoring_network_mismatch"):
+        aggregate_static_window([epoch, mainnet_next])
+
+
 # fault -> (failure code, attribution, content fault charged, fraud, alert)
 FAULTS: dict[str, tuple[Callable[[dict[str, Any]], Any], str, str, bool, bool, str | None]] = {
     "attested wrong body": (

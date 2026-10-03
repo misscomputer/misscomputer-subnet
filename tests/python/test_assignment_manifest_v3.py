@@ -173,6 +173,33 @@ def test_golden_v3_signs_under_its_own_domain() -> None:
     assert hashlib.sha256(message).hexdigest() == GOLDEN_V3_MESSAGE_SHA256
 
 
+def test_testnet_v3_manifest_is_bound_to_a_testnet_trust_policy() -> None:
+    mainnet_policy = build_policy(signer_keys())
+    unsigned_policy = {
+        **model_document(mainnet_policy, exclude={"trust_policy_digest_sha256"}),
+        "network": "test",
+        "netuid": 581,
+    }
+    testnet_policy = AssignmentManifestTrustPolicy.model_validate(
+        {**unsigned_policy, "trust_policy_digest_sha256": digest(unsigned_policy)}
+    )
+    manifest = v3_manifest(
+        mainnet_policy,
+        network="test",
+        netuid=581,
+        trust_policy_digest_sha256=testnet_policy.trust_policy_digest_sha256,
+    )
+
+    assert verify(manifest, testnet_policy).manifest == manifest
+    assert parse_assignment_manifest_v3(assignment_manifest_v3_bytes(manifest)) == manifest
+    with pytest.raises(AssignmentProbeError):
+        verify(manifest, mainnet_policy)
+    with pytest.raises(ValueError, match="static_subnet_invalid"):
+        v3_manifest(mainnet_policy, network="test", netuid=24)
+    with pytest.raises(ValueError, match="static_subnet_invalid"):
+        v3_manifest(mainnet_policy, network="finney", netuid=581)
+
+
 def test_golden_v3_oci_deployment_is_the_golden_v2_deployment() -> None:
     v2 = parse_canonical_document(
         golden("active-assignment-manifest.v2"), ActiveAssignmentManifestV2
