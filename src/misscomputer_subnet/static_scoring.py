@@ -158,6 +158,7 @@ StaticScoringRejectionCode = Literal[
     "static_scoring_identity_conflict",
     "static_scoring_index_abstained",
     "static_scoring_index_state_invalid",
+    "static_scoring_network_mismatch",
     "static_scoring_observation_duplicate",
     "static_scoring_observation_unpublished",
     "static_scoring_outcome_inconsistent",
@@ -526,8 +527,8 @@ class StaticEpochScore(StrictFrozenModel):
     )
     schema_version: Literal[1]
     purpose: Literal["static_availability_scoring_v1"]
-    network: Literal["finney"]
-    netuid: Literal[24]
+    network: Literal["finney", "test"]
+    netuid: Literal[24, 581]
     validator_hotkey: Hotkey
     epoch_seconds: int = Field(ge=60, le=3_600)
     epoch_index: EpochIndex
@@ -551,6 +552,8 @@ class StaticEpochScore(StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_epoch(self) -> Self:
+        if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
+            raise ValueError("static_subnet_invalid")
         ids = [item.deployment_id for item in self.targets]
         covered = [item.deployment_id for item in self.coverage]
         abstained = [item.deployment_id for item in self.index_abstentions]
@@ -719,6 +722,8 @@ def score_static_epoch(
     epoch_seconds: int = DEFAULT_EPOCH_SECONDS,
     min_attempts: int = DEFAULT_MIN_ATTEMPTS,
     probe_body_ceiling: int = HIDDEN_PROBE_CEILING_BYTES,
+    network: Literal["finney", "test"] = "finney",
+    netuid: Literal[24, 581] = 24,
 ) -> StaticEpochScore:
     """Seal one static epoch from verified targets, index states and hidden evidence.
 
@@ -818,8 +823,8 @@ def score_static_epoch(
         "schema": STATIC_EPOCH_SCORE_SCHEMA,
         "schema_version": 1,
         "purpose": STATIC_SCORING_PURPOSE,
-        "network": "finney",
-        "netuid": 24,
+        "network": network,
+        "netuid": netuid,
         "validator_hotkey": validator_hotkey,
         "epoch_seconds": epoch_seconds,
         "epoch_index": epoch_index,
@@ -869,6 +874,8 @@ def replay_static_epoch_score(
         epoch_seconds=value.epoch_seconds,
         min_attempts=value.min_attempts,
         probe_body_ceiling=value.probe_body_ceiling,
+        network=value.network,
+        netuid=value.netuid,
     )
     if static_epoch_score_bytes(rebuilt) != static_epoch_score_bytes(value):
         _reject("static_scoring_outcome_inconsistent")
@@ -903,8 +910,8 @@ class StaticAvailabilityScore(StrictFrozenModel):
     )
     schema_version: Literal[1]
     purpose: Literal["static_availability_scoring_v1"]
-    network: Literal["finney"]
-    netuid: Literal[24]
+    network: Literal["finney", "test"]
+    netuid: Literal[24, 581]
     validator_hotkey: Hotkey
     epoch_seconds: int = Field(ge=60, le=3_600)
     epoch_indexes: list[EpochIndex] = Field(min_length=1, max_length=MAX_EPOCHS)
@@ -917,6 +924,8 @@ class StaticAvailabilityScore(StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_score(self) -> Self:
+        if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
+            raise ValueError("static_subnet_invalid")
         if self.epoch_indexes != sorted(set(self.epoch_indexes)) or len(
             self.epoch_score_digests
         ) != len(self.epoch_indexes):
@@ -949,6 +958,9 @@ def aggregate_static_window(epochs: Sequence[StaticEpochScore]) -> StaticAvailab
         _reject("static_scoring_epochs_invalid")
     if any(item.validator_hotkey != validator for item in values):
         _reject("static_scoring_validator_mismatch")
+    network, netuid = values[0].network, values[0].netuid
+    if any((item.network, item.netuid) != (network, netuid) for item in values):
+        _reject("static_scoring_network_mismatch")
     sums: dict[tuple[int, str], Fraction] = defaultdict(Fraction)
     counts: dict[tuple[int, str], int] = defaultdict(int)
     faults: dict[str, int] = defaultdict(int)
@@ -999,8 +1011,8 @@ def aggregate_static_window(epochs: Sequence[StaticEpochScore]) -> StaticAvailab
         "schema": STATIC_WINDOW_SCORE_SCHEMA,
         "schema_version": 1,
         "purpose": STATIC_SCORING_PURPOSE,
-        "network": "finney",
-        "netuid": 24,
+        "network": network,
+        "netuid": netuid,
         "validator_hotkey": validator,
         "epoch_seconds": epoch_seconds,
         "epoch_indexes": indexes,

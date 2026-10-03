@@ -147,12 +147,18 @@
       "type": "integer"
     },
     "netuid": {
-      "const": 24,
+      "enum": [
+        24,
+        581
+      ],
       "title": "Netuid",
       "type": "integer"
     },
     "network": {
-      "const": "finney",
+      "enum": [
+        "finney",
+        "test"
+      ],
       "title": "Network",
       "type": "string"
     },

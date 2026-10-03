@@ -472,6 +472,8 @@ def finish_static_epoch(
         validator_hotkey=validator_hotkey,
         epoch_index=epoch_index,
         probe_body_ceiling=probe_ceiling,
+        network=run.verification.manifest.network,
+        netuid=run.verification.manifest.netuid,
     )
     rendered = static_epoch_score_bytes(epoch)
     _write_output(run.config.epoch_output, rendered, state_root=run.root.path)

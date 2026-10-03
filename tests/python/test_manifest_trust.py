@@ -65,13 +65,13 @@ EVALUATION_EPOCH = BASE_EPOCH
 # private producer byte-for-byte; any change is a compatibility event.
 FROZEN_CONTRACT_DIGESTS: dict[str, str] = {
     "schemas/assignment-manifest-trust-policy.v1.schema.json": (
-        "85394d7eb8efc70b16146cb4eca2ac44eafad0d6be5dbdbb1d913af459fa3ab9"
+        "037a3814ad302fcc7d5a604837ea4738716ea885d7705631ba079070e098443e"
     ),
     "schemas/assignment-manifest-signature-envelope.v1.schema.json": (
         "4545017e4a018b0c8eab812d2ae1a11826eea0b72cf700ca325a8a0eb6e4c7d5"
     ),
     "schemas/assignment-manifest-chain-state.v1.schema.json": (
-        "a51d5253e047831d3a2e4e1bf5b8605086aa5bb4545fe7c339ac1929a384ad99"
+        "de6813692f88c4e3e8a3dbdbf94f3c7ac7d078bc67944682a842cd91ab2449b4"
     ),
     "schemas/weight-plan.v1.schema.json": (
         "d4fa8861c0683a05796834952363498cbae8afd6c0a9c80b64ef3cf888445b53"
