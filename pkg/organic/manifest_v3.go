@@ -115,7 +115,8 @@ func (a OrganicDeploymentAssignmentV3) validate() error {
 // Validate applies the v2 manifest rules to a v3 manifest.
 func (m ActiveAssignmentManifestV3) Validate() error {
 	if err := validSchema(m.Schema, "active-assignment-manifest"); err != nil || m.SchemaVersion != 3 ||
-		m.Purpose != ManifestV3Purpose || m.Network != "finney" || m.NetUID != 24 {
+		m.Purpose != ManifestV3Purpose || !((m.Network == "finney" && m.NetUID == 24) ||
+		(m.Network == "test" && m.NetUID == 581)) {
 		return errors.New("unsupported active assignment manifest schema")
 	}
 	if !ValidHex64(m.CentralAuthorityFingerprintSHA256) || !ValidHex64(m.TrustPolicyDigestSHA256) ||
