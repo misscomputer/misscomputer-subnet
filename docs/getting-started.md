@@ -61,6 +61,7 @@ The install adds these console scripts to `.venv/bin`:
 | `misscomputer-weight-reconcile` | validators | Read-only reconciliation of an uncertain weight attempt |
 | `misscomputer-validator` | subnet operator | Long-running validator bridge; needs an operator-owned Go control service (see the validator guide) |
 | `misscomputer-release-verify` | release auditors | Offline production release verification |
+| `misscomputer-d18-verify` | rollout auditors | Bounded, one-shot old/new validator D18 capture verification |
 | `misscomputer-python-boundary`, `misscomputer-checkpoint-boundary` | tooling | One-shot request/response process boundaries |
 
 `misscomputer-miner`, `misscomputer-validator`, `misscomputer-weight-executor`,
