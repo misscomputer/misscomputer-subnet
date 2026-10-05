@@ -39,6 +39,7 @@ misscomputer-assignment-probe = "misscomputer_subnet.assignment_probe_cli:main"
 misscomputer-organic-window = "misscomputer_subnet.organic_window_cli:main"
 misscomputer-release-verify = "misscomputer_subnet.production_release_verifier:main"
 misscomputer-python-boundary = "misscomputer_subnet.process_boundary:main"
+misscomputer-d18-verify = "misscomputer_subnet.d18_verifier_boundary:main"
 misscomputer-checkpoint-boundary = "misscomputer_subnet.checkpoint_boundary:main"
 
 [tool.hatch.build.targets.wheel]
