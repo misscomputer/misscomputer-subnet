@@ -430,6 +430,25 @@ class StaticProbeObservation(StrictFrozenModel):
                 )
             ):
                 raise ValueError("observation_public_framing_invalid")
+        if self.schema_version == 2 and self.quarantine_candidate:
+            if (
+                self.attestation_status != "verified"
+                or self.attestation is None
+                or self.attestation.response_header_sha256 != self.expected_header_sha256
+                or self.failure_code == "header_mismatch"
+                or (
+                    self.failure_code == "status_mismatch"
+                    and self.response_status == self.expected_status
+                )
+                or (
+                    self.failure_code == "body_mismatch"
+                    and (
+                        self.response_status != self.expected_status
+                        or self.response_body_sha256 == self.expected_body_sha256
+                    )
+                )
+            ):
+                raise ValueError("observation_content_fault_unproved")
         if self.attribution == "miner" and not self.upstream_marker:
             raise ValueError("observation_attribution_invalid")
         verify_model_digest(self, "observation_digest_sha256")

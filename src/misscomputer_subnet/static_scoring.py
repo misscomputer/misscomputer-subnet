@@ -290,7 +290,15 @@ def _answer(obs: StaticProbeObservation) -> tuple[object, ...]:
     if obs.outcome == "success":
         return _PASS
     if obs.quarantine_candidate:
-        return (obs.response_status, obs.response_body_sha256, obs.response_header_sha256)
+        # V2's public framing digest may differ for the same signed response
+        # (Content-Length versus chunked). Corroboration compares the miner's
+        # authenticated representation, never CDN-specific wire framing.
+        header = (
+            obs.attestation.response_header_sha256
+            if obs.schema_version == 2 and obs.attestation is not None
+            else obs.response_header_sha256
+        )
+        return (obs.response_status, obs.response_body_sha256, header)
     return ("other", obs.failure_code)
 
 
@@ -770,6 +778,15 @@ def _verify_observation(
         if obs.quarantine_candidate and (
             obs.attestation is None
             or obs.attestation.response_header_sha256 != expected.header_sha256
+            or obs.failure_code == "header_mismatch"
+            or (obs.failure_code == "status_mismatch" and obs.response_status == expected.status)
+            or (
+                obs.failure_code == "body_mismatch"
+                and (
+                    obs.response_status != expected.status
+                    or obs.response_body_sha256 == expected.body_sha256
+                )
+            )
         ):
             _reject("static_scoring_attestation_unverified")
 

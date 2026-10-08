@@ -37,6 +37,7 @@ from misscomputer_subnet.static_index import (
 )
 from misscomputer_subnet.static_probe import (
     PlannedStaticProbe,
+    StaticProbeObservation,
     StaticPublicTransportPolicy,
     parse_static_probe_observation,
     static_probe_observation_bytes,
@@ -86,10 +87,14 @@ class PublicFraming:
     def fetch(self, **kwargs: Any) -> ProbeResponse:
         response = self.edge.fetch(**kwargs)
         assert isinstance(response, ProbeResponse)
-        headers = [(k, v) for k, v in response.headers if k.lower() != "content-length"]
-        if self.change == "chunked":
+        headers = (
+            list(response.headers)
+            if self.change == "length"
+            else [(k, v) for k, v in response.headers if k.lower() != "content-length"]
+        )
+        if self.change in {"chunked", "gzip", "stable", "truncated"}:
             headers.append(("Transfer-Encoding", "chunked"))
-        elif self.change == "duplicate_length":
+        if self.change == "duplicate_length":
             headers.extend([("Content-Length", "22"), ("Content-Length", "22")])
         elif self.change == "gzip":
             headers.append(("Content-Encoding", "gzip"))
@@ -108,8 +113,9 @@ def probe(
     path: str = "/",
     change: str = "chunked",
     framed: bool = True,
+    endpoint_position: int = 0,
 ):
-    endpoint = index.target.endpoints[0]
+    endpoint = index.target.endpoints[endpoint_position]
     expected = expected_static_response(index, method, path)
     planned = PlannedStaticProbe(
         probe_kind="hidden",
@@ -123,7 +129,7 @@ def probe(
         expected_content_length=expected.content_length,
         probe_index=0,
         fire_at_millis=ISSUED_EPOCH * 1000,
-        nonce=sha((method + path + change).encode()),
+        nonce=sha((method + path + change + str(endpoint_position)).encode()),
     )
     return send_static_probe(
         index,
@@ -224,3 +230,50 @@ def test_profile_cannot_be_removed_or_mixed_after_sealing() -> None:
     document["observation_digest_sha256"] = digest(document)
     with pytest.raises(ValueError):
         parse_static_probe_observation(canonical_json(document) + b"\n")
+
+
+def test_resealed_v2_success_cannot_become_miner_content_fault() -> None:
+    index, edge = site()
+    observation = probe(index, edge)
+    document = model_document(observation, exclude={"observation_digest_sha256"})
+    document.update(
+        outcome="failure",
+        failure_code="body_mismatch",
+        attribution="miner",
+        quarantine_candidate=True,
+    )
+    document["observation_digest_sha256"] = digest(document)
+    with pytest.raises(ValueError, match="observation_content_fault_unproved"):
+        StaticProbeObservation.model_validate(document)
+
+
+def test_same_signed_wrong_answer_is_index_suspect_across_public_framing() -> None:
+    index, edge = site()
+    for endpoint in index.target.endpoints:
+        edge.faults[endpoint.endpoint_id] = lambda state: state.update(
+            body=b"X" * len(state["body"]),
+            attested_body=b"X" * len(state["attested_body"]),
+        )
+    observations = [
+        probe(
+            index, edge, change="length" if position == 0 else "chunked", endpoint_position=position
+        )
+        for position in range(len(index.target.endpoints))
+    ]
+    assert {item.failure_code for item in observations} == {"body_mismatch"}
+    assert len({item.response_header_sha256 for item in observations}) == 2
+    epoch = score_static_epoch(
+        [index.target],
+        [index],
+        [],
+        observations,
+        validator_hotkey=VALIDATOR,
+        epoch_index=ISSUED_EPOCH // 300,
+        min_attempts=1,
+        network="test",
+        netuid=581,
+        public_transport_policy=policy(),
+    )
+    assert len(epoch.index_suspect_requests) == 1
+    assert epoch.content_fault_evidence == []
+    assert epoch.endpoint_actions == []
