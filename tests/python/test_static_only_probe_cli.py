@@ -164,7 +164,7 @@ def test_public_framing_pin_refuses_mainnet_before_a_probe(tmp_path: Path) -> No
     unsigned = {
         "schema": "miss.computer/misscomputer-subnet/static-public-transport-policy",
         "schema_version": 1,
-        "profile": "cloudflare-framing-v1",
+        "profile": "public-framing-v1",
         "network": "test",
         "netuid": 581,
         "route_host_suffix": "on.miss.computer",

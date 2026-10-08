@@ -53,7 +53,7 @@ def policy() -> StaticPublicTransportPolicy:
     unsigned = {
         "schema": "miss.computer/misscomputer-subnet/static-public-transport-policy",
         "schema_version": 1,
-        "profile": "cloudflare-framing-v1",
+        "profile": "public-framing-v1",
         "network": "test",
         "netuid": 581,
         "route_host_suffix": "on.miss.computer",

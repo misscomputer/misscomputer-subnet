@@ -561,7 +561,7 @@ class StaticEpochScore(StrictFrozenModel):
     endpoint_actions: list[StaticEndpointAction] = Field(max_length=MAX_ENDPOINTS)
     alerts: list[StaticAlert] = Field(max_length=MAX_ENDPOINTS * 4)
     observations: list[StaticProbeObservation] = Field(max_length=MAX_OBSERVATIONS)
-    transport_profile: Literal["cloudflare-framing-v1"] | None = None
+    transport_profile: Literal["public-framing-v1"] | None = None
     transport_policy_digest_sha256: Hex64 | None = None
     observation_vector_digest_sha256: Hex64
     epoch_score_digest_sha256: Hex64

@@ -421,7 +421,7 @@
         "transport_profile": {
           "anyOf": [
             {
-              "const": "cloudflare-framing-v1",
+              "const": "public-framing-v1",
               "type": "string"
             },
             {

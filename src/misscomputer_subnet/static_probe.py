@@ -137,7 +137,7 @@ _HOP_HEADERS: Final = frozenset({ATTESTATION_HEADER, UPSTREAM_RESPONSE_HEADER})
 _ADMISSION_DOMAIN: Final = b"miss.computer/misscomputer-subnet/static-admission-crawl/v1"
 _HIDDEN_DOMAIN: Final = b"miss.computer/misscomputer-subnet/static-hidden-probe/v1"
 _MAX_EPOCH_MILLIS: Final = 253_402_300_799_999
-PUBLIC_FRAMING_PROFILE: Final = "cloudflare-framing-v1"
+PUBLIC_FRAMING_PROFILE: Final = "public-framing-v1"
 PUBLIC_TRANSPORT_POLICY_SCHEMA: Final = (
     "miss.computer/misscomputer-subnet/static-public-transport-policy"
 )
@@ -150,7 +150,7 @@ class StaticPublicTransportPolicy(StrictFrozenModel):
         Field(alias="schema")
     )
     schema_version: Literal[1]
-    profile: Literal["cloudflare-framing-v1"]
+    profile: Literal["public-framing-v1"]
     network: Literal["test"]
     netuid: Literal[581]
     route_host_suffix: Literal["on.miss.computer"]
@@ -327,7 +327,7 @@ class StaticProbeObservation(StrictFrozenModel):
     tls_leaf_certificate_sha256: Hex64 | None
     attestation_status: AttestationStatus
     attestation: MinerProbeAttestationV2 | None
-    transport_profile: Literal["cloudflare-framing-v1"] | None = None
+    transport_profile: Literal["public-framing-v1"] | None = None
     transport_policy_digest_sha256: Hex64 | None = None
     delivered_http_version: Literal["HTTP/1.1", "HTTP/2", "HTTP/3"] | None = None
     delivered_headers: list[list[str]] | None = None
