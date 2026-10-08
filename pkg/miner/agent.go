@@ -14,6 +14,7 @@ import (
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/artifact"
 	"github.com/misscomputer/misscomputer-subnet/pkg/durable"
+	"github.com/misscomputer/misscomputer-subnet/pkg/organic"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	deployruntime "github.com/misscomputer/misscomputer-subnet/pkg/runtime"
 	"github.com/misscomputer/misscomputer-subnet/pkg/tunnel"
@@ -411,6 +412,7 @@ func (a *Agent) ProxyRuntime(w http.ResponseWriter, req *http.Request, endpointI
 	ticket, started := a.organicTickets[endpointID]
 	a.mu.Unlock()
 	if rawURL == "" || !started {
+		w.Header().Set(organic.AgentEndpointUnavailableHeader, organic.AgentEndpointUnavailableValue)
 		http.Error(w, "endpoint is inactive", http.StatusNotFound)
 		return
 	}

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/durable"
+	"github.com/misscomputer/misscomputer-subnet/pkg/organic"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	deployruntime "github.com/misscomputer/misscomputer-subnet/pkg/runtime"
 	"github.com/misscomputer/misscomputer-subnet/pkg/tunnel"
@@ -305,6 +306,9 @@ func TestRestartNeverServesAnOldIncarnation(t *testing.T) {
 	restarted.ProxyRuntime(recorder, req, result.EndpointID)
 	if recorder.Code != http.StatusNotFound || hits.Load() != before {
 		t.Fatalf("restarted agent served an old incarnation: status=%d contacts=%d", recorder.Code, hits.Load()-before)
+	}
+	if got := recorder.Header().Values(organic.AgentEndpointUnavailableHeader); len(got) != 1 || got[0] != organic.AgentEndpointUnavailableValue {
+		t.Fatalf("restarted agent availability signal = %v", got)
 	}
 }
 
