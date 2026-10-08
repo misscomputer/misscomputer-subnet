@@ -709,6 +709,43 @@ async def test_runtime_proxy_returns_only_the_agent_attestation_header(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "agent_state", "expected"),
+    [
+        (404, ["unavailable-v1"], ["unavailable-v1"]),
+        (200, ["unavailable-v1"], []),
+        (404, ["forged"], []),
+        (404, ["unavailable-v1", "unavailable-v1"], []),
+    ],
+)
+async def test_runtime_proxy_forwards_only_agent_inactive_endpoint_signal(
+    tmp_path: Path, status_code: int, agent_state: list[str], expected: list[str]
+) -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            stream=ChunkedResponse([b"endpoint is inactive\n"]),
+            headers=[
+                *(("X-Miss-Agent-Endpoint-State", value) for value in agent_state),
+                ("X-Miss-Internal", "forged"),
+            ],
+        )
+
+    neuron = runtime_neuron(tmp_path, httpx.MockTransport(handler))
+    status, raw_headers, content = await call_runtime_app(
+        neuron,
+        method="GET",
+        raw_path=b"/runtime/ep-1/",
+        headers=[(b"x-miss-edge-authorization", EDGE_AUTH.encode())],
+    )
+    headers = httpx.Headers(raw_headers)
+    assert status == status_code
+    assert content == b"endpoint is inactive\n"
+    assert headers.get_list("x-miss-agent-endpoint-state") == expected
+    assert "x-miss-internal" not in headers
+
+
+@pytest.mark.asyncio
 async def test_runtime_proxy_forwards_edge_signed_request_byte_exact(tmp_path: Path) -> None:
     # The Go agent verifies X-Miss-Edge-Authorization over the escaped path,
     # raw query and body, so the Python hop must not decode or drop any of them.
