@@ -220,7 +220,10 @@ def _load_v3_publication(
 
 
 def preflight_static(
-    config: StaticSitesConfig, *, organic_state_root: str, organic_inputs: set[str]
+    config: StaticSitesConfig,
+    *,
+    organic_state_root: str | None = None,
+    organic_inputs: set[str] | None = None,
 ) -> tuple[StaticSiteReleaseTrustPolicy, str, str]:
     """Refuse an unsafe or aliased static configuration before anything is probed."""
 
@@ -228,18 +231,20 @@ def preflight_static(
     index_origin = _validated_https_url(config.index_origin, code="static_index_origin_invalid")
     index_origin = index_origin.rstrip("/")
     static_root = _normalized_absolute_path(config.state_root, code="state_root_path_unsafe")
-    if (
+    if organic_state_root is not None and (
         static_root == organic_state_root
         or static_root.startswith(organic_state_root + "/")
         or organic_state_root.startswith(static_root + "/")
     ):
         _fail("static_state_root_alias")
-    inputs = organic_inputs | static_input_paths(config)
+    inputs = (organic_inputs or set()) | static_input_paths(config)
     for path in (config.epoch_output, config.journal):
         normalized = _normalized_absolute_path(path, code="output_path_unsafe")
         if normalized in inputs:
             _fail("output_path_alias")
-        for root in (organic_state_root, static_root):
+        for root in (
+            (static_root,) if organic_state_root is None else (organic_state_root, static_root)
+        ):
             if normalized == root or normalized.startswith(root + "/"):
                 _fail("output_path_unsafe")
     if _normalized_absolute_path(config.epoch_output, code="output_path_unsafe") == (
