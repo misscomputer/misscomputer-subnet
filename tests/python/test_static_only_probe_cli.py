@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,9 +29,10 @@ from misscomputer_subnet.assignment_probe import (
     assignment_manifest_signature_envelope_bytes,
     assignment_manifest_trust_policy_bytes,
 )
-from misscomputer_subnet.assignment_probe_cli import EXIT_DEGRADED, EXIT_OK
-from misscomputer_subnet.contract_codec import digest, model_document
+from misscomputer_subnet.assignment_probe_cli import EXIT_DEGRADED, EXIT_OK, EXIT_REJECTED
+from misscomputer_subnet.contract_codec import digest, model_bytes, model_document
 from misscomputer_subnet.organic_manifest import assignment_manifest_v3_bytes
+from misscomputer_subnet.static_probe import StaticPublicTransportPolicy
 from misscomputer_subnet.static_scoring import parse_static_epoch_score
 
 _COMMON_OPTIONS = frozenset(
@@ -154,3 +156,31 @@ def test_static_only_cli_accepts_test581_v3_and_rejects_wrong_subnet_policy(
     wrong = replace(wrong, trust_policy=mainnet_policy)
     assert static_cli.run_cli(_static_only_argv(config_argv(wrong))) == EXIT_DEGRADED
     assert not Path(wrong.static_sites.epoch_output).exists()
+
+
+def test_public_framing_pin_refuses_mainnet_before_a_probe(tmp_path: Path) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    config = cli_config(publication, tmp_path / "run")
+    unsigned = {
+        "schema": "miss.computer/misscomputer-subnet/static-public-transport-policy",
+        "schema_version": 1,
+        "profile": "cloudflare-framing-v1",
+        "network": "test",
+        "netuid": 581,
+        "route_host_suffix": "on.miss.computer",
+        "manifest_trust_policy_digest_sha256": publication.policy.trust_policy_digest_sha256,
+    }
+    pinned = StaticPublicTransportPolicy.model_validate(
+        {**unsigned, "policy_digest_sha256": digest(unsigned)}
+    )
+    raw = model_bytes(pinned, StaticPublicTransportPolicy)
+    path = secure_write(tmp_path / "transport-policy.json", raw)
+    argv = [
+        *_static_only_argv(config_argv(config)),
+        "--public-transport-policy",
+        str(path),
+        "--public-transport-policy-sha256",
+        hashlib.sha256(raw).hexdigest(),
+    ]
+    assert static_cli.run_cli(argv) == EXIT_REJECTED
+    assert not any(kind == "static" for kind, _ in publication.world.calls)

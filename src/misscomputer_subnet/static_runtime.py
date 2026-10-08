@@ -90,6 +90,7 @@ from .static_probe import (
     HIDDEN_PROBE_CEILING_BYTES,
     PlannedStaticProbe,
     StaticProbeObservation,
+    StaticPublicTransportPolicy,
     plan_static_hidden_probes,
 )
 from .static_scoring import StaticEpochScore, score_static_epoch, static_epoch_score_bytes
@@ -135,6 +136,7 @@ class StaticEpochRun:
     journal: StaticEvidenceJournal | None = None
     skipped: int = 0
     epoch: StaticEpochScore | None = None
+    public_transport_policy: StaticPublicTransportPolicy | None = None
 
     def close(self) -> None:
         if self.journal is not None:
@@ -450,6 +452,7 @@ def static_probe_schedule(
                 probe_port=manifest.probe_port,
                 edge_origin=edge_origin,
                 pinned_edge_leaf_certificate_sha256=policy.pinned_edge_leaf_certificate_sha256,
+                public_transport_policy=run.public_transport_policy,
             )
             journal.append(observation)
             run.observations.append(observation)
@@ -479,6 +482,7 @@ def finish_static_epoch(
         probe_body_ceiling=probe_ceiling,
         network=run.verification.manifest.network,
         netuid=run.verification.manifest.netuid,
+        public_transport_policy=run.public_transport_policy,
     )
     rendered = static_epoch_score_bytes(epoch)
     _write_output(run.config.epoch_output, rendered, state_root=run.root.path)

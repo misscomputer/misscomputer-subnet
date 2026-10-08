@@ -64,6 +64,7 @@ from .static_probe import (
     StaticCrawlRefusal,
     StaticFailureCode,
     StaticProbeObservation,
+    StaticPublicTransportPolicy,
     evaluate_static_probe,
     find_static_endpoint,
     plan_static_admission_crawl,
@@ -140,6 +141,7 @@ def send_static_probe(
     probe_port: int,
     edge_origin: str | None,
     pinned_edge_leaf_certificate_sha256: Sequence[str] = (),
+    public_transport_policy: StaticPublicTransportPolicy | None = None,
 ) -> StaticProbeObservation:
     """Sign, send, and judge one targeted request to one incarnation."""
 
@@ -181,6 +183,7 @@ def send_static_probe(
         probe_kind=planned.probe_kind,
         timeout_millis=timeout_millis,
         pinned_edge_leaf_certificate_sha256=pinned_edge_leaf_certificate_sha256,
+        public_transport_policy=public_transport_policy,
     )
 
 

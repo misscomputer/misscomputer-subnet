@@ -171,7 +171,7 @@ class StaticEvidenceRecord(StrictFrozenModel):
     contract_schema: Literal["miss.computer/misscomputer-subnet/static-evidence-record"] = Field(
         alias="schema"
     )
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     record_index: int = Field(ge=1, le=MAX_EVIDENCE_RECORDS)
     prior_record_digest_sha256: Hex64 | None
     observation: StaticProbeObservation
@@ -179,6 +179,8 @@ class StaticEvidenceRecord(StrictFrozenModel):
 
     @model_validator(mode="after")
     def canonical_record(self) -> Self:
+        if self.schema_version != self.observation.schema_version:
+            raise ValueError("static_evidence_profile_mismatch")
         if (self.record_index == 1) != (self.prior_record_digest_sha256 is None):
             raise ValueError("static_evidence_link_invalid")
         verify_model_digest(self, "record_digest_sha256")
@@ -199,7 +201,7 @@ def append_static_evidence(
         raise ValueError("static_evidence_append_invalid")
     document: dict[str, object] = {
         "schema": STATIC_EVIDENCE_RECORD_SCHEMA,
-        "schema_version": 1,
+        "schema_version": value.schema_version,
         "record_index": 1 if previous is None else previous.record_index + 1,
         "prior_record_digest_sha256": None if previous is None else previous.record_digest_sha256,
         "observation": model_document(value),

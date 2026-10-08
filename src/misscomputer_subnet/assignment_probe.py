@@ -403,6 +403,9 @@ class ProbeResponse:
     body: bytes
     latency_millis: int
     tls_leaf_certificate_sha256: str | None
+    #: Wire protocol observed by the HTTPS client. Static public-framing
+    #: verification refuses an unknown protocol rather than guessing.
+    http_version: str | None = None
 
 
 @dataclass(frozen=True)
