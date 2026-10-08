@@ -86,6 +86,7 @@ EDGE_AUTHORIZATION_HEADER = organic_contracts.EDGE_AUTHORIZATION_HEADER.lower()
 ORGANIC_PROBE_AUTHORIZATION_HEADER = organic_contracts.ORGANIC_PROBE_AUTHORIZATION_HEADER.lower()
 # The miner-probe-attestation v2 the Go agent signed for an authorized probe.
 PROBE_ATTESTATION_HEADER = organic_contracts.PROBE_ATTESTATION_HEADER.lower()
+AGENT_ENDPOINT_UNAVAILABLE_HEADER = organic_contracts.AGENT_ENDPOINT_UNAVAILABLE_HEADER.lower()
 RUNTIME_ENDPOINT_ID = re.compile(r"[A-Za-z0-9-]{1,256}")
 # Request and response headers that never cross a proxy hop. Content-Length
 # is recomputed from the exact buffered body.
@@ -140,18 +141,33 @@ def runtime_request_headers(raw: list[tuple[bytes, bytes]]) -> list[tuple[bytes,
     return forwarded
 
 
-def runtime_response_headers(raw: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+def runtime_response_headers(
+    raw: list[tuple[bytes, bytes]], *, status_code: int
+) -> list[tuple[bytes, bytes]]:
     """End-to-end response headers, repeated values preserved (Set-Cookie)."""
 
     dropped = _connection_tokens(raw)
+    endpoint_state = [
+        value
+        for name, value in raw
+        if name.lower().decode("latin-1") == AGENT_ENDPOINT_UNAVAILABLE_HEADER
+    ]
+    allow_endpoint_unavailable = status_code == 404 and endpoint_state == [
+        organic_contracts.AGENT_ENDPOINT_UNAVAILABLE_VALUE.encode()
+    ]
     kept: list[tuple[bytes, bytes]] = []
     for name, value in raw:
         lowered = name.lower().decode("latin-1")
         if lowered in HOP_BY_HOP_HEADERS or lowered in dropped:
             continue
-        # The agent-signed probe attestation is the only X-Miss-* header
-        # allowed back out; the Go agent already stripped workload copies.
-        if lowered.startswith("x-miss-") and lowered != PROBE_ATTESTATION_HEADER:
+        # Only the agent-signed probe attestation and the exact inactive
+        # endpoint signal may cross this hop. The Go agent strips workload
+        # copies of both reserved headers before proxying an application.
+        if (
+            lowered.startswith("x-miss-")
+            and lowered != PROBE_ATTESTATION_HEADER
+            and not (lowered == AGENT_ENDPOINT_UNAVAILABLE_HEADER and allow_endpoint_unavailable)
+        ):
             continue
         kept.append((lowered.encode("latin-1"), value))
     return kept
@@ -760,7 +776,9 @@ class MinerNeuron:
                     await upstream.aclose()
                 content = b"".join(chunks)
                 status_code = upstream.status_code
-                headers = runtime_response_headers(list(upstream.headers.raw))
+                headers = runtime_response_headers(
+                    list(upstream.headers.raw), status_code=status_code
+                )
             response = Response(content=content, status_code=status_code)
             if status_code < 200 or status_code in (204, 304):
                 length_header: list[tuple[bytes, bytes]] = []

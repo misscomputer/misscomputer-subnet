@@ -67,7 +67,12 @@ const (
 	// from a replica, as opposed to one the edge synthesized on the
 	// replica's behalf; UpstreamResponseMarker is its only replica value.
 	UpstreamResponseHeader = "X-Miss-Edge-Upstream"
-	UpstreamResponseMarker = "replica"
+	// AgentEndpointUnavailableHeader is emitted by an authenticated miner agent
+	// only when its bound organic endpoint has no active runtime incarnation.
+	// Workload responses cannot supply this reserved protocol header.
+	AgentEndpointUnavailableHeader = "X-Miss-Agent-Endpoint-State"
+	AgentEndpointUnavailableValue  = "unavailable-v1"
+	UpstreamResponseMarker         = "replica"
 
 	// MaxDocumentBytes bounds every organic wire document DecodeStrict accepts.
 	MaxDocumentBytes = 16 << 20
