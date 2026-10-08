@@ -50,7 +50,7 @@ import hmac
 from collections.abc import Sequence
 from typing import Final, Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from .assignment_probe import (
     MAX_LATENCY_MILLIS,
@@ -99,6 +99,7 @@ from .static_index import (
     StaticEndpointTarget,
     VerifiedStaticIndex,
     expected_static_response,
+    normative_headers,
 )
 
 STATIC_OBSERVATION_SCHEMA: Final = "miss.computer/misscomputer-subnet/static-probe-observation"
@@ -136,6 +137,88 @@ _HOP_HEADERS: Final = frozenset({ATTESTATION_HEADER, UPSTREAM_RESPONSE_HEADER})
 _ADMISSION_DOMAIN: Final = b"miss.computer/misscomputer-subnet/static-admission-crawl/v1"
 _HIDDEN_DOMAIN: Final = b"miss.computer/misscomputer-subnet/static-hidden-probe/v1"
 _MAX_EPOCH_MILLIS: Final = 253_402_300_799_999
+PUBLIC_FRAMING_PROFILE: Final = "public-framing-v1"
+PUBLIC_TRANSPORT_POLICY_SCHEMA: Final = (
+    "miss.computer/misscomputer-subnet/static-public-transport-policy"
+)
+
+
+class StaticPublicTransportPolicy(StrictFrozenModel):
+    """Explicit testnet-only pin for comparing signed representation to public framing."""
+
+    contract_schema: Literal["miss.computer/misscomputer-subnet/static-public-transport-policy"] = (
+        Field(alias="schema")
+    )
+    schema_version: Literal[1]
+    profile: Literal["public-framing-v1"]
+    network: Literal["test"]
+    netuid: Literal[581]
+    route_host_suffix: Literal["on.miss.computer"]
+    manifest_trust_policy_digest_sha256: Hex64
+    policy_digest_sha256: Hex64
+
+    @model_validator(mode="after")
+    def canonical_policy(self) -> Self:
+        verify_model_digest(self, "policy_digest_sha256")
+        return self
+
+
+def parse_static_public_transport_policy(rendered: bytes) -> StaticPublicTransportPolicy:
+    return parse_model(
+        rendered,
+        StaticPublicTransportPolicy,
+        lambda value: model_bytes(value, StaticPublicTransportPolicy),
+        maximum_bytes=4_096,
+    )
+
+
+def _public_framing_valid(
+    headers: Sequence[Sequence[str]],
+    *,
+    http_version: str,
+    request_method: str,
+    expected_content_type: str,
+    expected_content_length: int,
+) -> bool:
+    """Match end-to-end headers and permit only well-formed public wire framing."""
+
+    if http_version not in {"HTTP/1.1", "HTTP/2", "HTTP/3"}:
+        return False
+    if (
+        len(headers) > 128
+        or sum(len(name) + len(value) for name, value in headers) > 16_384
+        or any(
+            not name.isascii() or not value.isascii() or len(name) > 128 or len(value) > 8_192
+            for name, value in headers
+        )
+    ):
+        return False
+    stable = {
+        name: value
+        for name, value in normative_headers(expected_content_type, expected_content_length)
+        if name != "content-length"
+    }
+    for name, value in stable.items():
+        if _header_values(headers, name) != [value]:
+            return False
+    if _header_values(headers, "allow") or _has_forbidden_header(
+        [(name, value) for name, value in headers if name.lower() != "transfer-encoding"]
+    ):
+        return False
+    lengths = _header_values(headers, "content-length")
+    codings = _header_values(headers, "transfer-encoding")
+    if len(lengths) > 1 or len(codings) > 1:
+        return False
+    if lengths and (lengths[0] != str(expected_content_length) or codings):
+        return False
+    if codings and (http_version != "HTTP/1.1" or codings != ["chunked"]):
+        return False
+    if http_version == "HTTP/1.1" and request_method == "GET" and not lengths and not codings:
+        return False
+    # A complete HTTP/2 or HTTP/3 response may omit the representation length;
+    # its signed expected digest and raw body length remain mandatory.
+    return True
+
 
 ProbeKind = Literal["admission", "hidden"]
 Attribution = Literal["miner", "none", "path"]
@@ -187,7 +270,7 @@ def static_failure_attribution(code: str | None) -> Attribution:
     return "none" if code is None else _ATTRIBUTION[code]
 
 
-def observed_header_sha256(headers: Sequence[tuple[str, str]]) -> str:
+def observed_header_sha256(headers: Sequence[Sequence[str]]) -> str:
     """``response_header_sha256`` over the observed headers of the normative set."""
 
     return response_header_sha256(
@@ -195,7 +278,7 @@ def observed_header_sha256(headers: Sequence[tuple[str, str]]) -> str:
     )
 
 
-def _has_forbidden_header(headers: Sequence[tuple[str, str]]) -> bool:
+def _has_forbidden_header(headers: Sequence[Sequence[str]]) -> bool:
     for name, _value in headers:
         lowered = name.lower()
         if lowered in FORBIDDEN_HEADER_NAMES or (
@@ -211,7 +294,7 @@ class StaticProbeObservation(StrictFrozenModel):
     contract_schema: Literal["miss.computer/misscomputer-subnet/static-probe-observation"] = Field(
         alias="schema"
     )
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     probe_kind: Literal["admission", "hidden"]
     validator_hotkey: Hotkey
     deployment_id: DNSLabel
@@ -244,10 +327,48 @@ class StaticProbeObservation(StrictFrozenModel):
     tls_leaf_certificate_sha256: Hex64 | None
     attestation_status: AttestationStatus
     attestation: MinerProbeAttestationV2 | None
+    transport_profile: Literal["public-framing-v1"] | None = None
+    transport_policy_digest_sha256: Hex64 | None = None
+    delivered_http_version: Literal["HTTP/1.1", "HTTP/2", "HTTP/3"] | None = None
+    delivered_headers: list[list[str]] | None = None
     observation_digest_sha256: Hex64
+
+    @model_serializer(mode="wrap")
+    def serialize_versioned(self, handler: object) -> dict[str, object]:
+        document: dict[str, object] = handler(self)  # type: ignore[operator]
+        if self.schema_version == 1:
+            for name in (
+                "transport_profile",
+                "transport_policy_digest_sha256",
+                "delivered_http_version",
+                "delivered_headers",
+            ):
+                document.pop(name, None)
+        return document
 
     @model_validator(mode="after")
     def canonical_observation(self) -> Self:
+        if self.schema_version == 1:
+            if any(
+                value is not None
+                for value in (
+                    self.transport_profile,
+                    self.transport_policy_digest_sha256,
+                    self.delivered_http_version,
+                    self.delivered_headers,
+                )
+            ):
+                raise ValueError("observation_profile_invalid")
+        elif (
+            self.transport_profile != PUBLIC_FRAMING_PROFILE
+            or self.transport_policy_digest_sha256 is None
+        ):
+            raise ValueError("observation_profile_invalid")
+        if self.schema_version == 2 and self.delivered_headers is not None:
+            if self.delivered_http_version is None or (
+                self.response_header_sha256 != observed_header_sha256(self.delivered_headers)
+            ):
+                raise ValueError("observation_delivered_headers_invalid")
         if (self.outcome == "success") != (self.failure_code is None):
             raise ValueError("observation_outcome_invalid")
         if self.attribution != static_failure_attribution(self.failure_code):
@@ -258,7 +379,10 @@ class StaticProbeObservation(StrictFrozenModel):
             not self.upstream_marker
             or self.response_status != self.expected_status
             or self.response_body_sha256 != self.expected_body_sha256
-            or self.response_header_sha256 != self.expected_header_sha256
+            or (
+                self.schema_version == 1
+                and self.response_header_sha256 != self.expected_header_sha256
+            )
             or self.attestation_status != "verified"
         ):
             raise ValueError("observation_success_invalid")
@@ -276,17 +400,62 @@ class StaticProbeObservation(StrictFrozenModel):
                 or self.attestation.probe_nonce != self.probe_nonce
                 or self.attestation.response_status != self.response_status
                 or self.attestation.response_body_sha256 != self.response_body_sha256
-                or self.attestation.response_header_sha256 != self.response_header_sha256
+                or (
+                    self.schema_version == 1
+                    and self.attestation.response_header_sha256 != self.response_header_sha256
+                )
             )
         ):
             raise ValueError("observation_attestation_binding_invalid")
+        if self.schema_version == 2 and self.outcome == "success":
+            content_types = (
+                _header_values(self.delivered_headers, "content-type")
+                if self.delivered_headers is not None
+                else []
+            )
+            if (
+                self.attestation is None
+                or self.attestation.response_header_sha256 != self.expected_header_sha256
+                or self.response_bytes
+                != (self.expected_content_length if self.request_method == "GET" else 0)
+                or self.delivered_headers is None
+                or self.delivered_http_version is None
+                or len(content_types) != 1
+                or not _public_framing_valid(
+                    self.delivered_headers,
+                    http_version=self.delivered_http_version,
+                    request_method=self.request_method,
+                    expected_content_type=content_types[0],
+                    expected_content_length=self.expected_content_length,
+                )
+            ):
+                raise ValueError("observation_public_framing_invalid")
+        if self.schema_version == 2 and self.quarantine_candidate:
+            if (
+                self.attestation_status != "verified"
+                or self.attestation is None
+                or self.attestation.response_header_sha256 != self.expected_header_sha256
+                or self.failure_code == "header_mismatch"
+                or (
+                    self.failure_code == "status_mismatch"
+                    and self.response_status == self.expected_status
+                )
+                or (
+                    self.failure_code == "body_mismatch"
+                    and (
+                        self.response_status != self.expected_status
+                        or self.response_body_sha256 == self.expected_body_sha256
+                    )
+                )
+            ):
+                raise ValueError("observation_content_fault_unproved")
         if self.attribution == "miner" and not self.upstream_marker:
             raise ValueError("observation_attribution_invalid")
         verify_model_digest(self, "observation_digest_sha256")
         return self
 
 
-def _header_values(headers: Sequence[tuple[str, str]], name: str) -> list[str]:
+def _header_values(headers: Sequence[Sequence[str]], name: str) -> list[str]:
     return [value for key, value in headers if key.lower() == name]
 
 
@@ -311,6 +480,7 @@ def evaluate_static_probe(
     probe_kind: ProbeKind,
     timeout_millis: int,
     pinned_edge_leaf_certificate_sha256: Sequence[str] = (),
+    public_transport_policy: StaticPublicTransportPolicy | None = None,
 ) -> StaticProbeObservation:
     """Judge one observed static response against ``expected(...)`` (§11.4)."""
 
@@ -320,9 +490,13 @@ def evaluate_static_probe(
         raise ValueError("authorization_request_mismatch")
     expected = expected_static_response(index, request.method, request.path)
     target = index.target
+    if public_transport_policy is not None and not target.route_host.endswith(
+        "." + public_transport_policy.route_host_suffix
+    ):
+        raise ValueError("public_transport_route_out_of_scope")
     document: dict[str, object] = {
         "schema": STATIC_OBSERVATION_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 2 if public_transport_policy is not None else 1,
         "probe_kind": probe_kind,
         "validator_hotkey": request.validator_hotkey,
         "deployment_id": target.deployment_id,
@@ -356,6 +530,13 @@ def evaluate_static_probe(
         "attestation_status": "not_presented",
         "attestation": None,
     }
+    if public_transport_policy is not None:
+        document.update(
+            transport_profile=public_transport_policy.profile,
+            transport_policy_digest_sha256=public_transport_policy.policy_digest_sha256,
+            delivered_http_version=None,
+            delivered_headers=None,
+        )
 
     def fail(code: StaticFailureCode) -> StaticProbeObservation:
         document["failure_code"] = code
@@ -376,6 +557,19 @@ def evaluate_static_probe(
     document["response_bytes"] = min(len(result.body), MAX_FILE_BYTES + 1)
     document["response_body_sha256"] = body_digest
     document["response_header_sha256"] = header_digest
+    if public_transport_policy is not None:
+        document["delivered_http_version"] = (
+            result.http_version if result.http_version in {"HTTP/1.1", "HTTP/2", "HTTP/3"} else None
+        )
+        if (
+            len(result.headers) <= 128
+            and sum(len(name) + len(value) for name, value in result.headers) <= 16_384
+            and all(
+                name.isascii() and value.isascii() and len(name) <= 128 and len(value) <= 8_192
+                for name, value in result.headers
+            )
+        ):
+            document["delivered_headers"] = [list(item) for item in result.headers]
     pins = tuple(pinned_edge_leaf_certificate_sha256)
     if pins and result.tls_leaf_certificate_sha256 not in pins:
         return fail("tls_pin_mismatch")
@@ -423,12 +617,34 @@ def evaluate_static_probe(
     if (
         attestation.response_status != result.status
         or attestation.response_body_sha256 != body_digest
-        or attestation.response_header_sha256 != header_digest
+        or (public_transport_policy is None and attestation.response_header_sha256 != header_digest)
     ):
         document["attestation_status"] = "rejected"
         return fail("content_altered_in_transit")
     document["attestation_status"] = "verified"
     document["attestation"] = model_document(attestation)
+    if public_transport_policy is not None:
+        # The signature commits to the complete representation header set,
+        # including Content-Length. Its opaque mismatch cannot identify a
+        # miner fault, so preserve path attribution and abstain.
+        if attestation.response_header_sha256 != expected.header_sha256:
+            return fail("content_altered_in_transit")
+        if result.status != expected.status:
+            return fail("status_mismatch")
+        if body_digest != expected.body_sha256:
+            return fail("body_mismatch")
+        if len(result.body) != (expected.content_length if request.method == "GET" else 0):
+            return fail("content_altered_in_transit")
+        if not _public_framing_valid(
+            result.headers,
+            http_version=result.http_version or "",
+            request_method=request.method,
+            expected_content_type=expected.content_type,
+            expected_content_length=expected.content_length,
+        ):
+            return fail("content_altered_in_transit")
+        document["outcome"] = "success"
+        return _seal(document)
     if result.status != expected.status:
         return fail("status_mismatch")
     if body_digest != expected.body_sha256:

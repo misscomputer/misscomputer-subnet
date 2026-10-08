@@ -430,6 +430,7 @@ class HttpsProbeTransport:
                             body=body,
                             latency_millis=latency_millis,
                             tls_leaf_certificate_sha256=leaf,
+                            http_version=response.http_version,
                         )
                     )
         except Exception as exc:  # noqa: BLE001 - every transport fault is classified

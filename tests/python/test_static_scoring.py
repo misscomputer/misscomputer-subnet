@@ -97,7 +97,12 @@ def test_generated_schema_and_golden_fixture_are_pinned(stem: str) -> None:
     rendered = json.dumps(
         SCHEMA_MODELS[stem][1].model_json_schema(), indent=2, sort_keys=True, ensure_ascii=True
     )
-    assert fixture_path(stem, schema=True).read_bytes() == (rendered + "\n").encode("ascii")
+    current_schema = fixture_path(stem, schema=True)
+    if stem in {"static-epoch-score", "static-evidence-record"}:
+        # Historical v1 schemas stay frozen; the current parser also accepts
+        # profile-bound v2 records, whose schema is archived separately.
+        current_schema = current_schema.with_name(f"{stem}.v2.schema.json")
+    assert current_schema.read_bytes() == (rendered + "\n").encode("ascii")
     assert fixture_bytes == fixture_documents()[stem]
 
 

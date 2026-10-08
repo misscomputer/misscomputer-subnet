@@ -72,7 +72,7 @@ from collections.abc import Mapping, Sequence
 from fractions import Fraction
 from typing import Annotated, Final, Literal, NoReturn, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from .contract_codec import (
     StrictFrozenModel,
@@ -112,13 +112,17 @@ from .static_index import (
 )
 from .static_probe import (
     HIDDEN_PROBE_CEILING_BYTES,
+    PUBLIC_FRAMING_PROFILE,
     StaticProbeObservation,
+    StaticPublicTransportPolicy,
+    _public_framing_valid,
     static_probe_coverage,
 )
 
 STATIC_EPOCH_SCORE_SCHEMA: Final = "miss.computer/misscomputer-subnet/static-epoch-score"
 STATIC_WINDOW_SCORE_SCHEMA: Final = "miss.computer/misscomputer-subnet/static-availability-score"
 STATIC_SCORING_PURPOSE: Final = "static_availability_scoring_v1"
+STATIC_PUBLIC_FRAMING_PURPOSE: Final = "static_availability_scoring_public_framing_v2"
 DEFAULT_MIN_ATTEMPTS: Final = 2
 MAX_ATTEMPTS_PER_ENDPOINT: Final = 16
 MAX_DEPLOYMENTS: Final = 4_096
@@ -286,7 +290,15 @@ def _answer(obs: StaticProbeObservation) -> tuple[object, ...]:
     if obs.outcome == "success":
         return _PASS
     if obs.quarantine_candidate:
-        return (obs.response_status, obs.response_body_sha256, obs.response_header_sha256)
+        # V2's public framing digest may differ for the same signed response
+        # (Content-Length versus chunked). Corroboration compares the miner's
+        # authenticated representation, never CDN-specific wire framing.
+        header = (
+            obs.attestation.response_header_sha256
+            if obs.schema_version == 2 and obs.attestation is not None
+            else obs.response_header_sha256
+        )
+        return (obs.response_status, obs.response_body_sha256, header)
     return ("other", obs.failure_code)
 
 
@@ -525,8 +537,10 @@ class StaticEpochScore(StrictFrozenModel):
     contract_schema: Literal["miss.computer/misscomputer-subnet/static-epoch-score"] = Field(
         alias="schema"
     )
-    schema_version: Literal[1]
-    purpose: Literal["static_availability_scoring_v1"]
+    schema_version: Literal[1, 2]
+    purpose: Literal[
+        "static_availability_scoring_v1", "static_availability_scoring_public_framing_v2"
+    ]
     network: Literal["finney", "test"]
     netuid: Literal[24, 581]
     validator_hotkey: Hotkey
@@ -547,11 +561,44 @@ class StaticEpochScore(StrictFrozenModel):
     endpoint_actions: list[StaticEndpointAction] = Field(max_length=MAX_ENDPOINTS)
     alerts: list[StaticAlert] = Field(max_length=MAX_ENDPOINTS * 4)
     observations: list[StaticProbeObservation] = Field(max_length=MAX_OBSERVATIONS)
+    transport_profile: Literal["public-framing-v1"] | None = None
+    transport_policy_digest_sha256: Hex64 | None = None
     observation_vector_digest_sha256: Hex64
     epoch_score_digest_sha256: Hex64
 
+    @model_serializer(mode="wrap")
+    def serialize_versioned(self, handler: object) -> dict[str, object]:
+        document: dict[str, object] = handler(self)  # type: ignore[operator]
+        if self.schema_version == 1:
+            document.pop("transport_profile", None)
+            document.pop("transport_policy_digest_sha256", None)
+        return document
+
     @model_validator(mode="after")
     def canonical_epoch(self) -> Self:
+        if self.purpose != (
+            STATIC_SCORING_PURPOSE if self.schema_version == 1 else STATIC_PUBLIC_FRAMING_PURPOSE
+        ):
+            raise ValueError("static_epoch_purpose_invalid")
+        if self.schema_version == 1:
+            if (
+                self.transport_profile is not None
+                or self.transport_policy_digest_sha256 is not None
+            ):
+                raise ValueError("static_epoch_profile_invalid")
+        elif (
+            self.transport_profile != PUBLIC_FRAMING_PROFILE
+            or self.transport_policy_digest_sha256 is None
+            or (self.network, self.netuid) != ("test", 581)
+        ):
+            raise ValueError("static_epoch_profile_invalid")
+        if any(
+            item.schema_version != self.schema_version
+            or item.transport_profile != self.transport_profile
+            or item.transport_policy_digest_sha256 != self.transport_policy_digest_sha256
+            for item in self.observations
+        ):
+            raise ValueError("static_epoch_profile_mixed")
         if (self.network, self.netuid) not in {("finney", 24), ("test", 581)}:
             raise ValueError("static_subnet_invalid")
         ids = [item.deployment_id for item in self.targets]
@@ -655,11 +702,17 @@ def _attestation_status(
         issued - ATTESTATION_CLOCK_SKEW_NANOS
         <= observed
         <= issued + PROBE_AUTHORIZATION_VALIDITY_NANOS + ATTESTATION_CLOCK_SKEW_NANOS
-    ) or (
+    ):
+        return "rejected"
+    if (
         attestation.response_status,
         attestation.response_body_sha256,
-        attestation.response_header_sha256,
-    ) != (obs.response_status, obs.response_body_sha256, obs.response_header_sha256):
+    ) != (
+        obs.response_status,
+        obs.response_body_sha256,
+    ) or (
+        obs.schema_version == 1 and attestation.response_header_sha256 != obs.response_header_sha256
+    ):
         return "rejected"
     return "verified"
 
@@ -709,6 +762,33 @@ def _verify_observation(
         _reject("static_scoring_body_over_ceiling")
     if _attestation_status(obs, index.target, endpoint) != obs.attestation_status:
         _reject("static_scoring_attestation_unverified")
+    if obs.schema_version == 2:
+        if obs.outcome == "success" and (
+            obs.delivered_headers is None
+            or obs.delivered_http_version is None
+            or not _public_framing_valid(
+                obs.delivered_headers,
+                http_version=obs.delivered_http_version,
+                request_method=obs.request_method,
+                expected_content_type=expected.content_type,
+                expected_content_length=expected.content_length,
+            )
+        ):
+            _reject("static_scoring_attestation_unverified")
+        if obs.quarantine_candidate and (
+            obs.attestation is None
+            or obs.attestation.response_header_sha256 != expected.header_sha256
+            or obs.failure_code == "header_mismatch"
+            or (obs.failure_code == "status_mismatch" and obs.response_status == expected.status)
+            or (
+                obs.failure_code == "body_mismatch"
+                and (
+                    obs.response_status != expected.status
+                    or obs.response_body_sha256 == expected.body_sha256
+                )
+            )
+        ):
+            _reject("static_scoring_attestation_unverified")
 
 
 def score_static_epoch(
@@ -724,6 +804,7 @@ def score_static_epoch(
     probe_body_ceiling: int = HIDDEN_PROBE_CEILING_BYTES,
     network: Literal["finney", "test"] = "finney",
     netuid: Literal[24, 581] = 24,
+    public_transport_policy: StaticPublicTransportPolicy | None = None,
 ) -> StaticEpochScore:
     """Seal one static epoch from verified targets, index states and hidden evidence.
 
@@ -765,6 +846,15 @@ def score_static_epoch(
     if set(verified) | set(abstained) != set(by_id):
         _reject("static_scoring_index_state_invalid")
     values = [revalidate(item, StaticProbeObservation) for item in observations]
+    if public_transport_policy is not None and (network, netuid) != ("test", 581):
+        _reject("static_scoring_policy_invalid")
+    if any(
+        item.schema_version != (2 if public_transport_policy is not None else 1)
+        or item.transport_policy_digest_sha256
+        != (public_transport_policy.policy_digest_sha256 if public_transport_policy else None)
+        for item in values
+    ):
+        _reject("static_scoring_policy_invalid")
     seen_digests: set[str] = set()
     seen_nonces: set[str] = set()
     for obs in values:
@@ -821,8 +911,12 @@ def score_static_epoch(
     vector = [model_document(item) for item in values]
     unsigned: dict[str, object] = {
         "schema": STATIC_EPOCH_SCORE_SCHEMA,
-        "schema_version": 1,
-        "purpose": STATIC_SCORING_PURPOSE,
+        "schema_version": 2 if public_transport_policy is not None else 1,
+        "purpose": (
+            STATIC_SCORING_PURPOSE
+            if public_transport_policy is None
+            else STATIC_PUBLIC_FRAMING_PURPOSE
+        ),
         "network": network,
         "netuid": netuid,
         "validator_hotkey": validator_hotkey,
@@ -845,13 +939,19 @@ def score_static_epoch(
         "observations": vector,
         "observation_vector_digest_sha256": digest(vector),
     }
+    if public_transport_policy is not None:
+        unsigned["transport_profile"] = public_transport_policy.profile
+        unsigned["transport_policy_digest_sha256"] = public_transport_policy.policy_digest_sha256
     return StaticEpochScore.model_validate(
         {**unsigned, "epoch_score_digest_sha256": digest(unsigned)}
     )
 
 
 def replay_static_epoch_score(
-    record: StaticEpochScore, indexes: Sequence[VerifiedStaticIndex]
+    record: StaticEpochScore,
+    indexes: Sequence[VerifiedStaticIndex],
+    *,
+    public_transport_policy: StaticPublicTransportPolicy | None = None,
 ) -> StaticEpochScore:
     """Third-party audit: rebuild a record from its evidence and re-authenticated indexes.
 
@@ -861,6 +961,10 @@ def replay_static_epoch_score(
     """
 
     value = revalidate(record, StaticEpochScore)
+    if value.transport_policy_digest_sha256 != (
+        public_transport_policy.policy_digest_sha256 if public_transport_policy else None
+    ):
+        _reject("static_scoring_policy_invalid")
     rebuilt = score_static_epoch(
         value.targets,
         indexes,
@@ -876,6 +980,7 @@ def replay_static_epoch_score(
         probe_body_ceiling=value.probe_body_ceiling,
         network=value.network,
         netuid=value.netuid,
+        public_transport_policy=public_transport_policy,
     )
     if static_epoch_score_bytes(rebuilt) != static_epoch_score_bytes(value):
         _reject("static_scoring_outcome_inconsistent")

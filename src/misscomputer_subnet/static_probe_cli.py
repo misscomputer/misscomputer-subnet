@@ -48,6 +48,7 @@ from .score_checkpoint_relay_cli import (
     InputFile,
     _normalized_absolute_path,
 )
+from .static_probe import parse_static_public_transport_policy
 from .static_runtime import (
     StaticEpochRun,
     StaticSitesConfig,
@@ -73,6 +74,7 @@ class StaticProbeCLIConfig:
     static_sites: StaticSitesConfig
     edge_origin: str | None = None
     tls_ca_file: str | None = None
+    public_transport_policy: InputFile | None = None
 
 
 def execute_static_probe(
@@ -110,6 +112,27 @@ def execute_static_probe(
         _normalized_absolute_path(item.path, code="input_path_unsafe")
         for item in (config.trust_policy, config.probe_seed)
     }
+    public_transport_policy = None
+    if config.public_transport_policy is not None:
+        inputs.add(
+            _normalized_absolute_path(config.public_transport_policy.path, code="input_path_unsafe")
+        )
+        try:
+            public_transport_policy = parse_static_public_transport_policy(
+                _load_file_bytes(
+                    config.public_transport_policy,
+                    label="static_public_transport_policy",
+                    max_bytes=4_096,
+                )
+            )
+        except (TypeError, ValueError, ValidationError, RecursionError) as exc:
+            raise AssignmentProbeCLIError("static_public_transport_policy_invalid") from exc
+        if (
+            (policy.network, policy.netuid) != ("test", 581)
+            or public_transport_policy.manifest_trust_policy_digest_sha256
+            != policy.trust_policy_digest_sha256
+        ):
+            raise AssignmentProbeCLIError("static_public_transport_policy_mismatch")
     release_policy, server_digest, index_origin = preflight_static(
         config.static_sites, organic_inputs=inputs
     )
@@ -118,6 +141,7 @@ def execute_static_probe(
         raise AssignmentProbeCLIError("wallet_hotkey_mismatch")
     transport = transport_factory(build_probe_ssl_context(config.tls_ca_file))
     run = lock_static_epoch(config.static_sites, policy)
+    run.public_transport_policy = public_transport_policy
     try:
         try:
             load_static_epoch(
@@ -176,6 +200,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wallet-path", default="~/.bittensor/wallets")
     parser.add_argument("--edge-origin")
     parser.add_argument("--tls-ca-file")
+    parser.add_argument("--public-transport-policy")
+    parser.add_argument("--public-transport-policy-sha256")
     for name in _STATIC_SINGLE_OPTIONS:
         parser.add_argument(f"--{name}")
     parser.add_argument("--static-signature-file", action="append", default=[])
@@ -188,6 +214,10 @@ def _config_from_arguments(arguments: argparse.Namespace) -> StaticProbeCLIConfi
     arguments.static_sites = "on"
     static = _static_config_from_arguments(arguments)
     if static is None:
+        raise AssignmentProbeCLIError("usage")
+    if (arguments.public_transport_policy is None) != (
+        arguments.public_transport_policy_sha256 is None
+    ):
         raise AssignmentProbeCLIError("usage")
     return StaticProbeCLIConfig(
         trust_policy=InputFile(arguments.trust_policy, arguments.trust_policy_sha256),
@@ -203,6 +233,11 @@ def _config_from_arguments(arguments: argparse.Namespace) -> StaticProbeCLIConfi
         static_sites=static,
         edge_origin=cast(str | None, arguments.edge_origin),
         tls_ca_file=cast(str | None, arguments.tls_ca_file),
+        public_transport_policy=(
+            InputFile(arguments.public_transport_policy, arguments.public_transport_policy_sha256)
+            if arguments.public_transport_policy is not None
+            else None
+        ),
     )
 
 

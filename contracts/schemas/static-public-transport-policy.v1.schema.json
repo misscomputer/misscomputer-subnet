@@ -1,0 +1,58 @@
+{
+  "additionalProperties": false,
+  "description": "Explicit testnet-only pin for comparing signed representation to public framing.",
+  "properties": {
+    "manifest_trust_policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Manifest Trust Policy Digest Sha256",
+      "type": "string"
+    },
+    "netuid": {
+      "const": 581,
+      "title": "Netuid",
+      "type": "integer"
+    },
+    "network": {
+      "const": "test",
+      "title": "Network",
+      "type": "string"
+    },
+    "policy_digest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Policy Digest Sha256",
+      "type": "string"
+    },
+    "profile": {
+      "const": "public-framing-v1",
+      "title": "Profile",
+      "type": "string"
+    },
+    "route_host_suffix": {
+      "const": "on.miss.computer",
+      "title": "Route Host Suffix",
+      "type": "string"
+    },
+    "schema": {
+      "const": "miss.computer/misscomputer-subnet/static-public-transport-policy",
+      "title": "Schema",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "profile",
+    "network",
+    "netuid",
+    "route_host_suffix",
+    "manifest_trust_policy_digest_sha256",
+    "policy_digest_sha256"
+  ],
+  "title": "StaticPublicTransportPolicy",
+  "type": "object"
+}
