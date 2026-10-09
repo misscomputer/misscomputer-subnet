@@ -162,6 +162,7 @@ AbstentionCode = Literal[
     "release_binding_mismatch",
     "release_digest_mismatch",
     "release_invalid",
+    "release_revoked",
     "release_unavailable",
     "server_implementation_mismatch",
     "signature_invalid",
@@ -169,7 +170,9 @@ AbstentionCode = Literal[
     "signer_untrusted",
     "site_digest_mismatch",
 ]
-AbstentionRecordCode = Literal["static_index_invalid", "static_index_unavailable"]
+AbstentionRecordCode = Literal[
+    "static_index_invalid", "static_index_unavailable", "static_release_revoked"
+]
 ResponseKind = Literal["directory_index", "file", "navigation_fallback", "not_found"]
 
 
@@ -501,6 +504,8 @@ class StaticIndexAbstention:
 
         if self.code in {"index_unavailable", "release_unavailable"}:
             return "static_index_unavailable"
+        if self.code == "release_revoked":
+            return "static_release_revoked"
         return "static_index_invalid"
 
 

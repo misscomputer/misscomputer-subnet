@@ -153,6 +153,66 @@ def trust_policy(*keys: StaticReleaseKey) -> StaticSiteReleaseTrustPolicy:
     )
 
 
+#: §7.3 revocation authority: never a release key.
+REVOCATION_KEY = Ed25519PrivateKey.from_private_bytes(b"\x09" * 32)
+REVOCATION_KEY_ID = "static-revocation-1"
+
+
+def revocation_policy_bytes(
+    private: Ed25519PrivateKey = REVOCATION_KEY,
+    *,
+    valid_from_epoch: int = 1_767_225_600,
+    valid_until_epoch: int = 1_893_456_000,
+) -> bytes:
+    unsigned = {
+        "policy_id": "static-revocation-test",
+        "schema": "miss.computer/misscomputer-subnet/static-site-release-revocation-trust-policy",
+        "schema_version": 1,
+        "trusted_keys": [
+            {
+                "algorithm": "ed25519",
+                "key_id": REVOCATION_KEY_ID,
+                "public_key_hex": raw_public(private).hex(),
+                "valid_from_epoch": valid_from_epoch,
+                "valid_until_epoch": valid_until_epoch,
+            }
+        ],
+    }
+    return stored({**unsigned, "digest_sha256": sha(canonical_json(unsigned))})
+
+
+def revocation_snapshot_bytes(
+    sequence: int,
+    issued_epoch: int,
+    *,
+    releases: tuple[tuple[str, str, str], ...] = (),
+    signer_keys: tuple[tuple[str, str, str], ...] = (),
+    private: Ed25519PrivateKey = REVOCATION_KEY,
+) -> bytes:
+    """Sign one snapshot; ``releases`` are (release, site, reason), keys (id, hex, reason)."""
+
+    unsigned = {
+        "issued_at": datetime.fromtimestamp(issued_epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "revoked_releases": [
+            {"reason_category": reason, "release_digest": release, "site_digest": site}
+            for release, site, reason in sorted(releases)
+        ],
+        "revoked_signer_keys": [
+            {"key_id": key_id, "public_key_hex": public, "reason_category": reason}
+            for key_id, public, reason in sorted(signer_keys)
+        ],
+        "schema": "miss.computer/misscomputer-subnet/static-site-release-revocation",
+        "schema_version": 1,
+        "sequence": sequence,
+        "signer_key_id": REVOCATION_KEY_ID,
+    }
+    message = (
+        b"miss.computer/misscomputer-subnet/static-site-release-revocation/v1/ed25519\x00"
+        + canonical_json(unsigned)
+    )
+    return stored({**unsigned, "signature": private.sign(message).hex()})
+
+
 def endpoint(hotkey: str, *, uid: int, generation: int = 1) -> StaticEndpointTarget:
     nonce = sha(hotkey.encode())[:32]
     return StaticEndpointTarget(

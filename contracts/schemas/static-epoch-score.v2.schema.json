@@ -119,6 +119,7 @@
             "static_index_suspect",
             "static_index_unavailable",
             "static_path_tampering",
+            "static_release_revoked",
             "static_replay_observed"
           ],
           "title": "Code",
@@ -618,6 +619,7 @@
             "release_binding_mismatch",
             "release_digest_mismatch",
             "release_invalid",
+            "release_revoked",
             "release_unavailable",
             "server_implementation_mismatch",
             "signature_invalid",
@@ -637,7 +639,8 @@
         "record_code": {
           "enum": [
             "static_index_invalid",
-            "static_index_unavailable"
+            "static_index_unavailable",
+            "static_release_revoked"
           ],
           "title": "Record Code",
           "type": "string"

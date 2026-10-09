@@ -23,8 +23,10 @@ Inputs
 Epoch rules
 -----------
 1. Endpoints of an abstained deployment **abstain** (``abstain_index``, alert
-   ``static_index_unavailable`` / ``static_index_invalid``): never zero, never
-   judged by a dynamic predicate; observations of them refuse the epoch.
+   ``static_index_unavailable`` / ``static_index_invalid``, or
+   ``static_release_revoked`` for a revoked release or release signer): never
+   zero, never judged by a dynamic predicate; observations of them refuse the
+   epoch.
 2. Every observation must be a hidden probe by this validator of a published
    incarnation, carry exactly the target's release digest and the index's
    release trust-policy digest, the ``expected_static_response`` (status,
@@ -148,6 +150,7 @@ AlertCode = Literal[
     "static_index_suspect",
     "static_index_unavailable",
     "static_path_tampering",
+    "static_release_revoked",
     "static_replay_observed",
 ]
 ActionReason = Literal["attestation_fraud", "content_fault"]

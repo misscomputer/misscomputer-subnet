@@ -9,29 +9,20 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from assignment_probe_context import signer_keys
 from organic_context import EPOCH_START
 from static_cli_context import (
     FakeTime,
     alice_signer,
-    build_v3_manifest,
     cli_config,
     config_argv,
-    input_file,
+    retarget_test581,
     secure_write,
-    sign_v3,
     write_static_publication,
 )
 
 import misscomputer_subnet.static_probe_cli as static_cli
-from misscomputer_subnet.assignment_probe import (
-    AssignmentManifestTrustPolicy,
-    assignment_manifest_signature_envelope_bytes,
-    assignment_manifest_trust_policy_bytes,
-)
 from misscomputer_subnet.assignment_probe_cli import EXIT_DEGRADED, EXIT_OK, EXIT_REJECTED
-from misscomputer_subnet.contract_codec import digest, model_bytes, model_document
-from misscomputer_subnet.organic_manifest import assignment_manifest_v3_bytes
+from misscomputer_subnet.contract_codec import digest, model_bytes
 from misscomputer_subnet.static_probe import StaticPublicTransportPolicy
 from misscomputer_subnet.static_scoring import parse_static_epoch_score
 
@@ -109,30 +100,7 @@ def test_static_only_cli_accepts_test581_v3_and_rejects_wrong_subnet_policy(
 ) -> None:
     publication = write_static_publication(tmp_path / "publication")
     mainnet_policy = publication.policy_file
-    unsigned = model_document(publication.policy, exclude={"trust_policy_digest_sha256"})
-    unsigned.update({"network": "test", "netuid": 581})
-    policy = AssignmentManifestTrustPolicy.model_validate(
-        {**unsigned, "trust_policy_digest_sha256": digest(unsigned)}
-    )
-    v3 = build_v3_manifest(policy, [model_document(item) for item in publication.v3.deployments])
-    publication.policy_file = input_file(
-        secure_write(
-            tmp_path / "publication" / "test581-policy.json",
-            assignment_manifest_trust_policy_bytes(policy),
-        )
-    )
-    publication.v3_file = input_file(
-        secure_write(tmp_path / "publication" / "test581-v3.json", assignment_manifest_v3_bytes(v3))
-    )
-    publication.v3_signature_files = tuple(
-        input_file(
-            secure_write(
-                tmp_path / "publication" / f"test581-{item.signer_key_id}.json",
-                assignment_manifest_signature_envelope_bytes(item),
-            )
-        )
-        for item in sign_v3(v3, signer_keys())
-    )
+    retarget_test581(publication)
     fake = FakeTime(EPOCH_START)
     monkeypatch.setattr(
         static_cli,

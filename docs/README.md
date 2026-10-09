@@ -40,6 +40,7 @@ deployment.
 | Hidden-probe design | [public-validator-live-probe.md](public-validator-live-probe.md) |
 | Static-site index ingestion, admission crawl, and hidden probes (development) | [static-site-validator-probe.md](static-site-validator-probe.md) |
 | Static sites in the validator probe CLI (`--static-sites`, default off) | [static-site-validator-runtime.md](static-site-validator-runtime.md) |
+| Static release revocation: snapshot verification, durable high water, freshness, `release_revoked` abstention | [static-site-release-revocation.md](static-site-release-revocation.md) |
 | Static-site scoring, durable evidence, quarantine and alert records (development) | [static-site-scoring.md](static-site-scoring.md) |
 | Signed score checkpoint design | [signed-score-checkpoint-relay.md](signed-score-checkpoint-relay.md) |
 | Release integrity contracts | [production-release-integrity.md](production-release-integrity.md) |

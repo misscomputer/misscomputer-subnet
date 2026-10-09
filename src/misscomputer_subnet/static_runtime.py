@@ -12,15 +12,22 @@ Off by default. When enabled, one probe run additionally:
    path **abstain** for the epoch (no probe, no record, never a zero and never
    a dynamic probe) while the organic path runs unchanged;
 3. archives the verified v3 manifest, then advances the v3 state;
-4. authenticates ``static-site-v1`` deployment indexes (stored site manifest
+4. with a pinned revocation policy (required on ``finney``), offers the
+   operator-delivered ``static-site-release-revocation`` v1 snapshot to the
+   durable high water in the static state root, and abstains for the epoch
+   unless that high water exists and is fresh (§7.3,
+   :mod:`misscomputer_subnet.static_revocation`);
+5. authenticates ``static-site-v1`` deployment indexes (stored site manifest
    and signed release) within a whole-epoch fetch budget under the pinned
    static release trust policy and implementation digest; a deployment whose
-   index is unfetched, unavailable or invalid abstains with its §11.2 record code;
-5. interleaves the static hidden plan (seed-derived instants and paths,
+   index is unfetched, unavailable or invalid abstains with its §11.2 record
+   code, and one whose release or release signer is revoked abstains with
+   ``static_release_revoked`` (never probed, never a zero);
+6. interleaves the static hidden plan (seed-derived instants and paths,
    GET only within the trust policy's response ceiling, HEAD above it) with
    the organic plan in one time-ordered schedule, appending every sealed
    observation to the durable hash-chained evidence journal as it is judged;
-6. seals a ``static-epoch-score`` v1 (coverage, content-fault and fraud
+7. seals a ``static-epoch-score`` v1 (coverage, content-fault and fraud
    evidence, quarantine recommendations, alerts) to its own exclusive output.
 
 Static records never enter the organic epoch record, the window decision,
@@ -93,6 +100,21 @@ from .static_probe import (
     StaticPublicTransportPolicy,
     plan_static_hidden_probes,
 )
+from .static_revocation import (
+    DEFAULT_MAX_AGE_SECONDS,
+    MAX_MAX_AGE_SECONDS,
+    MAX_REVOCATION_POLICY_BYTES,
+    MAX_REVOCATION_SNAPSHOT_BYTES,
+    MIN_MAX_AGE_SECONDS,
+    StaticRevocationError,
+    StaticSiteReleaseRevocationTrustPolicy,
+    VerifiedRevocation,
+    advance_static_site_release_revocation,
+    parse_static_site_release_revocation_trust_policy,
+    revocation_freshness,
+    static_index_revoked,
+    verify_static_site_release_revocation,
+)
 from .static_scoring import StaticEpochScore, score_static_epoch, static_epoch_score_bytes
 
 MAX_RELEASE_TRUST_POLICY_BYTES: Final = 256 * 1_024
@@ -100,6 +122,13 @@ MAX_RELEASE_TRUST_POLICY_BYTES: Final = 256 * 1_024
 # Targets not fetched within this wall-clock budget abstain, never score zero.
 STATIC_INDEX_LOAD_BUDGET_SECONDS: Final = 30.0
 _PREFIXED_DIGEST_HEX: Final = frozenset("0123456789abcdef")
+#: The durable revocation high water: exact stored snapshot bytes in the static root.
+REVOCATION_HIGH_WATER_NAME: Final = "static-release-revocation.json"
+REVOCATION_HIGH_WATER_INSTALL_NAME: Final = ".static-release-revocation.install"
+REVOCATION_STATE_ENTRIES: Final = frozenset(
+    {REVOCATION_HIGH_WATER_NAME, REVOCATION_HIGH_WATER_INSTALL_NAME}
+)
+_REVOCATION_PREFIX: Final = "static_revocation_"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +147,21 @@ class StaticSitesConfig:
     manifest_archive_dir: str
     epoch_output: str
     journal: str
+    #: Pinned ``static-site-release-revocation-trust-policy`` v1 path and its
+    #: ``digest_sha256``; ``None`` disables revocation (refused on ``finney``).
+    revocation_policy: str | None = None
+    revocation_policy_digest: str | None = None
+    #: Operator-delivered snapshot offered to the high water this run (self-authenticating).
+    revocation_snapshot: str | None = None
+    revocation_max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS
+
+
+@dataclass(slots=True)
+class StaticRevocationState:
+    """The pinned revocation authority and the durable high water this run relies on."""
+
+    policy: StaticSiteReleaseRevocationTrustPolicy
+    held: VerifiedRevocation | None
 
 
 @dataclass(slots=True)
@@ -137,6 +181,7 @@ class StaticEpochRun:
     skipped: int = 0
     epoch: StaticEpochScore | None = None
     public_transport_policy: StaticPublicTransportPolicy | None = None
+    revocation: StaticRevocationState | None = None
 
     def close(self) -> None:
         if self.journal is not None:
@@ -161,7 +206,159 @@ def static_input_paths(config: StaticSitesConfig) -> set[str]:
     if config.manifest.file is not None:
         files.append(config.manifest.file)
     files.extend(item.file for item in config.signatures if item.file is not None)
-    return {_normalized_absolute_path(item.path, code="input_path_unsafe") for item in files}
+    paths = [item.path for item in files]
+    paths.extend(
+        path for path in (config.revocation_policy, config.revocation_snapshot) if path is not None
+    )
+    return {_normalized_absolute_path(path, code="input_path_unsafe") for path in paths}
+
+
+def _check_revocation_options(config: StaticSitesConfig) -> None:
+    if (config.revocation_policy is None) != (config.revocation_policy_digest is None):
+        _fail("usage")
+    if config.revocation_policy is None and (
+        config.revocation_snapshot is not None
+        or config.revocation_max_age_seconds != DEFAULT_MAX_AGE_SECONDS
+    ):
+        _fail("usage")
+    digest_hex = config.revocation_policy_digest
+    if digest_hex is not None and (
+        len(digest_hex) != 64 or not set(digest_hex) <= _PREFIXED_DIGEST_HEX
+    ):
+        _fail("static_revocation_policy_digest_invalid")
+    age = config.revocation_max_age_seconds
+    if (
+        isinstance(age, bool)
+        or not isinstance(age, int)
+        or not MIN_MAX_AGE_SECONDS <= age <= MAX_MAX_AGE_SECONDS
+    ):
+        _fail("static_revocation_max_age_invalid")
+
+
+def _load_unpinned_file(path: str, *, label: str, max_bytes: int) -> bytes:
+    """Bounded hardened read of a self-authenticating or digest-pinned document."""
+
+    from .production_release_verifier import HardenedFileSet, ReleaseVerificationError
+
+    normalized = _normalized_absolute_path(path, code="input_path_unsafe")
+    try:
+        with HardenedFileSet().open(normalized, label=label) as source:
+            rendered, _ = source.read_bytes(max_bytes=max_bytes)
+    except ReleaseVerificationError as exc:
+        raise AssignmentProbeCLIError(f"{label}_unavailable") from exc
+    return rendered
+
+
+def _lock_revocation(
+    root: _StateRoot, config: StaticSitesConfig, policy: AssignmentManifestTrustPolicy
+) -> StaticRevocationState | None:
+    """Load the pinned revocation authority and re-verify the stored high water.
+
+    A held high water can never be dropped by configuration: without a policy
+    it refuses the run, as does ``finney`` without a policy. A high water the
+    pinned policy cannot verify refuses the run before any state advances.
+    """
+
+    stored = root.read_document(
+        REVOCATION_HIGH_WATER_NAME,
+        max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+        prefix=_REVOCATION_PREFIX,
+    )
+    if config.revocation_policy is None or config.revocation_policy_digest is None:
+        if stored is not None or policy.network == "finney":
+            _fail("static_revocation_policy_required")
+        return None
+    release_policy = _load_release_policy(config.release_trust_policy)
+    rendered = _load_unpinned_file(
+        config.revocation_policy,
+        label="static_revocation_policy",
+        max_bytes=MAX_REVOCATION_POLICY_BYTES,
+    )
+    try:
+        revocation_policy = parse_static_site_release_revocation_trust_policy(
+            rendered,
+            pinned_digest_sha256=config.revocation_policy_digest,
+            release_policy=release_policy,
+        )
+    except StaticRevocationError as exc:
+        raise AssignmentProbeCLIError(f"static_{exc.code}") from exc
+    held = None
+    if stored is not None:
+        try:
+            held = verify_static_site_release_revocation(stored, revocation_policy)
+        except StaticRevocationError as exc:
+            raise AssignmentProbeCLIError("static_revocation_high_water_invalid") from exc
+    return StaticRevocationState(policy=revocation_policy, held=held)
+
+
+def _install_revocation_high_water(
+    root: _StateRoot, state: StaticRevocationState, offered: VerifiedRevocation
+) -> None:
+    """Advance the durable high water; the store re-reads its own bytes, then memory follows."""
+
+    stored = root.read_document(
+        REVOCATION_HIGH_WATER_NAME,
+        max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+        prefix=_REVOCATION_PREFIX,
+    )
+    try:
+        held = (
+            None if stored is None else verify_static_site_release_revocation(stored, state.policy)
+        )
+    except StaticRevocationError as exc:
+        raise AssignmentProbeCLIError("static_revocation_high_water_invalid") from exc
+    if advance_static_site_release_revocation(held, offered):
+        root.install_document(
+            REVOCATION_HIGH_WATER_NAME,
+            REVOCATION_HIGH_WATER_INSTALL_NAME,
+            offered.stored,
+            max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+            prefix=_REVOCATION_PREFIX,
+        )
+        held = offered
+    state.held = held
+
+
+def _revocation_gate(run: StaticEpochRun, root: _StateRoot, *, evaluation_epoch: int) -> str | None:
+    """Offer this run's snapshot; ``None`` only when a fresh high water is held."""
+
+    state = run.revocation
+    if state is None:
+        return None
+    path = run.config.revocation_snapshot
+    if path is not None:
+        try:
+            offered_bytes = _load_unpinned_file(
+                path,
+                label="static_revocation_snapshot",
+                max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+            )
+            offered = verify_static_site_release_revocation(offered_bytes, state.policy)
+            # A future-dated snapshot would hold back every later issuance.
+            if (
+                revocation_freshness(
+                    offered,
+                    now_epoch=evaluation_epoch,
+                    max_age_seconds=MAX_MAX_AGE_SECONDS,
+                )
+                == "revocation_issued_in_future"
+            ):
+                return "static_revocation_issued_in_future"
+            _install_revocation_high_water(root, state, offered)
+        except AssignmentProbeCLIError as exc:
+            if exc.code == "static_revocation_snapshot_unavailable":
+                return exc.code
+            raise
+        except StaticRevocationError as exc:
+            return f"static_{exc.code}"
+    if state.held is None:
+        return "static_revocation_unavailable"
+    stale = revocation_freshness(
+        state.held,
+        now_epoch=evaluation_epoch,
+        max_age_seconds=run.config.revocation_max_age_seconds,
+    )
+    return None if stale is None else f"static_{stale}"
 
 
 def _load_release_policy(value: InputFile) -> StaticSiteReleaseTrustPolicy:
@@ -230,6 +427,7 @@ def preflight_static(
     """Refuse an unsafe or aliased static configuration before anything is probed."""
 
     server_digest = _pinned_digest(config.server_implementation_digest)
+    _check_revocation_options(config)
     index_origin = _validated_https_url(config.index_origin, code="static_index_origin_invalid")
     index_origin = index_origin.rstrip("/")
     static_root = _normalized_absolute_path(config.state_root, code="state_root_path_unsafe")
@@ -271,7 +469,10 @@ def lock_static_epoch(
     try:
         _preflight_output(config.epoch_output, state_root=root.path)
         run.journal = _open_journal(config.journal)
-        run.prior_state = _resolve_prior_state(root, policy, config.trusted_state_anchor)
+        run.prior_state = _resolve_prior_state(
+            root, policy, config.trusted_state_anchor, ignored=REVOCATION_STATE_ENTRIES
+        )
+        run.revocation = _lock_revocation(root, config, policy)
     except BaseException:
         run.close()
         raise
@@ -339,7 +540,12 @@ def load_static_epoch(
     )
     if not verification.reprobe:
         root.replace_state(assignment_manifest_chain_state_bytes(verification.next_chain_state))
+    revocation_code = _revocation_gate(run, root, evaluation_epoch=evaluation_epoch)
+    if revocation_code is not None:
+        run.abstained_code = revocation_code
+        return
     run.verification = verification
+    held = run.revocation.held if run.revocation is not None else None
     server_name = urlsplit(index_origin).hostname or ""
     deadline = time.monotonic() + STATIC_INDEX_LOAD_BUDGET_SECONDS
     targets = static_deployment_targets(verification)
@@ -348,6 +554,11 @@ def load_static_epoch(
     # manifest's canonical target order in finish_static_epoch.
     start = epoch_index % len(targets) if targets else 0
     for target in targets[start:] + targets[:start]:
+        if held is not None and held.release_revoked(target.release_digest):
+            run.abstentions.append(
+                StaticIndexAbstention(target.deployment_id, target.site_digest, "release_revoked")
+            )
+            continue
         if time.monotonic() >= deadline:
             run.abstentions.append(
                 StaticIndexAbstention(target.deployment_id, target.site_digest, "index_unavailable")
@@ -367,8 +578,14 @@ def load_static_epoch(
             release_policy,
             pinned_server_implementation_digest=server_digest,
         )
-        if isinstance(result, VerifiedStaticIndex):
+        if isinstance(result, VerifiedStaticIndex) and (
+            held is None or not static_index_revoked(held, result, release_policy)
+        ):
             run.indexes.append(result)
+        elif isinstance(result, VerifiedStaticIndex):
+            run.abstentions.append(
+                StaticIndexAbstention(target.deployment_id, target.site_digest, "release_revoked")
+            )
         else:
             run.abstentions.append(result)
 

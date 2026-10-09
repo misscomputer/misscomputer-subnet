@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -47,6 +48,8 @@ from static_context import (
     manifest_document,
     raw_public,
     release_bytes,
+    revocation_policy_bytes,
+    revocation_snapshot_bytes,
     sha,
     site_digest,
     stored,
@@ -286,6 +289,12 @@ class StaticPublication:
     v3_file: InputFile
     v3_signature_files: tuple[InputFile, ...]
     release_policy_file: InputFile
+    revocation_policy_file: Path
+    revocation_snapshot_file: Path
+
+
+#: The default snapshot is issued an hour before the run: fresh, revoking nothing.
+REVOCATION_ISSUED_EPOCH = EPOCH_START - 3_600
 
 
 def write_static_publication(
@@ -362,6 +371,40 @@ def write_static_publication(
         release_policy_file=write(
             "static-release-policy.json", static_site_release_trust_policy_bytes(trust_policy())
         ),
+        revocation_policy_file=secure_write(
+            root / "static-revocation-policy.json", revocation_policy_bytes()
+        ),
+        revocation_snapshot_file=secure_write(
+            root / "static-revocation-snapshot.json",
+            revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH),
+        ),
+    )
+
+
+def retarget_test581(publication: StaticPublication) -> None:
+    """Rebind the publication's manifest trust policy and signed v3 head to ``test``/581."""
+
+    unsigned = model_document(publication.policy, exclude={"trust_policy_digest_sha256"})
+    unsigned.update({"network": "test", "netuid": 581})
+    policy = AssignmentManifestTrustPolicy.model_validate(
+        {**unsigned, "trust_policy_digest_sha256": digest(unsigned)}
+    )
+    v3 = build_v3_manifest(policy, [model_document(item) for item in publication.v3.deployments])
+    root = publication.root
+    publication.policy_file = input_file(
+        secure_write(root / "test581-policy.json", assignment_manifest_trust_policy_bytes(policy))
+    )
+    publication.v3_file = input_file(
+        secure_write(root / "test581-v3.json", assignment_manifest_v3_bytes(v3))
+    )
+    publication.v3_signature_files = tuple(
+        input_file(
+            secure_write(
+                root / f"test581-{item.signer_key_id}.json",
+                assignment_manifest_signature_envelope_bytes(item),
+            )
+        )
+        for item in sign_v3(v3, signer_keys())
     )
 
 
@@ -382,6 +425,11 @@ def cli_config(
             manifest_archive_dir=str(run / "static-manifests"),
             epoch_output=str(run / "output" / "static-epoch.json"),
             journal=str(run / "evidence" / "static-journal.jsonl"),
+            revocation_policy=str(publication.revocation_policy_file),
+            revocation_policy_digest=json.loads(publication.revocation_policy_file.read_bytes())[
+                "digest_sha256"
+            ],
+            revocation_snapshot=str(publication.revocation_snapshot_file),
         )
         if static
         else None
@@ -447,6 +495,13 @@ def config_argv(config: AssignmentProbeCLIConfig) -> list[str]:
         "--static-epoch-output", static.epoch_output,
         "--static-journal", static.journal,
     ]  # fmt: skip
+    if static.revocation_policy is not None:
+        values += [
+            "--static-release-revocation-policy", static.revocation_policy,
+            "--static-release-revocation-policy-digest", str(static.revocation_policy_digest),
+        ]  # fmt: skip
+    if static.revocation_snapshot is not None:
+        values += ["--static-release-revocation-snapshot", static.revocation_snapshot]
     for item in static.signatures:
         assert item.file is not None
         values += [
