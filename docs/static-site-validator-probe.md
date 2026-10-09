@@ -36,7 +36,10 @@ and accepts them only if:
 
 Anything else, including an unavailable object, is an **abstention**. The
 record code is `static_index_unavailable` or `static_index_invalid`, and a
-finer stable reason is also kept. An abstained deployment is not probed, not
+finer stable reason is also kept. A release that the pinned revocation
+authority revoked, by digest or by signer key, abstains with `release_revoked`
+(record code `static_release_revoked`; see
+[static-site-release-revocation.md](static-site-release-revocation.md)). An abstained deployment is not probed, not
 scored as zero, and never falls back to the dynamic health probe.
 
 ## Admission crawl

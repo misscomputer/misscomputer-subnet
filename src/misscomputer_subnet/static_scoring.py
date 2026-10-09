@@ -23,8 +23,10 @@ Inputs
 Epoch rules
 -----------
 1. Endpoints of an abstained deployment **abstain** (``abstain_index``, alert
-   ``static_index_unavailable`` / ``static_index_invalid``): never zero, never
-   judged by a dynamic predicate; observations of them refuse the epoch.
+   ``static_index_unavailable`` / ``static_index_invalid``, or
+   ``static_release_revoked`` for a revoked release or release signer): never
+   zero, never judged by a dynamic predicate; observations of them refuse the
+   epoch.
 2. Every observation must be a hidden probe by this validator of a published
    incarnation, carry exactly the target's release digest and the index's
    release trust-policy digest, the ``expected_static_response`` (status,
@@ -123,6 +125,12 @@ STATIC_EPOCH_SCORE_SCHEMA: Final = "miss.computer/misscomputer-subnet/static-epo
 STATIC_WINDOW_SCORE_SCHEMA: Final = "miss.computer/misscomputer-subnet/static-availability-score"
 STATIC_SCORING_PURPOSE: Final = "static_availability_scoring_v1"
 STATIC_PUBLIC_FRAMING_PURPOSE: Final = "static_availability_scoring_public_framing_v2"
+#: ``static-epoch-score`` v3: an epoch scored under a pinned release revocation
+#: authority (§7.3). It binds the revocation policy and the high-water snapshot
+#: it relied on, and only it may carry ``release_revoked`` abstentions. v1
+#: (direct) and v2 (public framing) records are unchanged; v3 keeps either
+#: transport (``transport_profile`` null or ``public-framing-v1``).
+STATIC_REVOCATION_BOUND_VERSION: Final = 3
 DEFAULT_MIN_ATTEMPTS: Final = 2
 MAX_ATTEMPTS_PER_ENDPOINT: Final = 16
 MAX_DEPLOYMENTS: Final = 4_096
@@ -148,6 +156,7 @@ AlertCode = Literal[
     "static_index_suspect",
     "static_index_unavailable",
     "static_path_tampering",
+    "static_release_revoked",
     "static_replay_observed",
 ]
 ActionReason = Literal["attestation_fraud", "content_fault"]
@@ -532,12 +541,16 @@ def _observation_order(item: StaticProbeObservation) -> tuple[str, str, str]:
 
 
 class StaticEpochScore(StrictFrozenModel):
-    """``static-epoch-score`` v1: one validator's sealed static epoch, inputs bound."""
+    """``static-epoch-score`` v1/v2/v3: one validator's sealed static epoch, inputs bound.
+
+    v1 is the direct transport, v2 the testnet public-framing profile, and v3
+    either transport scored under a pinned release revocation authority.
+    """
 
     contract_schema: Literal["miss.computer/misscomputer-subnet/static-epoch-score"] = Field(
         alias="schema"
     )
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     purpose: Literal[
         "static_availability_scoring_v1", "static_availability_scoring_public_framing_v2"
     ]
@@ -563,6 +576,10 @@ class StaticEpochScore(StrictFrozenModel):
     observations: list[StaticProbeObservation] = Field(max_length=MAX_OBSERVATIONS)
     transport_profile: Literal["public-framing-v1"] | None = None
     transport_policy_digest_sha256: Hex64 | None = None
+    #: v3 only: ``digest_sha256`` of the pinned revocation trust policy.
+    release_revocation_policy_digest_sha256: Hex64 | None = None
+    #: v3 only: digest of the exact high-water snapshot this epoch relied on.
+    release_revocation_snapshot_digest: Digest | None = None
     observation_vector_digest_sha256: Hex64
     epoch_score_digest_sha256: Hex64
 
@@ -572,15 +589,21 @@ class StaticEpochScore(StrictFrozenModel):
         if self.schema_version == 1:
             document.pop("transport_profile", None)
             document.pop("transport_policy_digest_sha256", None)
+        if self.schema_version != STATIC_REVOCATION_BOUND_VERSION:
+            document.pop("release_revocation_policy_digest_sha256", None)
+            document.pop("release_revocation_snapshot_digest", None)
         return document
 
     @model_validator(mode="after")
     def canonical_epoch(self) -> Self:
-        if self.purpose != (
-            STATIC_SCORING_PURPOSE if self.schema_version == 1 else STATIC_PUBLIC_FRAMING_PURPOSE
-        ):
+        framed = (
+            self.schema_version == 2
+            or self.schema_version == STATIC_REVOCATION_BOUND_VERSION
+            and self.transport_profile is not None
+        )
+        if self.purpose != (STATIC_PUBLIC_FRAMING_PURPOSE if framed else STATIC_SCORING_PURPOSE):
             raise ValueError("static_epoch_purpose_invalid")
-        if self.schema_version == 1:
+        if not framed:
             if (
                 self.transport_profile is not None
                 or self.transport_policy_digest_sha256 is not None
@@ -592,8 +615,18 @@ class StaticEpochScore(StrictFrozenModel):
             or (self.network, self.netuid) != ("test", 581)
         ):
             raise ValueError("static_epoch_profile_invalid")
+        bound = (
+            self.release_revocation_policy_digest_sha256 is not None,
+            self.release_revocation_snapshot_digest is not None,
+        )
+        if bound != ((self.schema_version == STATIC_REVOCATION_BOUND_VERSION),) * 2:
+            raise ValueError("static_epoch_revocation_binding_invalid")
+        if self.schema_version != STATIC_REVOCATION_BOUND_VERSION and any(
+            row.code == "release_revoked" for row in self.index_abstentions
+        ):
+            raise ValueError("static_epoch_revocation_unbound")
         if any(
-            item.schema_version != self.schema_version
+            item.schema_version != (2 if framed else 1)
             or item.transport_profile != self.transport_profile
             or item.transport_policy_digest_sha256 != self.transport_policy_digest_sha256
             for item in self.observations
@@ -805,12 +838,17 @@ def score_static_epoch(
     network: Literal["finney", "test"] = "finney",
     netuid: Literal[24, 581] = 24,
     public_transport_policy: StaticPublicTransportPolicy | None = None,
+    release_revocation: tuple[str, str] | None = None,
 ) -> StaticEpochScore:
     """Seal one static epoch from verified targets, index states and hidden evidence.
 
     Every target needs exactly one index state (verified or abstained) bound
     to its own site digest; any unbound, inconsistent, duplicated, admission,
     or foreign observation refuses the epoch rather than scoring it.
+
+    ``release_revocation`` is ``(policy digest_sha256, high-water snapshot
+    digest)`` when the epoch ran under a pinned revocation authority; it seals
+    a v3 record. A ``release_revoked`` abstention without it is refused.
     """
 
     if (
@@ -844,6 +882,10 @@ def score_static_epoch(
             _reject("static_scoring_index_state_invalid")
         abstained[key] = row
     if set(verified) | set(abstained) != set(by_id):
+        _reject("static_scoring_index_state_invalid")
+    if release_revocation is None and any(
+        row.code == "release_revoked" for row in abstained.values()
+    ):
         _reject("static_scoring_index_state_invalid")
     values = [revalidate(item, StaticProbeObservation) for item in observations]
     if public_transport_policy is not None and (network, netuid) != ("test", 581):
@@ -911,7 +953,13 @@ def score_static_epoch(
     vector = [model_document(item) for item in values]
     unsigned: dict[str, object] = {
         "schema": STATIC_EPOCH_SCORE_SCHEMA,
-        "schema_version": 2 if public_transport_policy is not None else 1,
+        "schema_version": (
+            STATIC_REVOCATION_BOUND_VERSION
+            if release_revocation is not None
+            else 2
+            if public_transport_policy is not None
+            else 1
+        ),
         "purpose": (
             STATIC_SCORING_PURPOSE
             if public_transport_policy is None
@@ -939,9 +987,20 @@ def score_static_epoch(
         "observations": vector,
         "observation_vector_digest_sha256": digest(vector),
     }
-    if public_transport_policy is not None:
-        unsigned["transport_profile"] = public_transport_policy.profile
-        unsigned["transport_policy_digest_sha256"] = public_transport_policy.policy_digest_sha256
+    if public_transport_policy is not None or release_revocation is not None:
+        unsigned["transport_profile"] = (
+            public_transport_policy.profile if public_transport_policy is not None else None
+        )
+        unsigned["transport_policy_digest_sha256"] = (
+            public_transport_policy.policy_digest_sha256
+            if public_transport_policy is not None
+            else None
+        )
+    if release_revocation is not None:
+        (
+            unsigned["release_revocation_policy_digest_sha256"],
+            unsigned["release_revocation_snapshot_digest"],
+        ) = release_revocation
     return StaticEpochScore.model_validate(
         {**unsigned, "epoch_score_digest_sha256": digest(unsigned)}
     )
@@ -981,6 +1040,15 @@ def replay_static_epoch_score(
         network=value.network,
         netuid=value.netuid,
         public_transport_policy=public_transport_policy,
+        release_revocation=(
+            None
+            if value.release_revocation_policy_digest_sha256 is None
+            or value.release_revocation_snapshot_digest is None
+            else (
+                value.release_revocation_policy_digest_sha256,
+                value.release_revocation_snapshot_digest,
+            )
+        ),
     )
     if static_epoch_score_bytes(rebuilt) != static_epoch_score_bytes(value):
         _reject("static_scoring_outcome_inconsistent")

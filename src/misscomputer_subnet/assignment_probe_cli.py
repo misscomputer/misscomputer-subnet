@@ -758,15 +758,17 @@ class _StateRoot:
         except OSError as exc:
             raise AssignmentProbeCLIError("state_root_unsafe") from exc
 
-    def read_state(self) -> AssignmentManifestChainState | None:
+    def read_document(self, name: str, *, max_bytes: int, prefix: str = "state_") -> bytes | None:
+        """Exact bytes of one owner-only regular file in the root, or ``None`` when absent."""
+
         entries = self.entries()
-        if STATE_NAME not in entries:
+        if name not in entries:
             return None
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
-            descriptor = os.open(STATE_NAME, flags, dir_fd=self._directory_fd)
+            descriptor = os.open(name, flags, dir_fd=self._directory_fd)
         except OSError as exc:
-            raise AssignmentProbeCLIError("state_file_unsafe") from exc
+            raise AssignmentProbeCLIError(f"{prefix}file_unsafe") from exc
         try:
             metadata = os.fstat(descriptor)
             if (
@@ -774,55 +776,69 @@ class _StateRoot:
                 or metadata.st_uid != _effective_uid()
                 or stat.S_IMODE(metadata.st_mode) != STATE_FILE_MODE
                 or metadata.st_nlink != 1
-                or not 0 < metadata.st_size <= MAX_STATE_BYTES
+                or not 0 < metadata.st_size <= max_bytes
             ):
-                _fail("state_file_unsafe")
-            rendered = os.read(descriptor, MAX_STATE_BYTES + 1)
+                _fail(f"{prefix}file_unsafe")
+            rendered = os.read(descriptor, max_bytes + 1)
             if len(rendered) != metadata.st_size or os.read(descriptor, 1):
-                _fail("state_file_unsafe")
+                _fail(f"{prefix}file_unsafe")
         except OSError as exc:
-            raise AssignmentProbeCLIError("state_file_unsafe") from exc
+            raise AssignmentProbeCLIError(f"{prefix}file_unsafe") from exc
         finally:
             os.close(descriptor)
+        return rendered
+
+    def read_state(self) -> AssignmentManifestChainState | None:
+        rendered = self.read_document(STATE_NAME, max_bytes=MAX_STATE_BYTES)
+        if rendered is None:
+            return None
         try:
             return parse_assignment_manifest_chain_state(rendered)
         except (TypeError, ValueError, ValidationError, RecursionError) as exc:
             raise AssignmentProbeCLIError("state_file_invalid") from exc
 
-    def _remove_install_residue(self) -> None:
+    def _remove_install_residue(self, install_name: str, *, max_bytes: int, prefix: str) -> None:
         """Remove only a safe temp file left by an interrupted locked install."""
 
         try:
-            metadata = os.stat(STATE_INSTALL_NAME, dir_fd=self._directory_fd, follow_symlinks=False)
+            metadata = os.stat(install_name, dir_fd=self._directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             return
         except OSError as exc:
-            raise AssignmentProbeCLIError("state_install_residue") from exc
+            raise AssignmentProbeCLIError(f"{prefix}install_residue") from exc
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != _effective_uid()
             or stat.S_IMODE(metadata.st_mode) != STATE_FILE_MODE
             or metadata.st_nlink != 1
-            or metadata.st_size > MAX_STATE_BYTES
+            or metadata.st_size > max_bytes
         ):
-            _fail("state_install_residue")
+            _fail(f"{prefix}install_residue")
         try:
-            os.unlink(STATE_INSTALL_NAME, dir_fd=self._directory_fd)
+            os.unlink(install_name, dir_fd=self._directory_fd)
             os.fsync(self._directory_fd)
         except OSError as exc:
-            raise AssignmentProbeCLIError("state_install_residue") from exc
+            raise AssignmentProbeCLIError(f"{prefix}install_residue") from exc
 
-    def replace_state(self, rendered: bytes) -> None:
-        self._remove_install_residue()
+    def install_document(
+        self,
+        name: str,
+        install_name: str,
+        rendered: bytes,
+        *,
+        max_bytes: int,
+        prefix: str = "state_",
+    ) -> None:
+        """Atomically replace one root file (fsynced temp, rename, directory fsync, read-back)."""
+
+        self._remove_install_residue(install_name, max_bytes=max_bytes, prefix=prefix)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
-            descriptor = os.open(
-                STATE_INSTALL_NAME, flags, STATE_FILE_MODE, dir_fd=self._directory_fd
-            )
+            descriptor = os.open(install_name, flags, STATE_FILE_MODE, dir_fd=self._directory_fd)
         except FileExistsError as exc:
-            raise AssignmentProbeCLIError("state_install_residue") from exc
+            raise AssignmentProbeCLIError(f"{prefix}install_residue") from exc
         except OSError as exc:
-            raise AssignmentProbeCLIError("state_write_failed") from exc
+            raise AssignmentProbeCLIError(f"{prefix}write_failed") from exc
         try:
             os.fchmod(descriptor, STATE_FILE_MODE)
             view = memoryview(rendered)
@@ -830,20 +846,25 @@ class _StateRoot:
             while offset < len(view):
                 written = os.write(descriptor, view[offset:])
                 if written <= 0:
-                    _fail("state_write_failed")
+                    _fail(f"{prefix}write_failed")
                 offset += written
             os.fsync(descriptor)
             os.replace(
-                STATE_INSTALL_NAME,
-                STATE_NAME,
+                install_name,
+                name,
                 src_dir_fd=self._directory_fd,
                 dst_dir_fd=self._directory_fd,
             )
             os.fsync(self._directory_fd)
         except OSError as exc:
-            raise AssignmentProbeCLIError("state_write_failed") from exc
+            raise AssignmentProbeCLIError(f"{prefix}write_failed") from exc
         finally:
             os.close(descriptor)
+        if self.read_document(name, max_bytes=max_bytes, prefix=prefix) != rendered:
+            _fail(f"{prefix}write_failed")
+
+    def replace_state(self, rendered: bytes) -> None:
+        self.install_document(STATE_NAME, STATE_INSTALL_NAME, rendered, max_bytes=MAX_STATE_BYTES)
         installed = self.read_state()
         if installed is None or assignment_manifest_chain_state_bytes(installed) != rendered:
             _fail("state_write_failed")
@@ -918,10 +939,12 @@ def _resolve_prior_state(
     root: _StateRoot,
     policy: AssignmentManifestTrustPolicy,
     anchor: str,
+    *,
+    ignored: frozenset[str] = frozenset(),
 ) -> AssignmentManifestChainState:
     existing = root.read_state()
     if anchor == "genesis":
-        if existing is not None or root.entries() - {LOCK_NAME}:
+        if existing is not None or root.entries() - {LOCK_NAME} - ignored:
             _fail("state_anchor_stale")
         return build_initial_manifest_chain_state(policy)
     if existing is None:
@@ -1563,6 +1586,10 @@ _STATIC_SINGLE_OPTIONS: Final = (
     "static-manifest-archive-dir",
     "static-epoch-output",
     "static-journal",
+    "static-release-revocation-policy",
+    "static-release-revocation-policy-digest",
+    "static-release-revocation-snapshot",
+    "static-release-revocation-max-age-seconds",
 )
 _STATIC_REQUIRED: Final = (
     "static_state_root",
@@ -1617,6 +1644,16 @@ def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesC
     )
     if not signatures:
         _fail("usage")
+    from .static_revocation import DEFAULT_MAX_AGE_SECONDS
+
+    max_age = DEFAULT_MAX_AGE_SECONDS
+    if values["static_release_revocation_max_age_seconds"] is not None:
+        try:
+            max_age = _unsigned_decimal(
+                cast(str, values["static_release_revocation_max_age_seconds"])
+            )
+        except argparse.ArgumentTypeError as exc:
+            raise AssignmentProbeCLIError("usage") from exc
     return StaticSitesConfig(
         manifest=ManifestSource(file=InputFile(manifest_file, cast(str, manifest_digest)))
         if manifest_file is not None
@@ -1633,6 +1670,12 @@ def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesC
         manifest_archive_dir=cast(str, values["static_manifest_archive_dir"]),
         epoch_output=cast(str, values["static_epoch_output"]),
         journal=cast(str, values["static_journal"]),
+        revocation_policy=cast(str | None, values["static_release_revocation_policy"]),
+        revocation_policy_digest=cast(
+            str | None, values["static_release_revocation_policy_digest"]
+        ),
+        revocation_snapshot=cast(str | None, values["static_release_revocation_snapshot"]),
+        revocation_max_age_seconds=max_age,
     )
 
 
