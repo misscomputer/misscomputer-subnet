@@ -109,6 +109,17 @@ back every later issuance.
 | A deployment's release digest is revoked | Deployment abstains with `release_revoked` (record code `static_release_revoked`) before its index is fetched |
 | A deployment's verified release was signed by a revoked key | Deployment abstains with `release_revoked` |
 
+Every epoch scored under a revocation authority is a `static-epoch-score`
+**v3** record (`contracts/schemas/static-epoch-score.v3.schema.json`). It binds
+`release_revocation_policy_digest_sha256` and the exact
+`release_revocation_snapshot_digest` it relied on, so an auditor can fetch that
+snapshot and check every `release_revoked` row. v3 keeps either transport:
+`transport_profile` is null, or `public-framing-v1` on test/581. Only v3 may
+carry `release_revoked`; a v1 or v2 record with it, or a v3 record without its
+binding, is refused. Runs without a revocation authority keep writing the
+unchanged v1 or v2 records, and the frozen v1 and v2 schema files are
+untouched.
+
 An abstained epoch writes no static record, sends no static probe and never
 scores a zero; the v3 chain state still advances, and the organic path is
 unaffected. A revoked deployment's endpoints are `abstain_index`, carry no

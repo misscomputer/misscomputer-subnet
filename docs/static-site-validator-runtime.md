@@ -19,7 +19,7 @@ stay separate until an explicit scoring-policy digest combines them.
 | `--static-server-implementation-digest` | pinned `static-handler.v1` implementation digest (`sha256:<hex>`) |
 | `--static-index-origin` | HTTPS origin of the public static index (`static-sites/v1/...`) |
 | `--static-manifest-archive-dir` | write-once archive of verified v3 manifests (separate from the v2 archive) |
-| `--static-epoch-output` | exclusive `static-epoch-score` v1 output |
+| `--static-epoch-output` | exclusive `static-epoch-score` output (v1; v3 under a revocation authority) |
 | `--static-journal` | append-only, fsynced, hash-chained `static-evidence-record` v1 journal |
 
 Static release revocation ([static-site-release-revocation.md](static-site-release-revocation.md))
@@ -64,7 +64,8 @@ policy as v2.
    organic-only run). Static probes use seed-derived instants and paths, GET
    only within the trust policy's response ceiling (≤ 1 MiB), HEAD above it.
    Every static observation is appended to the journal as it is judged.
-8. Write the organic record, then the `static-epoch-score` v1: coverage,
+8. Write the organic record, then the `static-epoch-score` (v1, or v3 bound
+   to the revocation policy and high-water snapshot): coverage,
    content-fault and fraud evidence, quarantine recommendations
    (`endpoint_actions`, never trust-zero for wrong bytes) and alerts.
 

@@ -119,6 +119,7 @@
             "static_index_suspect",
             "static_index_unavailable",
             "static_path_tampering",
+            "static_release_revoked",
             "static_replay_observed"
           ],
           "title": "Code",
@@ -618,6 +619,7 @@
             "release_binding_mismatch",
             "release_digest_mismatch",
             "release_invalid",
+            "release_revoked",
             "release_unavailable",
             "server_implementation_mismatch",
             "signature_invalid",
@@ -637,7 +639,8 @@
         "record_code": {
           "enum": [
             "static_index_invalid",
-            "static_index_unavailable"
+            "static_index_unavailable",
+            "static_release_revoked"
           ],
           "title": "Record Code",
           "type": "string"
@@ -1066,7 +1069,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "``static-epoch-score`` v1: one validator's sealed static epoch, inputs bound.",
+  "description": "``static-epoch-score`` v1/v2/v3: one validator's sealed static epoch, inputs bound.\n\nv1 is the direct transport, v2 the testnet public-framing profile, and v3\neither transport scored under a pinned release revocation authority.",
   "properties": {
     "alerts": {
       "items": {
@@ -1213,6 +1216,32 @@
       "title": "Purpose",
       "type": "string"
     },
+    "release_revocation_policy_digest_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Release Revocation Policy Digest Sha256"
+    },
+    "release_revocation_snapshot_digest": {
+      "anyOf": [
+        {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Release Revocation Snapshot Digest"
+    },
     "sampled_endpoint_count": {
       "maximum": 524288,
       "minimum": 0,
@@ -1227,7 +1256,8 @@
     "schema_version": {
       "enum": [
         1,
-        2
+        2,
+        3
       ],
       "title": "Schema Version",
       "type": "integer"

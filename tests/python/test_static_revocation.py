@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import pytest
+from jsonschema import Draft202012Validator
 from organic_context import EPOCH_START
 from static_cli_context import (
     REVOCATION_ISSUED_EPOCH,
@@ -38,7 +39,9 @@ from misscomputer_subnet.assignment_probe_cli import (
     AssignmentProbeCLIResult,
     run_cli,
 )
+from misscomputer_subnet.contract_codec import digest, model_document
 from misscomputer_subnet.static_index import (
+    StaticIndexAbstention,
     StaticReleaseKey,
     build_static_site_release_trust_policy,
 )
@@ -51,7 +54,14 @@ from misscomputer_subnet.static_revocation import (
     verify_static_site_release_revocation,
 )
 from misscomputer_subnet.static_runtime import REVOCATION_HIGH_WATER_NAME, StaticEpochRun
-from misscomputer_subnet.static_scoring import aggregate_static_window
+from misscomputer_subnet.static_scoring import (
+    StaticScoringError,
+    aggregate_static_window,
+    parse_static_epoch_score,
+    replay_static_epoch_score,
+    score_static_epoch,
+    static_epoch_score_bytes,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 #: Produced by the Go reference verifier; Python must reach the same outcome on every case.
@@ -200,6 +210,17 @@ def _index_calls(publication: StaticPublication) -> list[str]:
 OTHER_KEY = "ab" * 32
 
 
+def _published_record(path: str) -> dict[str, Any]:
+    """The written record must validate under the committed schema of its own version."""
+
+    record: dict[str, Any] = json.loads(Path(path).read_bytes())
+    schema_path = ROOT / (
+        f"contracts/schemas/static-epoch-score.v{record['schema_version']}.schema.json"
+    )
+    Draft202012Validator(json.loads(schema_path.read_bytes())).validate(record)
+    return record
+
+
 @pytest.mark.parametrize(
     ("entries", "revoked", "index_fetched"),
     [
@@ -233,6 +254,18 @@ def test_revoked_release_abstains_without_a_probe_or_a_zero(
     assert result.epoch.epoch_status == "scored"  # the organic path is untouched
     assert result.static is not None and result.static.epoch is not None
     epoch = result.static.epoch
+    # finney epochs run under the revocation authority: v3, bound to what they relied on.
+    record = _published_record(result.static.config.epoch_output)
+    assert result.static.revocation is not None and result.static.revocation.held is not None
+    assert (
+        record["schema_version"],
+        record["release_revocation_policy_digest_sha256"],
+        record["release_revocation_snapshot_digest"],
+    ) == (
+        3,
+        result.static.revocation.policy.digest_sha256,
+        result.static.revocation.held.snapshot_digest,
+    )
     assert bool(_index_calls(publication)) is index_fetched
     if not revoked:
         assert epoch.index_abstentions == [] and epoch.epoch_status == "scored"
@@ -247,6 +280,7 @@ def test_revoked_release_abstains_without_a_probe_or_a_zero(
     assert "static_release_revoked" in {item.code for item in epoch.alerts}
     assert _static_calls(publication) == []
     assert aggregate_static_window([epoch]).miners == []
+    assert replay_static_epoch_score(epoch, []) == epoch
 
 
 @pytest.mark.parametrize(
@@ -466,6 +500,10 @@ def test_testnet_may_run_without_revocation_until_it_holds_a_high_water(tmp_path
     unpinned = _static_only(publication, tmp_path / "unpinned", **DISABLED)
 
     assert unpinned.epoch is not None and unpinned.epoch.epoch_status == "scored"
+    # Without a revocation authority the record keeps the frozen v1 contract.
+    unpinned_record = _published_record(unpinned.config.epoch_output)
+    assert unpinned_record["schema_version"] == 1
+    assert "release_revocation_snapshot_digest" not in unpinned_record
     pinned = _static_only(publication, tmp_path / "pinned")
     assert pinned.epoch is not None and pinned.revocation is not None
     state_root = pinned.config.state_root
@@ -523,3 +561,86 @@ def test_revocation_options_are_all_or_nothing_and_bounded(
     assert run_cli(argv) == exit_code
     assert capsys.readouterr().err == f"REJECTED {stderr}\n"
     assert publication.world.calls == []
+
+
+def _revoked_record(tmp_path: Path) -> dict[str, Any]:
+    publication = write_static_publication(tmp_path / "publication")
+    static = _static_deployment(publication)
+    snapshot = revocation_snapshot_bytes(
+        1,
+        REVOCATION_ISSUED_EPOCH,
+        releases=((static.release_digest, static.site_digest, "phishing"),),
+    )
+    result = _run(publication, tmp_path / "run", snapshot)
+    assert result.static is not None
+    return _published_record(result.static.config.epoch_output)
+
+
+def _reseal(document: dict[str, Any]) -> bytes:
+    unsigned = {key: value for key, value in document.items() if key != "epoch_score_digest_sha256"}
+    return (
+        json.dumps(
+            {**unsigned, "epoch_score_digest_sha256": digest(unsigned)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "drop_binding", "code"),
+    [
+        pytest.param(1, True, "static_epoch_revocation_unbound", id="v1 carrying release_revoked"),
+        pytest.param(3, True, "static_epoch_revocation_binding_invalid", id="v3 without binding"),
+        pytest.param(1, False, "static_epoch_revocation_binding_invalid", id="v1 with binding"),
+    ],
+)
+def test_release_revoked_is_only_parseable_in_a_bound_v3_record(
+    tmp_path: Path, version: int, drop_binding: bool, code: str
+) -> None:
+    record = _revoked_record(tmp_path)
+    assert parse_static_epoch_score(_reseal(record)).schema_version == 3  # control
+    changed = {**record, "schema_version": version}
+    if version == 1:
+        changed.pop("transport_profile")
+        changed.pop("transport_policy_digest_sha256")
+    if drop_binding:
+        changed.pop("release_revocation_policy_digest_sha256")
+        changed.pop("release_revocation_snapshot_digest")
+
+    with pytest.raises(ValueError) as error:
+        parse_static_epoch_score(_reseal(changed))
+
+    assert code in str(error.value.__cause__)
+
+
+def test_scoring_refuses_release_revoked_without_a_revocation_binding(tmp_path: Path) -> None:
+    epoch = parse_static_epoch_score(_reseal(_revoked_record(tmp_path)))
+    abstentions = [
+        StaticIndexAbstention(row.deployment_id, row.site_digest, row.code)
+        for row in epoch.index_abstentions
+    ]
+    common: dict[str, Any] = {
+        "validator_hotkey": epoch.validator_hotkey,
+        "epoch_index": epoch.epoch_index,
+        "probe_body_ceiling": epoch.probe_body_ceiling,
+    }
+
+    with pytest.raises(StaticScoringError) as error:
+        score_static_epoch(epoch.targets, [], abstentions, [], **common)
+
+    assert error.value.code == "static_scoring_index_state_invalid"
+    bound = score_static_epoch(
+        epoch.targets,
+        [],
+        abstentions,
+        [],
+        release_revocation=(
+            str(epoch.release_revocation_policy_digest_sha256),
+            str(epoch.release_revocation_snapshot_digest),
+        ),
+        **common,
+    )
+    assert static_epoch_score_bytes(bound) == static_epoch_score_bytes(epoch)
+    assert model_document(bound)["schema_version"] == 3

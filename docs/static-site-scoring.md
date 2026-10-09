@@ -19,6 +19,7 @@ never re-implement index authentication or probe judgement.
 | `static-probe-observation` v1 | validator probe evaluator (`static_probe.py`) | one judged request; owned by the validator track |
 | `static-evidence-record` v1 | validator → its own durable journal | hash-chained, fsynced wrapper of one observation |
 | `static-epoch-score` v1 | validator → auditors / runtime | sealed epoch: targets, index states, coverage, tallies, evidence, actions, alerts, observations |
+| `static-epoch-score` v3 | validator → auditors / runtime | the same epoch scored under a pinned release revocation authority: adds `release_revocation_policy_digest_sha256` and `release_revocation_snapshot_digest`, and is the only version that may carry `release_revoked` abstentions ([revocation](static-site-release-revocation.md)) |
 | `static-availability-score` v1 | validator → (future) decision | per-miner mean over eligible endpoint-epochs |
 | `static-edge-evidence` v1 | private edge → operators / auditors | one admission-crawl or ordinary-traffic check (static-site contract §10.4) |
 

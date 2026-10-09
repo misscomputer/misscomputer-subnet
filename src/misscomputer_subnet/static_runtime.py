@@ -700,11 +700,21 @@ def finish_static_epoch(
         network=run.verification.manifest.network,
         netuid=run.verification.manifest.netuid,
         public_transport_policy=run.public_transport_policy,
+        release_revocation=_revocation_binding(run),
     )
     rendered = static_epoch_score_bytes(epoch)
     _write_output(run.config.epoch_output, rendered, state_root=run.root.path)
     run.epoch = epoch
     return epoch
+
+
+def _revocation_binding(run: StaticEpochRun) -> tuple[str, str] | None:
+    state = run.revocation
+    if state is None:
+        return None
+    if state.held is None:  # the revocation gate abstains before any scoring
+        _fail("static_revocation_unavailable")
+    return state.policy.digest_sha256, state.held.snapshot_digest
 
 
 def static_summary(run: StaticEpochRun) -> str:
