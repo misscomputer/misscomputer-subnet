@@ -18,9 +18,14 @@ high-water entry unchanged. Anything else is ``revocation_rollback``,
 ``revocation_equivocation`` or ``revocation_not_cumulative``. A revocation is
 final: nothing here lifts one.
 
-A release is revoked when its ``release_digest`` is listed, or when its signer
-is listed by ``key_id`` **or** by public key, whatever the release's
-``issued_at`` (a compromised key can backdate). Unknown or expired release
+A release is revoked when its ``release_digest`` is listed, when its
+``site_digest`` is taken down, or when its signer is listed by ``key_id``
+**or** by public key, whatever the release's ``issued_at`` (a compromised key
+can backdate). A revoked-release entry whose reason is a §5 takedown category
+(:data:`TAKEDOWN_REASONS`) also denies its ``site_digest``: every release of
+that site is revoked, however it is re-signed. A ``key_compromise`` entry
+judges only that release's signature, so the same site may return as a
+release under a trusted key. Unknown or expired release
 keys are not revocations; :mod:`misscomputer_subnet.static_index` already
 abstains on those.
 
@@ -101,6 +106,11 @@ ReleaseReason = Literal[
     "platform_integrity",
 ]
 SignerKeyReason = Literal["key_compromise", "key_retired"]
+#: The release reasons that judge the site's content (§5): such an entry also
+#: denies its ``site_digest``. ``key_compromise`` judges only the signature.
+TAKEDOWN_REASONS: Final = frozenset(
+    {"credential_harvesting", "illegal_content", "malware", "phishing", "platform_integrity"}
+)
 
 RevocationCode = Literal[
     "revocation_policy_invalid",
@@ -262,6 +272,14 @@ class VerifiedRevocation:
     def release_revoked(self, release_digest: str) -> bool:
         return any(item.release_digest == release_digest for item in self.snapshot.revoked_releases)
 
+    def site_revoked(self, site_digest: str) -> bool:
+        """A takedown entry denies its site: every release of it is revoked."""
+
+        return any(
+            item.site_digest == site_digest and item.reason_category in TAKEDOWN_REASONS
+            for item in self.snapshot.revoked_releases
+        )
+
     def signer_revoked(self, key_id: str, public_key_hex: str) -> bool:
         """Match either identity, so a revoked key cannot return under a new ID or vice versa."""
 
@@ -355,14 +373,17 @@ def static_index_revoked(
     index: VerifiedStaticIndex,
     release_policy: StaticSiteReleaseTrustPolicy,
 ) -> bool:
-    """Whether an authenticated static index names a revoked release or signer.
+    """Whether an authenticated static index names a revoked release, site or signer.
 
-    ``release_policy`` must be the policy ``index`` was authenticated under;
-    otherwise the signer's public key is unknown and the release counts as
-    revoked (fail closed).
+    The site is the verified release's own ``site_digest``. ``release_policy``
+    must be the policy ``index`` was authenticated under; otherwise the
+    signer's public key is unknown and the release counts as revoked (fail
+    closed).
     """
 
-    if held.release_revoked(index.target.release_digest):
+    if held.release_revoked(index.target.release_digest) or held.site_revoked(
+        index.release.site_digest
+    ):
         return True
     signer_key_id = index.release.signer_key_id
     key = next((item for item in release_policy.trusted_keys if item.key_id == signer_key_id), None)
