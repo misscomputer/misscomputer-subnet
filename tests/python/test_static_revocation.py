@@ -30,6 +30,8 @@ from static_context import (
     revocation_policy_bytes,
     revocation_snapshot_bytes,
 )
+from static_context import trust_policy as static_trust_policy
+from static_scoring_context import verified_site
 
 import misscomputer_subnet.static_probe_cli as static_cli
 from misscomputer_subnet.assignment_probe_cli import (
@@ -51,6 +53,7 @@ from misscomputer_subnet.static_revocation import (
     advance_static_site_release_revocation,
     parse_static_site_release_revocation_trust_policy,
     revocation_freshness,
+    static_index_revoked,
     verify_static_site_release_revocation,
 )
 from misscomputer_subnet.static_runtime import REVOCATION_HIGH_WATER_NAME, StaticEpochRun
@@ -151,6 +154,73 @@ def test_index_outcome_matches_go(case: dict[str, Any]) -> None:
     )
 
     assert revoked is case["revoked"]
+
+
+@pytest.mark.parametrize("case", VECTORS["takedown_index_cases"], ids=lambda case: case["name"])
+def test_takedown_index_outcome_matches_go(case: dict[str, Any]) -> None:
+    held = verify_static_site_release_revocation(
+        VECTORS["takedown_index_snapshot"].encode(), POLICY
+    )
+
+    assert (
+        held.release_revoked(case["release_digest"]),
+        held.site_revoked(case["site_digest"]),
+        held.signer_revoked(case["key_id"], case["public_key_hex"]),
+    ) == (case["release_revoked"], case["site_revoked"], case["signer_revoked"])
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "credential_harvesting",
+        "illegal_content",
+        "key_compromise",
+        "malware",
+        "phishing",
+        "platform_integrity",
+    ],
+)
+def test_only_a_takedown_reason_denies_the_site(reason: str) -> None:
+    release, site = "sha256:" + "a1" * 32, "sha256:" + "5a" * 32
+    stored = revocation_snapshot_bytes(
+        1, REVOCATION_ISSUED_EPOCH, releases=((release, site, reason),)
+    )
+    policy = parse_static_site_release_revocation_trust_policy(
+        revocation_policy_bytes(),
+        pinned_digest_sha256=json.loads(revocation_policy_bytes())["digest_sha256"],
+        release_policy=RELEASE_POLICY,
+    )
+
+    held = verify_static_site_release_revocation(stored, policy)
+
+    assert held.release_revoked(release)
+    assert held.site_revoked(site) is (reason != "key_compromise")
+
+
+def test_authenticated_index_of_a_taken_down_site_is_revoked() -> None:
+    """The post-authentication path judges the verified release's own site_digest."""
+
+    index, _ = verified_site()
+    release_policy = static_trust_policy()
+    policy = parse_static_site_release_revocation_trust_policy(
+        revocation_policy_bytes(),
+        pinned_digest_sha256=json.loads(revocation_policy_bytes())["digest_sha256"],
+        release_policy=release_policy,
+    )
+    other_release = "sha256:" + "d4" * 32
+
+    def held(reason: str) -> Any:
+        return verify_static_site_release_revocation(
+            revocation_snapshot_bytes(
+                1,
+                REVOCATION_ISSUED_EPOCH,
+                releases=((other_release, index.release.site_digest, reason),),
+            ),
+            policy,
+        )
+
+    assert static_index_revoked(held("malware"), index, release_policy)
+    assert not static_index_revoked(held("key_compromise"), index, release_policy)  # control
 
 
 @pytest.mark.parametrize(
@@ -281,6 +351,49 @@ def test_revoked_release_abstains_without_a_probe_or_a_zero(
     assert _static_calls(publication) == []
     assert aggregate_static_window([epoch]).miners == []
     assert replay_static_epoch_score(epoch, []) == epoch
+
+
+@pytest.mark.parametrize(
+    ("reason", "same_release", "revoked"),
+    [
+        pytest.param("phishing", False, True, id="separately signed live release, takedown"),
+        pytest.param(
+            "platform_integrity", False, True, id="separately signed live release, platform"
+        ),
+        pytest.param(
+            "key_compromise", False, False, id="control: key_compromise rotation keeps the site"
+        ),
+        pytest.param("key_compromise", True, True, id="key_compromise of the live release"),
+    ],
+)
+def test_taken_down_site_abstains_every_release_but_key_compromise_rotates(
+    tmp_path: Path, reason: str, same_release: bool, revoked: bool
+) -> None:
+    """The edge withdraws every release of a taken-down site; so must the validator."""
+
+    publication = write_static_publication(tmp_path / "publication")
+    static = _static_deployment(publication)
+    # Another, separately signed release of the very site that is live.
+    release = static.release_digest if same_release else "sha256:" + "d4" * 32
+    snapshot = revocation_snapshot_bytes(
+        1, REVOCATION_ISSUED_EPOCH, releases=((release, static.site_digest, reason),)
+    )
+
+    result = _run(publication, tmp_path / "run", snapshot)
+
+    assert result.static is not None and result.static.epoch is not None
+    epoch = result.static.epoch
+    assert _published_record(result.static.config.epoch_output)["schema_version"] == 3
+    if not revoked:
+        assert epoch.index_abstentions == [] and epoch.epoch_status == "scored"
+        assert _static_calls(publication)
+        return
+    assert [(row.code, row.record_code) for row in epoch.index_abstentions] == [
+        ("release_revoked", "static_release_revoked")
+    ]
+    assert _index_calls(publication) == [] and _static_calls(publication) == []
+    assert {item.availability_numerator for item in epoch.endpoints} == {None}
+    assert aggregate_static_window([epoch]).miners == []
 
 
 @pytest.mark.parametrize(

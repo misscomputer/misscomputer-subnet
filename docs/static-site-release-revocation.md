@@ -59,11 +59,25 @@ trust policy (`revocation_policy_key_not_dedicated`).
   `revocation_snapshot_invalid`, `revocation_signer_untrusted`,
   `revocation_signer_outside_validity` and `revocation_signature_invalid`.
 
-A release is **revoked** when its `release_digest` is listed, or when its
-signer is listed by `key_id` *or* by public key, whatever the release's
-`issued_at`. A compromised key can backdate, and matching either identity
-stops a revoked key from coming back under a new ID. An unknown or expired
-release key is not a revocation: index ingestion already abstains on it.
+A release is **revoked** when its `release_digest` is listed, when its site is
+taken down, or when its signer is listed by `key_id` *or* by public key,
+whatever the release's `issued_at`. A compromised key can backdate, and
+matching either identity stops a revoked key from coming back under a new ID.
+An unknown or expired release key is not a revocation: index ingestion
+already abstains on it.
+
+**Taken-down site.** A revoked-release entry whose reason is a takedown
+category (`phishing`, `malware`, `credential_harvesting`, `illegal_content`,
+`platform_integrity`) also denies its `site_digest`. Every release of that
+site is revoked, whoever signed it and whenever, so re-signing or re-promoting
+the identical site cannot evade the takedown. The edge withdraws such a
+release, and the validator abstains on it instead of probing a route that
+answers 503. A `key_compromise` entry judges only that release's signature:
+the same site may return as a release under a trusted key and is probed
+normally. Site denial matches the exact `site_digest`, so changed content is
+another site. Because entries never change, a `key_compromise` entry cannot
+later become a takedown; take the site down with an entry for another release
+of it.
 
 ## High water
 
@@ -107,6 +121,7 @@ back every later issuance.
 | Offered snapshot is unreadable, unverifiable, a rollback, an equivocation, not cumulative, or future-dated | Static epoch **abstains** with `static_revocation_*`; the high water is unchanged |
 | No high water yet, or the high water is stale | Static epoch **abstains** (`static_revocation_unavailable` / `static_revocation_stale`) |
 | A deployment's release digest is revoked | Deployment abstains with `release_revoked` (record code `static_release_revoked`) before its index is fetched |
+| A deployment's site is taken down (any release of it, however signed) | Deployment abstains with `release_revoked` before its index is fetched; the verified release's `site_digest` is checked again after authentication |
 | A deployment's verified release was signed by a revoked key | Deployment abstains with `release_revoked` |
 
 Every epoch scored under a revocation authority is a `static-epoch-score`
@@ -141,6 +156,10 @@ worked example (revocation key seed `0x09` × 32, key ID `static-revocation-1`;
 signature `f60c1f7b…cda01`, digest
 `sha256:3e6e81bf52c93d8c4637472356a8926552e7bf3117ab1bbe976957b746e28ea9`) and
 policy, verify, high-water and lookup cases with the Go outcome of each.
+`takedown_index_snapshot` and `takedown_index_cases` are the same takedown
+vectors the edge pins. They hold a phishing entry and a `key_compromise` entry,
+and each case records whether the release, the site and the signer are
+revoked.
 `tests/python/test_static_revocation.py` requires the Python verifier to reach
 the same outcome on every case.
 

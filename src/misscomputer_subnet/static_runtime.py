@@ -554,7 +554,10 @@ def load_static_epoch(
     # manifest's canonical target order in finish_static_epoch.
     start = epoch_index % len(targets) if targets else 0
     for target in targets[start:] + targets[:start]:
-        if held is not None and held.release_revoked(target.release_digest):
+        # The manifest v3 binds the site; ingestion refuses a release naming another.
+        if held is not None and (
+            held.release_revoked(target.release_digest) or held.site_revoked(target.site_digest)
+        ):
             run.abstentions.append(
                 StaticIndexAbstention(target.deployment_id, target.site_digest, "release_revoked")
             )
