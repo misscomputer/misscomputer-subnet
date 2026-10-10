@@ -1570,6 +1570,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--static-signature-file", action="append", default=[])
     parser.add_argument("--static-signature-sha256", action="append", default=[])
     parser.add_argument("--static-signature-url", action="append", default=[])
+    parser.add_argument("--static-release-revocation-proof-policy", action="append", default=[])
+    parser.add_argument(
+        "--static-release-revocation-proof-policy-sha256", action="append", default=[]
+    )
     return parser
 
 
@@ -1614,6 +1618,8 @@ def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesC
             "static-signature-file",
             "static-signature-sha256",
             "static-signature-url",
+            "static-release-revocation-proof-policy",
+            "static-release-revocation-proof-policy-sha256",
         )
     }
     if arguments.static_sites == "off":
@@ -1635,6 +1641,10 @@ def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesC
     signature_digests = cast(list[str], values["static_signature_sha256"])
     if len(signature_files) != len(signature_digests):
         _fail("signature_count_invalid")
+    proof_files = cast(list[str], values["static_release_revocation_proof_policy"])
+    proof_digests = cast(list[str], values["static_release_revocation_proof_policy_sha256"])
+    if len(proof_files) != len(proof_digests):
+        _fail("usage")
     signatures = static_signature_sources(
         [
             InputFile(path, digest)
@@ -1673,6 +1683,9 @@ def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesC
         revocation_policy=cast(str | None, values["static_release_revocation_policy"]),
         revocation_policy_digest=cast(
             str | None, values["static_release_revocation_policy_digest"]
+        ),
+        revocation_proof_policies=tuple(
+            InputFile(path, digest) for path, digest in zip(proof_files, proof_digests, strict=True)
         ),
         revocation_snapshot=cast(str | None, values["static_release_revocation_snapshot"]),
         revocation_max_age_seconds=max_age,

@@ -48,6 +48,7 @@ from static_context import (
     manifest_document,
     raw_public,
     release_bytes,
+    revocation_evidence_bytes,
     revocation_policy_bytes,
     revocation_snapshot_bytes,
     sha,
@@ -376,7 +377,7 @@ def write_static_publication(
         ),
         revocation_snapshot_file=secure_write(
             root / "static-revocation-snapshot.json",
-            revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH),
+            revocation_evidence_bytes(revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH)),
         ),
     )
 
@@ -502,6 +503,11 @@ def config_argv(config: AssignmentProbeCLIConfig) -> list[str]:
         ]  # fmt: skip
     if static.revocation_snapshot is not None:
         values += ["--static-release-revocation-snapshot", static.revocation_snapshot]
+    for item in static.revocation_proof_policies:
+        values += [
+            "--static-release-revocation-proof-policy", item.path,
+            "--static-release-revocation-proof-policy-sha256", item.sha256,
+        ]  # fmt: skip
     for item in static.signatures:
         assert item.file is not None
         values += [
