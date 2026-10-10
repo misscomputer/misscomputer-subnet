@@ -41,6 +41,7 @@ chain, randomness, or signing capability.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, Self
 
@@ -87,6 +88,9 @@ MAX_REVOCATION_SNAPSHOT_BYTES: Final = 1 << 20
 MAX_REVOCATION_POLICY_BYTES: Final = 64 * 1_024
 MAX_REVOKED_RELEASES: Final = 4_096
 MAX_REVOKED_SIGNER_KEYS: Final = 64
+# Each historical release policy retains its own 16-key bound. An entry may
+# have a distinct historical signer, and current policy keys can be separate.
+MAX_RELEASE_PROOF_POLICIES: Final = MAX_REVOKED_RELEASES + MAX_REVOKED_SIGNER_KEYS + 1
 #: Keeps ``sequence`` exact in every JSON implementation.
 MAX_REVOCATION_SEQUENCE: Final = (1 << 53) - 1
 
@@ -235,12 +239,12 @@ def parse_static_site_release_revocation_trust_policy(
     stored: bytes,
     *,
     pinned_digest_sha256: str,
-    release_policy: StaticSiteReleaseTrustPolicy,
+    release_policy: StaticSiteReleaseTrustPolicy | Sequence[StaticSiteReleaseTrustPolicy],
 ) -> StaticSiteReleaseRevocationTrustPolicy:
     """Accept exact canonical policy bytes that are the pinned, dedicated policy.
 
     ``pinned_digest_sha256`` is the policy's ``digest_sha256``. Every key must
-    be absent from ``release_policy`` by public key.
+    be absent from the current and historical pinned release policies.
     """
 
     try:
@@ -254,10 +258,41 @@ def parse_static_site_release_revocation_trust_policy(
         raise StaticRevocationError("revocation_policy_invalid") from exc
     if policy.digest_sha256 != pinned_digest_sha256:
         raise StaticRevocationError("revocation_policy_digest_mismatch")
-    release_keys = {item.public_key_hex for item in release_policy.trusted_keys}
+    release_keys = {
+        item.public_key_hex
+        for release in validated_release_proof_policies(release_policy)
+        for item in release.trusted_keys
+    }
     if any(item.public_key_hex in release_keys for item in policy.trusted_keys):
         raise StaticRevocationError("revocation_policy_key_not_dedicated")
     return policy
+
+
+def validated_release_proof_policies(
+    value: StaticSiteReleaseTrustPolicy | Sequence[StaticSiteReleaseTrustPolicy],
+) -> tuple[StaticSiteReleaseTrustPolicy, ...]:
+    """Retain independently pinned policy generations without trusting key aliases.
+
+    Retired keys are used only to authenticate historical revocation proofs;
+    ordinary index releases still use the separate current release policy.
+    """
+
+    raw = (value,) if isinstance(value, StaticSiteReleaseTrustPolicy) else value
+    if not isinstance(raw, (list, tuple)) or not 1 <= len(raw) <= MAX_RELEASE_PROOF_POLICIES:
+        raise StaticRevocationError("revocation_entry_unbound")
+    try:
+        policies = tuple(revalidate(item, StaticSiteReleaseTrustPolicy) for item in raw)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise StaticRevocationError("revocation_entry_unbound") from exc
+    by_id: dict[str, StaticReleaseKey] = {}
+    by_public: dict[str, str] = {}
+    for policy in policies:
+        for key in policy.trusted_keys:
+            prior = by_id.setdefault(key.key_id, key)
+            prior_id = by_public.setdefault(key.public_key_hex, key.key_id)
+            if prior != key or prior_id != key.key_id:
+                raise StaticRevocationError("revocation_entry_unbound")
+    return policies
 
 
 @dataclass(frozen=True, slots=True)

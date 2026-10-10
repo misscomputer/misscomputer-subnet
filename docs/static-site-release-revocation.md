@@ -75,19 +75,26 @@ only inside a canonical `static-site-release-revocation-evidence` v1 envelope:
 
 There is exactly one proof per revoked-release entry, ordered by release
 digest. For each proof the verifier checks the stored-byte digest, canonical
-release, its signature and issuance window under the pinned release policy,
+release, its signature and issuance window under the current or an independently
+digest-pinned historical release policy,
 and equality between its signed `site_digest` and the snapshot entry. Every
 revoked signer-key ID/public-key pair must also occur in the pinned release
-policy. The same exact evidence envelope, limited to 4 MiB, is persisted and
+policy set. A key ID and public key must identify the same key and validity
+window in every supplied policy; aliases and changed windows fail closed.
+Historical policies are used only to authenticate cumulative revocation
+entries, **never** to authorize a current index release. The same exact
+evidence envelope, limited to 8 MiB, is persisted and
 re-verified on restart; the inner signed snapshot's digest remains the
 high-water and epoch-record digest. A bare signed snapshot, a missing proof,
 or any mismatched entry is `revocation_entry_unbound` and cannot advance the
-high water. Release policies must retain historical keys named in cumulative
-snapshots (with expired validity windows when retired); removing such a key
-before a coordinated migration makes the held high water unverifiable and
-fails the run closed. The revocation authority's v1 signature format is
+high water. Every historical policy needed by the cumulative snapshot must
+remain pinned and available across restarts; removing one first makes the held
+high water unverifiable and fails the run closed. Each v1 policy keeps its
+16-key bound; the proof-only policy list is bounded by the number of possible
+snapshot entries and may contain independently pinned generations. The
+revocation authority's v1 signature format is
 unchanged; the envelope is self-authenticating through that signature and
-the signed release proofs.
+the signed release proofs and out-of-band policy pins.
 
 A release is **revoked** when its `release_digest` is listed, when its site is
 taken down, or when its signer is listed by `key_id` *or* by public key,
@@ -176,7 +183,12 @@ Revocation is enabled by pinning both
 `--static-release-revocation-policy-digest <digest_sha256>`.
 `--static-release-revocation-snapshot <file>` offers the operator-delivered
 evidence envelope for this run. The signed snapshot and proofs are self-authenticating, so it is not
-digest-pinned. Without it, the run relies on the durable high water.
+digest-pinned. Repeat `--static-release-revocation-proof-policy <file>` with
+its matching `--static-release-revocation-proof-policy-sha256 <sha256>` for
+each historical release policy needed by the cumulative snapshot. The current
+`--static-release-trust-policy` is included automatically. Without an offered
+envelope, the run relies on the durable high water and still re-verifies it
+against those same pins.
 
 ## Vectors
 

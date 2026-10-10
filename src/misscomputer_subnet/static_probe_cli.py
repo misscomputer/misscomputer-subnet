@@ -207,6 +207,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--static-signature-file", action="append", default=[])
     parser.add_argument("--static-signature-sha256", action="append", default=[])
     parser.add_argument("--static-signature-url", action="append", default=[])
+    parser.add_argument("--static-release-revocation-proof-policy", action="append", default=[])
+    parser.add_argument(
+        "--static-release-revocation-proof-policy-sha256", action="append", default=[]
+    )
     return parser
 
 

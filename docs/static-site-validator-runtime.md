@@ -29,6 +29,7 @@ is required on `finney`, optional elsewhere, and all-or-nothing:
 | --- | --- |
 | `--static-release-revocation-policy` + `--static-release-revocation-policy-digest` | pinned `static-site-release-revocation-trust-policy` v1 and its `digest_sha256` |
 | `--static-release-revocation-snapshot` | optional operator-delivered `static-site-release-revocation-evidence` v1 envelope, carrying the signed snapshot and release proofs, offered to the durable high water; a bare snapshot is refused |
+| repeated `--static-release-revocation-proof-policy` + `--static-release-revocation-proof-policy-sha256` | independently pinned historical release policies for cumulative entry proofs only; they do not authorize current index releases |
 | `--static-release-revocation-max-age-seconds` | freshness limit of the high water (default 86400, 300 to 604800) |
 
 The v3 manifest is verified under the same pinned assignment-manifest trust

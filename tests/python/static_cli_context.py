@@ -503,6 +503,11 @@ def config_argv(config: AssignmentProbeCLIConfig) -> list[str]:
         ]  # fmt: skip
     if static.revocation_snapshot is not None:
         values += ["--static-release-revocation-snapshot", static.revocation_snapshot]
+    for item in static.revocation_proof_policies:
+        values += [
+            "--static-release-revocation-proof-policy", item.path,
+            "--static-release-revocation-proof-policy-sha256", item.sha256,
+        ]  # fmt: skip
     for item in static.signatures:
         assert item.file is not None
         values += [

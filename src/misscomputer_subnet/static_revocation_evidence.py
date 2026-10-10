@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import Field, model_validator
 
-from .contract_codec import StrictFrozenModel, model_bytes, parse_model, revalidate
+from .contract_codec import StrictFrozenModel, model_bytes, parse_model
 from .organic_contracts import Digest as PrefixedDigest
 from .static_index import (
     MAX_RELEASE_BYTES,
@@ -33,10 +34,13 @@ from .static_revocation import (
     StaticRevocationError,
     StaticSiteReleaseRevocationTrustPolicy,
     VerifiedRevocation,
+    validated_release_proof_policies,
     verify_static_site_release_revocation,
 )
 
-MAX_BOUND_REVOCATION_BYTES = 4 << 20
+# The v1 release fields are bounded (a maximal canonical release is under
+# 1 KiB); 4096 base64 proofs plus a 1 MiB snapshot fit within this bound.
+MAX_BOUND_REVOCATION_BYTES = 8 << 20
 
 
 class ReleaseProof(StrictFrozenModel):
@@ -85,7 +89,7 @@ def _decoded(encoded: str, maximum: int) -> bytes:
 def verify_bound_static_site_release_revocation(
     stored: bytes,
     revocation_policy: StaticSiteReleaseRevocationTrustPolicy,
-    release_policy: StaticSiteReleaseTrustPolicy,
+    release_policy: StaticSiteReleaseTrustPolicy | Sequence[StaticSiteReleaseTrustPolicy],
 ) -> VerifiedBoundRevocation:
     """Verify authority, release/site bindings, and signer-key identity.
 
@@ -93,7 +97,10 @@ def verify_bound_static_site_release_revocation(
     Its enclosing evidence bytes must be retained for restart verification.
     """
 
-    release_policy = revalidate(release_policy, StaticSiteReleaseTrustPolicy)
+    release_policies = validated_release_proof_policies(release_policy)
+    proof_policy_by_id = {
+        key.key_id: policy for policy in release_policies for key in policy.trusted_keys
+    }
     try:
         envelope = parse_model(
             stored,
@@ -123,9 +130,18 @@ def verify_bound_static_site_release_revocation(
             )
         except ValueError as exc:
             raise StaticRevocationError("revocation_entry_unbound") from exc
-        if release.site_digest != entry.site_digest or _verify_release(release, release_policy):
+        proof_policy = proof_policy_by_id.get(release.signer_key_id)
+        if (
+            release.site_digest != entry.site_digest
+            or proof_policy is None
+            or _verify_release(release, proof_policy)
+        ):
             raise StaticRevocationError("revocation_entry_unbound")
-    pinned_keys = {(key.key_id, key.public_key_hex) for key in release_policy.trusted_keys}
+    pinned_keys = {
+        (key.key_id, key.public_key_hex)
+        for policy in release_policies
+        for key in policy.trusted_keys
+    }
     if any(
         (entry.key_id, entry.public_key_hex) not in pinned_keys
         for entry in verified.snapshot.revoked_signer_keys

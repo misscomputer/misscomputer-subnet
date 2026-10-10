@@ -27,8 +27,10 @@ from static_cli_context import (
 from static_context import (
     RELEASE_KEY,
     RELEASE_KEY_ID,
+    key,
     raw_public,
     release_bytes,
+    release_key,
     revocation_evidence_bytes,
     revocation_policy_bytes,
     revocation_snapshot_bytes,
@@ -47,10 +49,12 @@ from misscomputer_subnet.assignment_probe_cli import (
     run_cli,
 )
 from misscomputer_subnet.contract_codec import digest, model_document
+from misscomputer_subnet.score_checkpoint_relay_cli import InputFile
 from misscomputer_subnet.static_index import (
     StaticIndexAbstention,
     StaticReleaseKey,
     build_static_site_release_trust_policy,
+    static_site_release_trust_policy_bytes,
 )
 from misscomputer_subnet.static_probe_cli import StaticProbeCLIConfig
 from misscomputer_subnet.static_revocation import (
@@ -485,6 +489,43 @@ def test_direct_snapshot_file_cannot_bypass_release_entry_binding(tmp_path: Path
     assert _index_calls(publication) == [] and _static_calls(publication) == []
 
 
+def test_historical_policy_proves_revocation_without_authorizing_live_indexes(
+    tmp_path: Path,
+) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    static = _static_deployment(publication)
+    retired = key("retired-release-authority")
+    retired_policy = static_trust_policy(
+        release_key(key_id="retired-release", public_key_hex=raw_public(retired).hex())
+    )
+    retired_policy_bytes = static_site_release_trust_policy_bytes(retired_policy)
+    policy_path = secure_write(tmp_path / "retired-policy.json", retired_policy_bytes)
+    archived = InputFile(str(policy_path), sha(retired_policy_bytes))
+    retired_release = release_bytes(static.site_digest, private=retired, key_id="retired-release")
+    evidence = _bound(
+        revocation_snapshot_bytes(
+            1,
+            REVOCATION_ISSUED_EPOCH,
+            releases=(("sha256:" + sha(retired_release), static.site_digest, "key_compromise"),),
+        ),
+        retired_release,
+    )
+
+    without = _run(publication, tmp_path / "without", evidence)
+    with_history = _run(
+        publication,
+        tmp_path / "with-history",
+        evidence,
+        revocation_proof_policies=(archived,),
+    )
+
+    assert without.static is not None
+    assert without.static.abstained_code == "static_revocation_entry_unbound"
+    assert with_history.static is not None and with_history.static.epoch is not None
+    assert with_history.static.epoch.epoch_status == "scored"
+    assert with_history.static.epoch.index_abstentions == []
+
+
 def test_high_water_is_durable_monotonic_and_cumulative_across_runs(tmp_path: Path) -> None:
     publication = write_static_publication(tmp_path / "publication")
     static = _static_deployment(publication)
@@ -706,6 +747,13 @@ def test_testnet_may_run_without_revocation_until_it_holds_a_high_water(tmp_path
             EXIT_USAGE,
             "usage",
             id="max age not decimal",
+        ),
+        pytest.param(
+            ["--static-release-revocation-proof-policy", "/archive/old-policy.json"],
+            set(),
+            EXIT_USAGE,
+            "usage",
+            id="historical policy without digest pin",
         ),
     ],
 )
