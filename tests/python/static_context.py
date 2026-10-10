@@ -10,6 +10,7 @@ responses from the code under test.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import threading
 import time
@@ -211,6 +212,25 @@ def revocation_snapshot_bytes(
         + canonical_json(unsigned)
     )
     return stored({**unsigned, "signature": private.sign(message).hex()})
+
+
+def revocation_evidence_bytes(snapshot: bytes, releases: tuple[bytes, ...] = ()) -> bytes:
+    """Package exact signed releases with a signed snapshot for verifier tests."""
+
+    return stored(
+        {
+            "schema": "miss.computer/misscomputer-subnet/static-site-release-revocation-evidence",
+            "schema_version": 1,
+            "snapshot_b64": base64.b64encode(snapshot).decode("ascii"),
+            "release_proofs": [
+                {
+                    "release_digest": "sha256:" + sha(release),
+                    "signed_release_b64": base64.b64encode(release).decode("ascii"),
+                }
+                for release in sorted(releases, key=sha)
+            ],
+        }
+    )
 
 
 def endpoint(hotkey: str, *, uid: int, generation: int = 1) -> StaticEndpointTarget:

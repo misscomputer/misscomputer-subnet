@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -27,8 +28,12 @@ from static_context import (
     RELEASE_KEY,
     RELEASE_KEY_ID,
     raw_public,
+    release_bytes,
+    revocation_evidence_bytes,
     revocation_policy_bytes,
     revocation_snapshot_bytes,
+    sha,
+    stored,
 )
 from static_context import trust_policy as static_trust_policy
 from static_scoring_context import verified_site
@@ -269,15 +274,16 @@ def _run(
     return execute(replace(config, static_sites=static), publication.world)
 
 
+def _bound(snapshot: bytes, *releases: bytes) -> bytes:
+    return revocation_evidence_bytes(snapshot, releases)
+
+
 def _static_calls(publication: StaticPublication) -> list[str]:
     return [target for kind, target in publication.world.calls if kind == "static"]
 
 
 def _index_calls(publication: StaticPublication) -> list[str]:
     return [target for kind, target in publication.world.calls if kind == "index"]
-
-
-OTHER_KEY = "ab" * 32
 
 
 def _published_record(path: str) -> dict[str, Any]:
@@ -295,9 +301,8 @@ def _published_record(path: str) -> dict[str, Any]:
     ("entries", "revoked", "index_fetched"),
     [
         pytest.param("release", True, False, id="release digest"),
-        pytest.param("signer-key", True, True, id="signer public key under another id"),
-        pytest.param("signer-id", True, True, id="signer id with another public key"),
-        pytest.param("unrelated", False, True, id="control: unrelated entries"),
+        pytest.param("signer-key", True, True, id="pinned signer key"),
+        pytest.param("unrelated", False, True, id="control: empty revocation set"),
     ],
 )
 def test_revoked_release_abstains_without_a_probe_or_a_zero(
@@ -308,15 +313,14 @@ def test_revoked_release_abstains_without_a_probe_or_a_zero(
     release_key = raw_public(RELEASE_KEY).hex()
     releases, signer_keys = {
         "release": (((static.release_digest, static.site_digest, "phishing"),), ()),
-        "signer-key": ((), (("static-release-2026a", release_key, "key_compromise"),)),
-        "signer-id": ((), ((RELEASE_KEY_ID, OTHER_KEY, "key_retired"),)),
-        "unrelated": (
-            (("sha256:" + "a1" * 32, "sha256:" + "5a" * 32, "malware"),),
-            (("static-release-2026a", OTHER_KEY, "key_compromise"),),
-        ),
+        "signer-key": ((), ((RELEASE_KEY_ID, release_key, "key_compromise"),)),
+        "unrelated": ((), ()),
     }[entries]
-    snapshot = revocation_snapshot_bytes(
-        1, REVOCATION_ISSUED_EPOCH, releases=releases, signer_keys=signer_keys
+    snapshot = _bound(
+        revocation_snapshot_bytes(
+            1, REVOCATION_ISSUED_EPOCH, releases=releases, signer_keys=signer_keys
+        ),
+        *((release_bytes(static.site_digest),) if entries == "release" else ()),
     )
 
     result = _run(publication, tmp_path / "run", snapshot)
@@ -374,9 +378,16 @@ def test_taken_down_site_abstains_every_release_but_key_compromise_rotates(
     publication = write_static_publication(tmp_path / "publication")
     static = _static_deployment(publication)
     # Another, separately signed release of the very site that is live.
-    release = static.release_digest if same_release else "sha256:" + "d4" * 32
-    snapshot = revocation_snapshot_bytes(
-        1, REVOCATION_ISSUED_EPOCH, releases=((release, static.site_digest, reason),)
+    signed_release = release_bytes(
+        static.site_digest,
+        **({} if same_release else {"issued_at": "2026-09-30T00:00:01Z"}),
+    )
+    release = "sha256:" + sha(signed_release)
+    snapshot = _bound(
+        revocation_snapshot_bytes(
+            1, REVOCATION_ISSUED_EPOCH, releases=((release, static.site_digest, reason),)
+        ),
+        signed_release,
     )
 
     result = _run(publication, tmp_path / "run", snapshot)
@@ -400,24 +411,30 @@ def test_taken_down_site_abstains_every_release_but_key_compromise_rotates(
     ("snapshot", "code"),
     [
         pytest.param(
-            lambda: revocation_snapshot_bytes(1, EPOCH_START - 86_400), None, id="control: max age"
+            lambda: _bound(revocation_snapshot_bytes(1, EPOCH_START - 86_400)),
+            None,
+            id="control: max age",
         ),
         pytest.param(
-            lambda: revocation_snapshot_bytes(1, EPOCH_START - 86_401),
+            lambda: _bound(revocation_snapshot_bytes(1, EPOCH_START - 86_401)),
             "static_revocation_stale",
             id="older than max age",
         ),
         pytest.param(
-            lambda: revocation_snapshot_bytes(1, EPOCH_START + 300), None, id="control: skew"
+            lambda: _bound(revocation_snapshot_bytes(1, EPOCH_START + 300)),
+            None,
+            id="control: skew",
         ),
         pytest.param(
-            lambda: revocation_snapshot_bytes(1, EPOCH_START + 301),
+            lambda: _bound(revocation_snapshot_bytes(1, EPOCH_START + 301)),
             "static_revocation_issued_in_future",
             id="beyond skew",
         ),
         pytest.param(lambda: None, "static_revocation_unavailable", id="never delivered"),
         pytest.param(
-            lambda: revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH, private=RELEASE_KEY),
+            lambda: _bound(
+                revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH, private=RELEASE_KEY)
+            ),
             "static_revocation_signature_invalid",
             id="signed by the release key",
         ),
@@ -450,11 +467,33 @@ def test_unfresh_or_unverified_revocation_abstains_the_whole_static_epoch(
         assert not high_water.exists()
 
 
+def test_direct_snapshot_file_cannot_bypass_release_entry_binding(tmp_path: Path) -> None:
+    publication = write_static_publication(tmp_path / "publication")
+    static = _static_deployment(publication)
+    bare = revocation_snapshot_bytes(
+        1,
+        REVOCATION_ISSUED_EPOCH,
+        releases=((static.release_digest, static.site_digest, "phishing"),),
+    )
+
+    result = _run(publication, tmp_path / "run", bare)
+
+    assert result.static is not None
+    assert result.static.abstained_code == "static_revocation_entry_unbound"
+    assert result.static.epoch is None
+    assert not (Path(result.static.config.state_root) / REVOCATION_HIGH_WATER_NAME).exists()
+    assert _index_calls(publication) == [] and _static_calls(publication) == []
+
+
 def test_high_water_is_durable_monotonic_and_cumulative_across_runs(tmp_path: Path) -> None:
     publication = write_static_publication(tmp_path / "publication")
     static = _static_deployment(publication)
     revoked = ((static.release_digest, static.site_digest, "phishing"),)
-    held = revocation_snapshot_bytes(2, REVOCATION_ISSUED_EPOCH, releases=revoked)
+    signed_release = release_bytes(static.site_digest)
+    held = _bound(
+        revocation_snapshot_bytes(2, REVOCATION_ISSUED_EPOCH, releases=revoked),
+        signed_release,
+    )
 
     first = _run(publication, tmp_path / "first", held)
 
@@ -463,13 +502,20 @@ def test_high_water_is_durable_monotonic_and_cumulative_across_runs(tmp_path: Pa
     high_water = Path(state_root) / REVOCATION_HIGH_WATER_NAME
     assert high_water.read_bytes() == held
     for name, offered, code in [
-        ("rollback", revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH), "rollback"),
+        ("rollback", _bound(revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH)), "rollback"),
         (
             "equivocation",
-            revocation_snapshot_bytes(2, REVOCATION_ISSUED_EPOCH + 1, releases=revoked),
+            _bound(
+                revocation_snapshot_bytes(2, REVOCATION_ISSUED_EPOCH + 1, releases=revoked),
+                signed_release,
+            ),
             "equivocation",
         ),
-        ("dropped", revocation_snapshot_bytes(3, REVOCATION_ISSUED_EPOCH + 1), "not_cumulative"),
+        (
+            "dropped",
+            _bound(revocation_snapshot_bytes(3, REVOCATION_ISSUED_EPOCH + 1)),
+            "not_cumulative",
+        ),
     ]:
         result = _run(publication, tmp_path / name, offered, state_root=state_root)
         assert result.static is not None
@@ -483,7 +529,10 @@ def test_high_water_is_durable_monotonic_and_cumulative_across_runs(tmp_path: Pa
     assert later.static is not None and later.static.epoch is not None
     assert [row.code for row in later.static.epoch.index_abstentions] == ["release_revoked"]
     assert _static_calls(publication) == []
-    newer = revocation_snapshot_bytes(3, REVOCATION_ISSUED_EPOCH + 1, releases=revoked)
+    newer = _bound(
+        revocation_snapshot_bytes(3, REVOCATION_ISSUED_EPOCH + 1, releases=revoked),
+        signed_release,
+    )
     advanced = _run(publication, tmp_path / "advanced", newer, state_root=state_root)
     assert advanced.static is not None and advanced.static.epoch is not None
     assert high_water.read_bytes() == newer
@@ -508,10 +557,12 @@ def _shared_key_policy(run: Path) -> dict[str, Any]:
 
 
 def _tamper(high_water: Path) -> None:
-    rendered = bytearray(high_water.read_bytes())
-    index = rendered.index(b'"signature":"') + len(b'"signature":"')
-    rendered[index] = ord("0") if rendered[index] != ord("0") else ord("1")
-    high_water.write_bytes(bytes(rendered))
+    envelope = json.loads(high_water.read_bytes())
+    signed = bytearray(base64.b64decode(envelope["snapshot_b64"]))
+    index = signed.index(b'"signature":"') + len(b'"signature":"')
+    signed[index] = ord("0") if signed[index] != ord("0") else ord("1")
+    envelope["snapshot_b64"] = base64.b64encode(signed).decode("ascii")
+    high_water.write_bytes(stored(envelope))
 
 
 @pytest.mark.parametrize(
@@ -549,7 +600,11 @@ def test_revocation_configuration_refuses_before_any_state_or_probe(
     publication = write_static_publication(tmp_path / "publication")
     state_root = None
     if prior:
-        first = _run(publication, tmp_path / "first", revocation_snapshot_bytes(1, EPOCH_START))
+        first = _run(
+            publication,
+            tmp_path / "first",
+            _bound(revocation_snapshot_bytes(1, EPOCH_START)),
+        )
         assert first.static is not None and first.static.epoch is not None
         state_root = first.static.config.state_root
         if prior == "tamper":
@@ -679,10 +734,13 @@ def test_revocation_options_are_all_or_nothing_and_bounded(
 def _revoked_record(tmp_path: Path) -> dict[str, Any]:
     publication = write_static_publication(tmp_path / "publication")
     static = _static_deployment(publication)
-    snapshot = revocation_snapshot_bytes(
-        1,
-        REVOCATION_ISSUED_EPOCH,
-        releases=((static.release_digest, static.site_digest, "phishing"),),
+    snapshot = _bound(
+        revocation_snapshot_bytes(
+            1,
+            REVOCATION_ISSUED_EPOCH,
+            releases=((static.release_digest, static.site_digest, "phishing"),),
+        ),
+        release_bytes(static.site_digest),
     )
     result = _run(publication, tmp_path / "run", snapshot)
     assert result.static is not None

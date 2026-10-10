@@ -120,6 +120,7 @@ RevocationCode = Literal[
     "revocation_signer_untrusted",
     "revocation_signer_outside_validity",
     "revocation_signature_invalid",
+    "revocation_entry_unbound",
     "revocation_rollback",
     "revocation_equivocation",
     "revocation_not_cumulative",

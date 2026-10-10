@@ -104,7 +104,6 @@ from .static_revocation import (
     DEFAULT_MAX_AGE_SECONDS,
     MAX_MAX_AGE_SECONDS,
     MAX_REVOCATION_POLICY_BYTES,
-    MAX_REVOCATION_SNAPSHOT_BYTES,
     MIN_MAX_AGE_SECONDS,
     StaticRevocationError,
     StaticSiteReleaseRevocationTrustPolicy,
@@ -113,7 +112,11 @@ from .static_revocation import (
     parse_static_site_release_revocation_trust_policy,
     revocation_freshness,
     static_index_revoked,
-    verify_static_site_release_revocation,
+)
+from .static_revocation_evidence import (
+    MAX_BOUND_REVOCATION_BYTES,
+    VerifiedBoundRevocation,
+    verify_bound_static_site_release_revocation,
 )
 from .static_scoring import StaticEpochScore, score_static_epoch, static_epoch_score_bytes
 
@@ -122,7 +125,7 @@ MAX_RELEASE_TRUST_POLICY_BYTES: Final = 256 * 1_024
 # Targets not fetched within this wall-clock budget abstain, never score zero.
 STATIC_INDEX_LOAD_BUDGET_SECONDS: Final = 30.0
 _PREFIXED_DIGEST_HEX: Final = frozenset("0123456789abcdef")
-#: The durable revocation high water: exact stored snapshot bytes in the static root.
+#: The durable revocation high water: exact canonical evidence envelope bytes.
 REVOCATION_HIGH_WATER_NAME: Final = "static-release-revocation.json"
 REVOCATION_HIGH_WATER_INSTALL_NAME: Final = ".static-release-revocation.install"
 REVOCATION_STATE_ENTRIES: Final = frozenset(
@@ -151,7 +154,7 @@ class StaticSitesConfig:
     #: ``digest_sha256``; ``None`` disables revocation (refused on ``finney``).
     revocation_policy: str | None = None
     revocation_policy_digest: str | None = None
-    #: Operator-delivered snapshot offered to the high water this run (self-authenticating).
+    #: Operator-delivered snapshot/evidence envelope offered to the high water.
     revocation_snapshot: str | None = None
     revocation_max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS
 
@@ -161,6 +164,7 @@ class StaticRevocationState:
     """The pinned revocation authority and the durable high water this run relies on."""
 
     policy: StaticSiteReleaseRevocationTrustPolicy
+    release_policy: StaticSiteReleaseTrustPolicy
     held: VerifiedRevocation | None
 
 
@@ -261,7 +265,7 @@ def _lock_revocation(
 
     stored = root.read_document(
         REVOCATION_HIGH_WATER_NAME,
-        max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+        max_bytes=MAX_BOUND_REVOCATION_BYTES,
         prefix=_REVOCATION_PREFIX,
     )
     if config.revocation_policy is None or config.revocation_policy_digest is None:
@@ -285,37 +289,43 @@ def _lock_revocation(
     held = None
     if stored is not None:
         try:
-            held = verify_static_site_release_revocation(stored, revocation_policy)
+            held = verify_bound_static_site_release_revocation(
+                stored, revocation_policy, release_policy
+            ).verified
         except StaticRevocationError as exc:
             raise AssignmentProbeCLIError("static_revocation_high_water_invalid") from exc
-    return StaticRevocationState(policy=revocation_policy, held=held)
+    return StaticRevocationState(policy=revocation_policy, release_policy=release_policy, held=held)
 
 
 def _install_revocation_high_water(
-    root: _StateRoot, state: StaticRevocationState, offered: VerifiedRevocation
+    root: _StateRoot, state: StaticRevocationState, offered: VerifiedBoundRevocation
 ) -> None:
     """Advance the durable high water; the store re-reads its own bytes, then memory follows."""
 
     stored = root.read_document(
         REVOCATION_HIGH_WATER_NAME,
-        max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+        max_bytes=MAX_BOUND_REVOCATION_BYTES,
         prefix=_REVOCATION_PREFIX,
     )
     try:
         held = (
-            None if stored is None else verify_static_site_release_revocation(stored, state.policy)
+            None
+            if stored is None
+            else verify_bound_static_site_release_revocation(
+                stored, state.policy, state.release_policy
+            ).verified
         )
     except StaticRevocationError as exc:
         raise AssignmentProbeCLIError("static_revocation_high_water_invalid") from exc
-    if advance_static_site_release_revocation(held, offered):
+    if advance_static_site_release_revocation(held, offered.verified):
         root.install_document(
             REVOCATION_HIGH_WATER_NAME,
             REVOCATION_HIGH_WATER_INSTALL_NAME,
             offered.stored,
-            max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+            max_bytes=MAX_BOUND_REVOCATION_BYTES,
             prefix=_REVOCATION_PREFIX,
         )
-        held = offered
+        held = offered.verified
     state.held = held
 
 
@@ -331,13 +341,15 @@ def _revocation_gate(run: StaticEpochRun, root: _StateRoot, *, evaluation_epoch:
             offered_bytes = _load_unpinned_file(
                 path,
                 label="static_revocation_snapshot",
-                max_bytes=MAX_REVOCATION_SNAPSHOT_BYTES,
+                max_bytes=MAX_BOUND_REVOCATION_BYTES,
             )
-            offered = verify_static_site_release_revocation(offered_bytes, state.policy)
+            offered = verify_bound_static_site_release_revocation(
+                offered_bytes, state.policy, state.release_policy
+            )
             # A future-dated snapshot would hold back every later issuance.
             if (
                 revocation_freshness(
-                    offered,
+                    offered.verified,
                     now_epoch=evaluation_epoch,
                     max_age_seconds=MAX_MAX_AGE_SECONDS,
                 )

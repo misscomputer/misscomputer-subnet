@@ -13,7 +13,7 @@ takedown.
 
 ## Documents
 
-Both documents are canonical JSON plus one newline.
+All documents are canonical JSON plus one newline.
 
 **`static-site-release-revocation-trust-policy` v1** has the shape of the
 release trust policy (§7.2) under its own schema: `policy_id`,
@@ -59,6 +59,36 @@ trust policy (`revocation_policy_key_not_dedicated`).
   `revocation_snapshot_invalid`, `revocation_signer_untrusted`,
   `revocation_signer_outside_validity` and `revocation_signature_invalid`.
 
+**Verifier-side entry evidence.** The validator accepts an offered snapshot
+only inside a canonical `static-site-release-revocation-evidence` v1 envelope:
+
+```json
+{
+  "schema": "miss.computer/misscomputer-subnet/static-site-release-revocation-evidence",
+  "schema_version": 1,
+  "snapshot_b64": "<base64 of exact signed snapshot bytes>",
+  "release_proofs": [
+    {"release_digest": "sha256:<64 hex>", "signed_release_b64": "<base64 of exact signed release bytes>"}
+  ]
+}
+```
+
+There is exactly one proof per revoked-release entry, ordered by release
+digest. For each proof the verifier checks the stored-byte digest, canonical
+release, its signature and issuance window under the pinned release policy,
+and equality between its signed `site_digest` and the snapshot entry. Every
+revoked signer-key ID/public-key pair must also occur in the pinned release
+policy. The same exact evidence envelope, limited to 4 MiB, is persisted and
+re-verified on restart; the inner signed snapshot's digest remains the
+high-water and epoch-record digest. A bare signed snapshot, a missing proof,
+or any mismatched entry is `revocation_entry_unbound` and cannot advance the
+high water. Release policies must retain historical keys named in cumulative
+snapshots (with expired validity windows when retired); removing such a key
+before a coordinated migration makes the held high water unverifiable and
+fails the run closed. The revocation authority's v1 signature format is
+unchanged; the envelope is self-authenticating through that signature and
+the signed release proofs.
+
 A release is **revoked** when its `release_digest` is listed, when its site is
 taken down, or when its signer is listed by `key_id` *or* by public key,
 whatever the release's `issued_at`. A compromised key can backdate, and
@@ -81,8 +111,8 @@ of it.
 
 ## High water
 
-The validator keeps the highest accepted snapshot (its high water) as exact
-bytes in `static-release-revocation.json` inside the owner-only, locked
+The validator keeps the highest accepted snapshot and its entry evidence as
+exact envelope bytes in `static-release-revocation.json` inside the owner-only, locked
 `--static-state-root`. A verified snapshot *N* replaces the high water *H* when
 *N* is byte-identical to *H* (no-op), or when `N.sequence > H.sequence`,
 `N.issued_at ≥ H.issued_at`, and every entry of *H* is unchanged in *N*.
@@ -118,7 +148,7 @@ back every later issuance.
 | A high water is held but no policy is configured (any network) | Same refusal; the configuration can never drop a held revocation |
 | Held high water fails verification under the pinned policy (tampered, or a rotation that dropped its key) | Run refused: `static_revocation_high_water_invalid` |
 | Policy is not the pinned digest, or shares a release key | Run refused: `static_revocation_policy_digest_mismatch` / `static_revocation_policy_key_not_dedicated` |
-| Offered snapshot is unreadable, unverifiable, a rollback, an equivocation, not cumulative, or future-dated | Static epoch **abstains** with `static_revocation_*`; the high water is unchanged |
+| Offered envelope is unreadable, has unbound entries, is unverifiable, a rollback, an equivocation, not cumulative, or future-dated | Static epoch **abstains** with `static_revocation_*`; the high water is unchanged |
 | No high water yet, or the high water is stale | Static epoch **abstains** (`static_revocation_unavailable` / `static_revocation_stale`) |
 | A deployment's release digest is revoked | Deployment abstains with `release_revoked` (record code `static_release_revoked`) before its index is fetched |
 | A deployment's site is taken down (any release of it, however signed) | Deployment abstains with `release_revoked` before its index is fetched; the verified release's `site_digest` is checked again after authentication |
@@ -145,7 +175,7 @@ Revocation is enabled by pinning both
 `--static-release-revocation-policy <file>` and
 `--static-release-revocation-policy-digest <digest_sha256>`.
 `--static-release-revocation-snapshot <file>` offers the operator-delivered
-snapshot for this run. The snapshot is self-authenticating, so it is not
+evidence envelope for this run. The signed snapshot and proofs are self-authenticating, so it is not
 digest-pinned. Without it, the run relies on the durable high water.
 
 ## Vectors

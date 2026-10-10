@@ -48,6 +48,7 @@ from static_context import (
     manifest_document,
     raw_public,
     release_bytes,
+    revocation_evidence_bytes,
     revocation_policy_bytes,
     revocation_snapshot_bytes,
     sha,
@@ -376,7 +377,7 @@ def write_static_publication(
         ),
         revocation_snapshot_file=secure_write(
             root / "static-revocation-snapshot.json",
-            revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH),
+            revocation_evidence_bytes(revocation_snapshot_bytes(1, REVOCATION_ISSUED_EPOCH)),
         ),
     )
 
