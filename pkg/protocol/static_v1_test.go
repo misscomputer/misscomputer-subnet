@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +94,52 @@ func TestDeploymentV4DecodersRejectStaticTickets(t *testing.T) {
 	var lifecycle protocol.Ticket
 	if json.Unmarshal(encoded, &lifecycle) == nil {
 		t.Fatal("deployment.v4 lifecycle decoder accepted a static ticket")
+	}
+}
+
+// A static ticket and its receipt bind the label's host in a route domain
+// that admits the label: on.miss.computer admits every route label (the
+// internal canaries), ms.computer only an unreserved <slug>-<l><dddd> label.
+func TestStaticTicketAdmitsALabelHostOnlyInItsRouteDomain(t *testing.T) {
+	_, validator, _ := ed25519.GenerateKey(rand.Reader)
+	_, miner, _ := ed25519.GenerateKey(rand.Reader)
+	for _, tc := range []struct {
+		label, host string
+		admitted    bool
+	}{
+		{"hello-k3j9x0q2ab", "hello-k3j9x0q2ab.on.miss.computer", true},
+		{"shop-a1234", "shop-a1234.ms.computer", true},
+		{"shop-a1234", "shop-a1234.on.miss.computer", true},
+		{"hello-k3j9x0q2ab", "hello-k3j9x0q2ab.ms.computer", false},
+		{"shop-a1234", "other-a1234.ms.computer", false},
+		{"shop-a1234", "shop-a1234.example.com", false},
+		{"shop-a1234", "x.shop-a1234.ms.computer", false},
+		{"shop-a1234", "shop-a1234.ms.computer.evil.example", false},
+	} {
+		ticket := staticTicket(t, validator, miner)
+		ticket.DeploymentID, ticket.RouteHost, ticket.Signature = tc.label, tc.host, ""
+		err := protocol.SignStaticTicketV1(&ticket, validator)
+		if (err == nil) != tc.admitted {
+			t.Fatalf("%s for %s: sign error %v, want admitted=%v", tc.host, tc.label, err, tc.admitted)
+		}
+		replica := tc.label + "-" + ticket.MinerID
+		receipt := protocol.StaticReceiptV1{
+			AssignmentNonce: ticket.AssignmentNonce, DeploymentID: tc.label, Generation: ticket.Generation,
+			EndpointID: fmt.Sprintf("%s-g%d-%s", replica, ticket.Generation, ticket.AssignmentNonce), MinerID: ticket.MinerID,
+			ReleaseDigest: ticket.ReleaseDigest, ReplicaID: replica, RouteHost: tc.host, Schema: protocol.StaticReceiptSchema,
+			SchemaVersion: 1, ServerImplementationDigest: ticket.ServerImplementationDigest, SiteDigest: ticket.SiteDigest,
+			Stage: protocol.StageAccepted, Subnet: ticket.Subnet, TicketDigest: "sha256:" + strings.Repeat("7c", 32),
+		}
+		if err := protocol.SignStaticReceiptV1(&receipt, miner); (err == nil) != tc.admitted {
+			t.Fatalf("%s for %s: receipt sign error %v, want admitted=%v", tc.host, tc.label, err, tc.admitted)
+		}
+		if tc.admitted {
+			if err := protocol.VerifyStaticTicketV1Signature(ticket, validator.Public().(ed25519.PublicKey)); err != nil {
+				t.Fatalf("%s: %v", tc.host, err)
+			}
+		}
+	}
+	if organic.ValidRouteHost("syn-a1234", "syn-a1234.ms.computer") {
+		t.Fatal("a reserved label took a public site host")
 	}
 }

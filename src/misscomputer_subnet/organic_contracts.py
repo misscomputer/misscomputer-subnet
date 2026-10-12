@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Final, Literal, Self
@@ -43,6 +44,10 @@ from misscomputer_subnet.protocol import SubnetBinding, _rfc3339nano_instant
 
 SCHEMA_PREFIX: Final = "miss.computer/misscomputer-subnet/"
 ROUTE_DOMAIN: Final = "on.miss.computer"
+#: Free public user sites. ``ROUTE_DOMAIN`` stays the default and keeps the
+#: internal canaries and every synthetic or readiness label.
+PUBLIC_SITE_ROUTE_DOMAIN: Final = "ms.computer"
+ROUTE_DOMAINS: Final = (ROUTE_DOMAIN, PUBLIC_SITE_ROUTE_DOMAIN)
 PLATFORM: Final = "linux/amd64"
 RUNTIME_PROFILE: Final = "small-v1"
 WORKLOAD_KIND: Final = "oci-image-v1"
@@ -87,6 +92,8 @@ EDGE_REQUEST_FRESHNESS_NANOS: Final = 10_000_000_000
 EDGE_REQUEST_FUTURE_SKEW_NANOS: Final = 2_000_000_000
 ORGANIC_PROBE_VALIDITY_SECONDS: Final = 30
 RESERVED_ROUTE_PREFIXES: Final = ("syn-", "readiness-probe", "xn--")
+#: ``<slug>-<l><dddd>``: the only labels ``PUBLIC_SITE_ROUTE_DOMAIN`` admits.
+_PUBLIC_SITE_LABEL: Final = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-[a-z][0-9]{4}")
 
 
 # --------------------------------------------------------------------------
@@ -188,8 +195,31 @@ def manifest_key(artifact_digest: str) -> str:
     return f"v1/manifests/{artifact_digest.removeprefix('sha256:')}.json"
 
 
-def route_host(route_label: str) -> str:
-    return f"{route_label}.{ROUTE_DOMAIN}"
+def valid_route_host(route_label: str, host: str) -> bool:
+    """Whether ``host`` is ``route_label``'s host in a route domain admitting it.
+
+    ``ROUTE_DOMAIN`` admits every route label; ``PUBLIC_SITE_ROUTE_DOMAIN``
+    only an unreserved ``<slug>-<l><dddd>`` label of at most 63 characters.
+    """
+
+    label, dot, domain = host.partition(".")
+    if not dot or label != route_label:
+        return False
+    if domain == ROUTE_DOMAIN:
+        return True
+    return (
+        domain == PUBLIC_SITE_ROUTE_DOMAIN
+        and len(route_label) <= 63
+        and not route_label.startswith(RESERVED_ROUTE_PREFIXES)
+        and _PUBLIC_SITE_LABEL.fullmatch(route_label) is not None
+    )
+
+
+def route_host(route_label: str, domain: str = ROUTE_DOMAIN) -> str:
+    host = f"{route_label}.{domain}"
+    if not valid_route_host(route_label, host):
+        raise ValueError("route_host_invalid")
+    return host
 
 
 def format_timestamp(value: datetime) -> str:

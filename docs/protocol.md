@@ -130,6 +130,17 @@ The miner neuron checks the btauth caller and current metagraph, UID, network/ne
 
 Go emits RFC3339Nano timestamps. Python deliberately preserves signed ticket and receipt timestamps as strings: coercing them to Python `datetime` would truncate nanoseconds and invalidate an otherwise correct Go signature.
 
+### Route domains
+
+A route host is `<route_label>.<route domain>`. `on.miss.computer` admits every
+route label and stays the default: internal canaries, synthetic and readiness
+labels live there. `ms.computer` addresses free public user sites and admits
+only an unreserved `<slug>-<l><dddd>` label (one lowercase letter, four
+digits). A static-site-v1 ticket or receipt whose route host is not its
+deployment ID's host in a domain admitting it is refused (`route_host_mismatch`,
+`receipt_identity_invalid`); `organic.ValidRouteHost` and
+`organic_contracts.valid_route_host` are the shared rule.
+
 ## Receipt
 
 Receipts bind deployment, generation, assignment nonce, miner, replica ID, endpoint ID, image digest, manifest key, route host, lifecycle stage/timestamps, and the exact `subnet` value copied from the ticket. The miner Go service signs them with its bound service key.

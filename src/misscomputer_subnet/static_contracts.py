@@ -43,7 +43,7 @@ from misscomputer_subnet.organic_contracts import (
     RouteLabel,
     Timestamp,
     document_bytes,
-    route_host,
+    valid_route_host,
 )
 from misscomputer_subnet.organic_contracts import ServiceKeyBinding as ServiceKeyBinding
 from misscomputer_subnet.protocol import SubnetBinding, _rfc3339nano_instant
@@ -326,7 +326,7 @@ class StaticDeploymentTicketV1(_SerializedByAlias):
 
     @model_validator(mode="after")
     def exact_identity(self) -> Self:
-        if self.route_host != route_host(self.deployment_id):
+        if not valid_route_host(self.deployment_id, self.route_host):
             raise ValueError("route_host_mismatch")
         if self.site_manifest_key != site_manifest_key(self.site_digest):
             raise ValueError("site_manifest_key_mismatch")
@@ -374,7 +374,7 @@ class StaticDeploymentReceiptV1(_SerializedByAlias):
         if (
             self.replica_id != replica
             or self.endpoint_id != f"{replica}-g{self.generation}-{self.assignment_nonce}"
-            or self.route_host != route_host(self.deployment_id)
+            or not valid_route_host(self.deployment_id, self.route_host)
         ):
             raise ValueError("receipt_identity_invalid")
         if self.miner_id != self.subnet.miner_hotkey:
