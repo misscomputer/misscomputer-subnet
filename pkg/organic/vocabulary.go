@@ -31,12 +31,16 @@ import (
 )
 
 const (
-	SchemaPrefix       = "miss.computer/misscomputer-subnet/"
-	RouteDomain        = "on.miss.computer"
-	Platform           = "linux/amd64"
-	RuntimeProfile     = "small-v1"
-	WorkloadKind       = "oci-image-v1"
-	ScoringDisposition = "organic_v1"
+	SchemaPrefix = "miss.computer/misscomputer-subnet/"
+	RouteDomain  = "on.miss.computer"
+	// PublicSiteRouteDomain addresses free public user sites. RouteDomain
+	// stays the default and keeps the internal canaries and every synthetic
+	// or readiness label.
+	PublicSiteRouteDomain = "ms.computer"
+	Platform              = "linux/amd64"
+	RuntimeProfile        = "small-v1"
+	WorkloadKind          = "oci-image-v1"
+	ScoringDisposition    = "organic_v1"
 	// CapabilityFeature is the miner capability a validator requires before
 	// assigning organic work; miners without it are ineligible (fail closed).
 	CapabilityFeature = "organic-oci-v1"
@@ -106,6 +110,7 @@ var (
 	apiDeploymentPattern  = regexp.MustCompile(`^dep_[0-9a-f]{32}$`)
 	uploadIDPattern       = regexp.MustCompile(`^upl_[0-9a-f]{32}$`)
 	dnsLabelPattern       = regexp.MustCompile(`^` + dnsLabel + `$`)
+	publicSiteLabel       = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*-[a-z][0-9]{4}$`)
 	hostnamePattern       = regexp.MustCompile(`^` + dnsLabel + `(?:\.` + dnsLabel + `)+$`)
 	printablePattern      = regexp.MustCompile(`^[\x20-\x7e]*$`)
 	upperSnakePattern     = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
@@ -145,8 +150,25 @@ func ValidHostname(value string) bool {
 // ValidHotkey reports whether value has the public hotkey shape.
 func ValidHotkey(value string) bool { return hotkeyPattern.MatchString(value) }
 
-// RouteHost is the public hostname of a route label.
+// RouteHost is the public hostname of a route label in RouteDomain.
 func RouteHost(routeLabel string) string { return routeLabel + "." + RouteDomain }
+
+// ValidRouteHost reports whether host is routeLabel's host in a route domain
+// admitting it: RouteDomain admits every route label, PublicSiteRouteDomain
+// only a valid route label of the form <slug>-<l><dddd>.
+func ValidRouteHost(routeLabel, host string) bool {
+	label, domain, ok := strings.Cut(host, ".")
+	if !ok || label != routeLabel {
+		return false
+	}
+	switch domain {
+	case RouteDomain:
+		return true
+	case PublicSiteRouteDomain:
+		return ValidRouteLabel(routeLabel) && publicSiteLabel.MatchString(routeLabel)
+	}
+	return false
+}
 
 // ManifestKey is the artifact bucket key of an artifact digest.
 func ManifestKey(artifactDigest string) string { return artifact.ManifestKey(artifactDigest) }

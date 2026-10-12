@@ -155,3 +155,49 @@ def test_deployment_v4_decoders_reject_static_documents() -> None:
         oc.parse_document(_fixture("static-deploy.v1"), oc.DeploySynapseV3)
     with pytest.raises(ValueError):
         oc.parse_document(_fixture("static-bridge-assign.v1"), oc.BridgeAssignRequestV3)
+
+
+# label, route_host, admitted: on.miss.computer admits every route label (the
+# internal canaries); ms.computer only an unreserved <slug>-<l><dddd> label.
+ROUTE_HOST_CASES = [
+    ("hello-world-k3j9x0q2ab", "hello-world-k3j9x0q2ab.on.miss.computer", True),
+    ("shop-a1234", "shop-a1234.ms.computer", True),
+    ("shop-a1234", "shop-a1234.on.miss.computer", True),
+    ("hello-world-k3j9x0q2ab", "hello-world-k3j9x0q2ab.ms.computer", False),
+    ("shop-a1234", "other-a1234.ms.computer", False),
+    ("shop-a1234", "shop-a1234.example.com", False),
+    ("shop-a1234", "x.shop-a1234.ms.computer", False),
+    ("shop-a1234", "shop-a1234.ms.computer.evil.example", False),
+]
+
+
+@pytest.mark.parametrize(("label", "host", "admitted"), ROUTE_HOST_CASES)
+def test_static_ticket_and_receipt_admit_a_label_host_only_in_its_route_domain(
+    label: str, host: str, admitted: bool
+) -> None:
+    ticket = json.loads(_fixture("static-deployment-ticket.v1"))
+    receipt = json.loads(_fixture("static-deployment-receipt.v1"))
+    replica = f"{label}-{receipt['miner_id']}"
+    ticket.update(deployment_id=label, route_host=host)
+    receipt.update(
+        deployment_id=label,
+        route_host=host,
+        replica_id=replica,
+        endpoint_id=f"{replica}-g{receipt['generation']}-{receipt['assignment_nonce']}",
+    )
+    for model, document, reason in (
+        (sc.StaticDeploymentTicketV1, ticket, "route_host_mismatch"),
+        (sc.StaticDeploymentReceiptV1, receipt, "receipt_identity_invalid"),
+    ):
+        if admitted:
+            assert model.model_validate(document).route_host == host
+        else:
+            with pytest.raises(ValidationError, match=reason):
+                model.model_validate(document)
+
+
+def test_a_reserved_label_never_takes_a_public_site_host() -> None:
+    assert not oc.valid_route_host("syn-a1234", "syn-a1234.ms.computer")
+    with pytest.raises(ValueError, match="route_host_invalid"):
+        oc.route_host("syn-a1234", oc.PUBLIC_SITE_ROUTE_DOMAIN)
+    assert oc.route_host("hello-world-k3j9x0q2ab") == "hello-world-k3j9x0q2ab.on.miss.computer"

@@ -147,7 +147,7 @@ func (t StaticTicketV1) validateUnsigned() error {
 		!organic.ValidDigest(t.ServerImplementationDigest) {
 		return errors.New("static ticket identity is invalid")
 	}
-	if t.RouteHost != organic.RouteHost(t.DeploymentID) {
+	if !organic.ValidRouteHost(t.DeploymentID, t.RouteHost) {
 		return errors.New("route_host_mismatch")
 	}
 	if t.SiteManifestKey != static.ManifestKey(t.SiteDigest) {
@@ -180,7 +180,7 @@ func (r StaticReceiptV1) validateUnsigned() error {
 		return errors.New("static receipt schema is invalid")
 	}
 	if !organic.ValidRouteLabel(r.DeploymentID) || r.Generation < 1 || !lowercaseHex(r.AssignmentNonce, 32) ||
-		!organic.ValidHotkey(r.MinerID) || r.RouteHost != organic.RouteHost(r.DeploymentID) ||
+		!organic.ValidHotkey(r.MinerID) || !organic.ValidRouteHost(r.DeploymentID, r.RouteHost) ||
 		!organic.ValidDigest(r.SiteDigest) || !organic.ValidDigest(r.ReleaseDigest) ||
 		!organic.ValidDigest(r.ServerImplementationDigest) || !organic.ValidDigest(r.TicketDigest) {
 		return errors.New("static receipt identity is invalid")
