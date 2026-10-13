@@ -101,6 +101,12 @@ func sandboxHandler[T any](a *api, apply func(context.Context, T, miner.SandboxR
 			bridge.WriteError(w, http.StatusConflict, "sandbox_conflict", err.Error(), false)
 			return
 		}
+		if errors.Is(err, miner.ErrSandboxCleanupPending) {
+			// The fence is durable; the release is acknowledged with a
+			// receipt only once its sandbox is destroyed.
+			bridge.WriteError(w, http.StatusServiceUnavailable, "cleanup_pending", err.Error(), true)
+			return
+		}
 		if err != nil {
 			status, code, retryable := assignmentError(err)
 			bridge.WriteError(w, status, code, err.Error(), retryable)

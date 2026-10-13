@@ -529,3 +529,37 @@ func TestNewSandboxLaneRequiresAnEnforcedDedicatedBudget(t *testing.T) {
 		})
 	}
 }
+
+// A release receipt tells the validator the slot is free, so it is signed
+// only once every sandbox of the identity is destroyed. While a destroy
+// fails, the release answers ErrSandboxCleanupPending (no receipt), the
+// fence stays durable and the capacity stays consumed; a replay of the
+// same release after the backend recovers destroys the sandbox and is
+// acknowledged.
+func TestSandboxReleaseIsAcknowledgedOnlyAfterDestroy(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	r, l, receipt, err := f.commitHeld(1, nil)
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+	f.backend.destroyErr = errors.New("daemon down")
+	release := f.release(r)
+	if receipt, err := f.lane.Release(ctx, release, f.request()); !errors.Is(err, ErrSandboxCleanupPending) {
+		t.Fatalf("release with a failing destroy answered %s/%v, want ErrSandboxCleanupPending", receipt.Stage, err)
+	}
+	if live, _, _ := f.backend.state(); live != 1 {
+		t.Fatalf("live sandboxes = %d, want the undestroyed one", live)
+	}
+	if _, active, err := f.store.Occupancy(ctx, f.now); err != nil || active.Sandboxes != 1 {
+		t.Fatalf("capacity after a failed destroy: active=%+v err=%v", active, err)
+	}
+	// The fence is durable even without a receipt.
+	again, err := f.lane.Reserve(ctx, f.reservation(1), f.request())
+	f.check(again, err, protocol.SandboxReservationSchema, f.reservation(1), sandbox.StageRefused, "released_before_use")
+
+	f.backend.destroyErr = nil
+	receipt, err = f.lane.Release(ctx, release, f.request())
+	f.check(receipt, err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
+	if live, _, _ := f.backend.state(); live != 0 || receipt.CapacityActive.Sandboxes != 0 {
+		t.Fatalf("after the acknowledged release: live=%d active=%+v", live, receipt.CapacityActive)
+	}
+}

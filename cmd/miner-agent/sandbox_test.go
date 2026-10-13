@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -84,7 +85,10 @@ func TestSandboxLeasesOffKeepsRoutesAndFeaturesUnchanged(t *testing.T) {
 }
 
 // sandboxBackend is an in-memory isolation backend for bridge tests.
-type sandboxBackend struct{ live map[string]bool }
+type sandboxBackend struct {
+	live       map[string]bool
+	destroyErr error
+}
 
 func (b *sandboxBackend) Budget(context.Context) (miner.SandboxBudget, error) {
 	return miner.SandboxBudget{Cgroup: "/mc-sandboxes", DiskMiB: 40960, Sandboxes: 4}, nil
@@ -95,6 +99,9 @@ func (b *sandboxBackend) Create(_ context.Context, instance string, _ protocol.S
 	return nil
 }
 func (b *sandboxBackend) Destroy(_ context.Context, instance string) error {
+	if b.destroyErr != nil {
+		return b.destroyErr
+	}
 	delete(b.live, instance)
 	return nil
 }
@@ -217,5 +224,44 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	}
 	if len(backend.live) != 0 {
 		t.Fatalf("reservations started %d sandboxes", len(backend.live))
+	}
+
+	// A release whose sandbox cannot be destroyed yet is a retryable bridge
+	// error, not a released receipt; its replay is acknowledged once the
+	// sandbox is gone.
+	digest, _ = protocol.SandboxDigestV1(held)
+	image := "sha256:" + strings.Repeat("c4", 32)
+	lease := protocol.SandboxLeaseV1{
+		AssignmentNonce: strings.Repeat("c3", 16), Env: map[string]string{}, Generation: 1, ImageDigest: image,
+		ImageReference: "docker.io/library/python@" + image, Isolation: sandbox.IsolationGVisor, IssuedAt: *protocol.StaticTime(now),
+		LeaseExpiresAt: *protocol.StaticTime(now.Add(10 * time.Minute)), MinerID: minerHotkey,
+		Network:           sandbox.NetworkPolicy{Mode: sandbox.NetworkNone, Allow: []string{}},
+		ReservationDigest: digest, Resources: held.Resources, SandboxID: held.SandboxID, Schema: protocol.SandboxLeaseSchema, SchemaVersion: 1,
+		SecretEnv: sandbox.SecretEnv{Delivery: sandbox.SecretDeliveryNone, Names: []string{}}, Subnet: binding, WorkloadKind: sandbox.WorkloadKind,
+	}
+	if err := protocol.SignSandboxLeaseV1(&lease, validatorPrivate); err != nil {
+		t.Fatal(err)
+	}
+	if response := serve(service.routes(), http.MethodPost, "/v1/sandbox/leases", envelope(lease, nil)); response.Code != http.StatusOK || len(backend.live) != 1 {
+		t.Fatalf("lease: %d %s live=%d", response.Code, response.Body.String(), len(backend.live))
+	}
+	release := protocol.SandboxReleaseV1{
+		Generation: 1, IssuedAt: *protocol.StaticTime(now), MinerID: minerHotkey, Reason: sandbox.ReleaseCustomerDelete,
+		SandboxID: held.SandboxID, Schema: protocol.SandboxReleaseSchema, SchemaVersion: 1, Subnet: binding,
+	}
+	if err := protocol.SignSandboxReleaseV1(&release, validatorPrivate); err != nil {
+		t.Fatal(err)
+	}
+	backend.destroyErr = errors.New("daemon down")
+	response = serve(service.routes(), http.MethodPost, "/v1/sandbox/releases", envelope(release, nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"cleanup_pending"`) ||
+		!strings.Contains(response.Body.String(), `"retryable":true`) {
+		t.Fatalf("release with a failing destroy: %d %s", response.Code, response.Body.String())
+	}
+	backend.destroyErr = nil
+	response = serve(service.routes(), http.MethodPost, "/v1/sandbox/releases", envelope(release, nil))
+	answer = sandboxResponse{}
+	if err := decodeJSON(bytes.NewReader(response.Body.Bytes()), &answer); err != nil || answer.Receipt.Stage != sandbox.StageReleased || len(backend.live) != 0 {
+		t.Fatalf("replayed release: %d %s live=%d", response.Code, response.Body.String(), len(backend.live))
 	}
 }

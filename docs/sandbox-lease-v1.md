@@ -153,7 +153,16 @@ including refused and failed receipts.
 - **Release, Sweep, Recover:** each moves leases to `cleanup` durably, then
   destroys their sandboxes. A failed destroy keeps the lease in `cleanup`,
   still consuming capacity, until a later sweep (every 10 seconds) destroys
-  it. A release that lands while a sandbox is being created waits for the
+  it.
+- **Release acknowledgement:** a `released` receipt for a release document
+  is signed only after every sandbox of the identity is destroyed. While a
+  destroy fails, the fence is already durable but the miner answers the
+  retryable bridge error `503 cleanup_pending` with no receipt; the
+  validator keeps the identity in `cleanup_pending` and replays the same
+  release. A lease or renewal receipt for a lease in `cleanup` reports the
+  lease's terminal intent (for example `released`) and is not a cleanup
+  acknowledgement: validators free capacity only on a release receipt or
+  after the lease expiry plus grace. A release that lands while a sandbox is being created waits for the
   create to return and then destroys it. Restart recovery destroys every
   sandbox that may exist before the agent serves.
 - **Backend interface (`SandboxBackend`):** `Budget`, `Unsupported`,

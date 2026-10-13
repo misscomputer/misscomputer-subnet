@@ -62,6 +62,13 @@ type SandboxLaneConfig struct {
 	ExclusiveOf []string
 }
 
+// ErrSandboxCleanupPending answers a release whose fence is durable but
+// whose sandbox could not be destroyed yet. No receipt is signed: a release
+// receipt tells the validator the slot is free, so it is signed only once
+// every sandbox of the identity is gone. The validator retries the same
+// release; the sweep keeps destroying in the meantime.
+var ErrSandboxCleanupPending = errors.New("sandbox release is fenced but its sandbox is not destroyed yet; retry the release")
+
 // SandboxRefusal is a backend failure that is not attributed to the miner,
 // such as an image that cannot be pulled.
 type SandboxRefusal struct{ Code string }
@@ -274,9 +281,11 @@ func (l *SandboxLane) Renew(ctx context.Context, r protocol.SandboxRenewalV1, re
 }
 
 // Release fences the identity of a verified release, then destroys every
-// sandbox it moved to cleanup. The receipt is signed once the fence is
-// durable; a sandbox whose destroy failed keeps consuming capacity, as the
-// receipt shows, until Sweep destroys it.
+// sandbox of the identity that is in cleanup. The released receipt is
+// signed only after every one of them is destroyed. If a destroy fails, the
+// fence stays durable, the sandbox keeps consuming capacity, and Release
+// returns ErrSandboxCleanupPending without a receipt; an exact replay of
+// the release retries the destroy.
 func (l *SandboxLane) Release(ctx context.Context, r protocol.SandboxReleaseV1, req SandboxRequest) (protocol.SandboxReceiptV1, error) {
 	now := l.now().UTC()
 	if err := protocol.VerifyBoundSandboxReleaseV1(r, req.ValidatorKey, now, req.CurrentBlock, req.Network, req.NetUID, req.CallerHotkey, req.MinerHotkey, req.MinerUID); err != nil {
@@ -290,7 +299,9 @@ func (l *SandboxLane) Release(ctx context.Context, r protocol.SandboxReleaseV1, 
 		return protocol.SandboxReceiptV1{}, err
 	}
 	if len(teardown) > 0 {
-		_ = l.destroyAll(ctx, teardown, now)
+		if err := l.destroyAll(ctx, teardown, now); err != nil {
+			return protocol.SandboxReceiptV1{}, fmt.Errorf("%w: %v", ErrSandboxCleanupPending, err)
+		}
 		if outcome.Held, outcome.Active, err = l.store.Occupancy(ctx, now); err != nil {
 			return protocol.SandboxReceiptV1{}, err
 		}
