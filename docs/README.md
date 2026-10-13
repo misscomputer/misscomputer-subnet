@@ -36,6 +36,7 @@ deployment.
 | Static sites on the miner (verify-then-serve, shared handler; off by default) | [miner-static-sites.md](miner-static-sites.md) |
 | Static temporary origin: verify-then-listen process contract (development) | [static-origin.md](static-origin.md) |
 | Organic deployment contracts and sources of truth | [organic-contracts.md](organic-contracts.md) |
+| Sandbox lease documents and durable holds (partial; off by default, not customer-ready) | [sandbox-lease-v1.md](sandbox-lease-v1.md) |
 | What the score measures and how probes are attributed | [organic-availability-scoring.md](organic-availability-scoring.md) |
 | Hidden-probe design | [public-validator-live-probe.md](public-validator-live-probe.md) |
 | Static-site index ingestion, admission crawl, and hidden probes (development) | [static-site-validator-probe.md](static-site-validator-probe.md) |
