@@ -23,7 +23,7 @@ two-phase protocol against one miner:
    two minutes. The miner checks its resource budget and records the hold in
    one transaction, or refuses.
 2. **Commit.** A validator-signed lease commits exactly that hold to one
-   image, isolation class, network policy and environment, with a hard expiry
+   image, isolation class, network policy and declared environment, with a hard expiry
    at most 15 minutes ahead.
 3. **Renew.** Validator-signed renewals with a strictly increasing
    `renewal_seq` move the expiry forward. A customer TTL and heartbeat live
@@ -72,11 +72,28 @@ Members that decide behavior are explicit and bounded:
 - `network.mode`: `none`, `public` or `allowlist`. `allow` is always an array;
   in allowlist mode it holds 1-64 sorted unique hostnames or canonical CIDR
   prefixes. Inbound is never open in v1.
-- `env`: non-secret values only, at most 128 entries and 32 KiB. Signed
-  documents are persisted and may be logged by both sides.
-- `secret_env`: `delivery: none`, or `delivery: sealed-bundle-v1` with the
-  sorted secret variable names and the `bundle_digest` of a separately
-  delivered sealed bundle. A secret value never appears in a signed document.
+  A hostname entry matches exactly that host: there is no wildcard or
+  suffix matching in v1. `*.example.com` is not a valid entry, and
+  `example.com` does not admit `api.example.com`. The gateway expands a
+  customer wildcard into exact hosts or CIDR prefixes, or rejects the
+  request; it never widens the policy to `public`. Miner enforcement of
+  hostname entries (DNS-pinned resolution) is not part of this slice, and a
+  miner that cannot enforce an entry refuses with
+  `network_policy_unsupported`.
+- `env`: always the empty object `{}` in v1. Signed documents are persisted
+  and may be logged by both sides, and a customer may pass a secret in any
+  variable, so no environment value ever appears in a signed document. A
+  validator-signed lease with any `env` entry fails validation, signing and
+  admission.
+- `secret_env`: the whole customer environment. `delivery: none` (no
+  variables), or `delivery: sealed-bundle-v1` with 1-128 sorted unique
+  variable names and the `bundle_digest` of a separately delivered sealed
+  bundle that holds the values. The gateway declares **every** customer
+  environment variable here, whether or not the customer marked it secret.
+  The sealed bundle format and delivery path are not built yet, so a miner
+  refuses every `sealed-bundle-v1` lease with `secret_delivery_unsupported`
+  (not a miner fault). Until that path exists, only sandboxes with no
+  customer environment can start.
 
 Receipt error codes and whether they are attributed to the miner:
 `runtime_start_failed` and `miner_restart` are miner faults. These are not:
@@ -125,17 +142,21 @@ customer's model endpoint, secrets for that endpoint, and kernel isolation.
 An earlier draft of this lane allowed only an `egress-deny-v1` network policy
 and no environment at all. That would have made the miner-facing contract
 unusable for that workload without a version bump, so v1 now carries every
-network mode and declared secrets. A miner that cannot yet enforce a mode or
-deliver secrets refuses with a non-fault code; it never silently weakens the
-policy.
+network mode and a declared customer environment. A miner that cannot yet
+enforce a mode or deliver the environment refuses with a non-fault code; it
+never silently weakens the policy. An earlier revision of this slice also
+signed plain, non-secret `env` values. The target workload passes secrets in
+ordinary environment variables and requires that they are never logged or
+listed, so v1 now routes the whole customer environment through
+`secret_env` and fails closed until sealed delivery exists.
 
 | Requirement | This slice | Later |
 | --- | --- | --- |
 | Create from a public OCI image, digest pinning | `image_reference` + `image_digest` | image cache, registry credentials, prefetch: miner backend and validator |
 | Create from a Dockerfile, or from a snapshot; fork N | not in v1 | new source kinds in a later schema version |
 | Resource request per sandbox, billed as requested | `resources` with bounds | usage metering |
-| Egress `public` / `none` / `allowlist` at create | all three modes in the contract | miner enforcement; runtime policy change needs a new document |
-| Secrets in env, never logged or listed | names + sealed bundle digest; values never signed | sealed bundle format and delivery path |
+| Egress `public` / `none` / `allowlist` at create | all three modes in the contract; exact hostnames and CIDR prefixes, no wildcards | miner enforcement; gateway wildcard expansion; runtime policy change needs a new document |
+| Secrets in env, never logged or listed | every customer variable is a `secret_env` name bound to a sealed bundle digest; signed `env` must be `{}`; miners refuse sealed bundles with `secret_delivery_unsupported` | sealed bundle format and delivery path; gateway never echoing values in get or list responses |
 | Kernel isolation (gVisor, Kata or Firecracker); nested Docker | `isolation` class required | backend, nested Docker conformance tests |
 | TTL with heartbeat; delete at expiry, not stop | lease expiry, renewal, release, sweep | customer TTL and heartbeat in the API gateway |
 | Idempotent create and delete | exact replay idempotent; release idempotent | `Idempotency-Key` handling in the API gateway |
@@ -194,3 +215,8 @@ behavior" test.
 - Sandbox state is not kept across a miner restart.
 - Snapshots, forks, exec, file transfer and inbound exposure are not part of
   this slice.
+- Customer environment cannot be delivered yet: every lease that declares
+  variables is refused with `secret_delivery_unsupported` until the sealed
+  bundle path lands.
+- Egress allowlists match exact hostnames and CIDR prefixes only; no
+  wildcard or suffix matching.

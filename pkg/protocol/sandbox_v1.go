@@ -59,7 +59,7 @@ type SandboxReservationV1 struct {
 // OCI image under a hard, renewable expiry.
 type SandboxLeaseV1 struct {
 	AssignmentNonce   string                 `json:"assignment_nonce"`
-	Env               map[string]string      `json:"env"`
+	Env               map[string]string      `json:"env"` // always {} in v1; see sandbox.ValidateEnv
 	Generation        uint64                 `json:"generation"`
 	ImageDigest       string                 `json:"image_digest"`
 	ImageReference    string                 `json:"image_reference"`
@@ -235,11 +235,6 @@ func (l SandboxLeaseV1) validateUnsigned() error {
 	}
 	if err := l.SecretEnv.Validate(); err != nil {
 		return err
-	}
-	for _, name := range l.SecretEnv.Names {
-		if _, plain := l.Env[name]; plain {
-			return errors.New("secret_env name is also a plain env name")
-		}
 	}
 	if err := validateSandboxWindow(l.IssuedAt, l.LeaseExpiresAt, sandbox.MaxLeaseWindow, "lease"); err != nil {
 		return err

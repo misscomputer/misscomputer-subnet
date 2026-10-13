@@ -37,9 +37,7 @@
   "reservation_digest": "sha256:bde669d7113e791522cb864df39b450dbe89914df382471747d7b3a248b72cc7",
   "lease": {
     "assignment_nonce": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
-    "env": {
-      "TASK": "django-12345"
-    },
+    "env": {},
     "generation": 1,
     "image_digest": "sha256:c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
     "image_reference": "docker.io/swebench/sweb.eval.x86_64.django_1776_django-12345@sha256:c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
@@ -66,7 +64,7 @@
       "delivery": "none",
       "names": []
     },
-    "signature": "6d6c1411c3c59e6bf705ee3ab493d6698217f87885140e4800d558dc2f944bc4cdd7aac5b3bce701a2c8cdb452232f2ce84beb20c3b7ec364c3c929197411101",
+    "signature": "4b57115852afc7ae00eb277614375d6433b14619a9133c89b2dab392008457c0df3b9c8045736a61c434235be27bfc29d610a4004999cfd18b454ab876aa8404",
     "subnet": {
       "chain_block": 100,
       "epoch": 10,
@@ -84,12 +82,12 @@
     },
     "workload_kind": "sandbox"
   },
-  "lease_digest": "sha256:63b06325864fc0cbbacd32bd729558f7e179fb8d28e6d07d2d866df34c749027",
+  "lease_digest": "sha256:c800ac3165b29cc8d7bc74470322b0ccf3f2a1e4dafd210d0455d1df6eca2869",
   "lease_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f-5Fminer-g1-b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
   "renewal": {
     "generation": 1,
     "issued_at": "2026-10-13T12:10:00Z",
-    "lease_digest": "sha256:63b06325864fc0cbbacd32bd729558f7e179fb8d28e6d07d2d866df34c749027",
+    "lease_digest": "sha256:c800ac3165b29cc8d7bc74470322b0ccf3f2a1e4dafd210d0455d1df6eca2869",
     "lease_expires_at": "2026-10-13T12:20:00Z",
     "lease_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f-5Fminer-g1-b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
     "miner_id": "5Fminer",
@@ -97,7 +95,7 @@
     "sandbox_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
     "schema": "miss.computer/misscomputer-subnet/sandbox-lease-renewal",
     "schema_version": 1,
-    "signature": "2b66027db45f492654ff2c204f8cd81c456900f7a93cb64d5d996c7ae48d6d8da24bea404dfbd8416e714e49bcc8dafeebe53c59d315957000cc7a748abcc008",
+    "signature": "f23949740c1d26644ab5c4400bf7f011b3ca5d216a61df1b4a45124eafab53782ec1d2c64becf3eea6a7175d2a087fdcbabbd4b83e33478b1ae516affbb46908",
     "subnet": {
       "chain_block": 100,
       "epoch": 10,
@@ -158,7 +156,7 @@
       "memory_mib": 32768,
       "sandboxes": 8
     },
-    "document_digest": "sha256:63b06325864fc0cbbacd32bd729558f7e179fb8d28e6d07d2d866df34c749027",
+    "document_digest": "sha256:c800ac3165b29cc8d7bc74470322b0ccf3f2a1e4dafd210d0455d1df6eca2869",
     "document_schema": "miss.computer/misscomputer-subnet/sandbox-lease-ticket",
     "error_code": null,
     "generation": 1,
@@ -169,7 +167,7 @@
     "sandbox_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
     "schema": "miss.computer/misscomputer-subnet/sandbox-lease-receipt",
     "schema_version": 1,
-    "signature": "8f1fd48f99f299d9be8dbf1bbd7fca004de76f02f7daa6d4f9541dbe847ceafb4bdab6c1cc4e0e2e0ed54106321a3f4e50fb1cee8753d848afe4362345736e07",
+    "signature": "51b8eadce39fe2e534d46fc82d2ee44c77d13b07ff5ff4ba2b9a6c6d335e252fa17385e5e0efd380185c62f72d7b8cb66dc538a7cf7073f7225877c3a000ba05",
     "stage": "ready",
     "subnet": {
       "chain_block": 100,

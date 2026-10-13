@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,7 +65,7 @@ func sandboxLease(t *testing.T, validator, miner ed25519.PrivateKey, reservation
 	}
 	image := "sha256:" + strings.Repeat("c4", 32)
 	l := protocol.SandboxLeaseV1{
-		AssignmentNonce: strings.Repeat("b2", 16), Env: map[string]string{"TASK": "django-12345"}, Generation: reservation.Generation,
+		AssignmentNonce: strings.Repeat("b2", 16), Env: map[string]string{}, Generation: reservation.Generation,
 		ImageDigest: image, ImageReference: "docker.io/swebench/sweb.eval.x86_64.django_1776_django-12345@" + image,
 		Isolation: sandbox.IsolationGVisor, IssuedAt: stamp(sandboxNow.Add(10 * time.Second)), LeaseExpiresAt: stamp(sandboxNow.Add(10 * time.Minute)),
 		MinerID: reservation.MinerID, Network: sandbox.NetworkPolicy{Mode: sandbox.NetworkPublic, Allow: []string{}},
@@ -331,9 +332,10 @@ func TestSandboxDocumentsAndWebTicketsDoNotCrossDecode(t *testing.T) {
 	}
 }
 
-// The v1 lease contract carries every egress mode and declared secrets; it
-// is not an egress-deny-only or secretless contract. Values never travel in
-// a signed document: secret_env binds only names and a bundle digest.
+// The v1 lease contract carries every egress mode and a declared customer
+// environment; it is not an egress-deny-only or environment-less contract.
+// Values never travel in a signed document: secret_env binds only names and
+// a bundle digest.
 func TestSandboxLeaseCarriesNetworkModesAndSecretDeclarations(t *testing.T) {
 	validator, miner := sandboxKeys()
 	reservation := sandboxReservation(t, validator, miner)
@@ -350,6 +352,11 @@ func TestSandboxLeaseCarriesNetworkModesAndSecretDeclarations(t *testing.T) {
 		},
 		"sealed secrets": func(l *protocol.SandboxLeaseV1) {
 			l.SecretEnv = sandbox.SecretEnv{Delivery: sandbox.SecretDeliverySealedBundle, Names: []string{"MODEL_API_KEY", "REGISTRY_TOKEN"}, BundleDigest: &bundle}
+		},
+		// Every customer variable is declared here, so the bound is the whole
+		// customer environment: 128 names, the earlier plain env limit.
+		"full declared environment": func(l *protocol.SandboxLeaseV1) {
+			l.SecretEnv = sandbox.SecretEnv{Delivery: sandbox.SecretDeliverySealedBundle, Names: envNames(128), BundleDigest: &bundle}
 		},
 		"kata":        func(l *protocol.SandboxLeaseV1) { l.Isolation = sandbox.IsolationKata },
 		"firecracker": func(l *protocol.SandboxLeaseV1) { l.Isolation = sandbox.IsolationFirecracker },
@@ -406,27 +413,29 @@ func TestSandboxDocumentsRejectInvalidMembers(t *testing.T) {
 		"unsorted allowlist": func(l *protocol.SandboxLeaseV1) {
 			l.Network = sandbox.NetworkPolicy{Mode: sandbox.NetworkAllowlist, Allow: []string{"pypi.org", "api.example.com"}}
 		},
+		"wildcard hostname": func(l *protocol.SandboxLeaseV1) {
+			l.Network = sandbox.NetworkPolicy{Mode: sandbox.NetworkAllowlist, Allow: []string{"*.example.com"}}
+		},
 		"non-canonical cidr": func(l *protocol.SandboxLeaseV1) {
 			l.Network = sandbox.NetworkPolicy{Mode: sandbox.NetworkAllowlist, Allow: []string{"10.1.2.3/8"}}
 		},
-		"null env":          func(l *protocol.SandboxLeaseV1) { l.Env = nil },
-		"invalid env name":  func(l *protocol.SandboxLeaseV1) { l.Env = map[string]string{"1BAD": "x"} },
-		"env control chars": func(l *protocol.SandboxLeaseV1) { l.Env = map[string]string{"OK": "a\nb"} },
+		"null env":        func(l *protocol.SandboxLeaseV1) { l.Env = nil },
+		"plain env value": func(l *protocol.SandboxLeaseV1) { l.Env = map[string]string{"TASK": "django-12345"} },
 		"secret names without delivery": func(l *protocol.SandboxLeaseV1) {
 			l.SecretEnv = sandbox.SecretEnv{Delivery: sandbox.SecretDeliveryNone, Names: []string{"TOKEN"}}
 		},
 		"sealed bundle without digest": func(l *protocol.SandboxLeaseV1) {
 			l.SecretEnv = sandbox.SecretEnv{Delivery: sandbox.SecretDeliverySealedBundle, Names: []string{"TOKEN"}}
 		},
-		"secret also plain env": func(l *protocol.SandboxLeaseV1) {
-			l.SecretEnv = sandbox.SecretEnv{Delivery: sandbox.SecretDeliverySealedBundle, Names: []string{"TASK"}, BundleDigest: &bundle}
+		"too many declared names": func(l *protocol.SandboxLeaseV1) {
+			l.SecretEnv = sandbox.SecretEnv{Delivery: sandbox.SecretDeliverySealedBundle, Names: envNames(129), BundleDigest: &bundle}
 		},
 		"unknown delivery":           func(l *protocol.SandboxLeaseV1) { l.SecretEnv.Delivery = "plaintext" },
 		"invalid reservation digest": func(l *protocol.SandboxLeaseV1) { l.ReservationDigest = "sha256:abc" },
 	}
 	for name, mutate := range leaseCases {
 		candidate := base
-		candidate.Env = map[string]string{"TASK": "django-12345"}
+		candidate.Env = map[string]string{}
 		candidate.Signature = ""
 		mutate(&candidate)
 		if protocol.SignSandboxLeaseV1(&candidate, validator) == nil {
@@ -578,5 +587,45 @@ func TestSandboxLeaseMustCommitItsReservation(t *testing.T) {
 	foreign := sandboxLease(t, otherValidator, miner, reservation, nil)
 	if protocol.SandboxLeaseCommitsReservationV1(reservation, foreign) == nil {
 		t.Fatal("another validator's lease committed the reservation")
+	}
+}
+
+func envNames(n int) []string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf("VAR_%03d", i)
+	}
+	return names
+}
+
+// Signed documents are persisted and may be logged, and a customer may put a
+// secret in any variable, so a lease that carries an environment value is
+// refused even when the validator key signed it under the lease domain: no
+// receiving miner may admit, store or act on it.
+func TestSandboxLeaseRefusesPlainEnvironmentValues(t *testing.T) {
+	validator, miner := sandboxKeys()
+	validatorKey := validator.Public().(ed25519.PublicKey)
+	reservation := sandboxReservation(t, validator, miner)
+	lease := sandboxLease(t, validator, miner, reservation, nil)
+	uid := uint16(7)
+	admit := func(l protocol.SandboxLeaseV1) error {
+		return protocol.VerifyBoundSandboxLeaseV1(l, validatorKey, sandboxNow.Add(time.Minute), 110, "test", 24, "5Hvalidator", "5Fminer", &uid)
+	}
+	if err := admit(lease); err != nil {
+		t.Fatal(err)
+	}
+	carrying := lease
+	carrying.Env = map[string]string{"MODEL_API_KEY": "sk-live-not-a-real-key"}
+	carrying.Signature = hex.EncodeToString(ed25519.Sign(validator, signedMessage(t, protocol.SandboxLeaseSigningDomain, carrying)))
+	if err := protocol.VerifySandboxLeaseV1Signature(carrying, validatorKey); err == nil {
+		t.Fatal("a validator-signed lease carrying an environment value verified")
+	}
+	if err := admit(carrying); err == nil {
+		t.Fatal("a validator-signed lease carrying an environment value was admitted")
+	}
+	resigned := carrying
+	resigned.Signature = ""
+	if protocol.SignSandboxLeaseV1(&resigned, validator) == nil {
+		t.Fatal("a lease carrying an environment value was signed")
 	}
 }

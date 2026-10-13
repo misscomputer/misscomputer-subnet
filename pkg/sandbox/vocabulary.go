@@ -108,6 +108,11 @@ type NetworkPolicy struct {
 	Mode  string   `json:"mode"`
 }
 
+// A hostname entry names exactly that host. v1 has no wildcard or suffix
+// match: "*.example.com" is not a valid entry and "example.com" does not
+// admit "api.example.com". A gateway expands a customer wildcard into exact
+// hosts or a CIDR, or refuses the request; it never widens it to public.
+//
 // Validate requires allow to be present (an empty array, never null), empty
 // unless mode is allowlist, and otherwise 1..64 sorted unique hostnames or
 // canonical CIDR prefixes.
@@ -161,50 +166,40 @@ func ValidIsolation(value string) bool {
 	return false
 }
 
-// Environment bounds. env carries only non-secret values: every signed
-// document is persisted and may be logged by validator and miner.
-const (
-	MaxEnvEntries    = 128
-	MaxEnvValueBytes = 4096
-	MaxEnvTotalBytes = 32768
-	MaxSecretNames   = 64
-)
+// MaxSecretNames bounds the declared environment of one sandbox. Every
+// customer environment variable is declared in secret_env, so this is the
+// whole customer environment, not only the variables a customer marks secret.
+const MaxSecretNames = 128
 
 var (
-	envNamePattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
-	envValuePattern = regexp.MustCompile(`^[\x20-\x7e\t]*$`)
-	imagePattern    = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*@(sha256:[0-9a-f]{64})$`)
+	envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+	imagePattern   = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*@(sha256:[0-9a-f]{64})$`)
 )
 
 // ValidEnvName reports whether value is a portable environment name.
 func ValidEnvName(value string) bool { return envNamePattern.MatchString(value) }
 
-// ValidateEnv checks a non-secret environment map. It must be present (an
-// empty object, never null).
+// ValidateEnv requires the signed env member to be an empty object (never
+// null). Signed documents are persisted and may be logged by validator and
+// miner, and a customer may pass a secret in any variable, so no environment
+// value travels in a signed document: the gateway declares every customer
+// variable in secret_env.
 func ValidateEnv(env map[string]string) error {
 	if env == nil {
 		return errors.New("env must be an object")
 	}
-	if len(env) > MaxEnvEntries {
-		return errors.New("env has too many entries")
-	}
-	total := 0
-	for name, value := range env {
-		if !ValidEnvName(name) || len(value) > MaxEnvValueBytes || !envValuePattern.MatchString(value) {
-			return errors.New("env entry is invalid")
-		}
-		total += len(name) + len(value)
-	}
-	if total > MaxEnvTotalBytes {
-		return errors.New("env is too large")
+	if len(env) != 0 {
+		return errors.New("env must be empty: customer environment is declared in secret_env")
 	}
 	return nil
 }
 
-// Secret delivery schemes. A signed document never carries a secret value.
-// sealed-bundle-v1 names the variables and binds the digest of a bundle
-// that is delivered separately; its delivery path is not implemented yet,
-// so a miner refuses it with secret_delivery_unsupported.
+// Secret delivery schemes. A signed document never carries an environment
+// value. sealed-bundle-v1 names the variables and binds the digest of a
+// bundle that is delivered separately. Its delivery path is not implemented
+// yet, so a miner refuses every sealed-bundle-v1 lease with
+// secret_delivery_unsupported; a sandbox with customer environment cannot
+// start until that path exists.
 const (
 	SecretDeliveryNone         = "none"
 	SecretDeliverySealedBundle = "sealed-bundle-v1"
@@ -236,7 +231,7 @@ func (s SecretEnv) Validate() error {
 		return errors.New("secret_env bundle_digest is invalid")
 	}
 	if len(s.Names) == 0 || len(s.Names) > MaxSecretNames || !sortedUnique(s.Names) {
-		return errors.New("secret_env names must be 1..64 sorted unique names")
+		return errors.New("secret_env names must be 1..128 sorted unique names")
 	}
 	for _, name := range s.Names {
 		if !ValidEnvName(name) {
