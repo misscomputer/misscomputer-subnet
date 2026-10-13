@@ -24,7 +24,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import organic_contracts, static_contracts
+from . import organic_contracts, sandbox_transport, static_contracts
 from .auth import (
     BRIDGE_MAX_BODY,
     BridgeClient,
@@ -63,6 +63,7 @@ from .protocol import (
     StatusSynapse,
     SubnetBinding,
 )
+from .sandbox_transport import LocalSandboxRequestV1, SandboxResponseV1, SandboxSynapseV1
 from .static_contracts import (
     LocalStaticAssignRequestV1,
     StaticDeployResponseV1,
@@ -284,6 +285,7 @@ class MinerNeuron:
         capability_fault_file: str | None = None,
         body_idle_timeout: float = DEFAULT_BODY_IDLE_TIMEOUT,
         body_total_timeout: float = DEFAULT_BODY_TOTAL_TIMEOUT,
+        sandbox_leases: bool = False,
     ) -> None:
         if mock_http == (tls_config is not None):
             raise ValueError("miner must use either validated TLS or explicit mock HTTP")
@@ -310,6 +312,8 @@ class MinerNeuron:
         # serving. The mock subnet uses it to pin the exact window in which a
         # discovery refresh omits an assigned miner.
         self.capability_fault_file = capability_fault_file
+        # Default off: without it no /api/v1/sandbox/* route exists.
+        self.sandbox_leases = sandbox_leases
         self.ready = asyncio.Event()
         self.stop = asyncio.Event()
         self.app = FastAPI(lifespan=self._lifespan)
@@ -483,7 +487,74 @@ class MinerNeuron:
         assert isinstance(result, (StaticDeployResponseV1, StaticStatusResponseV1))
         return result
 
+    async def _sandbox_forward(self, kind: str, request: Request) -> SandboxResponseV1:
+        """Forward one validator-signed sandbox document to the Go agent.
+
+        The same btauth and Bittensor identity checks as a static ticket run
+        before agent contact; the Go agent verifies the document itself. An
+        agent running with the sandbox lane off answers ``sandbox_disabled``,
+        which keeps its stable code here (ineligible, not a fault).
+        """
+
+        body = await self._body(request)
+        caller = await self._authenticated(request, body)
+        if _envelope_protocol(body) != sandbox_transport.SYNAPSE_VERSION:
+            raise HTTPException(
+                status_code=422,
+                detail="only subnet-sandbox-synapse.v1 sandbox documents are accepted",
+            )
+        try:
+            synapse = parse_document(body, SandboxSynapseV1)
+            header = sandbox_transport.document_header(synapse.document, kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if synapse.caller_hotkey != caller.hotkey:
+            raise HTTPException(status_code=403, detail="body caller differs from btauth caller")
+        await self._verify_assignment_identity(
+            caller.hotkey, synapse.current_block, synapse.validator_binding, header.subnet
+        )
+        local = LocalSandboxRequestV1(
+            protocol=sandbox_transport.SYNAPSE_VERSION,
+            request_id=synapse.request_id,
+            current_block=synapse.current_block,
+            caller_hotkey=caller.hotkey,
+            binding_verified=True,
+            validator_binding=synapse.validator_binding,
+            document=synapse.document,
+        )
+        async with self.gate.slot(caller.priority):
+            try:
+                result = await self.bridge.request(
+                    "POST", f"/v1/sandbox/{kind}", value=local, response_model=SandboxResponseV1
+                )
+            except BridgeError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+        assert isinstance(result, SandboxResponseV1)
+        try:
+            if result.request_id != synapse.request_id:
+                raise ValueError(sandbox_transport.SANDBOX_RECEIPT_MISMATCH)
+            sandbox_transport.receipt_answers(result.receipt, header, kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result
+
+    def _sandbox_route(self, kind: str) -> None:
+        async def forward(request: Request) -> SandboxResponseV1:
+            return await self._sandbox_forward(kind, request)
+
+        self.app.add_api_route(
+            f"/api/v1/sandbox/{kind}",
+            forward,
+            methods=["POST"],
+            response_model=None,
+            name=f"sandbox_{kind}",
+        )
+
     def _routes(self) -> None:
+        if self.sandbox_leases:
+            for kind in sandbox_transport.DOCUMENT_SCHEMAS:
+                self._sandbox_route(kind)
+
         @self.app.get("/healthz")
         async def health() -> Response:
             return Response(status_code=204 if self.ready.is_set() else 503)
@@ -834,6 +905,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mock-uri")
     parser.add_argument("--mock-peers")
     parser.add_argument("--mock-capability-fault-file")
+    parser.add_argument(
+        "--sandbox-leases",
+        choices=("on", "off"),
+        default="off",
+        help="forward subnet-sandbox-synapse.v1 documents to the Go agent (default off)",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -897,6 +974,7 @@ def main() -> None:
         mock_http=args.allow_insecure_mock_http,
         tls_config=tls_config,
         capability_fault_file=args.mock_capability_fault_file,
+        sandbox_leases=args.sandbox_leases == "on",
     )
     if tls_config is None:
         uvicorn.run(

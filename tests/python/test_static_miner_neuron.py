@@ -60,7 +60,7 @@ class StaticBridge(FakeBridge):
         return await super().request(method, path, value=value, response_model=response_model)
 
 
-async def _neuron(tmp_path: Path, bridge: FakeBridge) -> tuple[MinerNeuron, Any]:
+async def _neuron(tmp_path: Path, bridge: FakeBridge, **options: Any) -> tuple[MinerNeuron, Any]:
     peers = (
         MockPeer("//Validator", 0, None, True, 2_000),
         MockPeer("//Miner1", 1, "http://miner.invalid", False, 10),
@@ -79,6 +79,7 @@ async def _neuron(tmp_path: Path, bridge: FakeBridge) -> tuple[MinerNeuron, Any]
         max_concurrency=1,
         mock_http=True,
         tls_config=None,
+        **options,
     )
     snapshot = await chain.sync()
     await neuron.state.set(snapshot)
