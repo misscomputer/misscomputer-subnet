@@ -1,0 +1,192 @@
+{
+  "miner_test_seed": "2222222222222222222222222222222222222222222222222222222222222222",
+  "miner_service_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+  "reservation": {
+    "generation": 1,
+    "hold_expires_at": "2026-10-13T12:01:00Z",
+    "issued_at": "2026-10-13T12:00:00Z",
+    "miner_id": "5Fminer",
+    "reservation_nonce": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "resources": {
+      "cpu_millis": 1000,
+      "disk_mib": 10240,
+      "memory_mib": 4096,
+      "pids": 512
+    },
+    "sandbox_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "schema": "miss.computer/misscomputer-subnet/sandbox-reservation-ticket",
+    "schema_version": 1,
+    "signature": "74130ed0ebbf12320f0d44c1219c1a03dd6ac8e2556c1c6893b36c8476f2a4d77204b775ebdfbb042dd233f215cdfa7e610d055559441defef71ace736d82001",
+    "subnet": {
+      "chain_block": 100,
+      "epoch": 10,
+      "expires_at_block": 125,
+      "miner_axon_url": "https://8.8.8.8:8091",
+      "miner_hotkey": "5Fminer",
+      "miner_service_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "miner_tls_certificate_sha256": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "miner_transport": "https",
+      "miner_uid": 7,
+      "netuid": 24,
+      "network": "test",
+      "validator_hotkey": "5Hvalidator",
+      "validator_service_public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+    },
+    "workload_kind": "sandbox"
+  },
+  "reservation_digest": "sha256:bde669d7113e791522cb864df39b450dbe89914df382471747d7b3a248b72cc7",
+  "lease": {
+    "assignment_nonce": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "env": {
+      "TASK": "django-12345"
+    },
+    "generation": 1,
+    "image_digest": "sha256:c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "image_reference": "docker.io/swebench/sweb.eval.x86_64.django_1776_django-12345@sha256:c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+    "isolation": "gvisor",
+    "issued_at": "2026-10-13T12:00:10Z",
+    "lease_expires_at": "2026-10-13T12:10:00Z",
+    "miner_id": "5Fminer",
+    "network": {
+      "allow": [],
+      "mode": "public"
+    },
+    "reservation_digest": "sha256:bde669d7113e791522cb864df39b450dbe89914df382471747d7b3a248b72cc7",
+    "resources": {
+      "cpu_millis": 1000,
+      "disk_mib": 10240,
+      "memory_mib": 4096,
+      "pids": 512
+    },
+    "sandbox_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "schema": "miss.computer/misscomputer-subnet/sandbox-lease-ticket",
+    "schema_version": 1,
+    "secret_env": {
+      "bundle_digest": null,
+      "delivery": "none",
+      "names": []
+    },
+    "signature": "6d6c1411c3c59e6bf705ee3ab493d6698217f87885140e4800d558dc2f944bc4cdd7aac5b3bce701a2c8cdb452232f2ce84beb20c3b7ec364c3c929197411101",
+    "subnet": {
+      "chain_block": 100,
+      "epoch": 10,
+      "expires_at_block": 125,
+      "miner_axon_url": "https://8.8.8.8:8091",
+      "miner_hotkey": "5Fminer",
+      "miner_service_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "miner_tls_certificate_sha256": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "miner_transport": "https",
+      "miner_uid": 7,
+      "netuid": 24,
+      "network": "test",
+      "validator_hotkey": "5Hvalidator",
+      "validator_service_public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+    },
+    "workload_kind": "sandbox"
+  },
+  "lease_digest": "sha256:63b06325864fc0cbbacd32bd729558f7e179fb8d28e6d07d2d866df34c749027",
+  "lease_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f-5Fminer-g1-b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "renewal": {
+    "generation": 1,
+    "issued_at": "2026-10-13T12:10:00Z",
+    "lease_digest": "sha256:63b06325864fc0cbbacd32bd729558f7e179fb8d28e6d07d2d866df34c749027",
+    "lease_expires_at": "2026-10-13T12:20:00Z",
+    "lease_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f-5Fminer-g1-b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "miner_id": "5Fminer",
+    "renewal_seq": 1,
+    "sandbox_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "schema": "miss.computer/misscomputer-subnet/sandbox-lease-renewal",
+    "schema_version": 1,
+    "signature": "2b66027db45f492654ff2c204f8cd81c456900f7a93cb64d5d996c7ae48d6d8da24bea404dfbd8416e714e49bcc8dafeebe53c59d315957000cc7a748abcc008",
+    "subnet": {
+      "chain_block": 100,
+      "epoch": 10,
+      "expires_at_block": 125,
+      "miner_axon_url": "https://8.8.8.8:8091",
+      "miner_hotkey": "5Fminer",
+      "miner_service_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "miner_tls_certificate_sha256": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "miner_transport": "https",
+      "miner_uid": 7,
+      "netuid": 24,
+      "network": "test",
+      "validator_hotkey": "5Hvalidator",
+      "validator_service_public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+    }
+  },
+  "release": {
+    "generation": 1,
+    "issued_at": "2026-10-13T12:01:00Z",
+    "miner_id": "5Fminer",
+    "reason": "customer_delete",
+    "sandbox_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "schema": "miss.computer/misscomputer-subnet/sandbox-lease-release",
+    "schema_version": 1,
+    "signature": "a7d2fe55b979b29cc1791ecc26e5cfdb4bc39c4f2b983a45dbe955590bafb9a09b7e02a291216276cbc5de6d89de02d43fcd7cc6f5c7baaa7163b2504ed9eb01",
+    "subnet": {
+      "chain_block": 100,
+      "epoch": 10,
+      "expires_at_block": 125,
+      "miner_axon_url": "https://8.8.8.8:8091",
+      "miner_hotkey": "5Fminer",
+      "miner_service_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "miner_tls_certificate_sha256": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "miner_transport": "https",
+      "miner_uid": 7,
+      "netuid": 24,
+      "network": "test",
+      "validator_hotkey": "5Hvalidator",
+      "validator_service_public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+    }
+  },
+  "receipt": {
+    "capacity_active": {
+      "cpu_millis": 0,
+      "disk_mib": 0,
+      "memory_mib": 0,
+      "sandboxes": 0
+    },
+    "capacity_held": {
+      "cpu_millis": 1000,
+      "disk_mib": 10240,
+      "memory_mib": 4096,
+      "sandboxes": 1
+    },
+    "capacity_total": {
+      "cpu_millis": 8000,
+      "disk_mib": 204800,
+      "memory_mib": 32768,
+      "sandboxes": 8
+    },
+    "document_digest": "sha256:63b06325864fc0cbbacd32bd729558f7e179fb8d28e6d07d2d866df34c749027",
+    "document_schema": "miss.computer/misscomputer-subnet/sandbox-lease-ticket",
+    "error_code": null,
+    "generation": 1,
+    "lease_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f-5Fminer-g1-b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    "miner_id": "5Fminer",
+    "observed_at": "2026-10-13T12:00:01Z",
+    "renewal_seq": 0,
+    "sandbox_id": "sbx-0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "schema": "miss.computer/misscomputer-subnet/sandbox-lease-receipt",
+    "schema_version": 1,
+    "signature": "8f1fd48f99f299d9be8dbf1bbd7fca004de76f02f7daa6d4f9541dbe847ceafb4bdab6c1cc4e0e2e0ed54106321a3f4e50fb1cee8753d848afe4362345736e07",
+    "stage": "ready",
+    "subnet": {
+      "chain_block": 100,
+      "epoch": 10,
+      "expires_at_block": 125,
+      "miner_axon_url": "https://8.8.8.8:8091",
+      "miner_hotkey": "5Fminer",
+      "miner_service_public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "miner_tls_certificate_sha256": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+      "miner_transport": "https",
+      "miner_uid": 7,
+      "netuid": 24,
+      "network": "test",
+      "validator_hotkey": "5Hvalidator",
+      "validator_service_public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+    }
+  },
+  "validator_test_seed": "1111111111111111111111111111111111111111111111111111111111111111",
+  "validator_service_public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+}
