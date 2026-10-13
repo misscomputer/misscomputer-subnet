@@ -54,9 +54,12 @@ func (b *sbBackend) Budget(context.Context) (SandboxBudget, error) {
 
 func (b *sbBackend) Unsupported(protocol.SandboxLeaseV1) string { return b.unsupported }
 
-func (b *sbBackend) Create(_ context.Context, instance string, _ protocol.SandboxLeaseV1) error {
+func (b *sbBackend) Create(ctx context.Context, instance string, _ protocol.SandboxLeaseV1) error {
 	if b.createGate != nil {
 		<-b.createGate
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -68,7 +71,10 @@ func (b *sbBackend) Create(_ context.Context, instance string, _ protocol.Sandbo
 	return nil
 }
 
-func (b *sbBackend) Destroy(_ context.Context, instance string) error {
+func (b *sbBackend) Destroy(ctx context.Context, instance string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.destroyed = append(b.destroyed, instance)
@@ -369,6 +375,75 @@ func TestSandboxDestroyFailureKeepsCapacityUntilSweep(t *testing.T) {
 	}
 	if _, active, err := f.store.Occupancy(context.Background(), f.now); err != nil || active.Sandboxes != 0 {
 		t.Fatalf("after a successful sweep active=%+v err=%v", active, err)
+	}
+}
+
+// A client disconnect after the lease was saved must not abort a successful
+// create or prevent cleanup of a failed one.
+func TestSandboxCommitFinishesAfterRequestCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		createErr error
+		stage     string
+		code      string
+		status    string
+		active    int
+	}{
+		{name: "create succeeds", stage: sandbox.StageReady, status: "running", active: 1},
+		{name: "create fails", createErr: errors.New("runtime failed to start"), stage: sandbox.StageFailed, code: "runtime_start_failed", status: "failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newSBFixture(t)
+			ctx := context.Background()
+			r := f.reservation(1)
+			receipt, err := f.lane.Reserve(ctx, r, f.request())
+			f.check(receipt, err, protocol.SandboxReservationSchema, r, sandbox.StageHeld, "")
+			l := f.lease(r, nil)
+			leaseID := protocol.SandboxLeaseIDV1(l)
+			f.backend.createGate = make(chan struct{})
+			f.backend.createErr = test.createErr
+			requestCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			type result struct {
+				receipt protocol.SandboxReceiptV1
+				err     error
+			}
+			done := make(chan result, 1)
+			go func() {
+				receipt, err := f.lane.Commit(requestCtx, l, f.request())
+				done <- result{receipt, err}
+			}()
+			waitLease(t, f, leaseID, "pending")
+			cancel()
+			close(f.backend.createGate)
+			got := <-done
+			f.check(got.receipt, got.err, protocol.SandboxLeaseSchema, l, test.stage, test.code)
+			if record, found, err := f.store.Lease(ctx, leaseID); err != nil || !found || record.Status != test.status {
+				t.Fatalf("cancelled request left lease at %q (found=%v, err=%v), want %s", record.Status, found, err, test.status)
+			}
+			if _, active, err := f.store.Occupancy(ctx, f.now); err != nil || active.Sandboxes != test.active {
+				t.Fatalf("cancelled request left active capacity %+v, err=%v; want %d sandboxes", active, err, test.active)
+			}
+		})
+	}
+}
+
+// A crash after the durable pending write can be resumed by the same signed
+// lease rather than returning accepted forever without a sandbox.
+func TestSandboxCommitReplayStartsOrphanedPendingLease(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	r := f.reservation(1)
+	receipt, err := f.lane.Reserve(ctx, r, f.request())
+	f.check(receipt, err, protocol.SandboxReservationSchema, r, sandbox.StageHeld, "")
+	l := f.lease(r, nil)
+	if outcome, err := f.store.CommitLease(ctx, l, f.now); err != nil || !outcome.Start {
+		t.Fatalf("stage pending lease: outcome=%+v err=%v", outcome, err)
+	}
+	receipt, err = f.lane.Commit(ctx, l, f.request())
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+	if live, created, _ := f.backend.state(); live != 1 || len(created) != 1 {
+		t.Fatalf("replayed pending lease: live=%d creates=%v, want one live sandbox", live, created)
 	}
 }
 

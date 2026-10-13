@@ -32,10 +32,12 @@ type SandboxBackend interface {
 	Unsupported(lease protocol.SandboxLeaseV1) string
 	// Create starts the sandbox of lease under instanceID, a deterministic
 	// name derived from the lease ID. It must be idempotent per instanceID.
+	// It must return when ctx is cancelled, even if startup is incomplete;
+	// a later Destroy or replay of Create must settle that same instance.
 	// A *SandboxRefusal reports a condition that is not the miner's fault.
 	Create(ctx context.Context, instanceID string, lease protocol.SandboxLeaseV1) error
 	// Destroy deletes the sandbox and everything it wrote. It must be
-	// idempotent and return nil when the sandbox does not exist.
+	// idempotent, return nil when the sandbox does not exist, and honor ctx.
 	Destroy(ctx context.Context, instanceID string) error
 }
 
@@ -71,6 +73,12 @@ type SandboxLaneConfig struct {
 // every sandbox of the identity is gone. The validator retries the same
 // release; the sweep keeps destroying in the meantime.
 var ErrSandboxCleanupPending = errors.New("sandbox release is fenced but its sandbox is not destroyed yet; retry the release")
+
+const (
+	sandboxCreateTimeout  = 5 * time.Minute
+	sandboxStateTimeout   = 30 * time.Second
+	sandboxCleanupTimeout = 5 * time.Minute
+)
 
 // SandboxRefusal is a backend failure that is not attributed to the miner,
 // such as an image that cannot be pulled.
@@ -187,8 +195,10 @@ func (l *SandboxLane) Reserve(ctx context.Context, r protocol.SandboxReservation
 }
 
 // Commit commits a verified lease to its hold, starts its sandbox on the
-// first acceptance, and answers replays from durable state. The lease is
-// durable as pending before the backend is asked to create anything.
+// first acceptance, and resumes a pending lease on replay. The lease is
+// durable as pending before the backend is asked to create anything. Runtime
+// work is bounded but does not inherit the HTTP request's cancellation: a
+// disconnected validator cannot strand a lease after that durable write.
 func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1, req SandboxRequest) (protocol.SandboxReceiptV1, error) {
 	now := l.now().UTC()
 	if err := protocol.VerifyBoundSandboxLeaseV1(lease, req.ValidatorKey, now, req.CurrentBlock, req.Network, req.NetUID, req.CallerHotkey, req.MinerHotkey, req.MinerUID); err != nil {
@@ -200,7 +210,7 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 	leaseID := protocol.SandboxLeaseIDV1(lease)
 	unlock := l.locks.lock(leaseID)
 	outcome, err := l.store.CommitLease(ctx, lease, now)
-	if err == nil && outcome.Start {
+	if err == nil && (outcome.Start || outcome.Stage == sandbox.StageAccepted) {
 		outcome, err = l.start(ctx, lease, leaseID, now)
 	}
 	unlock()
@@ -215,16 +225,24 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, leaseID string, now time.Time) (durable.SandboxOutcome, error) {
 	instance := SandboxInstanceName(leaseID)
 	code := l.unsupported(lease)
+	workCtx := context.WithoutCancel(ctx)
 	if code == "" {
-		err := l.backend.Create(ctx, instance, lease)
+		createCtx, cancel := context.WithTimeout(workCtx, sandboxCreateTimeout)
+		err := l.backend.Create(createCtx, instance, lease)
+		cancel()
 		if err == nil {
 			// When a release or sweep moved the lease to cleanup while the
 			// sandbox started, the lease stays in cleanup: that caller is
 			// waiting on this lease's lock and destroys the sandbox next.
-			if _, err := l.store.MarkLeaseRunning(ctx, leaseID, now); err != nil {
-				return durable.SandboxOutcome{}, err
+			stateCtx, stateCancel := context.WithTimeout(workCtx, sandboxStateTimeout)
+			_, stateErr := l.store.MarkLeaseRunning(stateCtx, leaseID, now)
+			if stateErr == nil {
+				outcome, err := l.store.CommitLease(stateCtx, lease, now)
+				stateCancel()
+				return outcome, err
 			}
-			return l.store.CommitLease(ctx, lease, now)
+			stateCancel()
+			err = stateErr
 		}
 		code = "runtime_start_failed"
 		var refusal *SandboxRefusal
@@ -234,12 +252,14 @@ func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, 
 			}
 		}
 	}
-	if err := l.store.BeginLeaseCleanup(ctx, leaseID, "failed", &code, now); err != nil {
+	cleanupCtx, cleanupCancel := context.WithTimeout(workCtx, sandboxCleanupTimeout)
+	defer cleanupCancel()
+	if err := l.store.BeginLeaseCleanup(cleanupCtx, leaseID, "failed", &code, now); err != nil {
 		return durable.SandboxOutcome{}, err
 	}
-	_ = l.teardown(ctx, leaseID, instance, now)
+	_ = l.teardown(cleanupCtx, leaseID, instance, now)
 	// An exact replay of the lease answers from the durable row.
-	return l.store.CommitLease(ctx, lease, now)
+	return l.store.CommitLease(cleanupCtx, lease, now)
 }
 
 // unsupported is the non-fault refusal of a lease the lane or backend
