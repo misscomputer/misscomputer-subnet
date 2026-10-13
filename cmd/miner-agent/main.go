@@ -27,6 +27,7 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	deployruntime "github.com/misscomputer/misscomputer-subnet/pkg/runtime"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
 	"github.com/misscomputer/misscomputer-subnet/pkg/service"
 	"github.com/misscomputer/misscomputer-subnet/pkg/tunnel"
 )
@@ -39,6 +40,9 @@ type api struct {
 	hotkey  string
 	uid     *uint16
 	public  ed25519.PublicKey
+	// sandbox is the sandbox-lease-v1 lane; nil (the default) leaves its
+	// routes and capability absent.
+	sandbox *miner.SandboxLane
 }
 
 func main() {
@@ -82,6 +86,7 @@ func run() error {
 		staticCacheMaxBytes   = flag.Int64("static-cache-max-bytes", 8<<30, "byte quota of pinned static site files")
 		staticFetchTimeout    = flag.Duration("static-fetch-timeout", miner.DefaultStaticFetchTimeout, "bound on fetching and verifying one static site")
 		staticConcurrency     = flag.Int("static-request-concurrency", miner.DefaultStaticRequestConcurrency, "in-flight requests per static endpoint")
+		sandboxLeases         = flag.String("sandbox-leases", "off", "sandbox-lease-v1 workload: off (default); on needs a sandbox isolation backend, none is available yet")
 	)
 	flag.Parse()
 	if err := service.ValidateBind(*bind, *allowNonLoopback); err != nil {
@@ -135,10 +140,20 @@ func run() error {
 	if agent.Static, err = openStaticSites(*staticSites, *staticCacheDir, *staticCacheMaxBytes, *staticFetchTimeout, *staticConcurrency); err != nil {
 		return err
 	}
+	sandboxLane, err := openSandboxLeases(*sandboxLeases)
+	if err != nil {
+		return err
+	}
 	recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	if err := agent.RecoverCleanup(recoveryCtx); err != nil {
 		recoveryCancel()
 		return fmt.Errorf("restart cleanup: %w", err)
+	}
+	if sandboxLane != nil {
+		if err := sandboxLane.Recover(recoveryCtx); err != nil {
+			recoveryCancel()
+			return fmt.Errorf("sandbox restart cleanup: %w", err)
+		}
 	}
 	recoveryCancel()
 	var minerUID *uint16
@@ -148,15 +163,9 @@ func run() error {
 	}
 	serviceAPI := &api{
 		agent: agent, store: store, network: *network, netuid: uint16(*netuid), hotkey: *hotkey, uid: minerUID,
-		public: privateKey.Public().(ed25519.PublicKey),
+		public: privateKey.Public().(ed25519.PublicKey), sandbox: sandboxLane,
 	}
-	protected := http.NewServeMux()
-	protected.HandleFunc("GET /v1/capabilities", serviceAPI.capabilities)
-	protected.HandleFunc("POST /v1/assignments", serviceAPI.assign)
-	protected.HandleFunc("POST /v1/status", serviceAPI.status)
-	protected.HandleFunc("POST /v1/deactivate", serviceAPI.deactivate)
-	protected.HandleFunc("POST /v1/static/assignments", serviceAPI.assignStatic)
-	protected.HandleFunc("POST /v1/static/status", serviceAPI.staticStatus)
+	protected := serviceAPI.routes()
 	authenticator := bridge.Authenticator{Secret: secret, Store: store}
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
@@ -168,6 +177,9 @@ func run() error {
 	}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if sandboxLane != nil {
+		go sweepSandboxes(shutdownCtx, sandboxLane)
+	}
 	errorsChannel := make(chan error, 1)
 	go func() {
 		slog.Info("miner agent ready", "bind", *bind, "network", *network, "netuid", *netuid, "hotkey", *hotkey)
@@ -190,8 +202,29 @@ func run() error {
 	if err := agent.RecoverCleanup(cleanup); serveErr == nil && err != nil {
 		serveErr = fmt.Errorf("shutdown cleanup: %w", err)
 	}
+	if sandboxLane != nil {
+		if err := sandboxLane.Recover(cleanup); serveErr == nil && err != nil {
+			serveErr = fmt.Errorf("sandbox shutdown cleanup: %w", err)
+		}
+	}
 	cancelCleanup()
 	return serveErr
+}
+
+// routes is the authenticated bridge API. Sandbox routes exist only with an
+// enabled sandbox lane.
+func (a *api) routes() *http.ServeMux {
+	protected := http.NewServeMux()
+	protected.HandleFunc("GET /v1/capabilities", a.capabilities)
+	protected.HandleFunc("POST /v1/assignments", a.assign)
+	protected.HandleFunc("POST /v1/status", a.status)
+	protected.HandleFunc("POST /v1/deactivate", a.deactivate)
+	protected.HandleFunc("POST /v1/static/assignments", a.assignStatic)
+	protected.HandleFunc("POST /v1/static/status", a.staticStatus)
+	if a.sandbox != nil {
+		a.registerSandboxRoutes(protected)
+	}
+	return protected
 }
 
 // openOrganicRuntime configures Docker for organic OCI replicas and proves
@@ -261,6 +294,9 @@ func (a *api) features() []string {
 	}
 	if a.agent.Static != nil {
 		features = append(features, neuron.FeatureOrganicStaticV1)
+	}
+	if a.sandbox != nil {
+		features = append(features, sandbox.CapabilityFeature)
 	}
 	return features
 }
