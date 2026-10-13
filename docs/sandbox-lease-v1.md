@@ -1,11 +1,12 @@
 # Sandbox leases (`sandbox-lease-v1`): contract slice 1
 
-Status: **partial, off by default, not customer-ready.** This slice adds the
-signed documents and the miner-side durable holds of a sandbox
-reservation/lease lane. No miner agent route, no capability advertisement, no
-runtime backend, no validator scheduling, no customer API and no scoring use
-them yet. With nothing enabling the lane, every existing binary behaves
-exactly as before.
+Status: **partial, off by default, not customer-ready.** The signed
+documents, the miner-side durable holds and leases, and the miner agent lane
+(handlers, routes and backend interface) exist. No isolation backend, no
+Python neuron forwarding, no validator scheduling, no customer API and no
+scoring exist yet, so the lane cannot be enabled: `--sandbox-leases on`
+refuses to start. With the default `--sandbox-leases off`, every existing
+binary behaves exactly as before.
 
 Normative code: `pkg/sandbox` (vocabulary), `pkg/protocol/sandbox_v1.go`
 (documents), `pkg/durable/sandbox_v1.go` (durable holds and leases).
@@ -133,6 +134,47 @@ Invariants (each has a test in `pkg/durable/sandbox_v1_test.go`):
 - Restart recovery tears down every lease whose runtime may exist and
   answers `failed/miner_restart`, as `deployment.v4` endpoints are today.
 
+## Miner agent lane (`pkg/miner/sandbox.go`, `cmd/miner-agent/sandbox.go`)
+
+`SandboxLane` admits each validator document with the matching
+`VerifyBoundSandbox*V1` check against the validator service key from the
+verified hotkey binding, then requires the document to name this agent's
+service key, transport identity and hotkey. It applies the document to the
+durable lane and signs a `sandbox-lease-receipt` with the miner service key,
+including refused and failed receipts.
+
+- **Commit:** the lease is durable as `pending` before the backend creates
+  anything. A lease that declares customer environment is refused with
+  `secret_delivery_unsupported`, and a lease the backend cannot enforce
+  exactly with the backend's non-fault code; neither creates a sandbox. A
+  failed create answers `runtime_start_failed`; a backend may answer a
+  non-fault code such as `image_unavailable` but can never relabel its own
+  fault. Every sandbox name is `runtime.InstanceName(lease_id)`.
+- **Release, Sweep, Recover:** each moves leases to `cleanup` durably, then
+  destroys their sandboxes. A failed destroy keeps the lease in `cleanup`,
+  still consuming capacity, until a later sweep (every 10 seconds) destroys
+  it. A release that lands while a sandbox is being created waits for the
+  create to return and then destroys it. Restart recovery destroys every
+  sandbox that may exist before the agent serves.
+- **Backend interface (`SandboxBackend`):** `Budget`, `Unsupported`,
+  `Create` (idempotent per instance name), `Destroy` (idempotent). No
+  implementation ships; a gVisor, Kata or Firecracker adapter is a separate,
+  explicitly selected change, and the lane never falls back to plain Docker.
+- **Dedicated budget:** the lane exists, and `sandbox-lease-v1` is
+  advertised, only if the backend runs sandboxes in a dedicated cgroup v2
+  subtree whose `cpu.max` and `memory.max` are finite and cover the
+  configured budget, whose disk and count limits cover it too, and which is
+  disjoint from the agent's and the web replicas' cgroups
+  (`VerifySandboxCgroup`). Sandboxes never share CPU or memory with
+  `deployment.v4` replicas.
+- **Bridge routes** (only with an enabled lane, behind the bridge HMAC):
+  `POST /v1/sandbox/reservations`, `/v1/sandbox/leases`,
+  `/v1/sandbox/renewals`, `/v1/sandbox/releases`. The envelope is
+  `subnet-sandbox-synapse.v1`: `protocol`, `request_id`, `current_block`,
+  `caller_hotkey`, `binding_verified`, `validator_binding`, `document`; the
+  answer is `protocol`, `request_id`, `receipt`. Equivocation is
+  `409 sandbox_conflict` with no receipt.
+
 ## How the contract was reconciled with the target workload
 
 The first customer workload is agent benchmark and data-generation traffic:
@@ -197,15 +239,16 @@ only consume a byte-identical copy.
    and checked to reproduce them. The vectors stay in `pkg/protocol/testdata`
    until the private ownership map classifies the stems, so the public
    contract inventory does not change before the private side can accept it.
-4. **Miner agent lane (public, default off).** `--sandbox-leases off` by
-   default; routes, capability feature, backend interface with isolation and
-   egress enforcement, a separate resource budget from web replicas, and a
-   test that the feature list and routes are unchanged when off.
-5. **Neuron transport (public, default off).** `subnet-sandbox-synapse.v1`
-   forwarding in the Python miner axon and validator bridge; see
-   [Neuron transport](#neuron-transport-subnet-sandbox-synapsev1). It can land
-   before step 4: until a miner agent serves the routes and advertises the
-   feature, the validator refuses every document before miner contact.
+4. **Miner agent lane (public, default off).** This PR adds routes, the
+   capability feature, a separate budget interface and a backend seam. No
+   isolation backend or operator budget flags ship; `--sandbox-leases on`
+   refuses to start until both exist. Flag-off routes and features are
+   unchanged.
+5. **Neuron transport (public, default off).** Done in the separate transport
+   change: `subnet-sandbox-synapse.v1` forwarding in the Python miner axon
+   and validator bridge; see [Neuron transport](#neuron-transport-subnet-sandbox-synapsev1).
+   Until the miner lane has a real backend and advertises the feature, the
+   validator refuses every document before miner contact.
 6. **Validator placement and API gateway (private, default off).** Placement,
    write-ahead runtime table, renewal loop, verified capacity ledger, and the
    mapping from customer API requests to these documents.
