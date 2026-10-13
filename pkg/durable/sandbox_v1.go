@@ -69,7 +69,15 @@ CREATE TABLE IF NOT EXISTS sandbox_release_fences (
   release_json BLOB NOT NULL,
   updated_at_ns INTEGER NOT NULL,
   PRIMARY KEY(sandbox_id, generation, miner_hotkey)
-);`
+);
+-- Only live rows contribute to capacity. Terminal rows remain durable for
+-- replay and release fences, but do not grow these occupancy scans.
+CREATE INDEX IF NOT EXISTS sandbox_holds_live_expiry ON sandbox_holds(hold_expires_at_ns, cpu_millis, memory_mib, disk_mib) WHERE status='held';
+CREATE INDEX IF NOT EXISTS sandbox_leases_live_capacity ON sandbox_leases(cpu_millis, memory_mib, disk_mib) WHERE status IN ('pending','running','cleanup');
+-- Sweep needs the expiry range only for leases that can still be running.
+CREATE INDEX IF NOT EXISTS sandbox_leases_live_expiry ON sandbox_leases(lease_expires_at_ns) WHERE status IN ('pending','running');
+-- Failed teardown keeps cleanup rows live until the runtime is gone.
+CREATE INDEX IF NOT EXISTS sandbox_leases_cleanup ON sandbox_leases(lease_id) WHERE status='cleanup';`
 
 // ErrSandboxConflict reports signer equivocation: a different exact
 // document for an identity that already has one, a second lease for one

@@ -224,6 +224,102 @@ func TestSandboxLaneIsOffByDefaultAndLeavesWebTablesUnchanged(t *testing.T) {
 	}
 }
 
+// Terminal identities remain durable for replay and fences. Capacity and
+// expiry work must not inspect that ever-growing history on every request.
+func TestSandboxLiveQueriesSkipTerminalHistory(t *testing.T) {
+	store, _ := openSandboxLeases(t)
+	tx, err := store.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := range 512 {
+		id := sandboxID(n)
+		if _, err := tx.Exec(`INSERT INTO sandbox_holds(hold_id,sandbox_id,generation,miner_hotkey,validator_hotkey,reservation_nonce,reservation_digest,cpu_millis,memory_mib,disk_mib,hold_expires_at_ns,status,reservation_json,updated_at_ns)
+VALUES(?,?,1,'miner','validator',?,?,1,1,1,1,'committed','{}',1)`, id, id, nonce(n), "hold-"+id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`INSERT INTO sandbox_leases(lease_id,hold_id,sandbox_id,generation,miner_hotkey,validator_hotkey,assignment_nonce,lease_digest,cpu_millis,memory_mib,disk_mib,lease_expires_at_ns,status,lease_json,updated_at_ns)
+VALUES(?,?,?,1,'miner','validator',?,?,1,1,1,1,'released','{}',1)`, id, id, id, "lease-"+id, "digest-"+id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, update := range []string{
+		`UPDATE sandbox_holds SET status='held' WHERE hold_id='sbx-00000000000000000000000000000000'`,
+		`UPDATE sandbox_leases SET status='pending' WHERE lease_id='sbx-00000000000000000000000000000001'`,
+		`UPDATE sandbox_leases SET status='cleanup',cleanup_status='released' WHERE lease_id='sbx-00000000000000000000000000000002'`,
+	} {
+		if _, err := tx.Exec(update); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`ANALYZE`); err != nil {
+		t.Fatal(err)
+	}
+	partialIndexes := map[string]bool{}
+	for _, table := range []string{"sandbox_holds", "sandbox_leases"} {
+		rows, err := store.db.Query(`PRAGMA index_list(` + table + `)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var seq, unique, partial int
+			var name, origin string
+			if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+				t.Fatal(err)
+			}
+			partialIndexes[name] = partial == 1
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+	}
+	for _, tc := range []struct {
+		name, table, query string
+	}{
+		{"live holds", "sandbox_holds", `SELECT COUNT(*),COALESCE(SUM(cpu_millis),0),COALESCE(SUM(memory_mib),0),COALESCE(SUM(disk_mib),0) FROM sandbox_holds WHERE status='held' AND hold_expires_at_ns > 0`},
+		{"live leases", "sandbox_leases", `SELECT COUNT(*),COALESCE(SUM(cpu_millis),0),COALESCE(SUM(memory_mib),0),COALESCE(SUM(disk_mib),0) FROM sandbox_leases WHERE status IN ('pending','running','cleanup')`},
+		{"expired holds", "sandbox_holds", `UPDATE sandbox_holds SET status='expired' WHERE status='held' AND hold_expires_at_ns <= 1`},
+		{"expired leases", "sandbox_leases", `UPDATE sandbox_leases SET status='cleanup' WHERE status IN ('pending','running') AND lease_expires_at_ns <= 1`},
+		{"cleanup leases", "sandbox_leases", `SELECT lease_id,status,cleanup_status,cleanup_code,terminal_code,renewal_seq,lease_expires_at_ns,lease_json FROM sandbox_leases WHERE status='cleanup' ORDER BY lease_id`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := store.db.Query(`EXPLAIN QUERY PLAN ` + tc.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var plan []string
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				plan = append(plan, detail)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			usesPartial := false
+			for _, detail := range plan {
+				if _, after, ok := strings.Cut(detail, " INDEX "); ok {
+					usesPartial = partialIndexes[strings.Fields(after)[0]]
+				}
+				if strings.HasPrefix(tc.name, "expired") && strings.HasPrefix(detail, "SCAN "+tc.table) {
+					t.Fatalf("expiry query scans rather than seeks: %v", plan)
+				}
+			}
+			if !usesPartial {
+				t.Fatalf("live query does not use a partial index: %v", plan)
+			}
+		})
+	}
+}
+
 // Capacity is checked and held in one transaction against a resource
 // budget, refused when it does not fit, and freed when the hold lapses.
 func TestSandboxHoldsCountAgainstBudgetAndLapse(t *testing.T) {
