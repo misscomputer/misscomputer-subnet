@@ -169,13 +169,16 @@ including refused and failed receipts.
   `Create` (idempotent per instance name), `Destroy` (idempotent). No
   implementation ships; a gVisor, Kata or Firecracker adapter is a separate,
   explicitly selected change, and the lane never falls back to plain Docker.
-- **Dedicated budget:** the lane exists, and `sandbox-lease-v1` is
-  advertised, only if the backend runs sandboxes in a dedicated cgroup v2
-  subtree whose `cpu.max` and `memory.max` are finite and cover the
-  configured budget, whose disk and count limits cover it too, and which is
-  disjoint from the agent's and the web replicas' cgroups
-  (`VerifySandboxCgroup`). Sandboxes never share CPU or memory with
-  `deployment.v4` replicas.
+- **Dedicated budget:** the lane can be constructed only if the backend
+  reports a dedicated cgroup v2 subtree with finite `cpu.max` and
+  `memory.max`, disk and count limits covering its configured budget.
+  Construction requires explicit `AgentCgroup` and `DeploymentCgroup` paths;
+  missing, root, malformed, or overlapping paths fail closed in
+  `VerifySandboxCgroup`. These are trusted configuration values: the future
+  backend/activation review must prove they are the actual agent and web
+  replica subtrees, not merely arbitrary disjoint names. There is no backend
+  or activation flag implementation in this PR, so `--sandbox-leases on`
+  still refuses to start and no such isolation claim has been made live.
 - **Bridge routes** (only with an enabled lane, behind the bridge HMAC):
   `POST /v1/sandbox/reservations`, `/v1/sandbox/leases`,
   `/v1/sandbox/renewals`, `/v1/sandbox/releases`. The envelope is

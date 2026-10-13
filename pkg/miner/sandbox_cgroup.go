@@ -29,10 +29,8 @@ func VerifySandboxCgroup(root, cgroup string, forbidden []string) (sandbox.Capac
 		return sandbox.Capacity{}, fmt.Errorf("sandbox cgroup %q must be a clean absolute path below the cgroup root", cgroup)
 	}
 	for _, other := range forbidden {
-		other = path.Clean("/" + strings.TrimPrefix(other, "/"))
-		if other == "/" {
-			// The unlimited root cgroup is no budget to share.
-			continue
+		if other == "" || !path.IsAbs(other) || path.Clean(other) != other || other == "/" {
+			return sandbox.Capacity{}, fmt.Errorf("exclusive cgroup %q must be a clean absolute path below the cgroup root", other)
 		}
 		if within(clean, other) || within(other, clean) {
 			return sandbox.Capacity{}, fmt.Errorf("sandbox cgroup %q overlaps cgroup %q, which sandboxes must not share", clean, other)

@@ -145,7 +145,7 @@ func (f *sbFixture) agent() *Agent {
 
 func (f *sbFixture) newLane(agent *Agent) *SandboxLane {
 	f.t.Helper()
-	lane, err := NewSandboxLane(context.Background(), agent, f.store, f.backend, SandboxLaneConfig{Budget: sbBudget, CgroupRoot: f.root})
+	lane, err := NewSandboxLane(context.Background(), agent, f.store, f.backend, SandboxLaneConfig{Budget: sbBudget, CgroupRoot: f.root, AgentCgroup: "/system.slice/miner-agent.service", DeploymentCgroup: "/system.slice/deployment-v4.slice"})
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -493,12 +493,18 @@ func TestNewSandboxLaneRequiresAnEnforcedDedicatedBudget(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		cpu, mem  string
-		exclusive []string
+		agentPath string
+		webPath   string
+		omitAgent bool
+		omitWeb   bool
 		budget    func(*sandbox.Capacity)
 		noBackend bool
 		ok        bool
 	}{
-		{name: "enforced budget covers the configured one", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), exclusive: []string{"/", "/system.slice/miner-agent.service"}, ok: true},
+		{name: "enforced budget covers the configured one", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), ok: true},
+		{name: "missing agent path", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), omitAgent: true},
+		{name: "missing web path", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), omitWeb: true},
+		{name: "root as agent path", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), agentPath: "/"},
 		{name: "no backend", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), noBackend: true},
 		{name: "unlimited cpu", cpu: "max 100000", mem: fmt.Sprint(8192 << 20)},
 		{name: "unlimited memory", cpu: "400000 100000", mem: "max"},
@@ -506,8 +512,8 @@ func TestNewSandboxLaneRequiresAnEnforcedDedicatedBudget(t *testing.T) {
 		{name: "cpu below budget", cpu: "200000 100000", mem: fmt.Sprint(8192 << 20)},
 		{name: "memory below budget", cpu: "400000 100000", mem: fmt.Sprint(4096 << 20)},
 		{name: "disk above backend limit", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), budget: func(c *sandbox.Capacity) { c.DiskMiB++ }},
-		{name: "is the web replica cgroup", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), exclusive: []string{sbCgroup}},
-		{name: "contains the agent cgroup", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), exclusive: []string{sbCgroup + "/agent"}},
+		{name: "is the web replica cgroup", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), webPath: sbCgroup},
+		{name: "contains the agent cgroup", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), agentPath: sbCgroup + "/agent"},
 		{name: "zero budget component", cpu: "400000 100000", mem: fmt.Sprint(8192 << 20), budget: func(c *sandbox.Capacity) { c.Sandboxes = 0 }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -522,7 +528,22 @@ func TestNewSandboxLaneRequiresAnEnforcedDedicatedBudget(t *testing.T) {
 			if test.noBackend {
 				backend = nil
 			}
-			_, err := NewSandboxLane(context.Background(), f.agent(), f.store, backend, SandboxLaneConfig{Budget: budget, CgroupRoot: root, ExclusiveOf: test.exclusive})
+			agentPath, webPath := "/system.slice/miner-agent.service", "/system.slice/deployment-v4.slice"
+			if test.agentPath != "" {
+				agentPath = test.agentPath
+			}
+			if test.webPath != "" {
+				webPath = test.webPath
+			}
+			if test.omitAgent {
+				agentPath = ""
+			}
+			if test.omitWeb {
+				webPath = ""
+			}
+			_, err := NewSandboxLane(context.Background(), f.agent(), f.store, backend, SandboxLaneConfig{
+				Budget: budget, CgroupRoot: root, AgentCgroup: agentPath, DeploymentCgroup: webPath,
+			})
 			if (err == nil) != test.ok {
 				t.Fatalf("NewSandboxLane error = %v, want ok=%t", err, test.ok)
 			}

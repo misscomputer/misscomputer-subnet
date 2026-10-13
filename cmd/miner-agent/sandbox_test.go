@@ -143,6 +143,7 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	backend := &sandboxBackend{live: map[string]bool{}}
 	lane, err := miner.NewSandboxLane(ctx, agent, leases, backend, miner.SandboxLaneConfig{
 		Budget: sandbox.Capacity{CPUMillis: 4000, MemoryMiB: 8192, DiskMiB: 40960, Sandboxes: 4}, CgroupRoot: root,
+		AgentCgroup: "/system.slice/miner-agent.service", DeploymentCgroup: "/system.slice/deployment-v4.slice",
 	})
 	if err != nil {
 		t.Fatal(err)

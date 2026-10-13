@@ -57,9 +57,12 @@ type SandboxLaneConfig struct {
 	Budget sandbox.Capacity
 	// CgroupRoot is the cgroup v2 mount (DefaultCgroupRoot).
 	CgroupRoot string
-	// ExclusiveOf lists cgroups the sandbox subtree must be disjoint from:
-	// the miner agent's own and the one deployment.v4 replicas run in.
-	ExclusiveOf []string
+	// AgentCgroup is the miner agent's own cgroup. DeploymentCgroup is the
+	// reserved cgroup subtree for deployment.v4 replicas. Both are required:
+	// omitting either would make a finite sandbox budget look isolated when
+	// it still overlaps another workload.
+	AgentCgroup      string
+	DeploymentCgroup string
 }
 
 // ErrSandboxCleanupPending answers a release whose fence is durable but
@@ -106,7 +109,10 @@ func NewSandboxLane(ctx context.Context, agent *Agent, store *durable.SandboxLea
 	if err != nil {
 		return nil, fmt.Errorf("sandbox backend budget: %w", err)
 	}
-	limits, err := VerifySandboxCgroup(config.CgroupRoot, enforced.Cgroup, config.ExclusiveOf)
+	if config.AgentCgroup == "" || config.DeploymentCgroup == "" {
+		return nil, errors.New("sandbox lane requires both agent and deployment replica cgroup paths")
+	}
+	limits, err := VerifySandboxCgroup(config.CgroupRoot, enforced.Cgroup, []string{config.AgentCgroup, config.DeploymentCgroup})
 	if err != nil {
 		return nil, err
 	}
