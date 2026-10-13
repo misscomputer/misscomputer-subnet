@@ -201,12 +201,70 @@ only consume a byte-identical copy.
    default; routes, capability feature, backend interface with isolation and
    egress enforcement, a separate resource budget from web replicas, and a
    test that the feature list and routes are unchanged when off.
-5. **Validator placement and API gateway (private, default off).** Placement,
+5. **Neuron transport (public, default off).** `subnet-sandbox-synapse.v1`
+   forwarding in the Python miner axon and validator bridge; see
+   [Neuron transport](#neuron-transport-subnet-sandbox-synapsev1). It can land
+   before step 4: until a miner agent serves the routes and advertises the
+   feature, the validator refuses every document before miner contact.
+6. **Validator placement and API gateway (private, default off).** Placement,
    write-ahead runtime table, renewal loop, verified capacity ledger, and the
    mapping from customer API requests to these documents.
 
 Every step is a separate pull request with a "flag off means byte-identical
 behavior" test.
+
+## Neuron transport (`subnet-sandbox-synapse.v1`)
+
+Off by default in both neurons (`--sandbox-leases off`). Off, neither neuron
+registers a sandbox route: the axon answers 404 for `/api/v1/sandbox/*` and
+the validator bridge for `/v1/miners/{hotkey}/sandbox-*`, exactly as before.
+The organic, static, deactivate and runtime routes are unchanged either way.
+
+The Python neurons authenticate and forward; they never build, sign or choose
+anything. Each route carries exactly one validator document kind:
+
+| Validator bridge (from the Go runtime) | Miner axon (btauth) | Go miner agent (miss-bridge/1) | Document schema |
+| --- | --- | --- | --- |
+| `POST /v1/miners/{hotkey}/sandbox-reservations` | `POST /api/v1/sandbox/reservations` | `POST /v1/sandbox/reservations` | `sandbox-reservation-ticket` |
+| `POST /v1/miners/{hotkey}/sandbox-leases` | `POST /api/v1/sandbox/leases` | `POST /v1/sandbox/leases` | `sandbox-lease-ticket` |
+| `POST /v1/miners/{hotkey}/sandbox-renewals` | `POST /api/v1/sandbox/renewals` | `POST /v1/sandbox/renewals` | `sandbox-lease-renewal` |
+| `POST /v1/miners/{hotkey}/sandbox-releases` | `POST /api/v1/sandbox/releases` | `POST /v1/sandbox/releases` | `sandbox-lease-release` |
+
+Envelopes (`src/misscomputer_subnet/sandbox_transport.py`), all with
+`protocol: subnet-sandbox-synapse.v1` and the document as a JSON object passed
+through unchanged:
+
+- runtime → validator: `{protocol, request_id, document}`;
+- validator → miner: `{protocol, request_id, current_block, caller_hotkey, validator_binding, document}`;
+- miner → Go agent: the same plus `binding_verified: true`;
+- every answer: `{protocol, request_id, receipt}`, the miner-signed
+  `sandbox-lease-receipt`.
+
+The miner-agent half of this table is the contract step 4 implements; no
+released agent serves it yet.
+
+Checks before the document leaves each hop:
+
+- **Validator.** Miss-bridge HMAC from the runtime; the document's `schema`
+  matches the route; its `subnet` binding resolves to the current published
+  handshake of that exact miner (axon, UID, transport, leaf pin, service
+  keys, chain window), as for a static ticket; the miner advertises
+  `sandbox-lease-v1`, else `409 sandbox_capability_unsupported` before any
+  contact (ineligible, not a fault). Delivery is btauth over the pinned leaf.
+- **Miner.** btauth caller; envelope protocol; `schema` matches the route;
+  `miner_id` equals `subnet.miner_hotkey`; the static-ticket validator
+  service binding and Bittensor identity checks; then the priority gate. A
+  Go agent with the lane off answers `sandbox_disabled`, relayed with its
+  code.
+- **Both, on the way back.** The answer must be a receipt for this document
+  (`schema`, `document_schema`, `sandbox_id`, `generation`, `miner_id`), else
+  `502 sandbox_receipt_mismatch`. The Go runtime verifies the receipt
+  signature and document digest.
+
+Malformed documents are refused with stable codes
+(`sandbox_document_kind_mismatch`, `sandbox_document_invalid`) that never
+echo document members. Full document validation, signatures and
+`VerifyBoundSandbox*V1` admission stay in Go.
 
 ## Known limits
 

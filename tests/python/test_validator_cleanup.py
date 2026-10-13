@@ -134,7 +134,7 @@ class RecordingBridge:
         return {}
 
 
-def make_harness(tmp_path: Path) -> tuple[ValidatorNeuron, MockChain, DendriteSim]:
+def make_harness(tmp_path: Path, **options: Any) -> tuple[ValidatorNeuron, MockChain, DendriteSim]:
     peers = (VALIDATOR_PEER, MINER_A, MINER_B)
     chain = MockChain(network="local", netuid=24, own_uri="//Validator", peers=peers)
     sim = DendriteSim(peers)
@@ -153,6 +153,7 @@ def make_harness(tmp_path: Path) -> tuple[ValidatorNeuron, MockChain, DendriteSi
         allow_private_axons=True,
         mock_http_axons=True,
         dendrite_transport=httpx.MockTransport(sim.handler),
+        **options,
     )
     return neuron, chain, sim
 

@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from . import organic_contracts, static_contracts
+from . import organic_contracts, sandbox_transport, static_contracts
 from .auth import (
     BRIDGE_MAX_BODY,
     BridgeClient,
@@ -82,6 +82,7 @@ from .protocol import (
     parse_miner_registration,
     registration_features,
 )
+from .sandbox_transport import BridgeSandboxRequestV1, SandboxResponseV1, SandboxSynapseV1
 from .static_contracts import (
     BridgeStaticAssignRequestV1,
     StaticDeployResponseV1,
@@ -100,6 +101,9 @@ ORGANIC_STATIC_FEATURE = static_contracts.CAPABILITY_FEATURE
 #: reached the miner; the scheduler treats the miner as ineligible for static
 #: work, never as faulty.
 STATIC_CAPABILITY_UNSUPPORTED = "static_capability_unsupported"
+CAPABILITY_REFUSAL_CODES = frozenset(
+    {STATIC_CAPABILITY_UNSUPPORTED, sandbox_transport.SANDBOX_CAPABILITY_UNSUPPORTED}
+)
 PUBLICATION_LANE_SCHEMA_VERSION = 1
 PUBLICATION_RECORD_MAC_DOMAIN = "miss.computer/misscomputer-subnet/publication-record/v1"
 MAX_HISTORICAL_PUBLICATIONS = 512
@@ -776,6 +780,7 @@ class ValidatorNeuron:
         discovery_refresh_timeout: float = 30.0,
         discovery_backoff_base_rounds: int = 1,
         discovery_backoff_max_rounds: int = 16,
+        sandbox_leases: bool = False,
     ) -> None:
         if discovery_concurrency < 1:
             raise ValueError("discovery concurrency must be positive")
@@ -826,6 +831,8 @@ class ValidatorNeuron:
         self.discovery_refresh_timeout = discovery_refresh_timeout
         self.discovery_backoff_base_rounds = discovery_backoff_base_rounds
         self.discovery_backoff_max_rounds = discovery_backoff_max_rounds
+        # Default off: without it no /v1/miners/{hotkey}/sandbox-* route exists.
+        self.sandbox_leases = sandbox_leases
         self.state = MetagraphState()
         self.ready = asyncio.Event()
         self.fully_synced = asyncio.Event()
@@ -900,11 +907,11 @@ class ValidatorNeuron:
             status_code=exc.status_code,
             content={
                 "error": {
-                    # The static capability refusal keeps its own stable code
-                    # so the scheduler never mistakes it for a stale ticket.
+                    # Capability refusals keep their own stable code so the
+                    # scheduler never mistakes one for a stale ticket.
                     "code": (
-                        STATIC_CAPABILITY_UNSUPPORTED
-                        if message == STATIC_CAPABILITY_UNSUPPORTED
+                        message
+                        if message in CAPABILITY_REFUSAL_CODES
                         else codes.get(exc.status_code, "bridge_error")
                     ),
                     "message": message,
@@ -3099,7 +3106,75 @@ class ValidatorNeuron:
         if not verified:
             raise HTTPException(status_code=403, detail="probe authorization signature is invalid")
 
+    async def _sandbox_bridge(self, kind: str, hotkey: str, request: Request) -> SandboxResponseV1:
+        """Send one runtime-signed sandbox document to exactly one miner.
+
+        The runtime chose the miner and built the document; this hop only
+        checks that the document's signed binding is the handshake identity
+        of a miner that advertises ``sandbox-lease-v1``, then delivers it in
+        ``subnet-sandbox-synapse.v1`` over btauth and the pinned leaf.
+        """
+
+        body = await self._verify_local_bridge(request)
+        try:
+            local = parse_document(body, BridgeSandboxRequestV1)
+            header = sandbox_transport.document_header(local.document, kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        remote, validator_binding, snapshot = await self._remote_for_ticket(hotkey, header.subnet)
+        if not await self._remote_has_feature(
+            snapshot, remote, sandbox_transport.CAPABILITY_FEATURE
+        ):
+            # Refused before any miner contact: a miner without the lane is
+            # ineligible, never penalized.
+            raise HTTPException(
+                status_code=409, detail=sandbox_transport.SANDBOX_CAPABILITY_UNSUPPORTED
+            )
+        if self._ticket_binding_differs(
+            hotkey, header.miner_id, header.subnet, remote, validator_binding, snapshot
+        ):
+            raise HTTPException(status_code=403, detail="Go ticket binding differs from handshake")
+        synapse = SandboxSynapseV1(
+            protocol=sandbox_transport.SYNAPSE_VERSION,
+            request_id=local.request_id,
+            current_block=snapshot.block,
+            caller_hotkey=self.hotkey,
+            validator_binding=validator_binding,
+            document=local.document,
+        )
+        result = await self._forward_signed_post(
+            remote.axon_url,
+            hotkey,
+            f"/api/v1/sandbox/{kind}",
+            synapse,
+            SandboxResponseV1,
+            certificate_der=remote.certificate_der,
+        )
+        try:
+            if result.request_id != local.request_id:
+                raise ValueError(sandbox_transport.SANDBOX_RECEIPT_MISMATCH)
+            sandbox_transport.receipt_answers(result.receipt, header, kind)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result
+
+    def _sandbox_route(self, kind: str) -> None:
+        async def bridge(hotkey: str, request: Request) -> SandboxResponseV1:
+            return await self._sandbox_bridge(kind, hotkey, request)
+
+        self.app.add_api_route(
+            f"/v1/miners/{{hotkey}}/sandbox-{kind}",
+            bridge,
+            methods=["POST"],
+            response_model=None,
+            name=f"sandbox_{kind}_bridge",
+        )
+
     def _routes(self) -> None:
+        if self.sandbox_leases:
+            for kind in sandbox_transport.DOCUMENT_SCHEMAS:
+                self._sandbox_route(kind)
+
         @self.app.get("/healthz")
         async def health() -> Response:
             return Response(status_code=204 if self.fully_synced.is_set() else 503)
@@ -3343,6 +3418,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use HTTP axons only for an explicitly configured mock chain",
     )
+    parser.add_argument(
+        "--sandbox-leases",
+        choices=("on", "off"),
+        default="off",
+        help="bridge runtime sandbox documents to miners (default off)",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -3446,6 +3527,7 @@ def main() -> None:
         discovery_refresh_timeout=args.discovery_refresh_timeout,
         discovery_backoff_base_rounds=args.discovery_backoff_base_rounds,
         discovery_backoff_max_rounds=args.discovery_backoff_max_rounds,
+        sandbox_leases=args.sandbox_leases == "on",
     )
     uvicorn.run(neuron.app, host=args.bridge_host, port=args.bridge_port, log_config=None)
 
