@@ -355,6 +355,7 @@ func (h *host) process(exe, cgroup string, r sandbox.Resources) {
 	writeFile(h.t, filepath.Join(proc, "cgroup"), "0::"+cgroup+"\n")
 	dir := filepath.Join(h.config.CgroupRoot, cgroup)
 	writeFile(h.t, filepath.Join(dir, "memory.max"), strconv.Itoa(r.MemoryMiB<<20)+"\n")
+	writeFile(h.t, filepath.Join(dir, "memory.swap.max"), "0\n")
 	writeFile(h.t, filepath.Join(dir, "pids.max"), strconv.Itoa(r.PIDs)+"\n")
 	writeFile(h.t, filepath.Join(dir, "cpu.max"), strconv.Itoa(r.CPUMillis*100)+" 100000\n")
 }
@@ -705,6 +706,10 @@ func TestCreateRejectsSandboxesThatDoNotEnforceTheLease(t *testing.T) {
 		{name: "kernel memory is unlimited", process: func(h *host) {
 			h.process(h.sentry, scope, resources)
 			writeFile(h.t, filepath.Join(h.config.CgroupRoot, scope, "memory.max"), "max\n")
+		}, want: "kernel limits"},
+		{name: "kernel swap is unlimited", process: func(h *host) {
+			h.process(h.sentry, scope, resources)
+			writeFile(h.t, filepath.Join(h.config.CgroupRoot, scope, "memory.swap.max"), "max\n")
 		}, want: "kernel limits"},
 		{name: "kernel cpu exceeds the lease", process: func(h *host) {
 			h.process(h.sentry, scope, resources)

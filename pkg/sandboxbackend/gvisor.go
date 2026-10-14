@@ -914,7 +914,7 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 
 // verifyProcess proves the kernel's view of the running sandbox process:
 // the pinned gVisor binary Open hashed, in a cgroup below the slice whose
-// limits are the lease's.
+// limits are the lease's, with no swap.
 func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 	if !c.State.Running || c.State.Pid <= 0 {
 		return fmt.Errorf("sandbox %s is %s, not running: %q", c.Name, c.State.Status, c.State.Error)
@@ -944,6 +944,10 @@ func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 	if err != nil {
 		return err
 	}
+	swap, err := readSmall(filepath.Join(dir, "memory.swap.max"))
+	if err != nil {
+		return err
+	}
 	pids, err := readSmall(filepath.Join(dir, "pids.max"))
 	if err != nil {
 		return err
@@ -958,9 +962,10 @@ func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 		period, _ = strconv.ParseInt(fields[1], 10, 64)
 	}
 	millis := s.host.NanoCpus / 1_000_000
-	if memory != strconv.FormatInt(s.host.Memory, 10) || pids != strconv.FormatInt(*s.host.PidsLimit, 10) ||
+	if memory != strconv.FormatInt(s.host.Memory, 10) || swap != "0" || pids != strconv.FormatInt(*s.host.PidsLimit, 10) ||
 		quota <= 0 || period <= 0 || quota*1000/period > millis {
-		return fmt.Errorf("sandbox %s kernel limits cpu.max=%q memory.max=%q pids.max=%q differ from the lease", c.Name, cpu, memory, pids)
+		return fmt.Errorf("sandbox %s kernel limits cpu.max=%q memory.max=%q memory.swap.max=%q pids.max=%q differ from the lease",
+			c.Name, cpu, memory, swap, pids)
 	}
 	return nil
 }

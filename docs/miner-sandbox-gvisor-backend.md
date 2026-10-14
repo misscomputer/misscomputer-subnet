@@ -107,7 +107,7 @@ rules or requests, volume sources, links, extra groups, hosts or DNS
 settings) and the kernel's view of its process: `/proc/<pid>/exe` is the
 pinned sentry (or runsc), the same file Open hashed, unchanged, and
 `/proc/<pid>/cgroup` lies below the slice with `memory.max` and `pids.max`
-equal to the lease and `cpu.max` no larger. Anything else is a miner fault
+equal to the lease, `memory.swap.max` zero and `cpu.max` no larger. Anything else is a miner fault
 and the lane destroys the container.
 
 A workload that exits by itself after the engine started it (the engine
