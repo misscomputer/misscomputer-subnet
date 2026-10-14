@@ -165,7 +165,9 @@ including refused and failed receipts.
   lock. Commit answers its outcome if it ends within 60 seconds, otherwise
   `accepted` (the lease is `pending`), well inside the roughly two-minute
   transport hops, so a slow image pull is never an unknown outcome. The
-  validator polls by replaying the exact lease. A replay during the start
+  validator learns the outcome from its next renewal receipt (`accepted`
+  while pending, then `ready` or `failed`); replaying the exact lease
+  answers the same way. A replay during the start
   waits for that start again, up to the same bound, and never starts a
   second sandbox; afterwards it answers `ready`, `failed` or the lease's
   terminal stage.
