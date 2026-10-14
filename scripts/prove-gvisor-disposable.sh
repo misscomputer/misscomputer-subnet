@@ -193,12 +193,17 @@ report 'network=none: metadata and public TCP attempts blocked'
 
 # Docker overlay2 on XFS+pquota must return ENOSPC/EDQUOT before 192 MiB is
 # written to the 64 MiB writable layer. A mere StorageOpt field is not proof.
-docker exec "$container" sh -c '[ "$(stat -c %d /)" = "$(stat -c %d /tmp)" ]' || die '/tmp is not on the rootfs writable layer'
-if docker exec "$container" dd if=/dev/zero of=/tmp/quota-proof bs=1048576 count=192 >"$gate_dir/dd.log" 2>&1; then
+tmp_fstype=$(docker exec "$container" awk '$5 == "/tmp" {for (i=1; i<=NF; i++) if ($i == "-") {print $(i+1); exit}}' /proc/self/mountinfo)
+report "separate /tmp filesystem: ${tmp_fstype:-unknown} (outside writable-layer quota, charged to finite memory cgroup only if tmpfs)"
+[[ $tmp_fstype == tmpfs ]] || die '/tmp is a separate writable filesystem without proven memory accounting'
+# PID 1 stays nonroot. The administrator-controlled exec writes at / so this
+# experiment actually measures the Docker rootfs layer, not gVisor's /tmp.
+if docker exec --user 0 "$container" dd if=/dev/zero of=/quota-proof bs=1048576 count=192 >"$gate_dir/dd.log" 2>&1; then
   die 'container wrote past its 64 MiB writable-layer quota'
 fi
 grep -Eiq 'No space left on device|Disk quota exceeded' "$gate_dir/dd.log" || { cat "$gate_dir/dd.log" >&2; die 'disk write failed for a reason other than quota'; }
-written=$(docker exec "$container" stat -c '%s' /tmp/quota-proof)
+docker exec "$container" sh -c '[ "$(stat -c %d /)" = "$(stat -c %d /quota-proof)" ]' || die 'disk write did not target the rootfs layer'
+written=$(docker exec "$container" stat -c '%s' /quota-proof)
 (( written > 0 && written <= QUOTA_BYTES )) || die "writable-layer file size $written exceeds quota"
 report "writable-layer quota: 64 MiB, dd stopped at $written bytes with ENOSPC/EDQUOT"
 

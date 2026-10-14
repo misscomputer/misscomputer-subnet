@@ -22,6 +22,10 @@ writable-layer quota, and bounded JSON logs.
 The proof checks the engine's runtime/image/config, the pinned runsc process's
 actual cgroup, finite parent and child limits, failed metadata/public TCP
 attempts, and an actual write that stops at the quota with ENOSPC or EDQUOT.
+The long-lived probe process is nonroot; an administrator-controlled `exec`
+as root writes at `/` specifically to exercise the rootfs layer. gVisor's
+separate `/tmp` must report as tmpfs, which is charged to the finite memory
+cgroup rather than the disk quota.
 It then removes the container and image and verifies they are absent. The
 script cleans up its own daemon, unit, mount and loop device on success or
 failure. Missing XFS project quota, runtime registration, cgroup v2, actual
