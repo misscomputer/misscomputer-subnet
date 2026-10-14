@@ -53,8 +53,9 @@ type engineContainer struct {
 	Host        map[string]any
 	Status      string
 	Mounts      []map[string]any
-	// Error is the engine's start error and StartedAt its start time.
-	Error, StartedAt string
+	// Error is the engine's start error; StartedAt and FinishedAt are the
+	// workload's start and exit times.
+	Error, StartedAt, FinishedAt string
 }
 
 // fakeEngine is a scripted Docker Engine API: images a pull may produce,
@@ -63,6 +64,7 @@ type fakeEngine struct {
 	mu         sync.Mutex
 	version    string
 	info       map[string]any
+	networks   []map[string]string
 	catalog    map[string]engineImage // pull reference -> image it yields
 	images     map[string]engineImage // engine ID -> image
 	containers map[string]*engineContainer
@@ -83,8 +85,11 @@ func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
 		version: PinnedDockerVersion,
 		info: map[string]any{
 			"DockerRootDir": dataRoot, "Driver": "overlay2", "CgroupDriver": "systemd", "CgroupVersion": "2",
-			"Runtimes":   map[string]any{"runsc": map[string]any{"path": runsc, "runtimeArgs": []string{"--systemd-cgroup", "--overlay2=none"}}},
-			"Containerd": map[string]any{"Namespaces": map[string]any{"Containers": "mc-sandbox", "Plugins": "mc-sandbox-plugins"}},
+			"Runtimes": map[string]any{"runsc": map[string]any{"path": runsc, "runtimeArgs": []string{"--systemd-cgroup", "--overlay2=none"}}},
+			"Containerd": map[string]any{
+				"Address":    "/run/mc-sandbox/containerd/containerd.sock",
+				"Namespaces": map[string]any{"Containers": "mc-sandbox", "Plugins": "mc-sandbox-plugins"},
+			},
 			"RegistryConfig": map[string]any{
 				"InsecureRegistryCIDRs": []string{"::1/128", "127.0.0.0/8"}, "Mirrors": []string{},
 				"IndexConfigs": map[string]any{"docker.io": map[string]any{"Name": "docker.io", "Secure": true, "Mirrors": []string{}}},
@@ -96,6 +101,7 @@ func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
 				PullMessages: []string{`{"id":"layer1","status":"Downloading","progressDetail":{"current":1,"total":2097152}}`, `{"status":"Status: Downloaded"}`},
 			},
 		},
+		networks:   []map[string]string{{"Name": "none", "Driver": "null"}, {"Name": "host", "Driver": "host"}},
 		images:     map[string]engineImage{},
 		containers: map[string]*engineContainer{},
 	}
@@ -132,6 +138,8 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		reply(w, 200, map[string]string{"Version": e.version})
 	case r.Method == http.MethodGet && p == "/info":
 		reply(w, 200, e.info)
+	case r.Method == http.MethodGet && p == "/networks":
+		reply(w, 200, e.networks)
 	case r.Method == http.MethodPost && p == "/images/create":
 		e.pulls++
 		reference := r.URL.Query().Get("fromImage") + "@" + r.URL.Query().Get("tag")
@@ -248,13 +256,16 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		if c.Status == "running" {
 			pid = testPID
 		}
-		startedAt := c.StartedAt
+		startedAt, finishedAt := c.StartedAt, c.FinishedAt
 		if startedAt == "" {
 			startedAt = "0001-01-01T00:00:00Z"
 		}
+		if finishedAt == "" {
+			finishedAt = "0001-01-01T00:00:00Z"
+		}
 		reply(w, 200, map[string]any{
 			"Id": "id-" + c.Name, "Name": "/" + c.Name, "Image": c.Image,
-			"State":  map[string]any{"Status": c.Status, "Running": c.Status == "running", "Pid": pid, "Error": c.Error, "StartedAt": startedAt},
+			"State":  map[string]any{"Status": c.Status, "Running": c.Status == "running", "Pid": pid, "Error": c.Error, "StartedAt": startedAt, "FinishedAt": finishedAt},
 			"Config": map[string]any{"Labels": c.Labels}, "HostConfig": c.Host, "Mounts": c.Mounts,
 		})
 		if e.inspected != nil {
@@ -497,19 +508,25 @@ func TestCreateReplayStartsCreatedContainerAndRejectsAnotherLeases(t *testing.T)
 // engine's configuration is still verified, and a start the engine or
 // runtime reports as failed stays a miner fault.
 func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
-	exit := func(c *engineContainer) { c.Status = "exited" }
+	exit := func(c *engineContainer) { c.Status, c.FinishedAt = "exited", "2026-10-14T12:00:02.5Z" }
 	for _, test := range []struct {
 		name                        string
 		applied, started, inspected func(*engineContainer)
 		noProcess                   bool
-		want                        string // "" for success, else the miner fault
+		// leftover leaves a process in a cgroup named for the container.
+		leftover bool
+		want     string // "" for success, else the miner fault
 	}{
+		// The backend does not read the exit code or OOM flag: exit 0,
+		// non-zero and an OOM kill within the lease limit look alike to it.
 		{name: "exits at once", started: exit},
 		{name: "exits during the readback", inspected: func(c *engineContainer) {
 			if c.Status == "running" {
-				c.Status = "exited"
+				exit(c)
 			}
 		}, noProcess: true},
+		{name: "exit time not after start", started: func(c *engineContainer) { c.Status, c.FinishedAt = "exited", c.StartedAt }, want: "is exited, not running"},
+		{name: "a process remains in its cgroup", started: exit, leftover: true, want: "still has processes"},
 		{name: "exits under an unverified runtime", applied: func(c *engineContainer) { c.Host["Runtime"] = "runc" }, started: exit, want: "runtime is"},
 		{name: "runtime failed the start", started: func(c *engineContainer) {
 			c.Status, c.Error = "exited", "OCI runtime create failed: runsc: exit status 1"
@@ -526,6 +543,9 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 				}
 			}
 			lease := testLease(nil)
+			if test.leftover {
+				writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "docker-id-"+instanceOf(lease)+".scope", "cgroup.procs"), "4243\n")
+			}
 			err := h.backend().Create(context.Background(), instanceOf(lease), lease)
 			switch {
 			case test.want == "" && err != nil:
@@ -713,6 +733,10 @@ func TestCreateRejectsSandboxesThatDoNotEnforceTheLease(t *testing.T) {
 			h.process(h.sentry, scope, resources)
 			writeFile(h.t, filepath.Join(h.config.CgroupRoot, scope, "memory.swap.max"), "max\n")
 		}, want: "kernel limits"},
+		{name: "kernel cpu is below the lease", process: func(h *host) {
+			h.process(h.sentry, scope, resources)
+			writeFile(h.t, filepath.Join(h.config.CgroupRoot, scope, "cpu.max"), "50000 100000\n")
+		}, want: "kernel limits"},
 		{name: "kernel cpu exceeds the lease", process: func(h *host) {
 			h.process(h.sentry, scope, resources)
 			writeFile(h.t, filepath.Join(h.config.CgroupRoot, scope, "cpu.max"), "200000 100000\n")
@@ -759,8 +783,15 @@ func TestOpenRefusesUnverifiableHosts(t *testing.T) {
 		{name: "another data root", mutate: func(h *host, _ *Config) { h.engine.info["DockerRootDir"] = "/var/lib/docker" }, want: "want root="},
 		{name: "cgroup v1", mutate: func(h *host, _ *Config) { h.engine.info["CgroupVersion"] = "1" }, want: "want root="},
 		{name: "default containerd namespace", mutate: func(h *host, _ *Config) {
-			h.engine.info["Containerd"] = map[string]any{"Namespaces": map[string]any{"Containers": "moby", "Plugins": "plugins.moby"}}
+			h.engine.info["Containerd"] = map[string]any{"Address": "/run/mc-sandbox/containerd/containerd.sock", "Namespaces": map[string]any{"Containers": "moby", "Plugins": "plugins.moby"}}
 		}, want: "containerd namespaces"},
+		{name: "no containerd reported", mutate: func(h *host, _ *Config) { delete(h.engine.info, "Containerd") }, want: "dedicated containerd"},
+		{name: "daemon-managed containerd", mutate: func(h *host, _ *Config) {
+			h.engine.info["Containerd"] = map[string]any{"Address": "/var/run/docker/containerd/containerd.sock", "Namespaces": map[string]any{"Containers": "mc-sandbox", "Plugins": "mc-sandbox-plugins"}}
+		}, want: "default containerd"},
+		{name: "bridge network managed", mutate: func(h *host, _ *Config) {
+			h.engine.networks = append(h.engine.networks, map[string]string{"Name": "bridge", "Driver": "bridge"})
+		}, want: "no bridge"},
 		{name: "insecure registry", mutate: func(h *host, _ *Config) {
 			h.engine.info["RegistryConfig"].(map[string]any)["InsecureRegistryCIDRs"] = []string{"127.0.0.0/8", "10.0.0.0/8"}
 		}, want: "insecure registry"},

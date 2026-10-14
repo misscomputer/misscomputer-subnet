@@ -30,8 +30,11 @@ images no container uses are pruned.
 - the socket is not the default daemon's, the server is Docker
   `28.0.4` (the version the [disposable gate](gvisor-disposable-gate.md)
   proved the quota on), its data root is the configured `DataRoot`, storage is
-  `overlay2`, the cgroup driver is `systemd` on cgroup v2, and its containerd
-  namespaces are not the default engine's;
+  `overlay2`, the cgroup driver is `systemd` on cgroup v2, it reports a
+  containerd socket other than the host's shared or the daemon-managed
+  default with namespaces other than the default engine's (where that
+  containerd stores its data is not visible to the Engine API), and it
+  manages no network beyond `host` and `none` (no bridge);
 - the runtime is registered at the pinned runsc path with arguments drawn
   only from `--overlay2=none`, `--systemd-cgroup`, `--platform=systrap`,
   `--platform=kvm`, and including the first two (the quota holds only with
@@ -108,16 +111,20 @@ image ID, and no init process, sysctls, tmpfs, runtime annotations, device
 rules or requests, volume sources, links, extra groups, hosts or DNS
 settings) and the kernel's view of its process: `/proc/<pid>/exe` is the
 pinned sentry (or runsc), the same file Open hashed, unchanged, and
-`/proc/<pid>/cgroup` lies below the slice with `memory.max` and `pids.max`
-equal to the lease, `memory.swap.max` zero and `cpu.max` no larger. Anything else is a miner fault
+`/proc/<pid>/cgroup` lies below the slice with `cpu.max`, `memory.max` and
+`pids.max` equal to the lease and `memory.swap.max` zero. Anything else is a miner fault
 and the lane destroys the container.
 
 A workload that exits by itself after the engine started it (the engine
 records no start error), with any exit code and including an OOM kill
 within the lease limit, is not a miner fault (contract D11). If it exits
-before or during the kernel readback, `Create` succeeds once the engine
-configuration above matches, the per-process checks are logged as
-`not_run`, and the lease is served until release or expiry.
+before or during the kernel readback, `Create` succeeds only when the engine
+configuration above matches, a fresh inspection shows it exited with no
+start error, no PID and an exit time after its start time, and no process
+remains in a cgroup below the slice named for the container. The
+per-process checks are then logged as `not_run`, the exited container is
+never restarted, and it keeps its lease, writable layer and logs until
+release or expiry.
 
 `Create` is idempotent per instance name: a container already made for the
 same lease document is started if needed and verified again; one made for
@@ -160,8 +167,9 @@ container uses it; a missing container is success.
 opens the backend against the real host, then drives the real lane with
 signed documents: reserve, commit (real pull and gVisor container, verified
 as above), idempotent re-create, release (acknowledged only after the
-container is gone), commit again, and restart recovery (container destroyed,
-lease `failed`). It needs a provisioned dedicated daemon, runsc registration,
+container is gone), a workload that exits by itself (`ready`, kept until its
+release), commit again, and restart recovery (container destroyed, lease
+`failed`). It needs a provisioned dedicated daemon, runsc registration,
 slice and an XFS project-quota data root of at least 5.2 GiB, described by
 `MC_SANDBOX_DOCKER_HOST`, `MC_SANDBOX_RUNTIME`, `MC_SANDBOX_RUNSC_PATH`,
 `MC_SANDBOX_RUNSC_SHA256`, `MC_SANDBOX_SENTRY_PATH`,

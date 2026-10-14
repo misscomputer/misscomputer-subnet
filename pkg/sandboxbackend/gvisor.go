@@ -291,6 +291,7 @@ type daemonInfo struct {
 		Mirrors []string `json:"Mirrors"`
 	} `json:"RegistryConfig"`
 	Containerd *struct {
+		Address    string `json:"Address"`
 		Namespaces struct {
 			Containers string `json:"Containers"`
 			Plugins    string `json:"Plugins"`
@@ -316,11 +317,23 @@ func (b *GVisor) verifyDaemon(ctx context.Context) error {
 		return fmt.Errorf("sandbox docker daemon root=%q storage=%q cgroup=%q/v%s, want root=%q overlay2 systemd/v2",
 			info.DockerRootDir, info.Driver, info.CgroupDriver, info.CgroupVersion, b.config.DataRoot)
 	}
-	if info.Containerd != nil && (info.Containerd.Namespaces.Containers == "moby" || info.Containerd.Namespaces.Plugins == "plugins.moby") {
-		return errors.New("sandbox docker daemon shares the default engine's containerd namespaces")
+	if err := verifyContainerd(info); err != nil {
+		return err
 	}
 	if err := verifyRegistryConfig(info); err != nil {
 		return err
+	}
+	var networks []struct {
+		Name   string `json:"Name"`
+		Driver string `json:"Driver"`
+	}
+	if err := b.engine.call(ctx, http.MethodGet, "/networks", nil, nil, &networks); err != nil {
+		return fmt.Errorf("list sandbox daemon networks: %w", err)
+	}
+	for _, network := range networks {
+		if !(network.Name == "none" && network.Driver == "null") && !(network.Name == "host" && network.Driver == "host") {
+			return fmt.Errorf("sandbox docker daemon manages network %q (%s); it must run with no bridge and only host and none", network.Name, network.Driver)
+		}
 	}
 	runtime, ok := info.Runtimes[b.config.Runtime]
 	if !ok || runtime.Path != b.config.RunscPath {
@@ -346,6 +359,37 @@ func (b *GVisor) verifyDaemon(ctx context.Context) error {
 		if container.Labels[LabelSandbox] != sandboxLabelV1 {
 			return fmt.Errorf("sandbox docker daemon runs container %s that is not a sandbox; the daemon must be dedicated", container.ID)
 		}
+	}
+	return nil
+}
+
+// defaultContainerdSockets are the sockets of a host's shared containerd and
+// of the containerd a Docker daemon starts for itself.
+var defaultContainerdSockets = []string{
+	"/run/containerd/containerd.sock", "/var/run/containerd/containerd.sock",
+	"/run/docker/containerd/containerd.sock", "/var/run/docker/containerd/containerd.sock",
+}
+
+// verifyContainerd requires the daemon to use a containerd of its own: a
+// socket other than the shared or daemon-managed default, and namespaces
+// other than the default engine's. Where that containerd keeps its data is
+// not visible through the Engine API.
+func verifyContainerd(info daemonInfo) error {
+	c := info.Containerd
+	if c == nil || !filepath.IsAbs(c.Address) {
+		return errors.New("sandbox docker daemon does not report a dedicated containerd")
+	}
+	address := filepath.Clean(c.Address)
+	if resolved, err := filepath.EvalSymlinks(address); err == nil {
+		address = resolved
+	}
+	for _, shared := range defaultContainerdSockets {
+		if resolved, err := filepath.EvalSymlinks(shared); address == shared || (err == nil && resolved == address) {
+			return fmt.Errorf("sandbox docker daemon uses the default containerd at %s", c.Address)
+		}
+	}
+	if c.Namespaces.Containers == "" || c.Namespaces.Containers == "moby" || c.Namespaces.Plugins == "" || c.Namespaces.Plugins == "plugins.moby" {
+		return errors.New("sandbox docker daemon shares the default engine's containerd namespaces")
 	}
 	return nil
 }
@@ -443,11 +487,12 @@ type inspectedContainer struct {
 	Name  string `json:"Name"`
 	Image string `json:"Image"`
 	State struct {
-		Status    string `json:"Status"`
-		Running   bool   `json:"Running"`
-		Pid       int    `json:"Pid"`
-		Error     string `json:"Error"`
-		StartedAt string `json:"StartedAt"`
+		Status     string `json:"Status"`
+		Running    bool   `json:"Running"`
+		Pid        int    `json:"Pid"`
+		Error      string `json:"Error"`
+		StartedAt  string `json:"StartedAt"`
+		FinishedAt string `json:"FinishedAt"`
 	} `json:"State"`
 	Config struct {
 		Labels map[string]string `json:"Labels"`
@@ -592,6 +637,9 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 			if err := b.verifyEngine(again, s); err != nil {
 				return err
 			}
+			if err := b.instanceGone(again.ID); err != nil {
+				return err
+			}
 			return b.exited(again)
 		}
 		return err
@@ -601,11 +649,41 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 
 // workloadExited reports a container the engine started whose workload has
 // since exited by itself, with any exit code and including an OOM kill
-// within the lease limit. A start the engine or runtime failed records
-// State.Error and is not an exit.
+// within the lease limit (contract D11-C1). A start the engine or runtime
+// failed records State.Error and is not an exit.
 func workloadExited(c inspectedContainer) bool {
-	return !c.State.Running && c.State.Status == "exited" && c.State.Error == "" &&
-		c.State.StartedAt != "" && !strings.HasPrefix(c.State.StartedAt, "0001-01-01")
+	started, startErr := time.Parse(time.RFC3339Nano, c.State.StartedAt)
+	finished, finishErr := time.Parse(time.RFC3339Nano, c.State.FinishedAt)
+	return !c.State.Running && c.State.Pid == 0 && c.State.Status == "exited" && c.State.Error == "" &&
+		startErr == nil && finishErr == nil && started.Year() > 1 && finished.After(started)
+}
+
+// instanceGone requires that no process remains in any cgroup below the
+// slice named for container id; a removed cgroup has none (D11-C1).
+func (b *GVisor) instanceGone(id string) error {
+	if len(id) < 12 {
+		return fmt.Errorf("container ID %q is too short to find its cgroups", id)
+	}
+	root := filepath.Join(b.config.CgroupRoot, b.sliceCgroup)
+	return filepath.WalkDir(root, func(dir string, entry fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil || !entry.IsDir() || !strings.Contains(entry.Name(), id) {
+			return err
+		}
+		procs, err := readSmall(filepath.Join(dir, "cgroup.procs"))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if procs != "" {
+			return fmt.Errorf("exited sandbox %s still has processes in %s", id, dir)
+		}
+		return nil
+	})
 }
 
 // exited accepts a sandbox whose workload exited before its process could
@@ -918,7 +996,8 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 
 // verifyProcess proves the kernel's view of the running sandbox process:
 // the pinned gVisor binary Open hashed, in a cgroup below the slice whose
-// limits are the lease's, with no swap.
+// cpu.max, memory.max and pids.max equal the lease's, with no swap
+// (lease.child_limits_match).
 func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 	if !c.State.Running || c.State.Pid <= 0 {
 		return fmt.Errorf("sandbox %s is %s, not running: %q", c.Name, c.State.Status, c.State.Error)
@@ -967,7 +1046,7 @@ func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 	}
 	millis := s.host.NanoCpus / 1_000_000
 	if memory != strconv.FormatInt(s.host.Memory, 10) || swap != "0" || pids != strconv.FormatInt(*s.host.PidsLimit, 10) ||
-		quota <= 0 || period <= 0 || quota*1000/period > millis {
+		quota <= 0 || period <= 0 || quota*1000 != millis*period {
 		return fmt.Errorf("sandbox %s kernel limits cpu.max=%q memory.max=%q memory.swap.max=%q pids.max=%q differ from the lease",
 			c.Name, cpu, memory, swap, pids)
 	}

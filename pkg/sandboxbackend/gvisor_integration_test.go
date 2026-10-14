@@ -27,6 +27,10 @@ import (
 // proves digest verification of an index pull.
 const integrationImage = "registry.k8s.io/pause@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a"
 
+// exitingImage's default command is "sh", which exits at once without
+// stdin: a workload that exits by itself (contract D11).
+const exitingImage = "registry.k8s.io/e2e-test-images/busybox@sha256:a9155b13325b2abef48e71de77bb8ac015412a566829f621d06bfae5c699b1b9"
+
 // TestGVisorLaneOnDisposableHost drives the real sandbox lane through the
 // real backend on a provisioned disposable host: a dedicated Docker daemon
 // with runsc registered, a finite sandbox slice and an XFS project-quota
@@ -72,7 +76,7 @@ func TestGVisorLaneOnDisposableHost(t *testing.T) {
 	r := h.reservation(resources)
 	receipt, err := h.lane.Reserve(ctx, r, h.request())
 	h.expect(receipt, err, sandbox.StageHeld)
-	lease := h.lease(r)
+	lease := h.lease(r, integrationImage)
 	receipt, err = h.lane.Commit(ctx, lease, h.request())
 	h.expect(receipt, err, sandbox.StageReady)
 	instance := miner.SandboxInstanceName(protocol.SandboxLeaseIDV1(lease))
@@ -93,11 +97,24 @@ func TestGVisorLaneOnDisposableHost(t *testing.T) {
 		t.Fatalf("sandboxes after release = %+v, %v", instances, err)
 	}
 
+	// A workload that exits by itself is served, not a miner fault (D11),
+	// and keeps its sandbox until release.
+	r = h.reservation(resources)
+	receipt, err = h.lane.Reserve(ctx, r, h.request())
+	h.expect(receipt, err, sandbox.StageHeld)
+	receipt, err = h.lane.Commit(ctx, h.lease(r, exitingImage), h.request())
+	h.expect(receipt, err, sandbox.StageReady)
+	if instances, err := backend.Instances(ctx); err != nil || len(instances) != 1 {
+		t.Fatalf("sandboxes after an exited workload = %+v, %v", instances, err)
+	}
+	receipt, err = h.lane.Release(ctx, h.release(r), h.request())
+	h.expect(receipt, err, sandbox.StageReleased)
+
 	// A restart destroys every sandbox before the lane serves again.
 	r = h.reservation(resources)
 	receipt, err = h.lane.Reserve(ctx, r, h.request())
 	h.expect(receipt, err, sandbox.StageHeld)
-	lease = h.lease(r)
+	lease = h.lease(r, integrationImage)
 	receipt, err = h.lane.Commit(ctx, lease, h.request())
 	h.expect(receipt, err, sandbox.StageReady)
 	restarted := h.newLane(backend, budget)
@@ -215,16 +232,16 @@ func (h *laneHost) reservation(resources sandbox.Resources) protocol.SandboxRese
 	return r
 }
 
-func (h *laneHost) lease(r protocol.SandboxReservationV1) protocol.SandboxLeaseV1 {
+func (h *laneHost) lease(r protocol.SandboxReservationV1, reference string) protocol.SandboxLeaseV1 {
 	h.t.Helper()
 	digest, err := protocol.SandboxDigestV1(r)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	image, _ := sandbox.ImageDigest(integrationImage)
+	image, _ := sandbox.ImageDigest(reference)
 	l := protocol.SandboxLeaseV1{
 		AssignmentNonce: r.ReservationNonce, Env: map[string]string{}, Generation: 1, ImageDigest: image,
-		ImageReference: integrationImage, Isolation: sandbox.IsolationGVisor, IssuedAt: *protocol.StaticTime(h.now),
+		ImageReference: reference, Isolation: sandbox.IsolationGVisor, IssuedAt: *protocol.StaticTime(h.now),
 		LeaseExpiresAt: *protocol.StaticTime(h.now.Add(10 * time.Minute)), MinerID: itMinerHotkey,
 		Network:           sandbox.NetworkPolicy{Mode: sandbox.NetworkNone, Allow: []string{}},
 		ReservationDigest: digest, Resources: r.Resources, SandboxID: r.SandboxID, Schema: protocol.SandboxLeaseSchema, SchemaVersion: 1,
