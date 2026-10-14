@@ -101,6 +101,8 @@ PY
   exit "$result"
 }
 trap finish EXIT
+# An unexpected command failure must name itself, not end the run silently.
+trap 'echo "SANDBOX-HOST FAILED: unexpected failure at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 lease_cg=$(systemctl show --property=ControlGroup --value "$p_lease_slice")
 engine_cg=$(systemctl show --property=ControlGroup --value "$p_engine_slice")
@@ -591,7 +593,9 @@ sleep 8
 # Count guest processes from outside the sandbox with runsc's own state, so
 # the count needs no free slot inside a sandbox that is at its limit.
 full_id=$(docker inspect --format '{{.Id}}' "$container")
-state_dir=$(find "$p_run_root/exec" -maxdepth 3 -type d -path "*/runtime-runsc/$p_containerd_ns" 2>/dev/null | head -1)
+# runsc keeps <root>/<container id>/ state; find that root below the run root.
+state_dir=$(find "$p_run_root" -maxdepth 7 -name "$full_id*" -path '*runsc*' 2>/dev/null | head -1 || true)
+state_dir=${state_dir%/*}
 guest_procs=unavailable
 if [[ -n $state_dir ]]; then
   guest_procs=$(timeout 20 "$p_runsc_path" --root "$state_dir" ps --format json "$full_id" 2>/dev/null |
