@@ -5,13 +5,14 @@ package miner
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
+	"golang.org/x/sys/unix"
 )
 
 // DefaultCgroupRoot is the usual cgroup v2 mount point.
@@ -36,7 +37,11 @@ func VerifySandboxCgroup(root, cgroup string, forbidden []string) (sandbox.Capac
 			return sandbox.Capacity{}, fmt.Errorf("sandbox cgroup %q overlaps cgroup %q, which sandboxes must not share", clean, other)
 		}
 	}
-	dir := filepath.Join(root, filepath.FromSlash(clean))
+	dir, err := openSandboxCgroup(root, clean)
+	if err != nil {
+		return sandbox.Capacity{}, err
+	}
+	defer dir.Close()
 	cpu, err := readCgroupFile(dir, "cpu.max")
 	if err != nil {
 		return sandbox.Capacity{}, err
@@ -63,13 +68,41 @@ func VerifySandboxCgroup(root, cgroup string, forbidden []string) (sandbox.Capac
 	return sandbox.Capacity{CPUMillis: int(quota * 1000 / period), MemoryMiB: int(bytes >> 20)}, nil
 }
 
-func readCgroupFile(dir, name string) (string, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, name))
+// Open each path component relative to its already-open parent. A symlink in
+// the subtree or either limit file could otherwise make finite values from an
+// unrelated location stand in for the sandbox's actual cgroup limits.
+func openSandboxCgroup(root, cgroup string) (*os.File, error) {
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("sandbox cgroup %s has no %s; is it a cgroup v2 directory with the cpu and memory controllers?", dir, name)
+		return nil, fmt.Errorf("open cgroup root %q: %w", root, err)
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(cgroup, "/"), "/") {
+		next, openErr := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		unix.Close(fd)
+		if openErr != nil {
+			return nil, fmt.Errorf("open sandbox cgroup %q: %w", cgroup, openErr)
 		}
+		fd = next
+	}
+	return os.NewFile(uintptr(fd), cgroup), nil
+}
+
+func readCgroupFile(dir *os.File, name string) (string, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return "", fmt.Errorf("sandbox cgroup %s has no %s; is it a cgroup v2 directory with the cpu and memory controllers?", dir.Name(), name)
+		}
+		return "", fmt.Errorf("open sandbox cgroup %s/%s: %w", dir.Name(), name, err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, 257))
+	if err != nil {
 		return "", err
+	}
+	if len(raw) > 256 {
+		return "", fmt.Errorf("sandbox cgroup %s/%s is too large", dir.Name(), name)
 	}
 	return strings.TrimSpace(string(raw)), nil
 }

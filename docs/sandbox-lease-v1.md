@@ -177,9 +177,13 @@ including refused and failed receipts.
   `memory.max`, disk and count limits covering its configured budget.
   Construction requires explicit `AgentCgroup` and `DeploymentCgroup` paths;
   missing, root, malformed, or overlapping paths fail closed in
-  `VerifySandboxCgroup`. These are trusted configuration values: the future
-  backend/activation review must prove they are the actual agent and web
-  replica subtrees, not merely arbitrary disjoint names. There is no backend
+  `VerifySandboxCgroup`. The cgroup path and its `cpu.max` and `memory.max`
+  files are opened without following symlinks, so symlinks cannot substitute
+  limits from an unrelated subtree or ordinary file. These are trusted
+  configuration values: the future backend/activation review must prove
+  they are the actual agent and web replica subtrees, not merely arbitrary
+  disjoint names, and verify the cgroup mount/hierarchy itself. Bind mounts
+  or a substituted cgroup root are outside this check. There is no backend
   or activation flag implementation in this PR, so `--sandbox-leases on`
   still refuses to start and no such isolation claim has been made live.
 - **Bridge routes** (only with an enabled lane, behind the bridge HMAC):

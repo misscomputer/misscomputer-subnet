@@ -666,6 +666,42 @@ func TestNewSandboxLaneRequiresAnEnforcedDedicatedBudget(t *testing.T) {
 	}
 }
 
+// A cgroup limit read through a symlink can describe a different subtree
+// (or an ordinary file), while the sandbox subtree remains unlimited.
+func TestNewSandboxLaneRejectsSymlinkedCgroupLimits(t *testing.T) {
+	for _, name := range []string{"directory", "cpu.max", "memory.max"} {
+		t.Run(name, func(t *testing.T) {
+			f := newSBFixture(t)
+			root := t.TempDir()
+			writeCgroup(t, root, "400000 100000", fmt.Sprint(8192<<20))
+			dir := filepath.Join(root, sbCgroup)
+			if name == "directory" {
+				outside := filepath.Join(t.TempDir(), "finite-cgroup")
+				if err := os.Rename(dir, outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, dir); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				limit := filepath.Join(dir, name)
+				outside := filepath.Join(t.TempDir(), name)
+				if err := os.Rename(limit, outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, limit); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := NewSandboxLane(context.Background(), f.agent(), f.store, f.backend, SandboxLaneConfig{
+				Budget: sbBudget, CgroupRoot: root, AgentCgroup: "/system.slice/miner-agent.service", DeploymentCgroup: "/system.slice/deployment-v4.slice",
+			}); err == nil {
+				t.Fatal("accepted finite limits outside the selected sandbox cgroup")
+			}
+		})
+	}
+}
+
 // A release receipt tells the validator the slot is free, so it is signed
 // only once every sandbox of the identity is destroyed. While a destroy
 // fails, the release answers ErrSandboxCleanupPending (no receipt), the
