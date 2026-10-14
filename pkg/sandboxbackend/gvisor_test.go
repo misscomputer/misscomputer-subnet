@@ -85,7 +85,8 @@ func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
 		version: PinnedDockerVersion,
 		info: map[string]any{
 			"DockerRootDir": dataRoot, "Driver": "overlay2", "CgroupDriver": "systemd", "CgroupVersion": "2",
-			"Runtimes": map[string]any{"runsc": map[string]any{"path": runsc, "runtimeArgs": []string{"--systemd-cgroup", "--overlay2=none"}}},
+			"DriverStatus": [][]string{{"Backing Filesystem", "xfs"}, {"Supports d_type", "true"}, {"Using metacopy", "false"}, {"Native Overlay Diff", "true"}, {"userxattr", "false"}},
+			"Runtimes":     map[string]any{"runsc": map[string]any{"path": runsc, "runtimeArgs": []string{"--systemd-cgroup", "--overlay2=none"}}},
 			"Containerd": map[string]any{
 				"Address":    "/run/mc-sandbox/containerd/containerd.sock",
 				"Namespaces": map[string]any{"Containers": "mc-sandbox", "Plugins": "mc-sandbox-plugins"},
@@ -789,6 +790,12 @@ func TestOpenRefusesUnverifiableHosts(t *testing.T) {
 		{name: "daemon-managed containerd", mutate: func(h *host, _ *Config) {
 			h.engine.info["Containerd"] = map[string]any{"Address": "/var/run/docker/containerd/containerd.sock", "Namespaces": map[string]any{"Containers": "mc-sandbox", "Plugins": "mc-sandbox-plugins"}}
 		}, want: "default containerd"},
+		{name: "overlay2 on ext4", mutate: func(h *host, _ *Config) {
+			h.engine.info["DriverStatus"] = [][]string{{"Backing Filesystem", "extfs"}, {"Supports d_type", "true"}}
+		}, want: "want xfs with d_type"},
+		{name: "overlay2 without d_type", mutate: func(h *host, _ *Config) {
+			h.engine.info["DriverStatus"] = [][]string{{"Backing Filesystem", "xfs"}, {"Supports d_type", "false"}}
+		}, want: "want xfs with d_type"},
 		{name: "bridge network managed", mutate: func(h *host, _ *Config) {
 			h.engine.networks = append(h.engine.networks, map[string]string{"Name": "bridge", "Driver": "bridge"})
 		}, want: "no bridge"},

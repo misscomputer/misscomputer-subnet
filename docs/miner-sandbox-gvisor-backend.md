@@ -27,14 +27,14 @@ images no container uses are pruned.
 
 ## What Open verifies (no host changes)
 
-- the socket is not the default daemon's, the server is Docker
-  `28.0.4` (the version the [disposable gate](gvisor-disposable-gate.md)
-  proved the quota on), its data root is the configured `DataRoot`, storage is
-  `overlay2`, the cgroup driver is `systemd` on cgroup v2, it reports a
-  containerd socket other than the host's shared or the daemon-managed
-  default with namespaces other than the default engine's (where that
-  containerd stores its data is not visible to the Engine API), and it
-  manages no network beyond `host` and `none` (no bridge);
+- the socket is not the default daemon's, the server is Docker `28.0.4` (the
+  version the [disposable gate](gvisor-disposable-gate.md) proved the quota
+  on), its data root is the configured `DataRoot`, storage is `overlay2` on
+  an XFS backing filesystem with d_type, the cgroup driver is `systemd` on
+  cgroup v2, it reports a containerd socket other than the host's shared or
+  the daemon-managed default with namespaces other than the default engine's
+  (where that containerd stores its data is not visible to the Engine API),
+  and it manages no network beyond `host` and `none` (no bridge);
 - the runtime is registered at the pinned runsc path with arguments drawn
   only from `--overlay2=none`, `--systemd-cgroup`, `--platform=systrap`,
   `--platform=kvm`, and including the first two (the quota holds only with

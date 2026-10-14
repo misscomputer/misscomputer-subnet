@@ -276,8 +276,10 @@ func verifyBinary(file, want string) (fs.FileInfo, error) {
 type daemonInfo struct {
 	DockerRootDir string `json:"DockerRootDir"`
 	Driver        string `json:"Driver"`
-	CgroupDriver  string `json:"CgroupDriver"`
-	CgroupVersion string `json:"CgroupVersion"`
+	// DriverStatus is the storage driver's [name, value] pairs.
+	DriverStatus  [][]string `json:"DriverStatus"`
+	CgroupDriver  string     `json:"CgroupDriver"`
+	CgroupVersion string     `json:"CgroupVersion"`
 	Runtimes      map[string]struct {
 		Path        string   `json:"path"`
 		RuntimeArgs []string `json:"runtimeArgs"`
@@ -316,6 +318,10 @@ func (b *GVisor) verifyDaemon(ctx context.Context) error {
 	if info.DockerRootDir != b.config.DataRoot || info.Driver != "overlay2" || info.CgroupDriver != "systemd" || info.CgroupVersion != "2" {
 		return fmt.Errorf("sandbox docker daemon root=%q storage=%q cgroup=%q/v%s, want root=%q overlay2 systemd/v2",
 			info.DockerRootDir, info.Driver, info.CgroupDriver, info.CgroupVersion, b.config.DataRoot)
+	}
+	if driver := driverStatus(info); driver["Backing Filesystem"] != "xfs" || driver["Supports d_type"] != "true" {
+		return fmt.Errorf("sandbox docker daemon overlay2 is backed by %q with d_type %q, want xfs with d_type",
+			driver["Backing Filesystem"], driver["Supports d_type"])
 	}
 	if err := verifyContainerd(info); err != nil {
 		return err
@@ -361,6 +367,17 @@ func (b *GVisor) verifyDaemon(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// driverStatus indexes the storage driver's reported [name, value] pairs.
+func driverStatus(info daemonInfo) map[string]string {
+	status := map[string]string{}
+	for _, pair := range info.DriverStatus {
+		if len(pair) == 2 {
+			status[pair[0]] = pair[1]
+		}
+	}
+	return status
 }
 
 // defaultContainerdSockets are the sockets of a host's shared containerd and
