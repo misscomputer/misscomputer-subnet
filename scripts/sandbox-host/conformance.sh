@@ -67,7 +67,7 @@ gap() { python3 "$here/report.py" record "$ledger" "$1" unenforced gap "$(clean_
 
 finish() {
   local result=$?
-  trap - EXIT
+  trap - EXIT ERR
   set +e
   mapfile -t leftovers < <(timeout 30 docker ps -aq --filter label=mcsbx.conformance=1 2>/dev/null)
   if (( ${#leftovers[@]} )); then timeout 60 docker rm -f -v "${leftovers[@]}" >/dev/null 2>&1; fi
@@ -519,7 +519,7 @@ loop_probe=$(timeout 10 docker exec "$container" wget -T 3 -q -O /dev/null http:
 host_probe=$(timeout 10 docker exec "$container" wget -T 3 -q -O /dev/null "http://$host_addr:18089/" 2>&1 >/dev/null || true)
 sleep 1
 seen=$(cat "$work/listener.count")
-kill "$listener" >/dev/null 2>&1; wait "$listener" 2>/dev/null || true
+kill "$listener" >/dev/null 2>&1 || true; wait "$listener" 2>/dev/null || true
 [[ $loop_probe == "wget: can't connect to remote host (127.0.0.1): Connection refused" ]] || bad "sandbox 127.0.0.1 probe: $loop_probe"
 [[ $host_probe == "wget: can't connect to remote host ($host_addr): Network is unreachable" ]] || bad "host address probe: $host_probe"
 [[ $seen == 1 ]] || bad "host listener saw $seen connections (1 is the host-side control)"
@@ -556,7 +556,7 @@ for ref in 127.0.0.1:18090/mcsbx/probe:none "$host_addr:18090/mcsbx/probe:none" 
 done
 sleep 1
 seen=$(cat "$work/egress.count")
-kill "$egress_listener" >/dev/null 2>&1; wait "$egress_listener" 2>/dev/null || true
+kill "$egress_listener" >/dev/null 2>&1 || true; wait "$egress_listener" 2>/dev/null || true
 rejects_after=$(reject_count)
 [[ $seen == 1 ]] || bad "engine pulls reached the host listeners ($((seen - 1)) connections)"
 (( rejects_after > rejects_before )) || bad "egress reject counters did not move ($rejects_before -> $rejects_after); failures not attributable to the rule"
@@ -601,7 +601,7 @@ if [[ -n $state_dir ]]; then
   guest_procs=$(timeout 20 "$p_runsc_path" --root "$state_dir" ps --format json "$full_id" 2>/dev/null |
     python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))' 2>/dev/null || echo unavailable)
 fi
-kill "$spawner" >/dev/null 2>&1; wait "$spawner" 2>/dev/null || true
+kill "$spawner" >/dev/null 2>&1 || true; wait "$spawner" 2>/dev/null || true
 fork_errors=$(grep -Eci "can't fork|Resource temporarily unavailable|No child processes" "$work/pids.log" || true)
 [[ $guest_procs =~ ^[0-9]+$ ]] && (( guest_procs <= 64 && fork_errors > 0 )) || bad "guest processes=$guest_procs (runsc root ${state_dir:-not found}) fork errors=$fork_errors"
 ok "runsc ps: guest processes=$guest_procs <= 64 after 200 spawn attempts; fork errors=$fork_errors"
@@ -647,7 +647,7 @@ rc_a=0; rc_b=0
 timeout 120 docker exec --user 0 mcsbx-lease-agg-a dd if=/dev/zero of=/tmp/fill bs=1048576 count="$fill_mib" >/dev/null 2>&1 || rc_a=$?
 timeout 120 docker exec --user 0 mcsbx-lease-agg-b dd if=/dev/zero of=/tmp/fill bs=1048576 count="$fill_mib" >/dev/null 2>&1 || rc_b=$?
 sleep 1
-kill "$sampler" >/dev/null 2>&1; wait "$sampler" 2>/dev/null || true; sampler=
+kill "$sampler" >/dev/null 2>&1 || true; wait "$sampler" 2>/dev/null || true; sampler=
 after=$(awk '$1 == "max" || $1 == "oom" {s+=$2} END {print s+0}' "$p_cgroup_root$lease_cg/memory.events.local")
 states=$(docker inspect --format '{{.Name}} {{.State.Running}}' mcsbx-lease-agg-a mcsbx-lease-agg-b | tr '\n' ' ')
 max_peak=$(awk '{if ($1 > m) m = $1; if ($2 > m) m = $2} END {print m+0}' "$peak_file")
