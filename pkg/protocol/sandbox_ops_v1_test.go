@@ -580,6 +580,46 @@ func TestSandboxOpReceiptRules(t *testing.T) {
 	}
 }
 
+// D13: an unknown exec_start outcome becomes a definitive non-start only
+// through an exec_not_found the miner signed after the start's admission
+// window closed.
+func TestSandboxExecNeverStartedOnlyAfterTheAdmissionWindow(t *testing.T) {
+	validator, miner, lease := opLease(t)
+	start := signedOp(t, validator, unsignedOp(t, lease, sandbox.OpExecStart))
+	read := unsignedOp(t, lease, sandbox.OpExecRead)
+	read.OpNonce, read.ExecID = strings.Repeat("f6", 16), str(protocol.SandboxOpIDV1(start))
+	read.IssuedAt, read.ExpiresAt = stamp(opNow.Add(time.Minute)), stamp(opNow.Add(90*time.Second))
+	read = signedOp(t, validator, read)
+	notFound := func(request protocol.SandboxOpRequestV1, observed time.Time) protocol.SandboxOpReceiptV1 {
+		return opReceipt(t, miner, request, func(r *protocol.SandboxOpReceiptV1) {
+			r.Stage, r.ErrorCode, r.ObservedAt = sandbox.OpStageRefused, str("exec_not_found"), stamp(observed)
+		})
+	}
+	windowEnd := opNow.Add(30*time.Second + sandbox.IssueSkew)
+	if never, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd), read, start); err != nil || !never {
+		t.Fatalf("exec_not_found at the window end must be definitive: %v %v", never, err)
+	}
+	if never, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd.Add(-time.Nanosecond)), read, start); err != nil || never {
+		t.Fatalf("exec_not_found inside the window must not be definitive: %v %v", never, err)
+	}
+	running := opReceipt(t, miner, read, func(r *protocol.SandboxOpReceiptV1) {
+		r.Stage, r.Exec, r.ObservedAt = sandbox.OpStageRunning, runningExec(0, 0), stamp(windowEnd)
+		withResult(r, []byte{}, 0)
+	})
+	if never, err := protocol.SandboxExecNeverStartedV1(running, read, start); err != nil || never {
+		t.Fatalf("a running exec is not a non-start: %v %v", never, err)
+	}
+	otherExec := unsignedOp(t, lease, sandbox.OpExecCancel)
+	otherExec.OpNonce = strings.Repeat("a9", 16)
+	otherExec = signedOp(t, validator, otherExec)
+	if _, err := protocol.SandboxExecNeverStartedV1(notFound(otherExec, windowEnd), otherExec, start); err == nil {
+		t.Fatal("a read of another exec resolved this exec_start")
+	}
+	if _, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd), read, signedOp(t, validator, unsignedOp(t, lease, sandbox.OpFileStat))); err == nil {
+		t.Fatal("a non-exec op was resolved as an exec_start")
+	}
+}
+
 // The validator accepts a receipt only for the exact request and only with
 // result bytes that match its binding and the request's cursor.
 func TestSandboxOpReceiptMustAnswerRequestAndResult(t *testing.T) {

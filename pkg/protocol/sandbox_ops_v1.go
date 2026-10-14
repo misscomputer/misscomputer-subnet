@@ -469,6 +469,41 @@ func SandboxOpReceiptAnswersV1(r SandboxOpReceiptV1, request SandboxOpRequestV1,
 	return nil
 }
 
+// SandboxExecNeverStartedV1 is the definitive non-start rule for an
+// exec_start whose outcome is unknown (contract D13). It holds only when
+// readReceipt is a verified, accepted answer to readRequest; readRequest is
+// an exec_read or exec_cancel naming start's op ID on the same lease;
+// the receipt refuses with exec_not_found; and the miner signed it at or
+// after start.expires_at plus the issue skew. From then on start is
+// inadmissible by the miner's own clock, and the miner records every
+// admitted exec_start before any effect and keeps that record until lease
+// cleanup, so exec_not_found means the exec never started and never will.
+// An earlier exec_not_found is not definitive: start may still be in
+// flight. A miner that later reports start as started has signed a
+// contradiction of this receipt.
+func SandboxExecNeverStartedV1(readReceipt SandboxOpReceiptV1, readRequest, start SandboxOpRequestV1) (bool, error) {
+	if start.Op != sandbox.OpExecStart || (readRequest.Op != sandbox.OpExecRead && readRequest.Op != sandbox.OpExecCancel) ||
+		readRequest.ExecID == nil || *readRequest.ExecID != SandboxOpIDV1(start) || readRequest.LeaseID != start.LeaseID ||
+		readRequest.LeaseDigest != start.LeaseDigest || !sameSandboxParties(readRequest.Subnet, start.Subnet) {
+		return false, errors.New("sandbox exec resolution request does not name the exec_start")
+	}
+	if err := SandboxOpReceiptAnswersV1(readReceipt, readRequest, nil); err != nil {
+		return false, err
+	}
+	if readReceipt.Stage != sandbox.OpStageRefused || readReceipt.ErrorCode == nil || *readReceipt.ErrorCode != "exec_not_found" {
+		return false, nil
+	}
+	observed, err := parseStaticTime(readReceipt.ObservedAt)
+	if err != nil {
+		return false, err
+	}
+	deadline, err := parseStaticTime(start.ExpiresAt)
+	if err != nil {
+		return false, err
+	}
+	return !observed.Before(deadline.Add(sandbox.IssueSkew)), nil
+}
+
 // DecodeSandboxListResultV1 strictly decodes a file_list result body and
 // checks its entries: addressable names, sorted unique, valid file info.
 func DecodeSandboxListResultV1(result []byte) (sandbox.ListResult, error) {

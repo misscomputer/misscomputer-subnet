@@ -135,6 +135,31 @@ receipt that contradicts an exact request is miner fraud evidence.
   which the request is inadmissible, and at most until lease cleanup.
 - The envelope `request_id` is transport correlation only.
 
+### Unknown outcomes (no answer arrived)
+
+A lost answer, a timed-out hop or a validator runtime crash leaves an op's
+outcome unknown. The runtime holds `exec_start` and `file_write` payload
+bytes in memory only, until it has a verified receipt or until the
+request's `expires_at` plus the 30 s skew; no layer persists or logs them.
+
+- **Inside that window**, the runtime resolves by exact replay: the same
+  signed document with the same payload. The `op_id` makes the replay
+  idempotent at the miner.
+- **After the window** the request is inadmissible:
+  - `exec_start` is resolved with `exec_read` or `exec_cancel` naming
+    `exec_id = op_id`. The miner records every admitted `exec_start` before
+    any effect and keeps the record until lease cleanup, so an
+    `exec_not_found` receipt signed at or after the start's `expires_at`
+    plus the skew is a definitive non-start
+    (`SandboxExecNeverStartedV1`). An earlier `exec_not_found` is not
+    definitive, because the start may still be in flight. A miner that later
+    reports that exec as started has signed a contradiction.
+  - `file_write` is reported to the tenant as `outcome_unknown` (a gateway
+    status, not a miner code). The client re-uploads from offset 0.
+    `file_stat` may hint at the size but proves nothing about the content.
+- A released or expired lease answers `released` or `lease_expired`. The
+  sandbox and every exec are gone, but that does not prove a non-start.
+
 ## Deadlines, cancellation and caps
 
 - Admission window 60 s; file ops finish within 30 s or answer `timed_out`.
@@ -145,8 +170,16 @@ receipt that contradicts an exact request is miner fraud evidence.
 - At most 16 running execs and 1024 exec sessions per lease
   (`exec_limit_exceeded`).
 - Each stream retains its **first** `max_output_bytes`; later bytes are
-  counted and dropped at the producer. Retained output lives in miner memory
-  only.
+  counted and dropped at the producer.
+- Retained output never lives unbounded in miner-agent memory. The
+  in-sandbox helper captures it inside the sandbox, so it is charged to the
+  lease's own writable storage or memory. The agent holds only in-flight
+  chunks of at most 512 KiB per op. An agent without in-sandbox capture
+  must declare a finite per-agent retained-output budget, and refuse new
+  execs beyond it with `exec_limit_exceeded`.
+- Exec status and output are what the helper observed inside the
+  customer's sandbox, and customer code can influence both. They are
+  customer results, not evidence against the customer or the miner.
 - Chunks are at most 512 KiB raw, so a base64 payload or result plus the
   document fits the unchanged 1 MiB bridge body limit. A file reaches at
   most 256 MiB through writes (sequential chunks; the file is visible
@@ -186,8 +219,12 @@ exists, and an exec-level `env` would bypass that rule.
   `ops_unsupported`; there is no fallback.
 
 How the in-sandbox helper reaches a sandbox started from an arbitrary
-public image is an open design item (helper delivery); this slice ships no
-helper and no mount.
+public image is still an open design item. The proposal is a pinned,
+read-only, single-binary mount, present only when ops are enabled. Keeping
+the container alive after its own command exits is also undecided (helper
+as PID 1, or a lease v2 member). This slice ships no helper and no mount.
+Until both are decided, an op against an exited container answers
+`sandbox_exited`.
 
 ## Error codes
 
