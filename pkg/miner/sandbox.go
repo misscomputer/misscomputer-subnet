@@ -239,14 +239,10 @@ func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, 
 			stateCancel()
 			if stateErr == nil {
 				if !running {
-					// A slow create may finish after expiry, even though the
-					// lease was live when first admitted. The same path also
-					// finishes a release that arrived during creation.
+					// Expiry is already fenced in MarkLeaseRunning, or a
+					// release/sweep moved the lease to cleanup first.
 					cleanupCtx, cleanupCancel := context.WithTimeout(workCtx, sandboxCleanupTimeout)
-					stateErr = l.store.BeginLeaseCleanup(cleanupCtx, leaseID, "expired", nil, completedAt)
-					if stateErr == nil {
-						_ = l.teardown(cleanupCtx, leaseID, instance, completedAt)
-					}
+					_ = l.teardown(cleanupCtx, leaseID, instance, completedAt)
 					cleanupCancel()
 				}
 				if stateErr != nil {

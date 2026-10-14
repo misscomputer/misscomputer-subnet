@@ -130,7 +130,10 @@ Invariants (each has a test in `pkg/durable/sandbox_v1_test.go`):
   resources or parties differ from its hold, or a different renewal with the
   same sequence is `ErrSandboxConflict` (signer equivocation, no receipt).
 - An unrenewed lease is moved to cleanup at expiry plus grace, never
-  before. A renewal that arrives after expiry is not applied.
+  before when its runtime is already running. A renewal that arrives after
+  expiry is not applied. If a pending runtime finishes creation at or after
+  expiry, startup atomically fences it for cleanup and destroys it before
+  answering `expired`; a concurrent renewal cannot revive that fence.
 - Restart recovery tears down every lease whose runtime may exist and
   answers `failed/miner_restart`, as `deployment.v4` endpoints are today.
 

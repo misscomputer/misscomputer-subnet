@@ -475,7 +475,7 @@ func TestSandboxCreateFinishingAfterExpiryDestroysSandbox(t *testing.T) {
 		done <- result{receipt, err}
 	}()
 	waitLease(t, f, leaseID, "pending")
-	clock.Store(f.now.Add(2*time.Second + sandbox.Grace + time.Second).UnixNano())
+	clock.Store(f.now.Add(2 * time.Second).UnixNano())
 	close(f.backend.createGate)
 	got := <-done
 	f.check(got.receipt, got.err, protocol.SandboxLeaseSchema, l, sandbox.StageExpired, "")
