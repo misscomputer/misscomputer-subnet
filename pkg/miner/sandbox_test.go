@@ -39,6 +39,8 @@ var (
 type sbBackend struct {
 	mu          sync.Mutex
 	live        map[string]bool
+	leaseIDs    map[string]string
+	reclaimed   int
 	created     []string
 	destroyed   []string
 	unsupported string
@@ -47,7 +49,9 @@ type sbBackend struct {
 	createGate  chan struct{}
 }
 
-func newSBBackend() *sbBackend { return &sbBackend{live: map[string]bool{}} }
+func newSBBackend() *sbBackend {
+	return &sbBackend{live: map[string]bool{}, leaseIDs: map[string]string{}}
+}
 
 func (b *sbBackend) Budget(context.Context) (SandboxBudget, error) {
 	return SandboxBudget{Cgroup: sbCgroup, DiskMiB: sbBudget.DiskMiB, Sandboxes: sbBudget.Sandboxes}, nil
@@ -55,7 +59,7 @@ func (b *sbBackend) Budget(context.Context) (SandboxBudget, error) {
 
 func (b *sbBackend) Unsupported(protocol.SandboxLeaseV1) string { return b.unsupported }
 
-func (b *sbBackend) Create(ctx context.Context, instance string, _ protocol.SandboxLeaseV1) error {
+func (b *sbBackend) Create(ctx context.Context, instance string, lease protocol.SandboxLeaseV1) error {
 	if b.createGate != nil {
 		<-b.createGate
 	}
@@ -69,6 +73,7 @@ func (b *sbBackend) Create(ctx context.Context, instance string, _ protocol.Sand
 		return b.createErr
 	}
 	b.live[instance] = true
+	b.leaseIDs[instance] = protocol.SandboxLeaseIDV1(lease)
 	return nil
 }
 
@@ -83,6 +88,34 @@ func (b *sbBackend) Destroy(ctx context.Context, instance string) error {
 		return b.destroyErr
 	}
 	delete(b.live, instance)
+	return nil
+}
+
+func (b *sbBackend) Instances(ctx context.Context) ([]SandboxInstance, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var instances []SandboxInstance
+	for name := range b.live {
+		instances = append(instances, SandboxInstance{Name: name, LeaseID: b.leaseIDs[name]})
+	}
+	return instances, nil
+}
+
+// adopt makes the backend hold a sandbox the lane did not create.
+func (b *sbBackend) adopt(instance SandboxInstance) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.live[instance.Name] = true
+	b.leaseIDs[instance.Name] = instance.LeaseID
+}
+
+func (b *sbBackend) Reclaim(context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reclaimed++
 	return nil
 }
 
@@ -486,9 +519,11 @@ func TestSandboxCreateFinishingAfterExpiryDestroysSandbox(t *testing.T) {
 	}
 }
 
-// A release that lands while the sandbox is still being created fences the
-// identity at once; the sandbox is destroyed after create returns and the
-// lease ends released, not running.
+// A release that lands while a sandbox is being created does not wait for
+// the create: the fence is durable at once and the release answers
+// ErrSandboxCleanupPending. The create then sees the fence, destroys its
+// sandbox and answers released, and a replay of the release is
+// acknowledged.
 func TestSandboxReleaseDuringCreateDestroysTheSandbox(t *testing.T) {
 	f := newSBFixture(t)
 	ctx := context.Background()
@@ -503,29 +538,55 @@ func TestSandboxReleaseDuringCreateDestroysTheSandbox(t *testing.T) {
 		receipt protocol.SandboxReceiptV1
 		err     error
 	}
-	committed, released := make(chan result, 1), make(chan result, 1)
+	committed := make(chan result, 1)
 	go func() {
 		receipt, err := f.lane.Commit(ctx, l, f.request())
 		committed <- result{receipt, err}
 	}()
 	waitLease(t, f, leaseID, "pending")
 	release := f.release(r)
-	go func() {
-		receipt, err := f.lane.Release(ctx, release, f.request())
-		released <- result{receipt, err}
-	}()
+	if receipt, err := f.lane.Release(ctx, release, f.request()); !errors.Is(err, ErrSandboxCleanupPending) {
+		t.Fatalf("release during create answered %s/%v, want ErrSandboxCleanupPending without waiting", receipt.Stage, err)
+	}
 	waitLease(t, f, leaseID, "cleanup")
 	close(f.backend.createGate)
 
 	commit := <-committed
 	f.check(commit.receipt, commit.err, protocol.SandboxLeaseSchema, l, sandbox.StageReleased, "")
-	rel := <-released
-	f.check(rel.receipt, rel.err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
+	receipt, err = f.lane.Release(ctx, release, f.request())
+	f.check(receipt, err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
 	if live, created, destroyed := f.backend.state(); live != 0 || len(created) != 1 || len(destroyed) == 0 {
 		t.Fatalf("live=%d created=%v destroyed=%v", live, created, destroyed)
 	}
 	if record, _, _ := f.store.Lease(ctx, leaseID); record.Status != "released" {
 		t.Fatalf("lease status %q, want released", record.Status)
+	}
+}
+
+// A create slower than the answer budget is answered accepted, so no
+// transport hop times out on it. Replays while it runs answer accepted
+// without a second create; once it finishes, a replay answers ready.
+func TestSandboxSlowCreateAnswersAcceptedAndReplayAnswersReady(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	f.lane.answerWithin = 20 * time.Millisecond
+	f.backend.createGate = make(chan struct{})
+	r := f.reservation(1)
+	receipt, err := f.lane.Reserve(ctx, r, f.request())
+	f.check(receipt, err, protocol.SandboxReservationSchema, r, sandbox.StageHeld, "")
+	l := f.lease(r, nil)
+	receipt, err = f.lane.Commit(ctx, l, f.request())
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageAccepted, "")
+	receipt, err = f.lane.Commit(ctx, l, f.request())
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageAccepted, "")
+
+	close(f.backend.createGate)
+	waitLease(t, f, protocol.SandboxLeaseIDV1(l), "running")
+	f.lane.answerWithin = time.Minute
+	receipt, err = f.lane.Commit(ctx, l, f.request())
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+	if live, created, _ := f.backend.state(); live != 1 || len(created) != 1 {
+		t.Fatalf("live=%d creates=%v, want one sandbox created once", live, created)
 	}
 }
 
@@ -547,12 +608,18 @@ func TestSandboxRecoverDestroysEverySandbox(t *testing.T) {
 	f := newSBFixture(t)
 	_, l, receipt, err := f.commitHeld(1, nil)
 	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+	// A sandbox the durable state never recorded, such as one left by a
+	// lost state database, is destroyed as well.
+	f.backend.adopt(SandboxInstance{Name: "miss-unrecorded-000000000000", LeaseID: ""})
 	restarted := f.newLane(f.agent())
 	if err := restarted.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if live, _, _ := f.backend.state(); live != 0 {
 		t.Fatalf("%d sandboxes survive restart recovery", live)
+	}
+	if f.backend.reclaimed != 1 {
+		t.Fatalf("restart recovery reclaimed backend storage %d times, want once", f.backend.reclaimed)
 	}
 	again, err := restarted.Commit(context.Background(), l, f.request())
 	f.check(again, err, protocol.SandboxLeaseSchema, l, sandbox.StageFailed, "miner_restart")
@@ -732,5 +799,39 @@ func TestSandboxReleaseIsAcknowledgedOnlyAfterDestroy(t *testing.T) {
 	f.check(receipt, err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
 	if live, _, _ := f.backend.state(); live != 0 || receipt.CapacityActive.Sandboxes != 0 {
 		t.Fatalf("after the acknowledged release: live=%d active=%+v", live, receipt.CapacityActive)
+	}
+}
+
+// Sweep destroys every backend sandbox without a live lease: one whose
+// lease is unknown, one whose lease is terminal, and one whose labels do not
+// tie it to its name. A sandbox whose lease is live is kept.
+func TestSandboxSweepDestroysOrphansAndKeepsLiveSandboxes(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	_, live, receipt, err := f.commitHeld(1, nil)
+	f.check(receipt, err, protocol.SandboxLeaseSchema, live, sandbox.StageReady, "")
+	released, gone, receipt, err := f.commitHeld(2, func(l *protocol.SandboxLeaseV1) { l.AssignmentNonce = strings.Repeat("cd", 16) })
+	f.check(receipt, err, protocol.SandboxLeaseSchema, gone, sandbox.StageReady, "")
+	release := f.release(released)
+	receipt, err = f.lane.Release(ctx, release, f.request())
+	f.check(receipt, err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
+
+	liveName := SandboxInstanceName(protocol.SandboxLeaseIDV1(live))
+	unknownLease := strings.Replace(protocol.SandboxLeaseIDV1(live), "-g1-", "-g7-", 1)
+	orphans := []SandboxInstance{
+		{Name: SandboxInstanceName(unknownLease), LeaseID: unknownLease},
+		{Name: SandboxInstanceName(protocol.SandboxLeaseIDV1(gone)), LeaseID: protocol.SandboxLeaseIDV1(gone)},
+		{Name: "miss-mislabelled-000000000000", LeaseID: protocol.SandboxLeaseIDV1(live)},
+	}
+	for _, orphan := range orphans {
+		f.backend.adopt(orphan)
+	}
+	if err := f.lane.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.backend.mu.Lock()
+	defer f.backend.mu.Unlock()
+	if len(f.backend.live) != 1 || !f.backend.live[liveName] {
+		t.Fatalf("after sweep live sandboxes = %v, want only %s", f.backend.live, liveName)
 	}
 }

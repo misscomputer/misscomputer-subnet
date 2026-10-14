@@ -105,6 +105,8 @@ func (b *sandboxBackend) Destroy(_ context.Context, instance string) error {
 	delete(b.live, instance)
 	return nil
 }
+func (b *sandboxBackend) Instances(context.Context) ([]miner.SandboxInstance, error) { return nil, nil }
+func (b *sandboxBackend) Reclaim(context.Context) error                              { return nil }
 
 // With an enabled lane the bridge accepts validator-signed sandbox
 // documents in the subnet-sandbox-synapse.v1 envelope and answers signed

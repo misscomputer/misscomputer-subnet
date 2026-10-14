@@ -1,12 +1,13 @@
 # Sandbox leases (`sandbox-lease-v1`): contract slice 1
 
 Status: **partial, off by default, not customer-ready.** The signed
-documents, the miner-side durable holds and leases, and the miner agent lane
-(handlers, routes and backend interface) exist. No isolation backend, no
-Python neuron forwarding, no validator scheduling, no customer API and no
-scoring exist yet, so the lane cannot be enabled: `--sandbox-leases on`
-refuses to start. With the default `--sandbox-leases off`, every existing
-binary behaves exactly as before.
+documents, the miner-side durable holds and leases, the miner agent lane
+(handlers, routes and backend interface), Python neuron forwarding, and a
+gVisor backend ([miner-sandbox-gvisor-backend.md](miner-sandbox-gvisor-backend.md))
+exist. The backend is not wired into the agent yet. No validator
+scheduling, no customer API and no scoring exist yet, so the lane cannot be
+enabled: `--sandbox-leases on` refuses to start. With the default
+`--sandbox-leases off`, every existing binary behaves exactly as before.
 
 Normative code: `pkg/sandbox` (vocabulary), `pkg/protocol/sandbox_v1.go`
 (documents), `pkg/durable/sandbox_v1.go` (durable holds and leases).
@@ -160,6 +161,16 @@ including refused and failed receipts.
   failed create answers `runtime_start_failed`; a backend may answer a
   non-fault code such as `image_unavailable` but can never relabel its own
   fault. Every sandbox name is `runtime.InstanceName(lease_id)`.
+- **Bounded answer:** the start runs in the background under the lease's
+  lock. Commit answers its outcome if it ends within 60 seconds, otherwise
+  `accepted` (the lease is `pending`), well inside the roughly two-minute
+  transport hops, so a slow image pull is never an unknown outcome. The
+  validator learns the outcome from its next renewal receipt (`accepted`
+  while pending, then `ready` or `failed`); replaying the exact lease
+  answers the same way. A replay during the start
+  waits for that start again, up to the same bound, and never starts a
+  second sandbox; afterwards it answers `ready`, `failed` or the lease's
+  terminal stage.
 - **Release, Sweep, Recover:** each moves leases to `cleanup` durably, then
   destroys their sandboxes. A failed destroy keeps the lease in `cleanup`,
   still consuming capacity, until a later sweep (every 10 seconds) destroys
@@ -172,13 +183,20 @@ including refused and failed receipts.
   release. A lease or renewal receipt for a lease in `cleanup` reports the
   lease's terminal intent (for example `released`) and is not a cleanup
   acknowledgement: validators free capacity only on a release receipt or
-  after the lease expiry plus grace. A release that lands while a sandbox is being created waits for the
-  create to return and then destroys it. Restart recovery destroys every
+  after the lease expiry plus grace. A release that lands while a sandbox is being created does not wait: the
+  fence is durable, the release answers `503 cleanup_pending`, the start
+  destroys its sandbox once it sees the fence, and a replay of the release is
+  acknowledged. Sweep and orphan reconciliation likewise skip a lease whose
+  start or teardown is in progress, and retry it on the next sweep. Restart recovery destroys every
   sandbox that may exist before the agent serves.
 - **Backend interface (`SandboxBackend`):** `Budget`, `Unsupported`,
-  `Create` (idempotent per instance name), `Destroy` (idempotent). No
-  implementation ships; a gVisor, Kata or Firecracker adapter is a separate,
-  explicitly selected change, and the lane never falls back to plain Docker.
+  `Create` (idempotent per instance name), `Destroy` (idempotent),
+  `Instances` (every sandbox the backend holds, with its lease ID) and
+  `Reclaim` (free unused storage). The only implementation is the gVisor
+  backend in `pkg/sandboxbackend`; the lane never falls back to plain Docker.
+- **Orphans:** Sweep and Recover list the backend's sandboxes and, under each
+  lease's lock, destroy every one whose lease is unknown, terminal, or not
+  tied to its instance name. Recover then calls `Reclaim`.
 - **Dedicated budget:** the lane can be constructed only if the backend
   reports a dedicated cgroup v2 subtree with finite `cpu.max` and
   `memory.max`, disk and count limits covering its configured budget.
@@ -190,9 +208,11 @@ including refused and failed receipts.
   configuration values: the future backend/activation review must prove
   they are the actual agent and web replica subtrees, not merely arbitrary
   disjoint names, and verify the cgroup mount/hierarchy itself. Bind mounts
-  or a substituted cgroup root are outside this check. There is no backend
-  or activation flag implementation in this PR, so `--sandbox-leases on`
-  still refuses to start and no such isolation claim has been made live.
+  or a substituted cgroup root are outside this check. The gVisor backend
+  checks each sandbox's actual process cgroup and limits below its slice;
+  the agent and deployment cgroups remain trusted configuration until the
+  activation change. `--sandbox-leases on` still refuses to start and no
+  isolation claim has been made live.
 - **Bridge routes** (only with an enabled lane, behind the bridge HMAC):
   `POST /v1/sandbox/reservations`, `/v1/sandbox/leases`,
   `/v1/sandbox/renewals`, `/v1/sandbox/releases`. The envelope is
@@ -267,9 +287,10 @@ only consume a byte-identical copy.
    contract inventory does not change before the private side can accept it.
 4. **Miner agent lane (public, default off).** This PR adds routes, the
    capability feature, a separate budget interface and a backend seam. No
-   isolation backend or operator budget flags ship; `--sandbox-leases on`
-   refuses to start until both exist. Flag-off routes and features are
-   unchanged.
+   isolation backend or operator budget flags shipped in that step; the
+   gVisor backend followed separately, and its activation flags follow the
+   host-preflight package. Until then `--sandbox-leases on` refuses to
+   start. Flag-off routes and features are unchanged.
 5. **Neuron transport (public, default off).** Done in the separate transport
    change: `subnet-sandbox-synapse.v1` forwarding in the Python miner axon
    and validator bridge; see [Neuron transport](#neuron-transport-subnet-sandbox-synapsev1).
