@@ -17,10 +17,10 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
 )
 
-// SandboxBackend runs customer sandboxes for the sandbox-lease-v1 lane. No
-// implementation ships with this lane: a backend is an isolation adapter
-// (gVisor, Kata or Firecracker) selected separately, and without one the
-// lane cannot be enabled.
+// SandboxBackend runs customer sandboxes for the sandbox-lease-v1 lane. A
+// backend is an isolation adapter (pkg/sandboxbackend runs gVisor on a
+// dedicated Docker daemon) selected explicitly; without one the lane cannot
+// be enabled.
 type SandboxBackend interface {
 	// Budget reports what the backend enforces for all sandboxes together:
 	// the dedicated cgroup v2 subtree every sandbox runs in, never shared
@@ -39,6 +39,19 @@ type SandboxBackend interface {
 	// Destroy deletes the sandbox and everything it wrote. It must be
 	// idempotent, return nil when the sandbox does not exist, and honor ctx.
 	Destroy(ctx context.Context, instanceID string) error
+	// Instances lists every sandbox the backend holds, whether or not the
+	// lane still knows its lease, so that orphans can be destroyed.
+	Instances(ctx context.Context) ([]SandboxInstance, error)
+	// Reclaim frees backend storage no sandbox uses, such as cached images.
+	// The lane calls it only while no Create can run.
+	Reclaim(ctx context.Context) error
+}
+
+// SandboxInstance is one sandbox a backend holds: its instance name and the
+// lease ID it was created for, or "" when the backend cannot tell.
+type SandboxInstance struct {
+	Name    string
+	LeaseID string
 }
 
 // SandboxBudget is what a backend enforces for all sandboxes together.
@@ -348,25 +361,67 @@ func (l *SandboxLane) Release(ctx context.Context, r protocol.SandboxReleaseV1, 
 }
 
 // Sweep expires unused holds, moves leases past expiry plus grace to
-// cleanup, and destroys every sandbox in cleanup. Run it periodically.
+// cleanup, destroys every sandbox in cleanup, and destroys orphans. Run it
+// periodically.
 func (l *SandboxLane) Sweep(ctx context.Context) error {
 	now := l.now().UTC()
 	records, err := l.store.Sweep(ctx, now)
 	if err != nil {
 		return err
 	}
-	return l.destroyAll(ctx, records, now)
+	return errors.Join(l.destroyAll(ctx, records, now), l.destroyOrphans(ctx))
 }
 
 // Recover is the restart path: before the lane serves, every sandbox that
-// may exist is destroyed and its lease answers failed/miner_restart.
+// may exist is destroyed, its lease answers failed/miner_restart, sandboxes
+// without a live lease are destroyed, and unused backend storage is freed.
 func (l *SandboxLane) Recover(ctx context.Context) error {
 	now := l.now().UTC()
 	records, err := l.store.Recover(ctx, now)
 	if err != nil {
 		return err
 	}
-	return l.destroyAll(ctx, records, now)
+	if err := errors.Join(l.destroyAll(ctx, records, now), l.destroyOrphans(ctx)); err != nil {
+		return err
+	}
+	return l.backend.Reclaim(ctx)
+}
+
+// destroyOrphans destroys every backend sandbox whose lease is unknown or
+// terminal. Each is re-read under its lease lock, so a sandbox whose lease
+// Commit is creating concurrently is never mistaken for an orphan: Commit
+// writes the lease as pending under the same lock before Create runs.
+func (l *SandboxLane) destroyOrphans(ctx context.Context) error {
+	instances, err := l.backend.Instances(ctx)
+	if err != nil {
+		return fmt.Errorf("list sandboxes: %w", err)
+	}
+	var errs []error
+	for _, instance := range instances {
+		key := instance.LeaseID
+		if key == "" || SandboxInstanceName(key) != instance.Name {
+			// A sandbox the backend cannot tie to a lease is never live.
+			key = "instance:" + instance.Name
+		}
+		unlock := l.locks.lock(key)
+		live := false
+		if key == instance.LeaseID {
+			record, found, err := l.store.Lease(ctx, instance.LeaseID)
+			if err != nil {
+				unlock()
+				errs = append(errs, err)
+				continue
+			}
+			live = found && (record.Status == "pending" || record.Status == "running" || record.Status == "cleanup")
+		}
+		if !live {
+			if err := l.backend.Destroy(ctx, instance.Name); err != nil {
+				errs = append(errs, fmt.Errorf("destroy orphan sandbox %s: %w", instance.Name, err))
+			}
+		}
+		unlock()
+	}
+	return errors.Join(errs...)
 }
 
 func (l *SandboxLane) destroyAll(ctx context.Context, records []durable.SandboxLeaseRecord, now time.Time) error {
