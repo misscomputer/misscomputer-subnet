@@ -20,7 +20,7 @@ report() {
   if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then echo "$*" >> "$GITHUB_STEP_SUMMARY"; fi
 }
 
-for tool in curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt xfs_quota systemd-run systemctl python3 du timeout awk sed readlink truncate; do
+for tool in curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt xfs_quota systemd-run systemctl python3 du timeout awk sed readlink truncate sort; do
   command -v "$tool" >/dev/null || die "missing $tool"
 done
 [[ $(findmnt -n -o FSTYPE /sys/fs/cgroup) == cgroup2 ]] || die 'host is not cgroup v2'
@@ -50,13 +50,21 @@ cleanup() {
     wait "$daemon_pid" >/dev/null 2>&1
   fi
   systemctl stop "$anchor" >/dev/null 2>&1
-  if (( mounted )); then
-    if umount "$gate_dir/xfs"; then mounted=0; else cleanup_failed=1; fi
-  fi
+  # Docker may retain its own null-netns bind mount below exec-root after
+  # dockerd exits. Unmount only this gate's descendants, deepest first.
+  while IFS= read -r target; do
+    [[ $target == "$gate_dir/"* ]] || continue
+    if umount "$target"; then
+      if [[ $target == "$gate_dir/xfs" ]]; then mounted=0; fi
+    else cleanup_failed=1; fi
+  done < <(findmnt -rn -o TARGET | sort -r)
+  if (( mounted )); then cleanup_failed=1; fi
   if [[ -n $loop_device && $mounted == 0 ]]; then
     if losetup -d "$loop_device"; then loop_device=; else cleanup_failed=1; fi
   fi
-  if (( ! mounted )) && [[ -z $loop_device && -d $gate_dir ]]; then rm -rf -- "$gate_dir"; fi
+  if (( ! cleanup_failed && ! mounted )) && [[ -z $loop_device && -d $gate_dir ]]; then
+    rm -rf -- "$gate_dir" || cleanup_failed=1
+  fi
   if (( cleanup_failed )); then
     report "INCOMPLETE CLEANUP: inspect disposable runner path $gate_dir and loop device $loop_device"
     result=1
@@ -164,7 +172,7 @@ PY
 pid=$(docker inspect --format '{{.State.Pid}}' "$container")
 [[ $pid =~ ^[1-9][0-9]*$ ]] || die 'container has no host PID'
 actual_exe=$(readlink -f "/proc/$pid/exe")
-[[ $actual_exe == "$gate_dir/bin/runsc" ]] || die "container PID does not execute pinned runsc: $actual_exe"
+[[ $actual_exe == "$gate_dir/bin/gvisor-bin/gvisor_sentry" ]] || die "container PID does not execute the pinned gVisor sentry: $actual_exe"
 child_path=$(awk -F: '$1 == "0" {print $3}' "/proc/$pid/cgroup")
 [[ $child_path == "$slice_path"/* ]] || die "runsc process escaped dedicated cgroup: $child_path"
 [[ $(cat "/sys/fs/cgroup$child_path/memory.max") == 536870912 ]] || die 'actual child memory limit mismatch'
