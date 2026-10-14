@@ -585,15 +585,24 @@ docker rm -f "$container" >/dev/null
 main_pid=$pid main_cg=$child_cg
 
 begin effect.guest_pids_limit observed_effect
+# gVisor runs guest processes as sentry tasks; the lease pids limit is the
+# sandbox cgroup's pids.max, i.e. host threads of the sentry. A guest that
+# spawns past it may get EAGAIN or may terminate its own sandbox. Either is
+# containment; which one happened is recorded, and the host-side pids.events
+# counter attributes it to the task limit.
 container=mcsbx-lease-pids
 lease_run "$container" 256 64 64
+ppid=$(sentry_pid "$container")
+pcg=$(proc_cgroup "$ppid")
+( while :; do cat "$p_cgroup_root$pcg/pids.events" > "$work/pids.events.tmp" 2>/dev/null && mv "$work/pids.events.tmp" "$work/pids.events"; sleep 0.2; done ) &
+sampler=$!
 docker exec "$container" sh -c 'n=0; while [ $n -lt 200 ]; do sleep 120 & n=$((n+1)); done; echo "spawned=$n"; wait' > "$work/pids.log" 2>&1 &
 spawner=$!
 sleep 8
-# Count guest processes from outside the sandbox with runsc's own state, so
-# the count needs no free slot inside a sandbox that is at its limit. The
-# state root is the --root argument of this container's runsc processes.
+kill "$sampler" >/dev/null 2>&1 || true; wait "$sampler" 2>/dev/null || true; sampler=
+pids_max_events=$(awk '$1 == "max" {print $2}' "$work/pids.events" 2>/dev/null || true)
 full_id=$(docker inspect --format '{{.Id}}' "$container")
+state=$(docker inspect --format '{{.State.Running}} exit={{.State.ExitCode}}' "$container")
 state_dir=$(python3 - "$root/bin/" "$full_id" <<'PY'
 import os, sys
 bindir, cid = sys.argv[1:]
@@ -615,15 +624,23 @@ PY
 )
 guest_procs=unavailable
 if [[ -n $state_dir ]]; then
-  guest_procs=$(timeout 20 "$p_runsc_path" --root "$state_dir" ps --format json "$full_id" 2>"$work/runsc-ps.err" |
+  guest_procs=$(timeout 20 "$p_runsc_path" --root "$state_dir" ps --format json "$full_id" 2>/dev/null |
     python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))' 2>/dev/null || echo unavailable)
 fi
 kill "$spawner" >/dev/null 2>&1 || true; wait "$spawner" 2>/dev/null || true
-fork_errors=$(grep -Eci "can't fork|Resource temporarily unavailable|No child processes" "$work/pids.log" || true)
-spawn_tail=$(tail -3 "$work/pids.log" | tr '\n' ' ')
-[[ $guest_procs =~ ^[0-9]+$ ]] && (( guest_procs <= 64 && fork_errors > 0 )) ||
-  bad "guest processes=$guest_procs (runsc root ${state_dir:-not found}; ps: $(head -c 200 "$work/runsc-ps.err" 2>/dev/null || true)) fork errors=$fork_errors spawner: $spawn_tail"
-ok "runsc ps: guest processes=$guest_procs <= 64 after 200 spawn attempts; fork errors=$fork_errors; spawner: $spawn_tail"
+fork_errors=$(grep -Eci "can't fork|Resource temporarily unavailable" "$work/pids.log" || true)
+spawn_tail=$(tail -2 "$work/pids.log" | tr '\n' ' ' | cut -c1-200)
+mcsbx_finite "${pids_max_events:-0}" || bad "host task limit never reached (pids.events max=${pids_max_events:-none}); state=$state spawner: $spawn_tail"
+if [[ $state == true* ]]; then
+  [[ $guest_procs =~ ^[0-9]+$ ]] && (( guest_procs <= 64 && fork_errors > 0 )) ||
+    bad "sandbox survived but guest processes=$guest_procs fork errors=$fork_errors spawner: $spawn_tail"
+  pids_outcome="guest fork failed with EAGAIN; runsc ps counts $guest_procs guest processes"
+else
+  pids_outcome="sandbox terminated ($state) when its host task limit was hit; spawner: $spawn_tail"
+fi
+[[ -d $p_cgroup_root$lease_cg ]] && systemctl is-active --quiet "$MCSBX_DOCKERD_UNIT" || bad 'lease slice or engine did not survive the guest spawn storm'
+ok "200 spawns under pids 64: host pids.events max=$pids_max_events; $pids_outcome; lease slice and engine intact"
+gap lease.guest_pids_host_task_semantics "the lease pids limit bounds the sentry's host tasks, not guest processes; exceeding it may terminate the sandbox instead of returning EAGAIN (this run: ${pids_outcome:0:200})"
 docker rm -f "$container" >/dev/null
 
 begin effect.tmp_bounded_by_memory observed_effect

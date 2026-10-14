@@ -221,6 +221,7 @@ func (h Host) Preflight(profile Profile, exclusive []string) []Check {
 	r.gap("storage.shim_socket_dir_shared", "containerd shim sockets live in the host-wide /run/containerd/s directory")
 	r.gap("network.engine_pull_egress_public_unrestricted", "the engine may reach any public unicast address; no registry hostname allowlist")
 	r.gap("network.public_allowlist_unsupported", "only network=none is provisioned; public and allowlist must be refused")
+	r.gap("lease.guest_pids_host_task_semantics", "the lease pids limit bounds sentry host tasks, not guest processes; exceeding it may terminate the sandbox")
 	r.gap("lease.image_volumes_refused", "the engine gives image VOLUMEs no per-lease quota; the backend must refuse such images")
 	return r.checks
 }
