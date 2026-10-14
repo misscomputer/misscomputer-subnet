@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -122,8 +124,11 @@ type GVisor struct {
 	sliceCgroup string
 	slicePIDs   int
 	// sandboxExe is the resolved path of the binary every sandbox process
-	// must execute: the sentry, or runsc when no sentry is configured.
-	sandboxExe string
+	// must execute: the sentry, or runsc when no sentry is configured, and
+	// sandboxFile the file Open hashed there, so that a binary replaced or
+	// rewritten after Open is not accepted by path.
+	sandboxExe  string
+	sandboxFile fs.FileInfo
 	// lookup resolves a registry host before any pull.
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 	mu     sync.Mutex
@@ -158,11 +163,12 @@ func Open(ctx context.Context, config Config) (*GVisor, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyBinary(config.RunscPath, config.RunscSHA256); err != nil {
+	file, err := verifyBinary(config.RunscPath, config.RunscSHA256)
+	if err != nil {
 		return nil, err
 	}
 	if config.SentryPath != "" {
-		if err := verifyBinary(config.SentryPath, config.SentrySHA256); err != nil {
+		if file, err = verifyBinary(config.SentryPath, config.SentrySHA256); err != nil {
 			return nil, err
 		}
 	}
@@ -173,7 +179,7 @@ func Open(ctx context.Context, config Config) (*GVisor, error) {
 	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		return nil, err
 	}
-	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, lookup: lookupHost}
+	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, sandboxFile: file, lookup: lookupHost}
 	if err := b.verifyDaemon(ctx); err != nil {
 		return nil, err
 	}
@@ -244,25 +250,27 @@ func SliceCgroup(slice string) (string, error) {
 	return cgroup, nil
 }
 
-func verifyBinary(file, want string) error {
+// verifyBinary hashes file without following a final symlink and returns
+// the identity of the file it hashed.
+func verifyBinary(file, want string) (fs.FileInfo, error) {
 	fd, err := unix.Open(file, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return fmt.Errorf("open pinned binary %s: %w", file, err)
+		return nil, fmt.Errorf("open pinned binary %s: %w", file, err)
 	}
 	handle := os.NewFile(uintptr(fd), file)
 	defer handle.Close()
 	info, err := handle.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return fmt.Errorf("pinned binary %s is not a regular file", file)
+		return nil, fmt.Errorf("pinned binary %s is not a regular file", file)
 	}
 	hash := sha256.New()
 	if _, err := io.Copy(hash, handle); err != nil {
-		return fmt.Errorf("hash pinned binary %s: %w", file, err)
+		return nil, fmt.Errorf("hash pinned binary %s: %w", file, err)
 	}
 	if got := hex.EncodeToString(hash.Sum(nil)); got != want {
-		return fmt.Errorf("binary %s has SHA-256 %s, pinned %s", file, got, want)
+		return nil, fmt.Errorf("binary %s has SHA-256 %s, pinned %s", file, got, want)
 	}
-	return nil
+	return info, nil
 }
 
 type daemonInfo struct {
@@ -435,9 +443,11 @@ type inspectedContainer struct {
 	Name  string `json:"Name"`
 	Image string `json:"Image"`
 	State struct {
-		Status  string `json:"Status"`
-		Running bool   `json:"Running"`
-		Pid     int    `json:"Pid"`
+		Status    string `json:"Status"`
+		Running   bool   `json:"Running"`
+		Pid       int    `json:"Pid"`
+		Error     string `json:"Error"`
+		StartedAt string `json:"StartedAt"`
 	} `json:"State"`
 	Config struct {
 		Labels map[string]string `json:"Labels"`
@@ -475,6 +485,22 @@ type hostConfig struct {
 	} `json:"RestartPolicy"`
 	Binds   []string `json:"Binds"`
 	Devices []any    `json:"Devices"`
+	// The backend sets none of these; each must stay at its empty default.
+	Init              *bool             `json:"Init"`
+	Sysctls           map[string]string `json:"Sysctls"`
+	Tmpfs             map[string]string `json:"Tmpfs"`
+	Annotations       map[string]string `json:"Annotations"`
+	DeviceCgroupRules []string          `json:"DeviceCgroupRules"`
+	DeviceRequests    []any             `json:"DeviceRequests"`
+	VolumesFrom       []string          `json:"VolumesFrom"`
+	VolumeDriver      string            `json:"VolumeDriver"`
+	Links             []string          `json:"Links"`
+	GroupAdd          []string          `json:"GroupAdd"`
+	ExtraHosts        []string          `json:"ExtraHosts"`
+	DNS               []string          `json:"Dns"`
+	DNSOptions        []string          `json:"DnsOptions"`
+	DNSSearch         []string          `json:"DnsSearch"`
+	OomScoreAdj       int               `json:"OomScoreAdj"`
 }
 
 type logConfig struct {
@@ -541,7 +567,7 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	if existing.Config.Labels[LabelLeaseID] != protocol.SandboxLeaseIDV1(lease) || existing.Config.Labels[LabelLeaseDigest] != leaseDigest {
 		return fmt.Errorf("container %s exists for another lease", instanceID)
 	}
-	if !existing.State.Running {
+	if !existing.State.Running && !workloadExited(existing) {
 		if existing.State.Status != "created" {
 			return fmt.Errorf("sandbox %s is %s, not running", instanceID, existing.State.Status)
 		}
@@ -554,7 +580,41 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 			return fmt.Errorf("sandbox %s vanished after start", instanceID)
 		}
 	}
-	return b.verify(existing, b.spec(lease, leaseDigest, existing.Config.Labels[LabelImageID]))
+	s := b.spec(lease, leaseDigest, existing.Config.Labels[LabelImageID])
+	if err := b.verifyEngine(existing, s); err != nil {
+		return err
+	}
+	if err := b.verifyProcess(existing, s); err != nil {
+		// The workload may have exited by itself before or during the
+		// kernel readback; a process that is still running failed it.
+		if again, found, inspectErr := b.inspect(ctx, instanceID); inspectErr == nil && found && again.ID == existing.ID && workloadExited(again) {
+			if err := b.verifyEngine(again, s); err != nil {
+				return err
+			}
+			return b.exited(again)
+		}
+		return err
+	}
+	return nil
+}
+
+// workloadExited reports a container the engine started whose workload has
+// since exited by itself, with any exit code and including an OOM kill
+// within the lease limit. A start the engine or runtime failed records
+// State.Error and is not an exit.
+func workloadExited(c inspectedContainer) bool {
+	return !c.State.Running && c.State.Status == "exited" && c.State.Error == "" &&
+		c.State.StartedAt != "" && !strings.HasPrefix(c.State.StartedAt, "0001-01-01")
+}
+
+// exited accepts a sandbox whose workload exited before its process could
+// be read back (contract D11): no customer code remains to contain, so the
+// lease is served and stays leased until release or expiry. Its engine
+// configuration was verified; the kernel readbacks did not run.
+func (b *GVisor) exited(c inspectedContainer) error {
+	slog.Info("sandbox workload exited before the kernel readback; per-process checks not_run",
+		"sandbox", strings.TrimPrefix(c.Name, "/"), "started_at", c.State.StartedAt)
+	return nil
 }
 
 // createContainer pulls and verifies the lease's image and creates, but
@@ -624,6 +684,9 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 		return "", err
 	}
 	limit := int64(b.config.ImageMaxMiB) << 20
+	if err := b.pullHeadroom(); err != nil {
+		return "", err
+	}
 	if err := b.engine.pull(ctx, name, lease.ImageDigest, limit); err != nil {
 		switch {
 		case errors.Is(err, errPullTooLarge):
@@ -632,11 +695,20 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 				return "", discardErr
 			}
 			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			// The registry did not deliver the image within the create budget.
+			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 		case ctx.Err() != nil:
 			return "", ctx.Err()
-		case registryRefusal(err):
+		case engineStatus(err) != 0:
+			// The engine answered the pull with a failure. Registry answers
+			// and transport failures to the registry reach the backend only
+			// as engine messages whose text the registry can choose, so none
+			// is the miner's fault (contract D15). Running out of space after
+			// pullHeadroom held is the image outgrowing its limit.
 			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 		}
+		// The dedicated daemon did not answer: the miner's fault.
 		return "", fmt.Errorf("pull %s: %w", lease.ImageReference, err)
 	}
 	imageID, size, err := b.verifiedImage(ctx, name+"@"+lease.ImageDigest, lease)
@@ -652,6 +724,20 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 		return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 	}
 	return imageID, nil
+}
+
+// pullHeadroom requires the free space on the data root that the per-image
+// limit reserves for a pull. Its absence is the miner's fault, observed
+// locally; with it, a pull that runs out of space is the image's doing.
+func (b *GVisor) pullHeadroom() error {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(b.config.DataRoot, &stat); err != nil {
+		return fmt.Errorf("sandbox data root: %w", err)
+	}
+	if free := int64(stat.Bavail) * int64(stat.Bsize) >> 20; free < int64(b.config.ImageMaxMiB) {
+		return fmt.Errorf("sandbox data root has %d MiB free, below the %d MiB a pull reserves", free, b.config.ImageMaxMiB)
+	}
+	return nil
 }
 
 type inspectedImage struct {
@@ -705,7 +791,8 @@ func (b *GVisor) verifiedImage(ctx context.Context, image string, lease protocol
 
 // publicRegistry refuses, before the engine is asked to pull, a registry
 // the daemon would reach on the miner's own host or private networks:
-// localhost, any IP literal, and any host name that resolves to an address
+// localhost and other local-only names, any IP literal, and any host name
+// that resolves to an address
 // in the special-purpose prefixes of pkg/netpolicy (loopback, link-local,
 // RFC 1918, CGNAT, ULA, unspecified and the rest). The daemon resolves the
 // name again, and may follow registry redirects, so this does not replace
@@ -720,7 +807,7 @@ func (b *GVisor) publicRegistry(ctx context.Context, repository string) error {
 	if host == "docker.io" {
 		host = "registry-1.docker.io"
 	}
-	if _, err := netip.ParseAddr(host); err == nil || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+	if _, err := netip.ParseAddr(host); err == nil || !publicHostName(host) {
 		return &miner.SandboxRefusal{Code: "image_unavailable"}
 	}
 	addresses, err := b.lookup(ctx, host)
@@ -739,6 +826,22 @@ func (b *GVisor) publicRegistry(ctx context.Context, repository string) error {
 		}
 	}
 	return nil
+}
+
+// publicHostName refuses registry names that only resolve on the miner's
+// own host or site, whatever its resolver answers: single-label names,
+// absolute names, and the localhost, mDNS, home and .internal namespaces.
+func publicHostName(host string) bool {
+	host = strings.ToLower(host)
+	if !strings.Contains(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, suffix := range []string{".localhost", ".local", ".internal", ".home.arpa"} {
+		if strings.HasSuffix(host, suffix) {
+			return false
+		}
+	}
+	return true
 }
 
 func lookupHost(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -765,26 +868,6 @@ func normalizedRepository(reference string) (string, error) {
 	return domain + "/" + rest, nil
 }
 
-// registryRefusal reports a pull the registry refused for this image: it
-// does not exist, is not public, or has no linux/amd64 manifest. Any other
-// pull failure (network, daemon, disk) is the miner's.
-func registryRefusal(err error) bool {
-	status := engineStatus(err)
-	if status == 0 {
-		return false
-	}
-	if status == http.StatusNotFound || status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return true
-	}
-	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"manifest unknown", "not found", "does not exist", "unauthorized", "access denied", "authentication required", "no matching manifest"} {
-		if strings.Contains(message, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 func (b *GVisor) inspect(ctx context.Context, instanceID string) (inspectedContainer, bool, error) {
 	var container inspectedContainer
 	err := b.engine.call(ctx, http.MethodGet, "/containers/"+url.PathEscape(instanceID)+"/json", nil, nil, &container)
@@ -797,16 +880,12 @@ func (b *GVisor) inspect(ctx context.Context, instanceID string) (inspectedConta
 	return container, true, nil
 }
 
-// verify proves the running container is exactly s: the engine's recorded
-// configuration first, then the kernel's view of the sandbox process (the
-// pinned gVisor binary, in a cgroup below the slice whose limits are the
-// lease's).
-func (b *GVisor) verify(c inspectedContainer, s spec) error {
+// verifyEngine proves the engine's recorded configuration of the container
+// is exactly s.
+func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 	h := c.HostConfig
 	wantLog := s.host.LogConfig
 	switch {
-	case !c.State.Running || c.State.Pid <= 0:
-		return fmt.Errorf("sandbox %s is not running", c.Name)
 	case c.Image != s.labels[LabelImageID] || !strings.HasPrefix(c.Image, "sha256:"):
 		return fmt.Errorf("sandbox %s runs image %s, not the verified %s", c.Name, c.Image, s.labels[LabelImageID])
 	case h.Runtime != s.host.Runtime:
@@ -824,11 +903,22 @@ func (b *GVisor) verify(c inspectedContainer, s spec) error {
 		return fmt.Errorf("sandbox %s has privileges, mounts, devices or a restart policy", c.Name)
 	case !sameSet(h.CapDrop, s.host.CapDrop) || !sameSet(h.CapAdd, s.host.CapAdd) || !sameSet(h.SecurityOpt, s.host.SecurityOpt):
 		return fmt.Errorf("sandbox %s capabilities or security options differ from the sandbox spec", c.Name)
+	case (h.Init != nil && *h.Init) || len(h.Sysctls) != 0 || len(h.Tmpfs) != 0 || len(h.Annotations) != 0 ||
+		len(h.DeviceCgroupRules) != 0 || len(h.DeviceRequests) != 0 || len(h.VolumesFrom) != 0 || h.VolumeDriver != "" ||
+		len(h.Links) != 0 || len(h.GroupAdd) != 0 || len(h.ExtraHosts) != 0 || len(h.DNS) != 0 || len(h.DNSOptions) != 0 ||
+		len(h.DNSSearch) != 0 || h.OomScoreAdj != 0:
+		return fmt.Errorf("sandbox %s has host settings the sandbox spec does not set", c.Name)
 	}
-	return b.verifyProcess(c, s)
+	return nil
 }
 
+// verifyProcess proves the kernel's view of the running sandbox process:
+// the pinned gVisor binary Open hashed, in a cgroup below the slice whose
+// limits are the lease's.
 func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
+	if !c.State.Running || c.State.Pid <= 0 {
+		return fmt.Errorf("sandbox %s is %s, not running: %q", c.Name, c.State.Status, c.State.Error)
+	}
 	proc := filepath.Join(b.config.ProcRoot, strconv.Itoa(c.State.Pid))
 	exe, err := os.Readlink(filepath.Join(proc, "exe"))
 	if err != nil {
@@ -836,6 +926,11 @@ func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 	}
 	if exe != b.sandboxExe {
 		return fmt.Errorf("sandbox %s process runs %s, not the pinned gVisor binary %s", c.Name, exe, b.sandboxExe)
+	}
+	if file, err := os.Stat(filepath.Join(proc, "exe")); err != nil {
+		return fmt.Errorf("sandbox %s process executable: %w", c.Name, err)
+	} else if !os.SameFile(file, b.sandboxFile) || !file.ModTime().Equal(b.sandboxFile.ModTime()) || file.Size() != b.sandboxFile.Size() {
+		return fmt.Errorf("sandbox %s process runs a %s replaced or rewritten since the backend opened", c.Name, b.sandboxExe)
 	}
 	cgroup, err := processCgroup(filepath.Join(proc, "cgroup"))
 	if err != nil {

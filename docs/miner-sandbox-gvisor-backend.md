@@ -48,7 +48,9 @@ images no container uses are pruned.
 - the daemon runs no container without the sandbox label.
 
 These checks run once at startup; a binary or daemon changed later is caught
-only by the per-sandbox checks below.
+only by the per-sandbox checks below. They do not yet require the data root
+to be its own XFS project-quota filesystem or the slice to have swap
+disabled; those are host-preflight checks, and activation waits for them.
 
 ## What one sandbox is
 
@@ -58,24 +60,32 @@ than `gvisor` (`isolation_unsupported`), network other than `none`
 (`resources_unsupported`), and, in the lane, any `secret_env`
 (`secret_delivery_unsupported`).
 
-Registry (`image_unavailable`, before any engine call): `localhost`, any IP
-literal, and any registry host (Docker Hub as `registry-1.docker.io`) that
-does not resolve, or that resolves to any address in the `pkg/netpolicy`
-special-purpose prefixes: loopback, link-local and metadata, RFC 1918,
+Registry (`image_unavailable`, before any engine call): any IP literal, any
+name that only resolves on the miner's own host or site (`localhost`,
+single-label names, absolute names ending in `.`, and the `.localhost`,
+`.local`, `.internal` and `.home.arpa` namespaces), and any registry host
+(Docker Hub as `registry-1.docker.io`) that does not resolve, or that
+resolves to any address in the `pkg/netpolicy` special-purpose prefixes: loopback, link-local and metadata, RFC 1918,
 CGNAT, ULA, unspecified and the rest of that list. The daemon resolves the
 name again and follows registry redirects, so this check keeps a signed
 reference from naming a host-local service but does not replace host-level
 pull egress policy.
 
-Image: pulled by its exact digest for `linux/amd64`. The pull is stopped once
-the compressed layer sizes the engine reports exceed the per-image limit
-(`image_unavailable`). The engine must record the image under the lease's
+Image: pulled by its exact digest for `linux/amd64`, only while the data
+root has the per-image limit free (otherwise a miner fault). The pull is
+stopped once the compressed layer sizes the engine reports exceed the
+per-image limit (`image_unavailable`). The engine must record the image under the lease's
 repository (after Docker normalization) and digest. A wrong record is a
 miner fault. The image must be `linux/amd64` and within the stored-size
 limit (otherwise `image_unavailable`). It must declare no `VOLUME`, whose
 bytes no quota counts (otherwise `resources_unsupported`). A refused image
-is removed. Registry not-found or unauthorized is `image_unavailable`; any
-other pull failure is a miner fault. No registry credentials are supported.
+is removed. Every pull failure the engine reports is `image_unavailable`:
+registry answers of any status, transport failures to the registry, a pull
+that outlasts the create budget, and running out of space after the
+headroom check passed, because the engine relays registry-chosen text and
+only the headroom check is local evidence about the miner's disk. A daemon
+that does not answer or breaks its progress stream is a miner fault. No
+registry credentials are supported.
 For an index digest the engine records the index digest and the image
 (config) ID it ran; the chosen platform manifest digest is not recorded.
 
@@ -90,12 +100,22 @@ binding it to the lease ID, lease digest and image. The image's own
 entrypoint, command and default user run unchanged; that user may be root
 inside the gVisor sentry but holds no capabilities.
 
-`Create` reports success only after inspecting the running container
-(runtime, namespaces, ports, cgroup parent, every limit, logs, capabilities,
-mounts, image ID) and the kernel's view of its process: `/proc/<pid>/exe` is the
-pinned sentry (or runsc) and `/proc/<pid>/cgroup` lies below the slice with
-`memory.max` and `pids.max` equal to the lease and `cpu.max` no larger.
-Anything else is a miner fault and the lane destroys the container.
+`Create` reports success only after inspecting the container (runtime,
+namespaces, ports, cgroup parent, every limit, logs, capabilities, mounts,
+image ID, and no init process, sysctls, tmpfs, runtime annotations, device
+rules or requests, volume sources, links, extra groups, hosts or DNS
+settings) and the kernel's view of its process: `/proc/<pid>/exe` is the
+pinned sentry (or runsc), the same file Open hashed, unchanged, and
+`/proc/<pid>/cgroup` lies below the slice with `memory.max` and `pids.max`
+equal to the lease and `cpu.max` no larger. Anything else is a miner fault
+and the lane destroys the container.
+
+A workload that exits by itself after the engine started it (the engine
+records no start error), with any exit code and including an OOM kill
+within the lease limit, is not a miner fault (contract D11). If it exits
+before or during the kernel readback, `Create` succeeds once the engine
+configuration above matches, the per-process checks are logged as
+`not_run`, and the lease is served until release or expiry.
 
 `Create` is idempotent per instance name: a container already made for the
 same lease document is started if needed and verified again; one made for
@@ -109,17 +129,18 @@ container uses it; a missing container is success.
   weakened.
 - **Liveness:** a sandbox whose own command exits (or that is OOM-killed)
   stays leased until expiry or release; receipts report the durable lease
-  stage, not process liveness. An image whose command exits before the
-  post-start check fails `Create` as `runtime_start_failed`, which the
-  current contract attributes to the miner. Entrypoint/keepalive semantics
-  must be fixed in the shared contract (and are required by any exec/files
-  extension) before customer images can be relied on.
+  stage, not process liveness. Lease v1 carries no command and the backend
+  adds no init or keepalive process, so only images whose default command
+  keeps running are useful.
 - **Disk:** writable layers are quota-limited per container only on an
   XFS project-quota data root (the engine refuses `StorageOpt size`
   otherwise). Images and logs are bounded per sandbox and reserved on the
   data root, but a pull can transiently exceed its allowance before the
   compressed-size stop or the post-pull size check; it cannot outgrow the
-  dedicated data-root filesystem. gVisor's `/tmp` is memory-backed; whether
+  dedicated data-root filesystem. With more than one sandbox, such an
+  overshoot can take space other sandboxes' writable layers were promised;
+  the headroom check reserves the per-image limit only for the pull that
+  makes it. gVisor's `/tmp` is memory-backed; whether
   its bytes are charged to the sandbox memory limit is not measured.
 - **Exec, files, secrets, inbound access, GPUs, private registries:** not
   supported. With no capabilities, images that need root to change file

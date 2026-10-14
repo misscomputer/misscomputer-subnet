@@ -53,6 +53,8 @@ type engineContainer struct {
 	Host        map[string]any
 	Status      string
 	Mounts      []map[string]any
+	// Error is the engine's start error and StartedAt its start time.
+	Error, StartedAt string
 }
 
 // fakeEngine is a scripted Docker Engine API: images a pull may produce,
@@ -70,6 +72,9 @@ type fakeEngine struct {
 	// applied rewrites a container after creation, standing in for an
 	// engine that did not apply what it was asked.
 	applied func(*engineContainer)
+	// started rewrites a container after start and inspected after each
+	// inspection, standing in for a workload that exits.
+	started, inspected func(*engineContainer)
 }
 
 func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
@@ -228,7 +233,10 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			reply(w, 404, map[string]string{"message": "No such container"})
 			return
 		}
-		c.Status = "running"
+		c.Status, c.StartedAt = "running", "2026-10-14T12:00:01Z"
+		if e.started != nil {
+			e.started(c)
+		}
 		w.WriteHeader(204)
 	case r.Method == http.MethodGet && strings.HasPrefix(p, "/containers/") && strings.HasSuffix(p, "/json"):
 		c, ok := e.containers[strings.TrimSuffix(strings.TrimPrefix(p, "/containers/"), "/json")]
@@ -240,11 +248,18 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		if c.Status == "running" {
 			pid = testPID
 		}
+		startedAt := c.StartedAt
+		if startedAt == "" {
+			startedAt = "0001-01-01T00:00:00Z"
+		}
 		reply(w, 200, map[string]any{
 			"Id": "id-" + c.Name, "Name": "/" + c.Name, "Image": c.Image,
-			"State":  map[string]any{"Status": c.Status, "Running": c.Status == "running", "Pid": pid},
+			"State":  map[string]any{"Status": c.Status, "Running": c.Status == "running", "Pid": pid, "Error": c.Error, "StartedAt": startedAt},
 			"Config": map[string]any{"Labels": c.Labels}, "HostConfig": c.Host, "Mounts": c.Mounts,
 		})
+		if e.inspected != nil {
+			e.inspected(c)
+		}
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/containers/"):
 		name := strings.TrimPrefix(p, "/containers/")
 		if _, ok := e.containers[name]; !ok {
@@ -275,6 +290,8 @@ type host struct {
 	socket string
 	config Config
 	sentry string
+	// sentryFile is the sentry binary as Open would have hashed it.
+	sentryFile os.FileInfo
 	// dns answers registry host lookups; a host it lacks does not resolve.
 	dns map[string][]netip.Addr
 }
@@ -314,6 +331,10 @@ func newHost(t *testing.T) *host {
 		CgroupRoot: filepath.Join(root, "cgroup"), ProcRoot: filepath.Join(root, "proc"),
 		DiskMiB: 1024, Sandboxes: 2, ImageMaxMiB: 64, LogMiB: 4,
 	}}
+	var err error
+	if h.sentryFile, err = os.Stat(sentry); err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "pids.max"), "4096\n")
 	h.process(sentry, "/mc.slice/"+testSlice+"/docker-1.scope", testLease(nil).Resources)
 	return h
@@ -343,7 +364,7 @@ func (h *host) process(exe, cgroup string, r sandbox.Resources) {
 // it directly; TestOpenRefusesUnverifiableHosts covers Open.
 func (h *host) backend() *GVisor {
 	return &GVisor{
-		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry,
+		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry, sandboxFile: h.sentryFile,
 		lookup: func(_ context.Context, name string) ([]netip.Addr, error) {
 			if addresses, ok := h.dns[name]; ok {
 				return addresses, nil
@@ -468,6 +489,56 @@ func TestCreateReplayStartsCreatedContainerAndRejectsAnotherLeases(t *testing.T)
 	}
 }
 
+// A workload that exits by itself after the engine started it under the
+// verified configuration is served, not a miner fault (contract D11), even
+// when it exits between the inspection and the kernel readback. The
+// engine's configuration is still verified, and a start the engine or
+// runtime reports as failed stays a miner fault.
+func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
+	exit := func(c *engineContainer) { c.Status = "exited" }
+	for _, test := range []struct {
+		name                        string
+		applied, started, inspected func(*engineContainer)
+		noProcess                   bool
+		want                        string // "" for success, else the miner fault
+	}{
+		{name: "exits at once", started: exit},
+		{name: "exits during the readback", inspected: func(c *engineContainer) {
+			if c.Status == "running" {
+				c.Status = "exited"
+			}
+		}, noProcess: true},
+		{name: "exits under an unverified runtime", applied: func(c *engineContainer) { c.Host["Runtime"] = "runc" }, started: exit, want: "runtime is"},
+		{name: "runtime failed the start", started: func(c *engineContainer) {
+			c.Status, c.Error = "exited", "OCI runtime create failed: runsc: exit status 1"
+		}, want: "is exited, not running"},
+		{name: "never started", started: func(c *engineContainer) { c.Status, c.StartedAt = "exited", "" }, want: "is exited, not running"},
+		{name: "process vanished while running", noProcess: true, want: "process executable"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHost(t)
+			h.engine.applied, h.engine.started, h.engine.inspected = test.applied, test.started, test.inspected
+			if test.noProcess {
+				if err := os.RemoveAll(filepath.Join(h.config.ProcRoot, strconv.Itoa(testPID))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lease := testLease(nil)
+			err := h.backend().Create(context.Background(), instanceOf(lease), lease)
+			switch {
+			case test.want == "" && err != nil:
+				t.Fatalf("create = %v, want the exited workload served", err)
+			case test.want != "" && (err == nil || refusalCode(err) != "" || !strings.Contains(err.Error(), test.want)):
+				t.Fatalf("create = %v, want a miner fault containing %q", err, test.want)
+			case test.want == "":
+				if err := h.backend().Create(context.Background(), instanceOf(lease), lease); err != nil || len(h.engine.created) != 1 {
+					t.Fatalf("replayed create = %v with %d containers, want the exited sandbox adopted", err, len(h.engine.created))
+				}
+			}
+		})
+	}
+}
+
 func mustDigest(t *testing.T, lease protocol.SandboxLeaseV1) string {
 	t.Helper()
 	digest, err := protocol.SandboxDigestV1(lease)
@@ -486,8 +557,11 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 		name  string
 		lease func(*protocol.SandboxLeaseV1)
 		image func(*engineImage)
-		dns   map[string][]netip.Addr
-		code  string
+		// config changes the backend's configuration; such a case must
+		// not reach the engine either.
+		config func(*Config)
+		dns    map[string][]netip.Addr
+		code   string
 		// policy marks a refusal the backend must reach before any pull.
 		policy bool
 		fault  string // the miner fault a case without a refusal code must report
@@ -499,6 +573,19 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 			l.ImageReference = "ghcr.io/nobody/missing@" + testImageDigest
 		}, code: "image_unavailable"},
 		{name: "registry refuses access", image: func(i *engineImage) { i.PullStatus = http.StatusUnauthorized }, code: "image_unavailable"},
+		{name: "registry fails", image: func(i *engineImage) { i.PullStatus = http.StatusInternalServerError }, code: "image_unavailable"},
+		{name: "registry gateway fails", image: func(i *engineImage) { i.PullStatus = http.StatusBadGateway }, code: "image_unavailable"},
+		{name: "registry rate-limits mid-pull", image: func(i *engineImage) {
+			i.PullMessages = []string{`{"error":"toomanyrequests: You have reached your pull rate limit"}`}
+		}, code: "image_unavailable"},
+		{name: "registry unreachable", image: func(i *engineImage) {
+			i.PullMessages = []string{`{"error":"Get \"https://registry-1.docker.io/v2/\": net/http: TLS handshake timeout"}`}
+		}, code: "image_unavailable"},
+		// The engine relays registry text, so a disk-full message is not
+		// evidence of the miner's disk; the headroom check before the pull is.
+		{name: "pull runs out of reserved space", image: func(i *engineImage) {
+			i.PullMessages = []string{`{"error":"write /data/tmp: no space left on device"}`}
+		}, code: "image_unavailable"},
 		{name: "download exceeds the image limit", image: func(i *engineImage) {
 			i.PullMessages = []string{
 				`{"id":"a","status":"Downloading","progressDetail":{"total":40000000}}`,
@@ -523,15 +610,23 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 		{name: "registry that does not resolve", lease: func(l *protocol.SandboxLeaseV1) {
 			l.ImageReference = "registry.invalid/busybox@" + testImageDigest
 		}, code: "image_unavailable", policy: true},
+		{name: "single-label registry", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "registry:5000/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"registry": {netip.MustParseAddr("151.101.0.1")}}, code: "image_unavailable", policy: true},
+		{name: "internal registry name", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "metadata.google.internal/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"metadata.google.internal": {netip.MustParseAddr("151.101.0.1")}}, code: "image_unavailable", policy: true},
+		{name: "mDNS registry name", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "nas.local/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"nas.local": {netip.MustParseAddr("151.101.0.1")}}, code: "image_unavailable", policy: true},
 		{name: "engine records another digest", image: func(i *engineImage) {
 			i.RepoDigests = []string{"busybox@sha256:" + strings.Repeat("9", 64)}
 		}, fault: "is not recorded as"},
 		{name: "engine records another repository", image: func(i *engineImage) {
 			i.RepoDigests = []string{"evil/busybox@" + testImageDigest}
 		}, fault: "is not recorded as"},
-		{name: "daemon fails mid-pull", image: func(i *engineImage) {
-			i.PullMessages = []string{`{"error":"write /data/tmp: no space left on device"}`}
-		}, fault: "no space left"},
+		{name: "data root lacks the pull reserve", config: func(c *Config) { c.ImageMaxMiB = 1 << 40 }, fault: "a pull reserves"},
+		{name: "daemon breaks off the progress stream", image: func(i *engineImage) { i.PullMessages = []string{`{"error":`} }, fault: "decode docker pull progress"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newHost(t)
@@ -543,8 +638,12 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 			for name, addresses := range test.dns {
 				h.dns[name] = addresses
 			}
+			b := h.backend()
+			if test.config != nil {
+				test.config(&b.config)
+			}
 			lease := testLease(test.lease)
-			err := h.backend().Create(context.Background(), instanceOf(lease), lease)
+			err := b.Create(context.Background(), instanceOf(lease), lease)
 			if err == nil {
 				t.Fatal("create succeeded")
 			}
@@ -554,7 +653,7 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 			if len(h.engine.containers) != 0 || len(h.engine.images) != 0 {
 				t.Fatalf("refused create left %d containers and %d images", len(h.engine.containers), len(h.engine.images))
 			}
-			if test.policy && h.engine.pulls != 0 {
+			if (test.policy || test.config != nil) && h.engine.pulls != 0 {
 				t.Fatalf("engine pulled %d times before a policy refusal", h.engine.pulls)
 			}
 		})
@@ -584,10 +683,24 @@ func TestCreateRejectsSandboxesThatDoNotEnforceTheLease(t *testing.T) {
 			c.Host["PortBindings"] = map[string]any{"80/tcp": []any{map[string]any{"HostPort": "8080"}}}
 		}, want: "namespaces, ports"},
 		{name: "engine added a capability", applied: func(c *engineContainer) { c.Host["CapAdd"] = []any{"CAP_NET_ADMIN"} }, want: "capabilities"},
+		{name: "engine added an init process", applied: func(c *engineContainer) { c.Host["Init"] = true }, want: "host settings"},
+		{name: "engine passed runtime annotations", applied: func(c *engineContainer) {
+			c.Host["Annotations"] = map[string]any{"dev.gvisor.flag.network": "host"}
+		}, want: "host settings"},
+		{name: "engine mounted a tmpfs", applied: func(c *engineContainer) { c.Host["Tmpfs"] = map[string]any{"/run": ""} }, want: "host settings"},
+		{name: "engine set a sysctl", applied: func(c *engineContainer) { c.Host["Sysctls"] = map[string]any{"net.ipv4.ip_forward": "1"} }, want: "host settings"},
+		{name: "engine allowed device nodes", applied: func(c *engineContainer) { c.Host["DeviceCgroupRules"] = []any{"c 1:3 rwm"} }, want: "host settings"},
 		{name: "engine unbounded the log", applied: func(c *engineContainer) {
 			c.Host["LogConfig"] = map[string]any{"Type": "json-file", "Config": map[string]any{}}
 		}, want: "log bounds"},
 		{name: "process is not the pinned sentry", process: func(h *host) { h.process(h.config.RunscPath+"-other", scope, resources) }, want: "not the pinned gVisor binary"},
+		{name: "sentry replaced since open", process: func(h *host) {
+			replacement := h.sentry + ".new"
+			writeFile(h.t, replacement, "sentry binary")
+			if err := os.Rename(replacement, h.sentry); err != nil {
+				h.t.Fatal(err)
+			}
+		}, want: "replaced or rewritten"},
 		{name: "process escaped the slice", process: func(h *host) { h.process(h.sentry, "/system.slice/docker-1.scope", resources) }, want: "outside slice"},
 		{name: "kernel memory is unlimited", process: func(h *host) {
 			h.process(h.sentry, scope, resources)
