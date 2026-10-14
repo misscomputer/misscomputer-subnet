@@ -529,10 +529,37 @@ func sameSandboxParties(left, right *StaticSubnetBindingV1) bool {
 		left.MinerHotkey == right.MinerHotkey && left.MinerServicePublicKey == right.MinerServicePublicKey
 }
 
-// SandboxReceiptAnswersV1 is the validator's acceptance check: the receipt
-// names the exact document digest, schema and identity, and its miner and
-// validator service identities are the document's.
-func SandboxReceiptAnswersV1(r SandboxReceiptV1, documentSchema, documentDigest, sandboxID, minerID string, generation uint64, subnet *StaticSubnetBindingV1) error {
+// SandboxReceiptAnswersV1 is the validator's acceptance check. The complete
+// signed document is required so the receipt can be checked against its
+// lease ID and renewal sequence, not only its digest and outer identity.
+func SandboxReceiptAnswersV1(r SandboxReceiptV1, document any) error {
+	var documentSchema, sandboxID, minerID string
+	var generation uint64
+	var subnet *StaticSubnetBindingV1
+	switch d := document.(type) {
+	case SandboxReservationV1:
+		documentSchema, sandboxID, minerID, generation, subnet = d.Schema, d.SandboxID, d.MinerID, d.Generation, d.Subnet
+	case SandboxLeaseV1:
+		documentSchema, sandboxID, minerID, generation, subnet = d.Schema, d.SandboxID, d.MinerID, d.Generation, d.Subnet
+		leaseID := SandboxLeaseIDV1(d)
+		if r.LeaseID == nil || *r.LeaseID != leaseID {
+			return errors.New("sandbox receipt lease_id contradicts lease")
+		}
+	case SandboxRenewalV1:
+		documentSchema, sandboxID, minerID, generation, subnet = d.Schema, d.SandboxID, d.MinerID, d.Generation, d.Subnet
+		if r.LeaseID == nil || *r.LeaseID != d.LeaseID || r.RenewalSeq > d.RenewalSeq ||
+			((r.Stage == sandbox.StageAccepted || r.Stage == sandbox.StageReady) && r.RenewalSeq != d.RenewalSeq) {
+			return errors.New("sandbox receipt lease_id or renewal_seq contradicts renewal")
+		}
+	case SandboxReleaseV1:
+		documentSchema, sandboxID, minerID, generation, subnet = d.Schema, d.SandboxID, d.MinerID, d.Generation, d.Subnet
+	default:
+		return errors.New("not a validator sandbox-lease-v1 document")
+	}
+	documentDigest, err := SandboxDigestV1(document)
+	if err != nil {
+		return err
+	}
 	if r.DocumentSchema != documentSchema || r.DocumentDigest != documentDigest || r.SandboxID != sandboxID ||
 		r.MinerID != minerID || r.Generation != generation || !sameSandboxParties(r.Subnet, subnet) {
 		return errors.New("sandbox receipt does not answer the document")

@@ -228,8 +228,7 @@ func TestSandboxDocumentsMatchGoldenVectors(t *testing.T) {
 		"release":     protocol.VerifySandboxReleaseV1Signature(decodedRelease, validatorKey),
 		"receipt":     protocol.VerifySandboxReceiptV1(decodedReceipt, minerKey),
 		"commit":      protocol.SandboxLeaseCommitsReservationV1(decodedReservation, decodedLease),
-		"answers": protocol.SandboxReceiptAnswersV1(decodedReceipt, protocol.SandboxLeaseSchema, vectors.LeaseDigest,
-			decodedLease.SandboxID, decodedLease.MinerID, decodedLease.Generation, decodedLease.Subnet),
+		"answers":     protocol.SandboxReceiptAnswersV1(decodedReceipt, decodedLease),
 	} {
 		if err != nil {
 			t.Errorf("%s: %v", name, err)
@@ -488,12 +487,10 @@ func TestSandboxReceiptRules(t *testing.T) {
 	if protocol.VerifySandboxReceiptV1(held, validator.Public().(ed25519.PublicKey)) == nil {
 		t.Fatal("a receipt verified under the validator key")
 	}
-	reservationDigest, _ := protocol.SandboxDigestV1(reservation)
-	if err := protocol.SandboxReceiptAnswersV1(held, protocol.SandboxReservationSchema, reservationDigest, reservation.SandboxID, reservation.MinerID, 1, reservation.Subnet); err != nil {
+	if err := protocol.SandboxReceiptAnswersV1(held, reservation); err != nil {
 		t.Fatal(err)
 	}
-	leaseDigest, _ := protocol.SandboxDigestV1(lease)
-	if protocol.SandboxReceiptAnswersV1(held, protocol.SandboxLeaseSchema, leaseDigest, lease.SandboxID, lease.MinerID, 1, lease.Subnet) == nil {
+	if protocol.SandboxReceiptAnswersV1(held, lease) == nil {
 		t.Fatal("a reservation receipt answered a lease")
 	}
 	invalid := map[string]func(*protocol.SandboxReceiptV1){
@@ -525,6 +522,41 @@ func TestSandboxReceiptRules(t *testing.T) {
 			t.Errorf("receipt %s was signed", name)
 		}
 	}
+}
+
+// A miner's signature and the exact document digest do not make a receipt
+// consistent with the lease ID or renewal sequence inside that document.
+func TestSandboxReceiptRejectsDocumentContradictions(t *testing.T) {
+	validator, miner := sandboxKeys()
+	reservation := sandboxReservation(t, validator, miner)
+	lease := sandboxLease(t, validator, miner, reservation, nil)
+	leaseID := protocol.SandboxLeaseIDV1(lease)
+	otherID := leaseID[:len(leaseID)-1] + "0"
+	if otherID == leaseID {
+		otherID = leaseID[:len(leaseID)-1] + "1"
+	}
+	t.Run("wrong lease id", func(t *testing.T) {
+		wrongLease := sandboxReceipt(t, miner, lease.Subnet, lease, protocol.SandboxLeaseSchema, sandbox.StageReady, nil, &otherID)
+		if err := protocol.SandboxReceiptAnswersV1(wrongLease, lease); err == nil {
+			t.Fatal("signed receipt with another lease ID answered the lease")
+		}
+	})
+	renewal := sandboxRenewal(t, validator, miner, lease, 1, sandboxNow.Add(15*time.Minute))
+	t.Run("stale renewal sequence", func(t *testing.T) {
+		stale := sandboxReceipt(t, miner, renewal.Subnet, renewal, protocol.SandboxRenewalSchema, sandbox.StageReady, nil, &leaseID)
+		if err := protocol.SandboxReceiptAnswersV1(stale, renewal); err == nil {
+			t.Fatal("signed receipt with stale sequence confirmed the renewal")
+		}
+		// A terminal reply can accurately report that the renewal was not
+		// applied and therefore still carry the prior durable sequence.
+		stale.Stage, stale.Signature = sandbox.StageExpired, ""
+		if err := protocol.SignSandboxReceiptV1(&stale, miner); err != nil {
+			t.Fatal(err)
+		}
+		if err := protocol.SandboxReceiptAnswersV1(stale, renewal); err != nil {
+			t.Fatalf("terminal reply with prior sequence: %v", err)
+		}
+	})
 }
 
 // Admission binds every validator document to its window, the issuing

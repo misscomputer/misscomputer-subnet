@@ -103,6 +103,13 @@ Receipt error codes and whether they are attributed to the miner:
 `secret_delivery_unsupported`, `sandbox_disabled`, `released_before_use`,
 `hold_expired`, `lease_expired`, `image_unavailable`.
 
+Validator receipt acceptance is bound to the complete signed document, not
+only its digest and outer identity. A lease receipt must name that lease's
+derived `lease_id`. A renewal receipt must name the renewed `lease_id`; a
+`ready` or `accepted` renewal receipt must echo its `renewal_seq`. A terminal
+renewal receipt may report an earlier durable sequence when the renewal was
+not applied. A signed contradiction of an exact document is miner fraud.
+
 ## Durable holds and leases (miner side)
 
 `Store.EnableSandboxLeases` creates three tables (`sandbox_holds`,

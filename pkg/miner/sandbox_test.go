@@ -250,8 +250,7 @@ func (f *sbFixture) check(receipt protocol.SandboxReceiptV1, err error, schema s
 	if err := protocol.VerifySandboxReceiptV1(receipt, f.miner.Public().(ed25519.PublicKey)); err != nil {
 		f.t.Fatalf("receipt does not verify: %v", err)
 	}
-	digest, _ := protocol.SandboxDigestV1(document)
-	if err := protocol.SandboxReceiptAnswersV1(receipt, schema, digest, receipt.SandboxID, sbMinerHotkey, 1, f.binding()); err != nil {
+	if err := protocol.SandboxReceiptAnswersV1(receipt, document); err != nil {
 		f.t.Fatal(err)
 	}
 	got := ""
