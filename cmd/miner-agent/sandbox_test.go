@@ -24,6 +24,7 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandboxbackend"
 )
 
 var sandboxPaths = []string{"/v1/sandbox/reservations", "/v1/sandbox/leases", "/v1/sandbox/renewals", "/v1/sandbox/releases"}
@@ -45,15 +46,29 @@ func advertised(t *testing.T, service *api) []string {
 }
 
 // With the lane off (the default) the miner serves exactly the routes and
-// advertises exactly the features it did before the lane existed, and "on"
-// refuses to start because no isolation backend is available.
+// advertises exactly the features it did before the lane existed. "on"
+// without a verifiable backend, an unknown mode, or a backend setting with
+// the lane off refuses to start.
 func TestSandboxLeasesOffKeepsRoutesAndFeaturesUnchanged(t *testing.T) {
-	if lane, err := openSandboxLeases("off"); lane != nil || err != nil {
+	ctx := context.Background()
+	if lane, err := openSandboxLeases(ctx, sandboxOptions{Mode: "off"}, nil, nil); lane != nil || err != nil {
 		t.Fatalf("default sandbox mode: %v %v", lane, err)
 	}
-	for _, mode := range []string{"on", "true", ""} {
-		if lane, err := openSandboxLeases(mode); lane != nil || err == nil {
-			t.Fatalf("--sandbox-leases %q started: %v %v", mode, lane, err)
+	store, err := durable.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, options := range []sandboxOptions{
+		{Mode: "on"},
+		{Mode: "on", Backend: sandboxbackend.Config{DockerHost: "unix:///var/run/docker.sock", Runtime: "runsc"}},
+		{Mode: "true"},
+		{Mode: ""},
+		{Mode: "off", Backend: sandboxbackend.Config{DockerHost: "unix:///run/mc-sandbox/docker.sock"}},
+		{Mode: "off", Budget: sandbox.Capacity{Sandboxes: 4}},
+	} {
+		if lane, err := openSandboxLeases(ctx, options, miner.NewAgent("miner", nil, nil, nil, nil, nil), store); lane != nil || err == nil {
+			t.Fatalf("sandbox options %+v started: %v %v", options, lane, err)
 		}
 	}
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
@@ -106,7 +121,7 @@ func (b *sandboxBackend) Destroy(_ context.Context, instance string) error {
 	return nil
 }
 func (b *sandboxBackend) Instances(context.Context) ([]miner.SandboxInstance, error) { return nil, nil }
-func (b *sandboxBackend) Reclaim(context.Context) error                               { return nil }
+func (b *sandboxBackend) Reclaim(context.Context) error                              { return nil }
 
 // With an enabled lane the bridge accepts validator-signed sandbox
 // documents in the subnet-sandbox-synapse.v1 envelope and answers signed

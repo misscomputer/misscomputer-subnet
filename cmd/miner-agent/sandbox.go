@@ -9,6 +9,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/bridge"
@@ -16,6 +19,8 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
 	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandboxbackend"
 )
 
 // sandboxSynapseVersion is the loopback envelope of sandbox-lease-v1
@@ -26,19 +31,62 @@ const sandboxSynapseVersion = "subnet-sandbox-synapse.v1"
 // past its grace keeps capacity before the sweep reclaims it.
 const sandboxSweepInterval = 10 * time.Second
 
+// sandboxOptions is the --sandbox-* configuration. Backend members are
+// pkg/sandboxbackend's Config; Budget is what the lane holds against.
+type sandboxOptions struct {
+	Mode             string
+	Backend          sandboxbackend.Config
+	Budget           sandbox.Capacity
+	DeploymentCgroup string
+}
+
 // openSandboxLeases enables the sandbox-lease-v1 workload only when
-// explicitly requested. No isolation backend ships yet, so "on" refuses to
-// start rather than run customer code under an unselected runtime; with
-// "off" (the default) no sandbox route, table or capability exists.
-func openSandboxLeases(mode string) (*miner.SandboxLane, error) {
-	switch mode {
+// explicitly requested. With "off" (the default) no sandbox route, table or
+// capability exists, and any other --sandbox-* setting is refused so that a
+// configured backend is never silently unused. With "on" the gVisor backend
+// must verify its dedicated daemon and host, and the lane its budget and
+// cgroups, or the agent does not start. The agent's own cgroup is read from
+// the kernel rather than configured.
+func openSandboxLeases(ctx context.Context, options sandboxOptions, agent *miner.Agent, store *durable.Store) (*miner.SandboxLane, error) {
+	switch options.Mode {
 	case "off":
+		if !reflect.DeepEqual(options, sandboxOptions{Mode: "off"}) {
+			return nil, errors.New("--sandbox-* settings require --sandbox-leases on")
+		}
 		return nil, nil
 	case "on":
-		return nil, errors.New("--sandbox-leases on requires a sandbox isolation backend, and none is available in this build")
 	default:
-		return nil, fmt.Errorf("unsupported --sandbox-leases mode %q", mode)
+		return nil, fmt.Errorf("unsupported --sandbox-leases mode %q", options.Mode)
 	}
+	agentCgroup, err := selfCgroup()
+	if err != nil {
+		return nil, err
+	}
+	backend, err := sandboxbackend.Open(ctx, options.Backend)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox backend: %w", err)
+	}
+	leases, err := store.EnableSandboxLeases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return miner.NewSandboxLane(ctx, agent, leases, backend, miner.SandboxLaneConfig{
+		Budget: options.Budget, CgroupRoot: miner.DefaultCgroupRoot, AgentCgroup: agentCgroup, DeploymentCgroup: options.DeploymentCgroup,
+	})
+}
+
+// selfCgroup is this process's cgroup v2 path.
+func selfCgroup() (string, error) {
+	raw, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return "", fmt.Errorf("read agent cgroup: %w", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if cgroup, ok := strings.CutPrefix(line, "0::"); ok {
+			return cgroup, nil
+		}
+	}
+	return "", errors.New("the miner agent is not in a cgroup v2 hierarchy")
 }
 
 // registerSandboxRoutes adds the sandbox routes. It is called only for an

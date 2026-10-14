@@ -86,9 +86,27 @@ func run() error {
 		staticCacheMaxBytes   = flag.Int64("static-cache-max-bytes", 8<<30, "byte quota of pinned static site files")
 		staticFetchTimeout    = flag.Duration("static-fetch-timeout", miner.DefaultStaticFetchTimeout, "bound on fetching and verifying one static site")
 		staticConcurrency     = flag.Int("static-request-concurrency", miner.DefaultStaticRequestConcurrency, "in-flight requests per static endpoint")
-		sandboxLeases         = flag.String("sandbox-leases", "off", "sandbox-lease-v1 workload: off (default); on needs a sandbox isolation backend, none is available yet")
+		sandboxLeases         = flag.String("sandbox-leases", "off", "sandbox-lease-v1 workload: off (default) or on (gVisor on a dedicated Docker daemon; every --sandbox-* setting below is then required)")
+		sandboxConfig         = sandboxOptions{}
 	)
+	flag.StringVar(&sandboxConfig.Backend.DockerHost, "sandbox-docker-host", "", "unix://<socket> of the Docker daemon dedicated to sandboxes (never the default daemon)")
+	flag.StringVar(&sandboxConfig.Backend.Runtime, "sandbox-runtime", "", "name the sandbox daemon registers runsc under")
+	flag.StringVar(&sandboxConfig.Backend.RunscPath, "sandbox-runsc-path", "", "absolute path of the pinned runsc binary")
+	flag.StringVar(&sandboxConfig.Backend.RunscSHA256, "sandbox-runsc-sha256", "", "SHA-256 of the pinned runsc binary")
+	flag.StringVar(&sandboxConfig.Backend.SentryPath, "sandbox-sentry-path", "", "absolute path of the pinned gVisor sentry binary, for runsc releases that run a separate sentry")
+	flag.StringVar(&sandboxConfig.Backend.SentrySHA256, "sandbox-sentry-sha256", "", "SHA-256 of the pinned gVisor sentry binary")
+	flag.StringVar(&sandboxConfig.Backend.DataRoot, "sandbox-data-root", "", "data root of the sandbox daemon, on a filesystem dedicated to it")
+	flag.StringVar(&sandboxConfig.Backend.Slice, "sandbox-slice", "", "systemd slice with finite CPU, memory and pids limits that every sandbox runs in")
+	flag.StringVar(&sandboxConfig.DeploymentCgroup, "sandbox-deployment-cgroup", "", "cgroup v2 path deployment.v4 replicas run in, which sandboxes must not share")
+	flag.IntVar(&sandboxConfig.Budget.CPUMillis, "sandbox-cpu-millis", 0, "CPU of all sandboxes together, in millicores")
+	flag.IntVar(&sandboxConfig.Budget.MemoryMiB, "sandbox-memory-mib", 0, "memory of all sandboxes together, in MiB")
+	flag.IntVar(&sandboxConfig.Budget.DiskMiB, "sandbox-disk-mib", 0, "writable-layer disk of all sandboxes together, in MiB")
+	flag.IntVar(&sandboxConfig.Budget.Sandboxes, "sandbox-count", 0, "maximum number of sandboxes")
+	flag.IntVar(&sandboxConfig.Backend.ImageMaxMiB, "sandbox-image-max-mib", 0, "largest stored image one sandbox may run, in MiB")
+	flag.IntVar(&sandboxConfig.Backend.LogMiB, "sandbox-log-mib", 0, "container log bound of one sandbox, in MiB")
 	flag.Parse()
+	sandboxConfig.Mode = *sandboxLeases
+	sandboxConfig.Backend.DiskMiB, sandboxConfig.Backend.Sandboxes = sandboxConfig.Budget.DiskMiB, sandboxConfig.Budget.Sandboxes
 	if err := service.ValidateBind(*bind, *allowNonLoopback); err != nil {
 		return err
 	}
@@ -140,7 +158,9 @@ func run() error {
 	if agent.Static, err = openStaticSites(*staticSites, *staticCacheDir, *staticCacheMaxBytes, *staticFetchTimeout, *staticConcurrency); err != nil {
 		return err
 	}
-	sandboxLane, err := openSandboxLeases(*sandboxLeases)
+	sandboxCtx, sandboxCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	sandboxLane, err := openSandboxLeases(sandboxCtx, sandboxConfig, agent, store)
+	sandboxCancel()
 	if err != nil {
 		return err
 	}
