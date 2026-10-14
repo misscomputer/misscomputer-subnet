@@ -22,7 +22,7 @@ report() {
   if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then echo "$*" >> "$GITHUB_STEP_SUMMARY"; fi
 }
 
-for tool in curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt xfs_quota systemd-run systemctl python3 du df timeout awk sed readlink truncate sort; do
+for tool in curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt xfs_quota systemd-run systemctl python3 du df timeout awk sed readlink truncate sort nsenter ip; do
   command -v "$tool" >/dev/null || die "missing $tool"
 done
 [[ $(findmnt -n -o FSTYPE /sys/fs/cgroup) == cgroup2 ]] || die 'host is not cgroup v2'
@@ -53,6 +53,13 @@ cleanup() {
   fi
   systemctl stop "$anchor" >/dev/null 2>&1
   systemctl stop "$slice" >/dev/null 2>&1
+  # systemd created implicit parents for each '-' in the slice name; they
+  # belong to this gate only on a disposable runner.
+  parent=${slice%.slice}
+  while [[ $parent == *-* ]]; do
+    parent=${parent%-*}
+    systemctl stop "$parent.slice" >/dev/null 2>&1
+  done
   # Docker may retain its own null-netns bind mount below exec-root after
   # dockerd exits. Unmount only this gate's descendants, deepest first.
   while IFS= read -r target; do
@@ -195,26 +202,35 @@ read -r cpu_quota cpu_period < "/sys/fs/cgroup$child_path/cpu.max"
 report "actual runsc PID=$pid cgroup=$child_path cpu.max=$(cat "/sys/fs/cgroup$child_path/cpu.max") memory.max=$(cat "/sys/fs/cgroup$child_path/memory.max") pids.max=$(cat "/sys/fs/cgroup$child_path/pids.max")"
 
 docker exec "$container" sh -c 'command -v wget >/dev/null' || die 'network probe lacks wget'
-# Only a missing route counts as blocked. An HTTP error status, such as the
-# 400 cloud metadata services return without their header, a refused
-# connection or an ICMP unreachable reply means the address was reached.
+# Primary assertion: the sentry's host-side network namespace and the
+# sandbox itself have only lo and no route off it. Observed from the host,
+# this does not depend on gVisor's own report.
+host_links=$(nsenter --net="/proc/$pid/ns/net" ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//')
+host_routes=$( { nsenter --net="/proc/$pid/ns/net" ip -4 route show table all; nsenter --net="/proc/$pid/ns/net" ip -6 route show table all; } | grep -v ' dev lo' || true)
+[[ $host_links == lo && -z $host_routes ]] || die "sentry host netns is not lo-only without routes: links=${host_links//$'\n'/ } routes=${host_routes//$'\n'/ }"
+interfaces=$(docker exec "$container" awk 'NR > 2 {sub(/:.*/, ""); gsub(/ /, ""); print}' /proc/net/dev)
+[[ $interfaces == lo ]] || die "network=none sandbox exposes interfaces other than lo: ${interfaces//$'\n'/ }"
+# Corroboration: an HTTP error status (such as the 400 cloud metadata
+# services return without their header), a refused connection or a timeout
+# means the address was reached or the probe failed for another reason.
+# ENETUNREACH alone could also come from an upstream ICMP reply; here it is
+# local only because the namespace above has no interface but lo. The whole
+# error line must match.
 for address in 169.254.169.254 1.1.1.1; do
   if probe_error=$(timeout 8 docker exec "$container" wget -T 3 -q -O /dev/null "http://$address/" 2>&1 >/dev/null); then
     die "network=none container reached $address"
   fi
-  [[ $probe_error == *"can't connect to remote host ($address): Network is unreachable"* ]] || die "network probe to $address did not fail for lack of a route: ${probe_error:-no error output}"
+  [[ $probe_error == "wget: can't connect to remote host ($address): Network is unreachable" ]] || die "network probe to $address did not fail for lack of a route: ${probe_error:-no error output}"
   report "probe $address: $probe_error"
 done
-interfaces=$(docker exec "$container" awk 'NR > 2 {sub(/:.*/, ""); gsub(/ /, ""); print}' /proc/net/dev)
-[[ $interfaces == lo ]] || die "network=none sandbox exposes interfaces other than lo: ${interfaces//$'\n'/ }"
 docker exec "$container" true || die 'liveness control could not execute in the container after network probes'
 [[ $(docker inspect --format '{{.State.Running}}' "$container") == true ]] || die 'container stopped during network proof'
-report 'network=none: only lo present; metadata and public TCP attempts had no route'
+report 'network=none: sentry host netns and sandbox have only lo and no route; metadata and public TCP attempts had no route'
 
 # Docker overlay2 on XFS+pquota must return ENOSPC/EDQUOT before 192 MiB is
 # written to the 64 MiB writable layer. A mere StorageOpt field is not proof.
 tmp_fstype=$(docker exec "$container" awk '$5 == "/tmp" {for (i=1; i<=NF; i++) if ($i == "-") {print $(i+1); exit}}' /proc/self/mountinfo)
-report "separate /tmp filesystem: ${tmp_fstype:-unknown} (outside writable-layer quota, charged to finite memory cgroup only if tmpfs)"
+report "separate /tmp filesystem: ${tmp_fstype:-unknown} (outside writable-layer quota; its memory charge is not measured here)"
 [[ $tmp_fstype == tmpfs ]] || die '/tmp is a separate writable filesystem without proven memory accounting'
 # PID 1 stays nonroot. The administrator-controlled exec writes at / so this
 # experiment actually measures the Docker rootfs layer, not gVisor's /tmp.

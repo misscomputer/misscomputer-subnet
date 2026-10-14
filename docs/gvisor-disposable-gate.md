@@ -27,9 +27,13 @@ writable-layer quota, and bounded JSON logs.
 
 The proof checks the engine's runtime/image/config, the pinned runsc process's
 actual cgroup, finite parent and child CPU, memory and PID limits, that the
-sandbox has only a loopback interface, that metadata and public TCP attempts
-fail with no route (an HTTP error status, refusal or unreachable reply counts
-as reached), an actual write that
+sentry's host-side network namespace and the sandbox both have only a
+loopback interface and no route off it (the primary network assertion,
+observed from the host), that metadata and public TCP attempts fail with
+exactly BusyBox's `can't connect to remote host (<addr>): Network is
+unreachable` line (an HTTP error status, refusal or timeout counts as
+reached; ENETUNREACH could also come from an upstream ICMP reply, so it only
+corroborates the lo-only namespace), an actual write that
 stops within 4 MiB of the quota with ENOSPC or EDQUOT, the matching full XFS
 project limit, and that Docker logs actually rotated.
 The long-lived probe process is nonroot; an administrator-controlled `exec`
@@ -44,7 +48,8 @@ writable-layer bytes in sandbox-managed storage instead of Docker's overlay2
 upper directory, so a backend using other runtime arguments must use these or
 re-prove the quota.
 It then removes the container and image and verifies they are absent. The
-script cleans up its own daemon, unit, slice, mount and loop device on success
+script cleans up its own daemon, unit, slice (with the implicit parent slices
+systemd derives from its name), mount and loop device on success
 or failure. Its refusal check (`MC_GVISOR_DISPOSABLE_RUNNER`, `GITHUB_ACTIONS`,
 `RUNNER_ENVIRONMENT=github-hosted`, root) is an accident guard, not a security
 boundary; never run the script on a self-hosted runner or miner host.
@@ -65,3 +70,7 @@ or any live miner path.
 The existing `TestDockerOCIRuntimeRunsVerifiedImageUnderSmallV1` covers the
 organic runc runtime's separate image and deny-all-network contract. It does
 not exercise runsc or storage quotas; this gate owns that real-engine proof.
+
+The broader [sandbox-host conformance](sandbox-host-enforcement.md) adds a
+dedicated containerd, per-lease and aggregate effect checks, and a
+machine-readable report. This gate remains the narrow runsc/quota baseline.
