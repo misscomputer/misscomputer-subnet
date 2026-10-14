@@ -477,9 +477,10 @@ for family in -4 -6; do
       --memory 256m --memory-swap 256m --pids-limit 64 "$MCSBX_IMAGE" ping "$family" -c 1 -W 2 "$target" 2>&1); then
     bad "icmp $family reached $target: $icmp"
   fi
-  case $icmp in
-    *$'\n''ping: sendto: Network is unreachable') icmp_view+="$family no route: $(tr '\n' ' ' <<< "$icmp"); " ;;
-    'ping: permission denied (are you root?)'|*'Operation not permitted') icmp_view+="$family socket refused by runsc: $(tr '\n' ' ' <<< "$icmp"); " ;;
+  # The verdict line is the last one; BusyBox prints a PING header first.
+  case $(tail -1 <<< "$icmp") in
+    'ping: sendto: Network is unreachable') icmp_view+="$family no route: $(tail -1 <<< "$icmp"); " ;;
+    'ping: permission denied (are you root?)') icmp_view+="$family raw socket refused by runsc (no --net-raw), route not exercised by ICMP: $(tail -1 <<< "$icmp"); " ;;
     *) bad "icmp $family failed otherwise: $icmp" ;;
   esac
 done
