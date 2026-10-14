@@ -91,7 +91,8 @@ report "runsc: ${runsc_version%%$'\n'*}; archive sha256=$RUNSC_SHA256"
 # The daemon's image/cache/log data root is a disposable finite XFS filesystem;
 # project quota is needed for Docker overlay2 size. Its exec-root and the
 # shared system containerd's state stay on the disposable runner disk, but the
-# daemon uses its own containerd namespaces, not the default engine's.
+# daemon uses its own containerd namespaces, not the default engine's, and
+# leaves the host's IPv4/IPv6 firewall chains alone.
 truncate -s 3G "$gate_dir/docker.xfs"
 loop_device=$(losetup --find --show "$gate_dir/docker.xfs")
 mkfs.xfs -f "$loop_device" >/dev/null
@@ -110,9 +111,8 @@ with open(path, 'w', encoding='utf-8') as out:
         'data-root': root + '/xfs/docker', 'exec-root': root + '/exec',
         'hosts': ['unix://' + root + '/docker.sock'],
         'storage-driver': 'overlay2', 'bridge': 'none', 'iptables': False,
-        'ip-forward': False, 'ip-masq': False,
+        'ip6tables': False, 'ip-forward': False, 'ip-masq': False,
         'containerd-namespace': 'mc-gvisor-gate',
-        'containerd-plugins-namespace': 'mc-gvisor-gate-plugins',
         'exec-opts': ['native.cgroupdriver=systemd'],
         'runtimes': {'runsc': {'path': root + '/bin/runsc',
                                'runtimeArgs': ['--systemd-cgroup', '--overlay2=none']}},
@@ -120,7 +120,8 @@ with open(path, 'w', encoding='utf-8') as out:
 PY
 
 export DOCKER_HOST="unix://$gate_dir/docker.sock"
-dockerd --config-file "$gate_dir/daemon.json" --pidfile "$gate_dir/dockerd.pid" >"$gate_dir/dockerd.log" 2>&1 &
+# daemon.json silently ignores the plugin namespace key, so pass the flag.
+dockerd --config-file "$gate_dir/daemon.json" --containerd-plugins-namespace mc-gvisor-gate-plugins --pidfile "$gate_dir/dockerd.pid" >"$gate_dir/dockerd.log" 2>&1 &
 daemon_pid=$!
 for _ in {1..60}; do
   if docker info >/dev/null 2>&1; then daemon_ready=1; break; fi
@@ -130,7 +131,8 @@ done
 if (( ! daemon_ready )); then tail -80 "$gate_dir/dockerd.log" >&2; die 'isolated Docker daemon did not start'; fi
 [[ $(docker info --format '{{.DockerRootDir}} {{.Driver}} {{.CgroupDriver}}') == "$gate_dir/xfs/docker overlay2 systemd" ]] || die 'wrong Docker root, storage, or cgroup driver'
 [[ $(docker version --format '{{.Server.Version}}') == 28.0.4 ]] || die 'unreviewed isolated Docker server version'
-report "Docker: $(docker version --format '{{.Server.Version}}'); data root=$gate_dir/xfs/docker; storage=overlay2; cgroup=systemd"
+[[ $(docker info --format '{{.Containerd.Namespaces.Containers}} {{.Containerd.Namespaces.Plugins}}') == 'mc-gvisor-gate mc-gvisor-gate-plugins' ]] || die 'isolated daemon shares containerd namespaces with the default engine'
+report "Docker: $(docker version --format '{{.Server.Version}}'); data root=$gate_dir/xfs/docker; storage=overlay2; cgroup=systemd; containerd namespaces=mc-gvisor-gate/mc-gvisor-gate-plugins"
 
 systemd-run --unit "$anchor" --slice "$slice" --remain-after-exit /bin/true >/dev/null
 systemctl set-property --runtime "$slice" CPUQuota=200% MemoryMax=1073741824 TasksMax=512
@@ -193,20 +195,21 @@ read -r cpu_quota cpu_period < "/sys/fs/cgroup$child_path/cpu.max"
 report "actual runsc PID=$pid cgroup=$child_path cpu.max=$(cat "/sys/fs/cgroup$child_path/cpu.max") memory.max=$(cat "/sys/fs/cgroup$child_path/memory.max") pids.max=$(cat "/sys/fs/cgroup$child_path/pids.max")"
 
 docker exec "$container" sh -c 'command -v wget >/dev/null' || die 'network probe lacks wget'
-# Only a connect-level failure counts as blocked. An HTTP error status, such
-# as the 400 cloud metadata services return without their header, means the
-# address was reached.
+# Only a missing route counts as blocked. An HTTP error status, such as the
+# 400 cloud metadata services return without their header, a refused
+# connection or an ICMP unreachable reply means the address was reached.
 for address in 169.254.169.254 1.1.1.1; do
   if probe_error=$(timeout 8 docker exec "$container" wget -T 3 -q -O /dev/null "http://$address/" 2>&1 >/dev/null); then
     die "network=none container reached $address"
   fi
-  [[ $probe_error == *"can't connect to remote host"* ]] || die "network probe to $address did not fail to connect: ${probe_error:-no error output}"
+  [[ $probe_error == *"can't connect to remote host ($address): Network is unreachable"* ]] || die "network probe to $address did not fail for lack of a route: ${probe_error:-no error output}"
+  report "probe $address: $probe_error"
 done
 interfaces=$(docker exec "$container" awk 'NR > 2 {sub(/:.*/, ""); gsub(/ /, ""); print}' /proc/net/dev)
 [[ $interfaces == lo ]] || die "network=none sandbox exposes interfaces other than lo: ${interfaces//$'\n'/ }"
-docker exec "$container" true || die 'network negative control could not execute in a live container'
+docker exec "$container" true || die 'liveness control could not execute in the container after network probes'
 [[ $(docker inspect --format '{{.State.Running}}' "$container") == true ]] || die 'container stopped during network proof'
-report 'network=none: only lo present; metadata and public TCP attempts failed to connect'
+report 'network=none: only lo present; metadata and public TCP attempts had no route'
 
 # Docker overlay2 on XFS+pquota must return ENOSPC/EDQUOT before 192 MiB is
 # written to the 64 MiB writable layer. A mere StorageOpt field is not proof.

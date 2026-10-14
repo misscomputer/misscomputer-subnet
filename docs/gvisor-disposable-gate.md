@@ -17,9 +17,10 @@ container image executed. The workflow pins XFS tooling to Ubuntu's
 `28.0.4`; runner image, kernel and systemd versions are recorded in the job.
 It creates a disposable 3 GiB XFS loop filesystem
 with project quota and a separate Docker daemon whose data root is on that
-filesystem. The daemon has no bridge or forwarding and uses its own containerd
-namespaces; its exec-root and the runner's shared containerd state remain on
-the disposable runner disk. The test creates a
+filesystem. The daemon has no bridge, forwarding, or IPv4/IPv6 firewall
+management, and the gate asserts it uses its own containerd container and
+plugin namespaces; its exec-root and the runner's shared containerd state
+remain on the disposable runner disk. The test creates a
 dedicated finite systemd cgroup slice and one `runsc` container with
 `network=none`, per-container CPU, memory and PID limits, a 64 MiB overlay2
 writable-layer quota, and bounded JSON logs.
@@ -27,13 +28,21 @@ writable-layer quota, and bounded JSON logs.
 The proof checks the engine's runtime/image/config, the pinned runsc process's
 actual cgroup, finite parent and child CPU, memory and PID limits, that the
 sandbox has only a loopback interface, that metadata and public TCP attempts
-fail to connect (an HTTP error status counts as reached), an actual write that
+fail with no route (an HTTP error status, refusal or unreachable reply counts
+as reached), an actual write that
 stops within 4 MiB of the quota with ENOSPC or EDQUOT, the matching full XFS
 project limit, and that Docker logs actually rotated.
 The long-lived probe process is nonroot; an administrator-controlled `exec`
 as root writes at `/` specifically to exercise the rootfs layer. gVisor's
-separate `/tmp` must report as tmpfs, which is charged to the finite memory
-cgroup rather than the disk quota.
+separate `/tmp` must report as tmpfs. It is outside the disk quota and, by
+design, memory-backed; the gate checks the filesystem type but does not
+measure that memory charge.
+
+The quota result holds only for `runsc` registered with `--overlay2=none` and
+`--systemd-cgroup`, as this script does. runsc's default rootfs overlay keeps
+writable-layer bytes in sandbox-managed storage instead of Docker's overlay2
+upper directory, so a backend using other runtime arguments must use these or
+re-prove the quota.
 It then removes the container and image and verifies they are absent. The
 script cleans up its own daemon, unit, slice, mount and loop device on success
 or failure. Its refusal check (`MC_GVISOR_DISPOSABLE_RUNNER`, `GITHUB_ACTIONS`,
