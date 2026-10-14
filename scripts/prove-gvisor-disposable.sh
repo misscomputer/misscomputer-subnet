@@ -20,7 +20,7 @@ report() {
   if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then echo "$*" >> "$GITHUB_STEP_SUMMARY"; fi
 }
 
-for tool in curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt xfs_quota systemd-run systemctl python3 du timeout awk sed readlink truncate sort; do
+for tool in curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt xfs_quota systemd-run systemctl python3 du df timeout awk sed readlink truncate sort; do
   command -v "$tool" >/dev/null || die "missing $tool"
 done
 [[ $(findmnt -n -o FSTYPE /sys/fs/cgroup) == cgroup2 ]] || die 'host is not cgroup v2'
@@ -182,6 +182,7 @@ read -r cpu_quota cpu_period < "/sys/fs/cgroup$child_path/cpu.max"
 (( cpu_quota * 1000 / cpu_period <= 1000 )) || die 'actual child CPU quota exceeds one CPU'
 report "actual runsc PID=$pid cgroup=$child_path cpu.max=$(cat "/sys/fs/cgroup$child_path/cpu.max") memory.max=$(cat "/sys/fs/cgroup$child_path/memory.max") pids.max=$(cat "/sys/fs/cgroup$child_path/pids.max")"
 
+docker exec "$container" sh -c 'command -v wget >/dev/null' || die 'network probe lacks wget'
 for address in 169.254.169.254 1.1.1.1; do
   if timeout 8 docker exec "$container" wget -T 3 -q -O /dev/null "http://$address/" >/dev/null 2>&1; then
     die "network=none container reached $address"
@@ -202,10 +203,12 @@ if docker exec --user 0 "$container" dd if=/dev/zero of=/quota-proof bs=1048576 
   die 'container wrote past its 64 MiB writable-layer quota'
 fi
 grep -Eiq 'No space left on device|Disk quota exceeded' "$gate_dir/dd.log" || { cat "$gate_dir/dd.log" >&2; die 'disk write failed for a reason other than quota'; }
+global_free=$(df -B1 --output=avail "$gate_dir/xfs" | awk 'NR == 2 {print $1}')
+[[ $global_free =~ ^[0-9]+$ ]] && (( global_free > 1024 * 1024 * 1024 )) || die "global XFS free space too low to attribute the disk failure to the per-container quota: $global_free"
 docker exec "$container" sh -c '[ "$(stat -c %d /)" = "$(stat -c %d /quota-proof)" ]' || die 'disk write did not target the rootfs layer'
 written=$(docker exec "$container" stat -c '%s' /quota-proof)
 (( written > 0 && written <= QUOTA_BYTES )) || die "writable-layer file size $written exceeds quota"
-report "writable-layer quota: 64 MiB, dd stopped at $written bytes with ENOSPC/EDQUOT"
+report "writable-layer quota: 64 MiB, dd stopped at $written bytes with ENOSPC/EDQUOT while global XFS still had $global_free free bytes"
 
 log_path=$(docker inspect --format '{{.LogPath}}' "$container")
 [[ $log_path == "$gate_dir/xfs/docker/"* ]] || die 'container log escaped finite data root'
