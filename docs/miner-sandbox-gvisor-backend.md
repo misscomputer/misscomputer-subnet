@@ -11,37 +11,25 @@ through the real backend and must run only on a disposable provisioned host
 (see [Disposable-host proof](#disposable-host-proof)). Host provisioning is
 not part of this package.
 
-## Enabling it
+## Activation
 
-`miner-agent --sandbox-leases on` requires every `--sandbox-*` setting:
+Not wired yet. `miner-agent --sandbox-leases on` still refuses to start. The
+agent will enable this backend only in a separate change, after the
+host-preflight package for the dedicated daemon, slice and data root has
+merged. Agent startup must then require every kernel, cgroup and filesystem
+check, and every engine check below, to pass as an observed state. Until
+then the backend runs only under `TestGVisorLaneOnDisposableHost`.
 
-| Flag | Meaning |
-| --- | --- |
-| `--sandbox-docker-host` | `unix://<socket>` of the dedicated daemon; the default `/var/run/docker.sock` / `/run/docker.sock` (after symlinks) is refused |
-| `--sandbox-runtime` | name the daemon registers runsc under (`runc` is refused) |
-| `--sandbox-runsc-path`, `--sandbox-runsc-sha256` | pinned runsc binary |
-| `--sandbox-sentry-path`, `--sandbox-sentry-sha256` | pinned sentry binary, for runsc releases whose sandbox process is a separate sentry (as `release-20261005.0`) |
-| `--sandbox-data-root` | the daemon's data root, on a filesystem dedicated to it |
-| `--sandbox-slice` | systemd slice with finite `cpu.max`, `memory.max` and `pids.max` that every sandbox runs in |
-| `--sandbox-deployment-cgroup` | cgroup v2 path of `deployment.v4` replicas, which the slice must not overlap |
-| `--sandbox-cpu-millis`, `--sandbox-memory-mib`, `--sandbox-disk-mib`, `--sandbox-count` | the lane budget: holds are checked against it and receipts report it |
-| `--sandbox-image-max-mib`, `--sandbox-log-mib` | per-sandbox image and container-log allowance |
-
-With `--sandbox-leases off` (the default) any `--sandbox-*` setting is
-refused, so a configured backend is never silently unused; without settings
-the agent is unchanged. The agent's own cgroup is read from
-`/proc/self/cgroup`, not configured. Any preflight failure stops the agent.
-
-Before serving, the agent runs restart recovery: every lease whose sandbox
-may exist answers `failed/miner_restart` and is destroyed, every other
-sandbox container on the daemon is destroyed as an orphan, and images no
-container uses are pruned.
+The lane's restart recovery already uses the backend contract. Every lease
+whose sandbox may exist answers `failed/miner_restart` and is destroyed.
+Every other sandbox container on the daemon is destroyed as an orphan, and
+images no container uses are pruned.
 
 ## What Open verifies (no host changes)
 
 - the socket is not the default daemon's, the server is Docker
   `28.0.4` (the version the [disposable gate](gvisor-disposable-gate.md)
-  proved the quota on), its data root is `--sandbox-data-root`, storage is
+  proved the quota on), its data root is the configured `DataRoot`, storage is
   `overlay2`, the cgroup driver is `systemd` on cgroup v2, and its containerd
   namespaces are not the default engine's;
 - the runtime is registered at the pinned runsc path with arguments drawn
@@ -50,8 +38,10 @@ container uses are pruned.
   them); any other argument, such as host networking, is refused;
 - runsc and sentry binaries match their SHA-256 pins (opened without
   following symlinks);
+- the daemon trusts no insecure registry beyond the loopback prefixes Docker
+  always lists, uses no mirror, and has Docker Hub as its only, secure index;
 - the data root's filesystem holds at least `disk + count × (image max +
-  log)`;
+  log)` (the host-preflight check adds engine overhead and an image reserve);
 - the slice directory is on cgroup v2 with a finite `pids.max`; the lane
   separately requires finite `cpu.max` and `memory.max` covering the budget,
   disjoint from the agent's and the deployment cgroup;
@@ -68,27 +58,41 @@ than `gvisor` (`isolation_unsupported`), network other than `none`
 (`resources_unsupported`), and, in the lane, any `secret_env`
 (`secret_delivery_unsupported`).
 
+Registry (`image_unavailable`, before any engine call): `localhost`, any IP
+literal, and any registry host (Docker Hub as `registry-1.docker.io`) that
+does not resolve, or that resolves to any address in the `pkg/netpolicy`
+special-purpose prefixes: loopback, link-local and metadata, RFC 1918,
+CGNAT, ULA, unspecified and the rest of that list. The daemon resolves the
+name again and follows registry redirects, so this check keeps a signed
+reference from naming a host-local service but does not replace host-level
+pull egress policy.
+
 Image: pulled by its exact digest for `linux/amd64`. The pull is stopped once
-the compressed layer sizes the engine reports exceed `--sandbox-image-max-mib`
-(`resources_unsupported`). The engine must record the image under the lease's
-repository (after Docker normalization) and digest, for `linux/amd64`, with no
-image-defined `VOLUME` (whose bytes no quota counts) and a stored size within
-the limit; otherwise the image is removed. Registry not-found or
-unauthorized is `image_unavailable`; any other pull failure is a miner fault.
-No registry credentials are supported.
+the compressed layer sizes the engine reports exceed the per-image limit
+(`image_unavailable`). The engine must record the image under the lease's
+repository (after Docker normalization) and digest. A wrong record is a
+miner fault. The image must be `linux/amd64` and within the stored-size
+limit (otherwise `image_unavailable`). It must declare no `VOLUME`, whose
+bytes no quota counts (otherwise `resources_unsupported`). A refused image
+is removed. Registry not-found or unauthorized is `image_unavailable`; any
+other pull failure is a miner fault. No registry credentials are supported.
+For an index digest the engine records the index digest and the image
+(config) ID it ran; the chosen platform manifest digest is not recorded.
 
 Container: created from the verified engine image ID with runtime runsc,
 `NetworkMode=none`, cgroup parent the slice, the lease's CPU, memory (swap
 equal, so none), pids and writable-layer quota (`StorageOpt size`),
-`json-file` logs of two files within `--sandbox-log-mib`, `CapDrop ALL` plus
-`CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID`, `no-new-privileges`,
-private IPC, no mounts, devices, privileges or restart policy, and labels
+`json-file` logs of two files within the per-sandbox log allowance,
+`CapDrop ALL` with no capability added (any addition needs a security review),
+`no-new-privileges`, private IPC, PID, UTS, user and cgroup namespaces, no
+published ports, mounts, devices, privileges or restart policy, and labels
 binding it to the lease ID, lease digest and image. The image's own
-entrypoint and command run unchanged.
+entrypoint, command and default user run unchanged; that user may be root
+inside the gVisor sentry but holds no capabilities.
 
 `Create` reports success only after inspecting the running container
-(runtime, network, cgroup parent, every limit, logs, capabilities, mounts,
-image ID) and the kernel's view of its process: `/proc/<pid>/exe` is the
+(runtime, namespaces, ports, cgroup parent, every limit, logs, capabilities,
+mounts, image ID) and the kernel's view of its process: `/proc/<pid>/exe` is the
 pinned sentry (or runsc) and `/proc/<pid>/cgroup` lies below the slice with
 `memory.max` and `pids.max` equal to the lease and `cpu.max` no larger.
 Anything else is a miner fault and the lane destroys the container.
@@ -118,7 +122,12 @@ container uses it; a missing container is success.
   dedicated data-root filesystem. gVisor's `/tmp` is memory-backed; whether
   its bytes are charged to the sandbox memory limit is not measured.
 - **Exec, files, secrets, inbound access, GPUs, private registries:** not
-  supported.
+  supported. With no capabilities, images that need root to change file
+  ownership or switch users fail inside the sandbox.
+- **Host network of the sandbox process:** not yet observed per sandbox. The
+  container's recorded `NetworkMode=none` is checked; the observation that
+  the sentry's host network namespace has only loopback and no routes
+  belongs to the host-preflight package and is required before activation.
 - **Trust:** the miner operator controls the host; gVisor isolates the host
   from customer code, not customer code from the operator.
 

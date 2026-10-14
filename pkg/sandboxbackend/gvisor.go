@@ -16,7 +16,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -28,6 +30,7 @@ import (
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
+	"github.com/misscomputer/misscomputer-subnet/pkg/netpolicy"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
 	"golang.org/x/sys/unix"
@@ -62,10 +65,9 @@ var (
 )
 
 // sandboxCapabilities is the complete capability set of a sandbox's
-// processes inside the gVisor sentry: enough for a package manager to
-// change file ownership and drop to an unprivileged user, and nothing that
-// configures networking, devices or the kernel.
-var sandboxCapabilities = []string{"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_SETGID", "CAP_SETUID"}
+// processes inside the gVisor sentry. It is empty: any capability needs a
+// security review before it is added here and to the backend document.
+var sandboxCapabilities = []string{}
 
 const (
 	cgroupFSMagic   = 0x63677270
@@ -122,8 +124,10 @@ type GVisor struct {
 	// sandboxExe is the resolved path of the binary every sandbox process
 	// must execute: the sentry, or runsc when no sentry is configured.
 	sandboxExe string
-	mu         sync.Mutex
-	images     map[string]*imageLock
+	// lookup resolves a registry host before any pull.
+	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
+	mu     sync.Mutex
+	images map[string]*imageLock
 }
 
 type imageLock struct {
@@ -169,7 +173,7 @@ func Open(ctx context.Context, config Config) (*GVisor, error) {
 	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		return nil, err
 	}
-	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe}
+	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, lookup: lookupHost}
 	if err := b.verifyDaemon(ctx); err != nil {
 		return nil, err
 	}
@@ -270,6 +274,14 @@ type daemonInfo struct {
 		Path        string   `json:"path"`
 		RuntimeArgs []string `json:"runtimeArgs"`
 	} `json:"Runtimes"`
+	RegistryConfig struct {
+		InsecureRegistryCIDRs []string `json:"InsecureRegistryCIDRs"`
+		IndexConfigs          map[string]struct {
+			Secure  bool     `json:"Secure"`
+			Mirrors []string `json:"Mirrors"`
+		} `json:"IndexConfigs"`
+		Mirrors []string `json:"Mirrors"`
+	} `json:"RegistryConfig"`
 	Containerd *struct {
 		Namespaces struct {
 			Containers string `json:"Containers"`
@@ -299,6 +311,9 @@ func (b *GVisor) verifyDaemon(ctx context.Context) error {
 	if info.Containerd != nil && (info.Containerd.Namespaces.Containers == "moby" || info.Containerd.Namespaces.Plugins == "plugins.moby") {
 		return errors.New("sandbox docker daemon shares the default engine's containerd namespaces")
 	}
+	if err := verifyRegistryConfig(info); err != nil {
+		return err
+	}
 	runtime, ok := info.Runtimes[b.config.Runtime]
 	if !ok || runtime.Path != b.config.RunscPath {
 		return fmt.Errorf("sandbox docker daemon does not register runtime %q at %s", b.config.Runtime, b.config.RunscPath)
@@ -322,6 +337,28 @@ func (b *GVisor) verifyDaemon(ctx context.Context) error {
 	for _, container := range containers {
 		if container.Labels[LabelSandbox] != sandboxLabelV1 {
 			return fmt.Errorf("sandbox docker daemon runs container %s that is not a sandbox; the daemon must be dedicated", container.ID)
+		}
+	}
+	return nil
+}
+
+// verifyRegistryConfig requires the daemon to pull only over TLS from the
+// registry a reference names: no insecure registry beyond the loopback
+// prefixes Docker always lists (publicRegistry refuses loopback hosts), no
+// mirror, and Docker Hub as its only, secure index.
+func verifyRegistryConfig(info daemonInfo) error {
+	registries := info.RegistryConfig
+	for _, cidr := range registries.InsecureRegistryCIDRs {
+		if cidr != "127.0.0.0/8" && cidr != "::1/128" {
+			return fmt.Errorf("sandbox docker daemon trusts insecure registry %s", cidr)
+		}
+	}
+	if len(registries.Mirrors) != 0 {
+		return errors.New("sandbox docker daemon pulls through registry mirrors")
+	}
+	for name, index := range registries.IndexConfigs {
+		if name != "docker.io" || !index.Secure || len(index.Mirrors) != 0 {
+			return fmt.Errorf("sandbox docker daemon has registry index %q that is insecure, mirrored or not Docker Hub", name)
 		}
 	}
 	return nil
@@ -412,23 +449,28 @@ type inspectedContainer struct {
 }
 
 type hostConfig struct {
-	Runtime        string            `json:"Runtime"`
-	NetworkMode    string            `json:"NetworkMode"`
-	CgroupParent   string            `json:"CgroupParent"`
-	NanoCpus       int64             `json:"NanoCpus"`
-	Memory         int64             `json:"Memory"`
-	MemorySwap     int64             `json:"MemorySwap"`
-	PidsLimit      *int64            `json:"PidsLimit"`
-	StorageOpt     map[string]string `json:"StorageOpt"`
-	LogConfig      logConfig         `json:"LogConfig"`
-	CapDrop        []string          `json:"CapDrop"`
-	CapAdd         []string          `json:"CapAdd"`
-	SecurityOpt    []string          `json:"SecurityOpt"`
-	Privileged     bool              `json:"Privileged"`
-	ReadonlyRootfs bool              `json:"ReadonlyRootfs"`
-	IpcMode        string            `json:"IpcMode"`
-	PidMode        string            `json:"PidMode"`
-	RestartPolicy  struct {
+	Runtime         string            `json:"Runtime"`
+	NetworkMode     string            `json:"NetworkMode"`
+	CgroupParent    string            `json:"CgroupParent"`
+	NanoCpus        int64             `json:"NanoCpus"`
+	Memory          int64             `json:"Memory"`
+	MemorySwap      int64             `json:"MemorySwap"`
+	PidsLimit       *int64            `json:"PidsLimit"`
+	StorageOpt      map[string]string `json:"StorageOpt"`
+	LogConfig       logConfig         `json:"LogConfig"`
+	CapDrop         []string          `json:"CapDrop"`
+	CapAdd          []string          `json:"CapAdd"`
+	SecurityOpt     []string          `json:"SecurityOpt"`
+	Privileged      bool              `json:"Privileged"`
+	ReadonlyRootfs  bool              `json:"ReadonlyRootfs"`
+	IpcMode         string            `json:"IpcMode"`
+	PidMode         string            `json:"PidMode"`
+	UTSMode         string            `json:"UTSMode"`
+	UsernsMode      string            `json:"UsernsMode"`
+	CgroupnsMode    string            `json:"CgroupnsMode"`
+	PublishAllPorts bool              `json:"PublishAllPorts"`
+	PortBindings    map[string]any    `json:"PortBindings"`
+	RestartPolicy   struct {
 		Name string `json:"Name"`
 	} `json:"RestartPolicy"`
 	Binds   []string `json:"Binds"`
@@ -578,6 +620,9 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 	if err != nil {
 		return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 	}
+	if err := b.publicRegistry(ctx, name); err != nil {
+		return "", err
+	}
 	limit := int64(b.config.ImageMaxMiB) << 20
 	if err := b.engine.pull(ctx, name, lease.ImageDigest, limit); err != nil {
 		switch {
@@ -586,7 +631,7 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 			if discardErr := b.discardImage(ctx, name+"@"+lease.ImageDigest); discardErr != nil {
 				return "", discardErr
 			}
-			return "", &miner.SandboxRefusal{Code: "resources_unsupported"}
+			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 		case ctx.Err() != nil:
 			return "", ctx.Err()
 		case registryRefusal(err):
@@ -604,7 +649,7 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 	}
 	if size > limit {
 		_ = b.releaseImage(ctx, imageID)
-		return "", &miner.SandboxRefusal{Code: "resources_unsupported"}
+		return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 	}
 	return imageID, nil
 }
@@ -656,6 +701,48 @@ func (b *GVisor) verifiedImage(ctx context.Context, image string, lease protocol
 		return inspected.ID, 0, &miner.SandboxRefusal{Code: "resources_unsupported"}
 	}
 	return inspected.ID, inspected.Size, nil
+}
+
+// publicRegistry refuses, before the engine is asked to pull, a registry
+// the daemon would reach on the miner's own host or private networks:
+// localhost, any IP literal, and any host name that resolves to an address
+// in the special-purpose prefixes of pkg/netpolicy (loopback, link-local,
+// RFC 1918, CGNAT, ULA, unspecified and the rest). The daemon resolves the
+// name again, and may follow registry redirects, so this does not replace
+// host-level pull egress policy; it keeps a signed image reference from
+// naming a host-local service.
+func (b *GVisor) publicRegistry(ctx context.Context, repository string) error {
+	domain, _, _ := strings.Cut(repository, "/")
+	host := domain
+	if split, _, err := net.SplitHostPort(domain); err == nil {
+		host = split
+	}
+	if host == "docker.io" {
+		host = "registry-1.docker.io"
+	}
+	if _, err := netip.ParseAddr(host); err == nil || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return &miner.SandboxRefusal{Code: "image_unavailable"}
+	}
+	addresses, err := b.lookup(ctx, host)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &miner.SandboxRefusal{Code: "image_unavailable"}
+	}
+	if len(addresses) == 0 {
+		return &miner.SandboxRefusal{Code: "image_unavailable"}
+	}
+	for _, address := range addresses {
+		if _, err := netpolicy.CanonicalPublicAddress(address.String()); err != nil {
+			return &miner.SandboxRefusal{Code: "image_unavailable"}
+		}
+	}
+	return nil
+}
+
+func lookupHost(ctx context.Context, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
 // normalizedRepository returns the fully qualified repository of a digest
@@ -724,8 +811,9 @@ func (b *GVisor) verify(c inspectedContainer, s spec) error {
 		return fmt.Errorf("sandbox %s runs image %s, not the verified %s", c.Name, c.Image, s.labels[LabelImageID])
 	case h.Runtime != s.host.Runtime:
 		return fmt.Errorf("sandbox %s runtime is %q, not %q", c.Name, h.Runtime, s.host.Runtime)
-	case h.NetworkMode != "none" || h.CgroupParent != s.host.CgroupParent || h.IpcMode != "private" || (h.PidMode != "" && h.PidMode != "private"):
-		return fmt.Errorf("sandbox %s namespaces or cgroup parent differ from the sandbox spec", c.Name)
+	case h.NetworkMode != "none" || h.CgroupParent != s.host.CgroupParent || h.IpcMode != "private" || h.PidMode != "" ||
+		h.UTSMode != "" || h.UsernsMode != "" || (h.CgroupnsMode != "" && h.CgroupnsMode != "private") || h.PublishAllPorts || len(h.PortBindings) != 0:
+		return fmt.Errorf("sandbox %s namespaces, ports or cgroup parent differ from the sandbox spec", c.Name)
 	case h.NanoCpus != s.host.NanoCpus || h.Memory != s.host.Memory || h.MemorySwap != s.host.MemorySwap ||
 		h.PidsLimit == nil || *h.PidsLimit != *s.host.PidsLimit || h.StorageOpt["size"] != s.host.StorageOpt["size"] || len(h.StorageOpt) != 1:
 		return fmt.Errorf("sandbox %s resource limits differ from the lease", c.Name)

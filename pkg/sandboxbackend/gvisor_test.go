@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,6 +80,10 @@ func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
 			"DockerRootDir": dataRoot, "Driver": "overlay2", "CgroupDriver": "systemd", "CgroupVersion": "2",
 			"Runtimes":   map[string]any{"runsc": map[string]any{"path": runsc, "runtimeArgs": []string{"--systemd-cgroup", "--overlay2=none"}}},
 			"Containerd": map[string]any{"Namespaces": map[string]any{"Containers": "mc-sandbox", "Plugins": "mc-sandbox-plugins"}},
+			"RegistryConfig": map[string]any{
+				"InsecureRegistryCIDRs": []string{"::1/128", "127.0.0.0/8"}, "Mirrors": []string{},
+				"IndexConfigs": map[string]any{"docker.io": map[string]any{"Name": "docker.io", "Secure": true, "Mirrors": []string{}}},
+			},
 		},
 		catalog: map[string]engineImage{
 			"docker.io/library/busybox@" + testImageDigest: {
@@ -270,6 +275,8 @@ type host struct {
 	socket string
 	config Config
 	sentry string
+	// dns answers registry host lookups; a host it lacks does not resolve.
+	dns map[string][]netip.Addr
 }
 
 func writeFile(t *testing.T, file, content string) {
@@ -298,7 +305,10 @@ func newHost(t *testing.T) *host {
 		t.Fatal(err)
 	}
 	engine, socket := newFakeEngine(t, dataRoot, runsc)
-	h := &host{t: t, engine: engine, socket: socket, sentry: sentry, config: Config{
+	public := []netip.Addr{netip.MustParseAddr("151.101.0.1")}
+	h := &host{t: t, engine: engine, socket: socket, sentry: sentry, dns: map[string][]netip.Addr{
+		"registry-1.docker.io": public, "ghcr.io": public,
+	}, config: Config{
 		DockerHost: "unix://" + socket, Runtime: "runsc", RunscPath: runsc, RunscSHA256: digestOf("runsc binary"),
 		SentryPath: sentry, SentrySHA256: digestOf("sentry binary"), DataRoot: dataRoot, Slice: testSlice,
 		CgroupRoot: filepath.Join(root, "cgroup"), ProcRoot: filepath.Join(root, "proc"),
@@ -332,7 +342,15 @@ func (h *host) process(exe, cgroup string, r sandbox.Resources) {
 // real cgroup v2 mount for the slice, so tests of Create and Destroy build
 // it directly; TestOpenRefusesUnverifiableHosts covers Open.
 func (h *host) backend() *GVisor {
-	return &GVisor{config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry}
+	return &GVisor{
+		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry,
+		lookup: func(_ context.Context, name string) ([]netip.Addr, error) {
+			if addresses, ok := h.dns[name]; ok {
+				return addresses, nil
+			}
+			return nil, fmt.Errorf("lookup %s: no such host", name)
+		},
+	}
 }
 
 func testLease(mutate func(*protocol.SandboxLeaseV1)) protocol.SandboxLeaseV1 {
@@ -395,8 +413,8 @@ func TestCreateRunsTheLeaseUnderGVisorAndDestroyRemovesEverything(t *testing.T) 
 	if size := hostConfig["StorageOpt"].(map[string]any)["size"]; size != "5120m" {
 		t.Errorf("writable-layer quota %v, want 5120m", size)
 	}
-	if drop := fmt.Sprint(hostConfig["CapDrop"]); drop != "[ALL]" {
-		t.Errorf("CapDrop %s, want [ALL]", drop)
+	if drop, add := fmt.Sprint(hostConfig["CapDrop"]), fmt.Sprint(hostConfig["CapAdd"]); drop != "[ALL]" || (add != "[]" && add != "<nil>") {
+		t.Errorf("CapDrop %s CapAdd %s, want [ALL] and none", drop, add)
 	}
 	if _, binds := hostConfig["Binds"]; binds {
 		t.Error("sandbox container requests bind mounts")
@@ -468,12 +486,15 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 		name  string
 		lease func(*protocol.SandboxLeaseV1)
 		image func(*engineImage)
+		dns   map[string][]netip.Addr
 		code  string
-		fault string // the miner fault a case without a refusal code must report
+		// policy marks a refusal the backend must reach before any pull.
+		policy bool
+		fault  string // the miner fault a case without a refusal code must report
 	}{
-		{name: "kata isolation", lease: func(l *protocol.SandboxLeaseV1) { l.Isolation = sandbox.IsolationKata }, code: "isolation_unsupported"},
-		{name: "public network", lease: func(l *protocol.SandboxLeaseV1) { l.Network.Mode = sandbox.NetworkPublic }, code: "network_policy_unsupported"},
-		{name: "more pids than the slice", lease: func(l *protocol.SandboxLeaseV1) { l.Resources.PIDs = 8192 }, code: "resources_unsupported"},
+		{name: "kata isolation", lease: func(l *protocol.SandboxLeaseV1) { l.Isolation = sandbox.IsolationKata }, code: "isolation_unsupported", policy: true},
+		{name: "public network", lease: func(l *protocol.SandboxLeaseV1) { l.Network.Mode = sandbox.NetworkPublic }, code: "network_policy_unsupported", policy: true},
+		{name: "more pids than the slice", lease: func(l *protocol.SandboxLeaseV1) { l.Resources.PIDs = 8192 }, code: "resources_unsupported", policy: true},
 		{name: "registry has no such manifest", lease: func(l *protocol.SandboxLeaseV1) {
 			l.ImageReference = "ghcr.io/nobody/missing@" + testImageDigest
 		}, code: "image_unavailable"},
@@ -483,10 +504,25 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 				`{"id":"a","status":"Downloading","progressDetail":{"total":40000000}}`,
 				`{"id":"b","status":"Downloading","progressDetail":{"total":40000000}}`,
 			}
-		}, code: "resources_unsupported"},
-		{name: "unpacked image exceeds the limit", image: func(i *engineImage) { i.Size = 65<<20 + 1 }, code: "resources_unsupported"},
+		}, code: "image_unavailable"},
+		{name: "unpacked image exceeds the limit", image: func(i *engineImage) { i.Size = 65<<20 + 1 }, code: "image_unavailable"},
 		{name: "image declares a volume", image: func(i *engineImage) { i.Volumes = map[string]any{"/data": map[string]any{}} }, code: "resources_unsupported"},
 		{name: "image is not linux/amd64", image: func(i *engineImage) { i.Arch = "arm64" }, code: "image_unavailable"},
+		{name: "localhost registry", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "localhost:5000/busybox@" + testImageDigest
+		}, code: "image_unavailable", policy: true},
+		{name: "IP literal registry", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "151.101.0.1/busybox@" + testImageDigest
+		}, code: "image_unavailable", policy: true},
+		{name: "registry resolving to a private address", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "registry.internal.example/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"registry.internal.example": {netip.MustParseAddr("10.1.2.3")}}, code: "image_unavailable", policy: true},
+		{name: "registry with one metadata address", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "ghcr.io/someone/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"ghcr.io": {netip.MustParseAddr("151.101.0.1"), netip.MustParseAddr("169.254.169.254")}}, code: "image_unavailable", policy: true},
+		{name: "registry that does not resolve", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "registry.invalid/busybox@" + testImageDigest
+		}, code: "image_unavailable", policy: true},
 		{name: "engine records another digest", image: func(i *engineImage) {
 			i.RepoDigests = []string{"busybox@sha256:" + strings.Repeat("9", 64)}
 		}, fault: "is not recorded as"},
@@ -504,6 +540,9 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 				test.image(&image)
 				h.engine.catalog[key] = image
 			}
+			for name, addresses := range test.dns {
+				h.dns[name] = addresses
+			}
 			lease := testLease(test.lease)
 			err := h.backend().Create(context.Background(), instanceOf(lease), lease)
 			if err == nil {
@@ -514,6 +553,9 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 			}
 			if len(h.engine.containers) != 0 || len(h.engine.images) != 0 {
 				t.Fatalf("refused create left %d containers and %d images", len(h.engine.containers), len(h.engine.images))
+			}
+			if test.policy && h.engine.pulls != 0 {
+				t.Fatalf("engine pulled %d times before a policy refusal", h.engine.pulls)
 			}
 		})
 	}
@@ -532,12 +574,16 @@ func TestCreateRejectsSandboxesThatDoNotEnforceTheLease(t *testing.T) {
 		want    string
 	}{
 		{name: "engine ran runc", applied: func(c *engineContainer) { c.Host["Runtime"] = "runc" }, want: "runtime is"},
-		{name: "engine attached a network", applied: func(c *engineContainer) { c.Host["NetworkMode"] = "bridge" }, want: "namespaces or cgroup parent"},
+		{name: "engine attached a network", applied: func(c *engineContainer) { c.Host["NetworkMode"] = "bridge" }, want: "namespaces, ports"},
 		{name: "engine dropped the disk quota", applied: func(c *engineContainer) { delete(c.Host, "StorageOpt") }, want: "resource limits"},
 		{name: "engine dropped the memory limit", applied: func(c *engineContainer) { c.Host["Memory"] = 0 }, want: "resource limits"},
 		{name: "engine mounted a volume", applied: func(c *engineContainer) { c.Mounts = []map[string]any{{"Type": "volume"}} }, want: "privileges, mounts"},
 		{name: "engine granted privileges", applied: func(c *engineContainer) { c.Host["Privileged"] = true }, want: "privileges, mounts"},
-		{name: "engine added a capability", applied: func(c *engineContainer) { c.Host["CapAdd"] = append(c.Host["CapAdd"].([]any), "CAP_NET_ADMIN") }, want: "capabilities"},
+		{name: "engine shared the host UTS namespace", applied: func(c *engineContainer) { c.Host["UTSMode"] = "host" }, want: "namespaces, ports"},
+		{name: "engine published a port", applied: func(c *engineContainer) {
+			c.Host["PortBindings"] = map[string]any{"80/tcp": []any{map[string]any{"HostPort": "8080"}}}
+		}, want: "namespaces, ports"},
+		{name: "engine added a capability", applied: func(c *engineContainer) { c.Host["CapAdd"] = []any{"CAP_NET_ADMIN"} }, want: "capabilities"},
 		{name: "engine unbounded the log", applied: func(c *engineContainer) {
 			c.Host["LogConfig"] = map[string]any{"Type": "json-file", "Config": map[string]any{}}
 		}, want: "log bounds"},
@@ -595,6 +641,15 @@ func TestOpenRefusesUnverifiableHosts(t *testing.T) {
 		{name: "default containerd namespace", mutate: func(h *host, _ *Config) {
 			h.engine.info["Containerd"] = map[string]any{"Namespaces": map[string]any{"Containers": "moby", "Plugins": "plugins.moby"}}
 		}, want: "containerd namespaces"},
+		{name: "insecure registry", mutate: func(h *host, _ *Config) {
+			h.engine.info["RegistryConfig"].(map[string]any)["InsecureRegistryCIDRs"] = []string{"127.0.0.0/8", "10.0.0.0/8"}
+		}, want: "insecure registry"},
+		{name: "registry mirror", mutate: func(h *host, _ *Config) {
+			h.engine.info["RegistryConfig"].(map[string]any)["Mirrors"] = []string{"https://mirror.internal.example/"}
+		}, want: "mirrors"},
+		{name: "insecure index", mutate: func(h *host, _ *Config) {
+			h.engine.info["RegistryConfig"].(map[string]any)["IndexConfigs"] = map[string]any{"registry.internal.example": map[string]any{"Secure": false}}
+		}, want: "registry index"},
 		{name: "runtime registered elsewhere", mutate: func(h *host, _ *Config) {
 			h.engine.info["Runtimes"] = map[string]any{"runsc": map[string]any{"path": "/usr/bin/runsc", "runtimeArgs": []string{"--systemd-cgroup", "--overlay2=none"}}}
 		}, want: "does not register"},
