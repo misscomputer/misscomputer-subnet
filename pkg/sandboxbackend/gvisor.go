@@ -647,21 +647,38 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	if err := b.verifyEngine(existing, s); err != nil {
 		return err
 	}
-	if err := b.verifyProcess(existing, s); err != nil {
-		// The workload may have exited by itself before or during the
-		// kernel readback; a process that is still running failed it.
-		if again, found, inspectErr := b.inspect(ctx, instanceID); inspectErr == nil && found && again.ID == existing.ID && workloadExited(again) {
-			if err := b.verifyEngine(again, s); err != nil {
-				return err
-			}
-			if err := b.instanceGone(again.ID); err != nil {
-				return err
-			}
-			return b.exited(again)
-		}
+	err = b.verifyProcess(existing, s)
+	if !errors.Is(err, errProcessVanished) {
+		// nil, or a value read from the live process that differs from the
+		// lease: a miner fault even if the process exits afterwards.
 		return err
 	}
-	return nil
+	// The workload may have exited by itself before or during the kernel
+	// readback (contract D11-C2): accept that only from a fresh inspection.
+	again, found, inspectErr := b.inspect(ctx, instanceID)
+	if inspectErr != nil || !found || again.ID != existing.ID || !workloadExited(again) {
+		return err
+	}
+	if err := b.verifyEngine(again, s); err != nil {
+		return err
+	}
+	if err := b.sliceQuiet(ctx, instanceID); err != nil {
+		return err
+	}
+	return b.exited(again)
+}
+
+// errProcessVanished marks a kernel readback that found no process to read:
+// the engine reported none running, or its /proc or cgroup entries were gone.
+var errProcessVanished = errors.New("sandbox process vanished")
+
+// vanished marks err as errProcessVanished when it says an entry no longer
+// exists. Any other error, and any value read, is not a vanished process.
+func vanished(err error) error {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("%w: %w", errProcessVanished, err)
+	}
+	return err
 }
 
 // workloadExited reports a container the engine started whose workload has
@@ -675,19 +692,28 @@ func workloadExited(c inspectedContainer) bool {
 		startErr == nil && finishErr == nil && started.Year() > 1 && finished.After(started)
 }
 
-// instanceGone requires that no process remains in any cgroup below the
-// slice named for container id; a removed cgroup has none (D11-C1).
-func (b *GVisor) instanceGone(id string) error {
-	if len(id) < 12 {
-		return fmt.Errorf("container ID %q is too short to find its cgroups", id)
+// sliceQuiet requires that no process remains anywhere below the slice
+// once a sandbox's workload exited, except in the cgroups of other running
+// sandboxes (contract D11-C1). Cgroup names are not trusted to tell which
+// instance a process belongs to.
+func (b *GVisor) sliceQuiet(ctx context.Context, instanceID string) error {
+	owned, err := b.liveSandboxCgroups(ctx, instanceID)
+	if err != nil {
+		return err
 	}
 	root := filepath.Join(b.config.CgroupRoot, b.sliceCgroup)
 	return filepath.WalkDir(root, func(dir string, entry fs.DirEntry, err error) error {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
-		if err != nil || !entry.IsDir() || !strings.Contains(entry.Name(), id) {
+		if err != nil || !entry.IsDir() {
 			return err
+		}
+		cgroup := b.sliceCgroup + strings.TrimPrefix(dir, root)
+		for _, live := range owned {
+			if cgroup == live || strings.HasPrefix(cgroup, live+"/") {
+				return fs.SkipDir
+			}
 		}
 		procs, err := readSmall(filepath.Join(dir, "cgroup.procs"))
 		if errors.Is(err, fs.ErrNotExist) {
@@ -697,10 +723,37 @@ func (b *GVisor) instanceGone(id string) error {
 			return err
 		}
 		if procs != "" {
-			return fmt.Errorf("exited sandbox %s still has processes in %s", id, dir)
+			return fmt.Errorf("sandbox %s exited but processes remain in cgroup %s", instanceID, cgroup)
 		}
 		return nil
 	})
+}
+
+// liveSandboxCgroups returns the cgroups below the slice of the processes of
+// every running sandbox other than instanceID.
+func (b *GVisor) liveSandboxCgroups(ctx context.Context, instanceID string) ([]string, error) {
+	instances, err := b.Instances(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var owned []string
+	for _, instance := range instances {
+		if instance.Name == instanceID {
+			continue
+		}
+		c, found, err := b.inspect(ctx, instance.Name)
+		if err != nil {
+			return nil, err
+		}
+		if !found || !c.State.Running || c.State.Pid <= 0 {
+			continue
+		}
+		cgroup, err := processCgroup(filepath.Join(b.config.ProcRoot, strconv.Itoa(c.State.Pid), "cgroup"))
+		if err == nil && strings.HasPrefix(cgroup, b.sliceCgroup+"/") {
+			owned = append(owned, cgroup)
+		}
+	}
+	return owned, nil
 }
 
 // exited accepts a sandbox whose workload exited before its process could
@@ -1014,48 +1067,40 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 // verifyProcess proves the kernel's view of the running sandbox process:
 // the pinned gVisor binary Open hashed, in a cgroup below the slice whose
 // cpu.max, memory.max and pids.max equal the lease's, with no swap
-// (lease.child_limits_match).
+// (lease.child_limits_match). It reports errProcessVanished only when
+// there was no process left to read; a mismatch it read is a plain error.
 func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 	if !c.State.Running || c.State.Pid <= 0 {
-		return fmt.Errorf("sandbox %s is %s, not running: %q", c.Name, c.State.Status, c.State.Error)
+		return fmt.Errorf("%w: sandbox %s is %s, not running: %q", errProcessVanished, c.Name, c.State.Status, c.State.Error)
 	}
 	proc := filepath.Join(b.config.ProcRoot, strconv.Itoa(c.State.Pid))
 	exe, err := os.Readlink(filepath.Join(proc, "exe"))
 	if err != nil {
-		return fmt.Errorf("sandbox %s process executable: %w", c.Name, err)
+		return fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
 	}
 	if exe != b.sandboxExe {
 		return fmt.Errorf("sandbox %s process runs %s, not the pinned gVisor binary %s", c.Name, exe, b.sandboxExe)
 	}
 	if file, err := os.Stat(filepath.Join(proc, "exe")); err != nil {
-		return fmt.Errorf("sandbox %s process executable: %w", c.Name, err)
+		return fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
 	} else if !os.SameFile(file, b.sandboxFile) || !file.ModTime().Equal(b.sandboxFile.ModTime()) || file.Size() != b.sandboxFile.Size() {
 		return fmt.Errorf("sandbox %s process runs a %s replaced or rewritten since the backend opened", c.Name, b.sandboxExe)
 	}
 	cgroup, err := processCgroup(filepath.Join(proc, "cgroup"))
 	if err != nil {
-		return fmt.Errorf("sandbox %s: %w", c.Name, err)
+		return fmt.Errorf("sandbox %s: %w", c.Name, vanished(err))
 	}
 	if !strings.HasPrefix(cgroup, b.sliceCgroup+"/") {
 		return fmt.Errorf("sandbox %s process cgroup %s is outside slice %s", c.Name, cgroup, b.sliceCgroup)
 	}
 	dir := filepath.Join(b.config.CgroupRoot, cgroup)
-	memory, err := readSmall(filepath.Join(dir, "memory.max"))
-	if err != nil {
-		return err
+	limits := map[string]string{}
+	for _, name := range []string{"memory.max", "memory.swap.max", "pids.max", "cpu.max"} {
+		if limits[name], err = readSmall(filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("sandbox %s cgroup %s: %w", c.Name, cgroup, vanished(err))
+		}
 	}
-	swap, err := readSmall(filepath.Join(dir, "memory.swap.max"))
-	if err != nil {
-		return err
-	}
-	pids, err := readSmall(filepath.Join(dir, "pids.max"))
-	if err != nil {
-		return err
-	}
-	cpu, err := readSmall(filepath.Join(dir, "cpu.max"))
-	if err != nil {
-		return err
-	}
+	memory, swap, pids, cpu := limits["memory.max"], limits["memory.swap.max"], limits["pids.max"], limits["cpu.max"]
 	var quota, period int64
 	if fields := strings.Fields(cpu); len(fields) == 2 {
 		quota, _ = strconv.ParseInt(fields[0], 10, 64)

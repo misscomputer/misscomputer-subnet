@@ -117,14 +117,17 @@ and the lane destroys the container.
 
 A workload that exits by itself after the engine started it (the engine
 records no start error), with any exit code and including an OOM kill
-within the lease limit, is not a miner fault (contract D11). If it exits
-before or during the kernel readback, `Create` succeeds only when the engine
-configuration above matches, a fresh inspection shows it exited with no
-start error, no PID and an exit time after its start time, and no process
-remains in a cgroup below the slice named for the container. The
-per-process checks are then logged as `not_run`, the exited container is
-never restarted, and it keeps its lease, writable layer and logs until
-release or expiry.
+within the lease limit, is not a miner fault (contract D11). This applies
+only when the kernel readback found no process to read (the engine reported
+none running, or its `/proc` or cgroup entries were gone); any value read
+from the live process that differs from the lease stays a miner fault even
+if the process exits afterwards. `Create` then succeeds only when the engine
+configuration above matches, a fresh inspection shows the container exited
+with no start error, no PID and an exit time after its start time, and no
+process remains anywhere below the slice except in the cgroups of other
+running sandboxes. The per-process checks are logged as `not_run`, the
+exited container is never restarted, and it keeps its lease, writable layer
+and logs until release or expiry.
 
 `Create` is idempotent per instance name: a container already made for the
 same lease document is started if needed and verified again; one made for

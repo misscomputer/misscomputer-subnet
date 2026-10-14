@@ -510,24 +510,46 @@ func TestCreateReplayStartsCreatedContainerAndRejectsAnotherLeases(t *testing.T)
 // runtime reports as failed stays a miner fault.
 func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 	exit := func(c *engineContainer) { c.Status, c.FinishedAt = "exited", "2026-10-14T12:00:02.5Z" }
+	// exitAfterInspect lets the post-start inspection see the workload
+	// running, so the kernel readback reads its process, and then exits it.
+	exitAfterInspect := func(c *engineContainer) {
+		if c.Status == "running" {
+			exit(c)
+		}
+	}
+	scope := "/mc.slice/" + testSlice + "/docker-1.scope"
+	resources := testLease(nil).Resources
 	for _, test := range []struct {
 		name                        string
 		applied, started, inspected func(*engineContainer)
+		process                     func(*host)
 		noProcess                   bool
-		// leftover leaves a process in a cgroup named for the container.
-		leftover bool
-		want     string // "" for success, else the miner fault
+		// leftover leaves a process in this cgroup below the slice; "%s" is
+		// the container's own scope name.
+		leftover string
+		// other runs another sandbox whose process is in docker-1.scope.
+		other bool
+		want  string // "" for success, else the miner fault
 	}{
 		// The backend does not read the exit code or OOM flag: exit 0,
 		// non-zero and an OOM kill within the lease limit look alike to it.
 		{name: "exits at once", started: exit},
-		{name: "exits during the readback", inspected: func(c *engineContainer) {
-			if c.Status == "running" {
-				exit(c)
-			}
-		}, noProcess: true},
+		{name: "exits during the readback", inspected: exitAfterInspect, noProcess: true},
+		// A mismatch read from the live process stays a fault when the
+		// process exits afterwards (D11-C2).
+		{name: "unpinned binary read, then exits", inspected: exitAfterInspect, process: func(h *host) {
+			h.process(h.config.RunscPath+"-other", scope, resources)
+		}, want: "not the pinned gVisor binary"},
+		{name: "doubled memory.max read, then exits", inspected: exitAfterInspect, process: func(h *host) {
+			writeFile(h.t, filepath.Join(h.config.CgroupRoot, scope, "memory.max"), strconv.Itoa(2*resources.MemoryMiB<<20)+"\n")
+		}, want: "kernel limits"},
+		{name: "cgroup outside the slice read, then exits", inspected: exitAfterInspect, process: func(h *host) {
+			h.process(h.sentry, "/system.slice/docker-1.scope", resources)
+		}, want: "outside slice"},
 		{name: "exit time not after start", started: func(c *engineContainer) { c.Status, c.FinishedAt = "exited", c.StartedAt }, want: "is exited, not running"},
-		{name: "a process remains in its cgroup", started: exit, leftover: true, want: "still has processes"},
+		{name: "a process remains in its cgroup", started: exit, leftover: "docker-id-%s.scope", want: "processes remain"},
+		{name: "a process remains in another cgroup of the slice", started: exit, leftover: "runsc-sandbox.scope", want: "processes remain"},
+		{name: "another running sandbox keeps its processes", started: exit, leftover: "docker-1.scope", other: true},
 		{name: "exits under an unverified runtime", applied: func(c *engineContainer) { c.Host["Runtime"] = "runc" }, started: exit, want: "runtime is"},
 		{name: "runtime failed the start", started: func(c *engineContainer) {
 			c.Status, c.Error = "exited", "OCI runtime create failed: runsc: exit status 1"
@@ -538,14 +560,22 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			h := newHost(t)
 			h.engine.applied, h.engine.started, h.engine.inspected = test.applied, test.started, test.inspected
+			if test.process != nil {
+				test.process(h)
+			}
 			if test.noProcess {
 				if err := os.RemoveAll(filepath.Join(h.config.ProcRoot, strconv.Itoa(testPID))); err != nil {
 					t.Fatal(err)
 				}
 			}
 			lease := testLease(nil)
-			if test.leftover {
-				writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "docker-id-"+instanceOf(lease)+".scope", "cgroup.procs"), "4243\n")
+			if test.leftover != "" {
+				dir := strings.ReplaceAll(test.leftover, "%s", "id-"+instanceOf(lease))
+				writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, dir, "cgroup.procs"), "4243\n")
+			}
+			if test.other {
+				h.engine.containers["other"] = &engineContainer{Name: "other", Image: testImageID, Status: "running",
+					Labels: map[string]string{LabelSandbox: sandboxLabelV1, LabelLeaseID: "other-lease"}}
 			}
 			err := h.backend().Create(context.Background(), instanceOf(lease), lease)
 			switch {
