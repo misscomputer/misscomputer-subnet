@@ -593,6 +593,30 @@ func TestUnrenewedSandboxLeaseExpiresAfterGrace(t *testing.T) {
 	wantStage(t, outcome, err, sandbox.StageExpired, "")
 }
 
+// A renewal that sampled the clock before expiry must not revive a lease
+// after startup has atomically chosen expiry and begun teardown.
+func TestSandboxStartupExpiryFencesInFlightRenewal(t *testing.T) {
+	_, lane := openSandboxLeases(t)
+	ctx := context.Background()
+	parties := newSandboxParties(0x11, "5Hvalidator")
+	reservation := parties.reservation(t, 1, nonce(1), sandboxT0)
+	mustHold(t, lane, reservation, capacityFor(1), sandboxT0)
+	lease := parties.lease(t, reservation, nonce(100), sandboxT0, nil)
+	if _, err := lane.CommitLease(ctx, lease, sandboxT0); err != nil {
+		t.Fatal(err)
+	}
+	leaseID := protocol.SandboxLeaseIDV1(lease)
+	expiry := sandboxT0.Add(10 * time.Minute)
+	if running, err := lane.MarkLeaseRunning(ctx, leaseID, expiry); err != nil || running {
+		t.Fatalf("expired startup became running: %v %v", running, err)
+	}
+	// Renew's timestamp can precede the startup transition even if its store
+	// transaction commits after it. The durable expiry fence must win.
+	renewal := parties.renewal(t, lease, 1, expiry.Add(-time.Second), expiry.Add(5*time.Minute))
+	outcome, err := lane.Renew(ctx, renewal, expiry.Add(-time.Nanosecond))
+	wantStage(t, outcome, err, sandbox.StageExpired, "")
+}
+
 // Restart recovery tears down every lease whose runtime may exist,
 // including one that crashed between the write-ahead row and the runtime
 // start, with the attributable miner_restart code. A release that wins the

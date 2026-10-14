@@ -103,6 +103,13 @@ Receipt error codes and whether they are attributed to the miner:
 `secret_delivery_unsupported`, `sandbox_disabled`, `released_before_use`,
 `hold_expired`, `lease_expired`, `image_unavailable`.
 
+Validator receipt acceptance is bound to the complete signed document, not
+only its digest and outer identity. A lease receipt must name that lease's
+derived `lease_id`. A renewal receipt must name the renewed `lease_id`; a
+`ready` or `accepted` renewal receipt must echo its `renewal_seq`. A terminal
+renewal receipt may report an earlier durable sequence when the renewal was
+not applied. A signed contradiction of an exact document is miner fraud.
+
 ## Durable holds and leases (miner side)
 
 `Store.EnableSandboxLeases` creates three tables (`sandbox_holds`,
@@ -130,7 +137,10 @@ Invariants (each has a test in `pkg/durable/sandbox_v1_test.go`):
   resources or parties differ from its hold, or a different renewal with the
   same sequence is `ErrSandboxConflict` (signer equivocation, no receipt).
 - An unrenewed lease is moved to cleanup at expiry plus grace, never
-  before. A renewal that arrives after expiry is not applied.
+  before when its runtime is already running. A renewal that arrives after
+  expiry is not applied. If a pending runtime finishes creation at or after
+  expiry, startup atomically fences it for cleanup and destroys it before
+  answering `expired`; a concurrent renewal cannot revive that fence.
 - Restart recovery tears down every lease whose runtime may exist and
   answers `failed/miner_restart`, as `deployment.v4` endpoints are today.
 
@@ -174,9 +184,13 @@ including refused and failed receipts.
   `memory.max`, disk and count limits covering its configured budget.
   Construction requires explicit `AgentCgroup` and `DeploymentCgroup` paths;
   missing, root, malformed, or overlapping paths fail closed in
-  `VerifySandboxCgroup`. These are trusted configuration values: the future
-  backend/activation review must prove they are the actual agent and web
-  replica subtrees, not merely arbitrary disjoint names. There is no backend
+  `VerifySandboxCgroup`. The cgroup path and its `cpu.max` and `memory.max`
+  files are opened without following symlinks, so symlinks cannot substitute
+  limits from an unrelated subtree or ordinary file. These are trusted
+  configuration values: the future backend/activation review must prove
+  they are the actual agent and web replica subtrees, not merely arbitrary
+  disjoint names, and verify the cgroup mount/hierarchy itself. Bind mounts
+  or a substituted cgroup root are outside this check. There is no backend
   or activation flag implementation in this PR, so `--sandbox-leases on`
   still refuses to start and no such isolation claim has been made live.
 - **Bridge routes** (only with an enabled lane, behind the bridge HMAC):
