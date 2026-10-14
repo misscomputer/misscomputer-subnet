@@ -377,16 +377,21 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, leaseID, holdID, lease.SandboxID
 	return l.finish(ctx, tx, now, SandboxOutcome{Stage: sandbox.StageAccepted, LeaseID: &leaseID, Start: true})
 }
 
-// MarkLeaseRunning records that the runtime of a pending lease started. It
-// returns false when a release, expiry or restart moved the lease first; the
-// caller must then tear the runtime down.
+// MarkLeaseRunning atomically promotes a live pending lease or fences an
+// expired one for cleanup. A renewal can commit before or after this update,
+// but cannot be accepted between an expiry decision and its cleanup fence.
+// False means the caller must tear the runtime down.
 func (l *SandboxLeases) MarkLeaseRunning(ctx context.Context, leaseID string, now time.Time) (bool, error) {
-	result, err := l.db.ExecContext(ctx, `UPDATE sandbox_leases SET status='running',updated_at_ns=? WHERE lease_id=? AND status='pending'`, now.UnixNano(), leaseID)
-	if err != nil {
-		return false, err
+	var status string
+	err := l.db.QueryRowContext(ctx, `UPDATE sandbox_leases SET
+status=CASE WHEN lease_expires_at_ns > ? THEN 'running' ELSE 'cleanup' END,
+cleanup_status=CASE WHEN lease_expires_at_ns > ? THEN cleanup_status ELSE 'expired' END,
+updated_at_ns=? WHERE lease_id=? AND status='pending' RETURNING status`,
+		now.UnixNano(), now.UnixNano(), now.UnixNano(), leaseID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
-	rows, err := result.RowsAffected()
-	return rows == 1, err
+	return status == "running", err
 }
 
 // BeginLeaseCleanup moves a pending or running lease to cleanup with the
