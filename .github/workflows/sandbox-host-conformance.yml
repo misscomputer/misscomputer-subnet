@@ -32,7 +32,7 @@ jobs:
           printf 'Kernel: %s\n' "$(uname -r)"
           systemctl --version | head -1
           docker version
-          containerd --version
+          printf 'Runner containerd (not used by the dedicated engine): %s\n' "$(containerd --version)"
           mkfs.xfs -V
       - name: Provision dedicated engine
         env:

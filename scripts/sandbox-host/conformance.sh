@@ -76,7 +76,7 @@ finish() {
     "runner_image=${ImageOS:-unknown} ${ImageVersion:-unknown}"
     "kernel=$(uname -r)" "systemd=$(systemctl --version | head -1)"
     "docker=$(timeout 10 docker version --format '{{.Server.Version}}' 2>/dev/null)"
-    "containerd=$(containerd --version 2>/dev/null)"
+    "containerd=$("$root/bin/containerd/containerd" --version 2>/dev/null)"
     "runsc=$("$p_runsc_path" --version 2>/dev/null | head -1)"
   )
   python3 "$here/report.py" finalize "$ledger" "$profile" conformance "$report_path" "${env_args[@]}"
@@ -147,7 +147,7 @@ ok "$lease_cg pids.max=$slice_pids >= sandboxes $p_agg_sandboxes x per-lease pid
 
 begin cgroup.engine_processes_member observed_state
 member_evidence=
-for unit_exe in "$MCSBX_CONTAINERD_UNIT:/usr/bin/containerd" "$MCSBX_DOCKERD_UNIT:/usr/bin/dockerd"; do
+for unit_exe in "$MCSBX_CONTAINERD_UNIT:$root/bin/containerd/containerd" "$MCSBX_DOCKERD_UNIT:/usr/bin/dockerd"; do
   unit=${unit_exe%%:*}; exe=${unit_exe#*:}
   pid=$(systemctl show --property=MainPID --value "$unit")
   mcsbx_finite "$pid" || bad "$unit has no main PID"
@@ -354,7 +354,9 @@ for proc in /proc/[0-9]*; do
   pexe=$(readlink -f "$proc/exe" 2>/dev/null) || continue
   case $pexe in
     "$root"/bin/*) ;;
-    /usr/bin/containerd-shim-runc-v2) tr '\0' ' ' < "$proc/cmdline" 2>/dev/null | grep -qF -- "$p_containerd_address" || continue ;;
+    */containerd-shim-runc-v2)
+      if tr '\0' ' ' < "$proc/cmdline" 2>/dev/null | grep -qF -- "$p_containerd_address"; then bad "PID $p runs unpinned shim $pexe"; fi
+      continue ;;
     *) continue ;;
   esac
   pcg=$(proc_cgroup "$p" 2>/dev/null) || continue

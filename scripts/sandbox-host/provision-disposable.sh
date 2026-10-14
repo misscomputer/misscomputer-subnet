@@ -41,14 +41,12 @@ lane_disk_mib=$((data_fs_mib - sandboxes * (image_max_mib + log_mib) - engine_ov
 (( lane_disk_mib > 0 )) || mcsbx_die 'data filesystem leaves no lane disk budget after overhead'
 (( lease_tasks >= sandboxes * lease_pids_max )) || mcsbx_die 'lease slice tasks do not cover sandboxes x per-lease pids'
 
-mcsbx_require_tools curl tar sha256sum docker dockerd containerd ctr losetup mkfs.xfs mount umount findmnt \
+mcsbx_require_tools curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt \
   xfs_quota systemd-run systemctl python3 truncate stat
 [[ $(findmnt -n -o FSTYPE /sys/fs/cgroup) == cgroup2 ]] || mcsbx_die 'host is not cgroup v2'
 [[ $(uname -m) == x86_64 ]] || mcsbx_die 'pinned runsc and image require x86_64'
 [[ $(dockerd --version) == "Docker version $MCSBX_DOCKER_VERSION,"* ]] || mcsbx_die 'unreviewed dockerd version'
 [[ $(docker --version) == "Docker version $MCSBX_DOCKER_VERSION,"* ]] || mcsbx_die 'unreviewed docker client version'
-containerd_version=$(containerd --version)
-[[ $containerd_version == *" $MCSBX_CONTAINERD_SERIES"* ]] || mcsbx_die "unreviewed containerd series: $containerd_version"
 [[ ! -e $root ]] || mcsbx_die "$root already exists; provisioning is not re-entrant, run teardown first"
 for unit in "$MCSBX_CONTAINERD_UNIT" "$MCSBX_DOCKERD_UNIT" "$MCSBX_LEASE_SLICE" "$MCSBX_ENGINE_SLICE"; do
   [[ $(systemctl show --property=LoadState --value "$unit") != loaded ]] || ! systemctl is-active --quiet "$unit" ||
@@ -70,6 +68,15 @@ tar -xjf "$root/gvisor.tar.bz2" -C "$root/bin"
 rm -f "$root/gvisor.tar.bz2"
 chmod 0755 "$root/bin/runsc"
 runsc_sha256=$(sha256sum "$root/bin/runsc" | awk '{print $1}')
+mkdir -m 0700 "$root/bin/containerd"
+curl --fail --silent --show-error --location --max-time 90 \
+  "https://github.com/containerd/containerd/releases/download/v$MCSBX_CONTAINERD_VERSION/containerd-static-$MCSBX_CONTAINERD_VERSION-linux-amd64.tar.gz" \
+  -o "$root/containerd.tar.gz"
+printf '%s  %s\n' "$MCSBX_CONTAINERD_ARCHIVE_SHA256" "$root/containerd.tar.gz" | sha256sum --check --status || mcsbx_die 'containerd archive checksum mismatch'
+tar -xzf "$root/containerd.tar.gz" -C "$root/bin/containerd" --strip-components=1 bin/containerd bin/containerd-shim-runc-v2 bin/ctr
+rm -f "$root/containerd.tar.gz"
+containerd_version=$("$root/bin/containerd/containerd" --version)
+[[ $containerd_version == *" v$MCSBX_CONTAINERD_VERSION "* ]] || mcsbx_die "unexpected containerd build: $containerd_version"
 runsc_version=$("$root/bin/runsc" --version | head -1)
 # Newer releases execute a bundled sentry binary; older ones run runsc itself.
 sentry_path=$root/bin/runsc
@@ -109,15 +116,18 @@ disabled_plugins = ["io.containerd.grpc.v1.cri", "io.containerd.cri.v1.runtime",
 [metrics]
   address = ""
 EOF
+# PATH puts the pinned shim first; the host's containerd-shim-runc-v2 is
+# never used by this daemon.
 systemd-run --quiet --unit "$MCSBX_CONTAINERD_UNIT" --slice "$MCSBX_ENGINE_SLICE" \
   --property=KillMode=control-group --property=TasksMax=infinity \
-  /usr/bin/containerd --config "$root/containerd.toml"
+  --setenv=PATH="$root/bin/containerd:/usr/sbin:/usr/bin:/sbin:/bin" \
+  "$root/bin/containerd/containerd" --config "$root/containerd.toml"
 note containerd_unit 1
 for _ in {1..30}; do
-  if ctr --address "$root/run/containerd/containerd.sock" version >/dev/null 2>&1; then break; fi
+  if "$root/bin/containerd/ctr" --address "$root/run/containerd/containerd.sock" version >/dev/null 2>&1; then break; fi
   sleep 1
 done
-ctr --address "$root/run/containerd/containerd.sock" version >/dev/null || mcsbx_die 'dedicated containerd did not start'
+"$root/bin/containerd/ctr" --address "$root/run/containerd/containerd.sock" version >/dev/null || mcsbx_die 'dedicated containerd did not start'
 
 # 4. Dedicated dockerd on its own socket and data root. Defaults are chosen
 #    to fail closed when a backend forgets a flag: runsc is the default

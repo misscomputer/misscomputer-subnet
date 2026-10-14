@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -185,10 +186,9 @@ def validate(report: dict[str, Any]) -> None:
 def _abs(value: Any, name: str) -> str:
     if (
         not isinstance(value, str)
+        or value == "/"
+        or posixpath.normpath(value) != value
         or not value.startswith("/")
-        or "//" in value
-        or "/../" in value
-        or value.endswith("/..")
     ):
         raise ReportError(f"profile {name} must be a clean absolute path")
     return value
