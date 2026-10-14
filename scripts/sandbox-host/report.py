@@ -259,6 +259,13 @@ def check_profile(profile: dict[str, Any]) -> None:
         containerd["namespace"],
     ):
         raise ReportError("containerd namespaces must be dedicated")
+    engine = profile["engine"]
+    if (
+        not isinstance(engine, dict)
+        or set(engine) != {"docker_version"}
+        or not isinstance(engine["docker_version"], str)
+    ):
+        raise ReportError("engine must name only docker_version")
     runtime = profile["runtime"]
     if (
         set(runtime)

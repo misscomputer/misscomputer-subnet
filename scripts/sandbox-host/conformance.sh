@@ -401,15 +401,31 @@ docker exec "$container" true || bad 'liveness control failed after probes'
 ok "$probe_view"
 
 begin effect.udp_dns_no_route observed_effect
+# BusyBox nc reports a failed UDP connect only with -v (without it, rc 1 and
+# no output, which proves nothing). A UDP connect succeeds whenever a route
+# exists, so only the exact local connect failure counts. Without an IPv6
+# source address the kernel answers EADDRNOTAVAIL instead of ENETUNREACH;
+# both mean the datagram cannot leave, and the host-side namespace check is
+# the primary assertion. Lines were reproduced with the pinned BusyBox
+# 1.36.1 in an unprivileged network-less namespace.
 udp_view=
-for target in 1.1.1.1 2606:4700:4700::1111; do
-  if udp=$(timeout 10 docker exec "$container" sh -c 'echo probe | nc -u -w 2 "$1" 53' sh "$target" 2>&1); then bad "udp to $target succeeded: $udp"; fi
-  [[ $udp == *'Network is unreachable'* ]] || bad "udp $target failed otherwise: ${udp:-no output}"
-  udp_view+="udp $target: $udp; "
-done
-if dns=$(timeout 15 docker exec "$container" nslookup -timeout=3 example.com 1.1.1.1 2>&1); then bad "dns lookup answered: $dns"; fi
-[[ $dns == *'Network is unreachable'* ]] || bad "dns failed otherwise: $dns"
-ok "$udp_view dns: $(tr '\n' ' ' <<< "$dns")"
+udp_probe() {  # expected-line... -- command...
+  local expected=() out
+  while [[ $1 != -- ]]; do expected+=("$1"); shift; done
+  shift
+  if out=$(timeout 15 docker exec "$container" "$@" 2>&1 </dev/null); then bad "udp probe succeeded: $* -> $out"; fi
+  for line in "${expected[@]}"; do
+    if [[ $out == "$line" ]]; then udp_view+="$out; "; return 0; fi
+  done
+  bad "udp probe $* failed otherwise: ${out:-no output}"
+}
+udp_probe 'nc: 1.1.1.1 (1.1.1.1:53): Network is unreachable' -- nc -v -u -w 2 1.1.1.1 53
+udp_probe 'nc: 2606:4700:4700::1111 ([2606:4700:4700::1111]:53): Network is unreachable' \
+  'nc: 2606:4700:4700::1111 ([2606:4700:4700::1111]:53): Cannot assign requested address' -- nc -v -u -w 2 2606:4700:4700::1111 53
+udp_probe "nslookup: can't connect to remote host (1.1.1.1): Network is unreachable" -- nslookup -timeout=3 example.com 1.1.1.1
+udp_probe "nslookup: can't connect to remote host: Network is unreachable" \
+  "nslookup: can't connect to remote host: Cannot assign requested address" -- nslookup -timeout=3 example.com 2606:4700:4700::1111
+ok "$udp_view"
 
 begin effect.icmp_no_route_with_net_raw observed_effect
 # NET_RAW is more than any lease gets, so a missing capability cannot be
@@ -423,8 +439,8 @@ for family in -4 -6; do
     bad "icmp $family reached $target: $icmp"
   fi
   case $icmp in
-    *'Network is unreachable'*) icmp_view+="$family no route: $(tr '\n' ' ' <<< "$icmp"); " ;;
-    *'Operation not permitted'*|*'Permission denied'*|*'permission denied'*) icmp_view+="$family socket refused by runsc: $(tr '\n' ' ' <<< "$icmp"); " ;;
+    *$'\n''ping: sendto: Network is unreachable') icmp_view+="$family no route: $(tr '\n' ' ' <<< "$icmp"); " ;;
+    'ping: permission denied (are you root?)'|*'Operation not permitted') icmp_view+="$family socket refused by runsc: $(tr '\n' ' ' <<< "$icmp"); " ;;
     *) bad "icmp $family failed otherwise: $icmp" ;;
   esac
 done

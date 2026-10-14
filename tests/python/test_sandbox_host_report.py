@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
 from typing import Any
 
@@ -18,56 +19,12 @@ assert _SPEC and _SPEC.loader
 report = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(report)
 
-ROOT = "/run/mcsbx"
-PROFILE: dict[str, Any] = {
-    "schema": report.PROFILE_SCHEMA,
-    "schema_version": 1,
-    "docker_host": f"unix://{ROOT}/run/docker/docker.sock",
-    "containerd": {
-        "address": f"{ROOT}/run/containerd/containerd.sock",
-        "namespace": "mc-sandbox",
-        "plugins_namespace": "mc-sandbox-plugins",
-    },
-    "data_root": f"{ROOT}/data",
-    "docker_data_root": f"{ROOT}/data/docker",
-    "run_root": f"{ROOT}/run",
-    "runtime": {
-        "name": "runsc",
-        "path": f"{ROOT}/bin/runsc",
-        "sha256": "a" * 64,
-        "sentry_path": f"{ROOT}/bin/gvisor-bin/gvisor_sentry",
-        "sentry_sha256": "b" * 64,
-        "args": ["--systemd-cgroup", "--overlay2=none"],
-        "release": "release-20261005.0",
-    },
-    "engine": {"docker_version": "28.0.4"},
-    "cgroup_root": "/sys/fs/cgroup",
-    "lease_slice": "mcsbxlease.slice",
-    "engine_slice": "mcsbxengine.slice",
-    "aggregate": {
-        "cpu_millis": 2000,
-        "memory_mib": 1024,
-        "pids": 1024,
-        "data_fs_mib": 4096,
-        "run_tmpfs_mib": 64,
-        "image_reserve_mib": 512,
-        "engine_overhead_mib": 512,
-        "image_max_mib": 256,
-        "log_mib": 16,
-        "disk_mib": 1984,
-        "sandboxes": 4,
-    },
-    "per_lease": {
-        "default_writable_mib": 64,
-        "log_max_size_mib": 8,
-        "log_max_file": 2,
-        "pids_max": 64,
-        "mounts": "none",
-        "image_volumes": "refuse",
-        "network_modes": ["none"],
-        "isolation": ["gvisor"],
-    },
-}
+VECTORS = json.loads(
+    (
+        Path(__file__).resolve().parents[2] / "pkg/sandboxhost/testdata/profile-vectors.json"
+    ).read_text()
+)
+PROFILE: dict[str, Any] = VECTORS["valid"]
 
 
 def _complete(mode: str) -> list[dict[str, Any]]:
@@ -153,27 +110,18 @@ def test_validate_rejects_tampered_reports(tamper: Any) -> None:
         report.validate(built)
 
 
-@pytest.mark.parametrize(
-    ("path", "value"),
-    [
-        (("docker_host",), "unix:///var/run/docker.sock"),
-        (("containerd", "namespace"), "moby"),
-        (("runtime", "args"), ["--systemd-cgroup"]),
-        # D7: lane disk + per-sandbox image/log + reserves would exceed the data fs
-        (("aggregate", "disk_mib"), 1985),
-        (("aggregate", "log_mib"), 8),
-        (("per_lease", "pids_max"), 512),  # 4 x 512 > aggregate pids 1024
-        (("per_lease", "network_modes"), ["none", "public"]),
-        (("lease_slice",), "mc-sandbox.slice"),
-    ],
-)
-def test_profile_rejects_unprovable_or_shared_configuration(
-    path: tuple[str, ...], value: Any
-) -> None:
+def test_profile_vectors_match_the_go_package() -> None:
+    report.check_profile(PROFILE)
+    built = report.build_report(_complete("preflight"), PROFILE, "preflight", {})
+    assert built["profile_digest"] == VECTORS["valid_digest"]
+
+
+@pytest.mark.parametrize("case", VECTORS["invalid"], ids=lambda case: case["name"])
+def test_profile_rejects_unprovable_or_shared_configuration(case: dict[str, Any]) -> None:
     profile = copy.deepcopy(PROFILE)
     target = profile
-    for key in path[:-1]:
+    for key in case["path"][:-1]:
         target = target[key]
-    target[path[-1]] = value
+    target[case["path"][-1]] = case["value"]
     with pytest.raises(report.ReportError):
         report.check_profile(profile)
