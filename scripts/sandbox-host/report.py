@@ -262,10 +262,11 @@ def check_profile(profile: dict[str, Any]) -> None:
     engine = profile["engine"]
     if (
         not isinstance(engine, dict)
-        or set(engine) != {"docker_version"}
+        or set(engine) != {"docker_version", "egress_table"}
         or not isinstance(engine["docker_version"], str)
+        or not re.fullmatch(r"[a-z0-9_]{1,32}", str(engine["egress_table"]))
     ):
-        raise ReportError("engine must name only docker_version")
+        raise ReportError("engine must name docker_version and an nft egress_table")
     runtime = profile["runtime"]
     if (
         set(runtime)

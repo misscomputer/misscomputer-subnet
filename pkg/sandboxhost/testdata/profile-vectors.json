@@ -25,7 +25,8 @@
       "release": "release-20261005.0"
     },
     "engine": {
-      "docker_version": "28.0.4"
+      "docker_version": "28.0.4",
+      "egress_table": "mcsbx_engine_egress"
     },
     "cgroup_root": "/sys/fs/cgroup",
     "lease_slice": "mcsbxlease.slice",
@@ -58,7 +59,7 @@
       ]
     }
   },
-  "valid_digest": "sha256:1fbd90d385a781628011246b271751513a3894956f02d2bf9bdac519be563b7a",
+  "valid_digest": "sha256:48a3cea900f8000842f68e7d906179a3bd94e9eab46084de98e04da666f0cb3c",
   "invalid": [
     {
       "name": "default docker socket",
@@ -135,6 +136,14 @@
       "value": "/run/mcsbx/data/"
     },
     {
+      "name": "non-integer size",
+      "path": [
+        "aggregate",
+        "sandboxes"
+      ],
+      "value": 4.5
+    },
+    {
       "name": "unknown member",
       "path": [
         "engine",
@@ -143,12 +152,12 @@
       "value": 1
     },
     {
-      "name": "non-integer size",
+      "name": "no egress table",
       "path": [
-        "aggregate",
-        "sandboxes"
+        "engine",
+        "egress_table"
       ],
-      "value": 4.5
+      "value": ""
     }
   ]
 }

@@ -27,6 +27,7 @@ for unit in "$MCSBX_DOCKERD_UNIT" "$MCSBX_CONTAINERD_UNIT" mcsbxleaseanchor.serv
   systemctl stop "$unit" >/dev/null 2>&1
   systemctl reset-failed "$unit" >/dev/null 2>&1
 done
+if nft list table inet "$MCSBX_EGRESS_TABLE" >/dev/null 2>&1; then nft delete table inet "$MCSBX_EGRESS_TABLE" || failed=1; fi
 for slice in "$MCSBX_LEASE_SLICE" "$MCSBX_ENGINE_SLICE"; do
   systemctl stop "$slice" >/dev/null 2>&1
 done
@@ -46,6 +47,7 @@ done
 for path in /sys/fs/cgroup/$MCSBX_LEASE_SLICE /sys/fs/cgroup/$MCSBX_ENGINE_SLICE; do
   if [[ -e $path ]]; then echo "cgroup remains: $path" >&2; failed=1; fi
 done
+if nft list table inet "$MCSBX_EGRESS_TABLE" >/dev/null 2>&1; then echo "nft table $MCSBX_EGRESS_TABLE remains" >&2; failed=1; fi
 if findmnt -rn -o TARGET | grep -Fq "$root/"; then echo "mount remains below $root" >&2; failed=1; fi
 if [[ -n $loop_device ]] && losetup "$loop_device" >/dev/null 2>&1 &&
    losetup -n -O BACK-FILE "$loop_device" | grep -Fq "$root/"; then
@@ -56,4 +58,4 @@ if (( failed )); then
   mcsbx_report "INCOMPLETE TEARDOWN: inspect disposable runner path $root"
   exit 1
 fi
-mcsbx_report "teardown: dedicated units, slices, cgroups, mounts, loop device and $root removed"
+mcsbx_report "teardown: dedicated units, slices, cgroups, egress table, mounts, loop device and $root removed"

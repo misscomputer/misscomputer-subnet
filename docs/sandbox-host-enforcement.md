@@ -16,6 +16,8 @@ Files:
 | `scripts/sandbox-host/teardown-disposable.sh` | removes everything and fails on incomplete cleanup |
 | `scripts/sandbox-host/report.py` | ledger, profile check, report derivation and validation |
 | `pkg/sandboxhost/check-catalog.v1.json` | the only list of check IDs, their evidence class, owner and modes |
+| `pkg/sandboxhost` (Go) | live read-only implementation of the lane-2-owned preflight and instance checks, profile decoding and report building, for the backend to consume |
+| `cmd/sandbox-host-observe` | prints `pkg/sandboxhost` observations as JSON; conformance runs it on the provisioned host |
 | `.github/workflows/sandbox-host-conformance.yml` | label `run-sandbox-host-gate` on a same-repository PR |
 
 ## Trigger and containment
@@ -27,7 +29,9 @@ the PR's exact head SHA (printed in the log and recorded in the report as
 `environment.source_sha`). Evidence applies to that SHA only: after a push,
 remove and re-apply the label. "Re-run" replays the original SHA.
 
-Every script that runs as root refuses unless `MC_SANDBOX_HOST_DISPOSABLE=1`,
+The work root is always `$RUNNER_TEMP/mcsbx`; no caller-chosen path is
+accepted, because teardown removes it recursively. Every script that runs as
+root refuses unless `MC_SANDBOX_HOST_DISPOSABLE=1`,
 `GITHUB_ACTIONS=true`, `RUNNER_ENVIRONMENT=github-hosted`, `ImageOS` and
 `ImageVersion` are set, and refuses if `/run/.containerenv`, `/.dockerenv`,
 `/etc/misscomputer`, `/opt/misscomputer-*`, a `.bittensor` wallet directory
@@ -46,6 +50,7 @@ security boundary: all of it is caller-controlled.
 | Runtime | gVisor `release-20261005.0` by archive SHA-256, registered as `runsc --systemd-cgroup --overlay2=none` | the overlay2 quota holds only with these arguments |
 | `mcsbxlease.slice` | `CPUQuota=200%`, `MemoryMax=1G`, `MemorySwapMax=0`, `TasksMax=1024` | aggregate lease CPU, memory, swap and host task budget |
 | `mcsbxengine.slice` | containerd and dockerd units, finite memory and tasks, swap 0 | engine, shim and gofer overhead never borrows the lease budget and never runs unbounded |
+| Engine egress | nft table `inet mcsbx_engine_egress`: sockets of the engine slice may reach the host resolver `127.0.0.53:53` and public unicast addresses only; loopback, this-network, RFC1918, CGNAT, link-local (metadata), benchmarking, multicast/reserved, IPv4-mapped, NAT64, ULA and IPv6 link-local/multicast are rejected | `network=none` does not constrain the daemon's own pulls; Docker always treats loopback registries as plain-HTTP |
 
 Slice names contain no `-`, so systemd creates no implicit parent slices.
 
@@ -79,9 +84,13 @@ what the catalog and its checks imply.
 
 Modes: `conformance` (this lab, every check), `preflight` (a live backend's
 read-only startup checks) and `instance` (per sandbox after create). The
-catalog `owner` says who implements the live check: lane 2 owns kernel,
-cgroup, filesystem and process observation; the backend owns `engine.*`
-through its Engine API client. A live backend may start only when every
+catalog `owner` says who implements the live check, exactly once: lane 2
+(`pkg/sandboxhost`: `host.*`, `cgroup.*`, `storage.*`, `budget.*`,
+`network.engine_egress_restricted`, `lease.runtime_processes_in_finite_cgroups`,
+`lease.host_netns_lo_only_no_routes`); the backend (`engine.*` through its
+Engine API client, and the sentry executable, cgroup and limit checks it
+already performs). `lease.sandbox_interfaces_lo_only` and
+`lease.engine_socket_absent` need a process in the guest and are lab-only. A live backend may start only when every
 `observed_state` check of the preflight mode passes; `configured` checks
 are recorded, not accepted as startup evidence.
 
@@ -121,8 +130,11 @@ loopback insecure CIDRs, no foreign containers). Storage: XFS project quota
 accounting and enforcement on, data filesystem dedicated and sized as
 profiled, run root a sized tmpfs; profile budgets fit inside observed limits.
 
-Per lease (`runsc`, `network=none`, 1 CPU, 512 MiB, 64 pids, 64 MiB writable
-layer, logs 1m x 2, nonroot, no capabilities): the engine recorded settings;
+Per lease, created with the backend's flags (`runsc`, `network=none`, lease
+cgroup parent, 1 CPU, 512 MiB with equal swap limit, 64 pids, 64 MiB writable
+layer, logs 1m x 2, `CapDrop ALL` with no `CapAdd`, `no-new-privileges`, ipc
+private, no restart) and the image's own user (root) and default command, as
+`pkg/sandboxbackend` does: the engine recorded settings;
 the container PID executes the pinned sentry; its actual cgroup is a child
 of the lease slice with exactly the lease's `cpu.max`, `memory.max`,
 `memory.swap.max` and `pids.max`; every gVisor and shim process of the
@@ -130,7 +142,20 @@ instance is in the lease or engine slice; the sentry's host-side network
 namespace has only `lo` and no route off it; the guest sees only `lo` and no
 engine socket.
 
-Effects: IPv4 metadata, IPv4 and IPv6 public TCP fail with exactly the
+`pkg/sandboxhost`, built from the checked-out source, then runs on the same
+host (`conformance.go_observer_matches`) and must pass every check it owns,
+so the live Go implementation, not only this script, is proven against a
+real kernel.
+
+Effects: the dedicated daemon's own pulls from `127.0.0.1`, the host's
+primary address and `169.254.169.254` never connect (listeners see only a
+caller-side control, the nft reject counters rise) while the pinned
+`docker.io` pull succeeds. The data filesystem cannot be `nodev` (Docker's
+overlay2 quota control opens a device node it creates there), so device
+nodes in image layers become real host device files: an image layer with
+`/dev/mem`, `/dev/kmsg`, `/dev/null` and the data filesystem's own block
+device must stay unusable from the guest, as root and nonroot
+(`effect.image_device_nodes_inert`). IPv4 metadata, IPv4 and IPv6 public TCP fail with exactly the
 no-route line; UDP 53 and DNS fail for lack of a route; ICMP from a probe
 granted `NET_RAW` cannot leave; host listeners on `127.0.0.1` and the host's
 primary address see no sandbox connection; the writable layer stops at its
@@ -149,9 +174,15 @@ remains.
 - A production host. The lab uses a loop file, not a dedicated device, and
   its cgroup mount, kernel and Docker are GitHub's. Each live host needs its
   own preflight; this evidence is per SHA and per runner image.
-- Image cache reservation, registry pull egress restriction (container
-  `network=none` does not constrain the daemon's pulls), `public` and
-  `allowlist` egress, secret delivery, exec and file transfer.
+- Image cache reservation, registry hostname allowlisting (the engine may
+  still reach any public unicast address:
+  `network.engine_pull_egress_public_unrestricted`), `public` and
+  `allowlist` sandbox egress, secret delivery, exec and file transfer.
+- Effects for the backend's own `Create`: conformance uses the backend's
+  flags, but a joint job running `pkg/sandboxbackend` on this host is still
+  needed to prove the backend issues them.
+- Host root processes other than the engine can open device nodes stored
+  under the data root (it is not `nodev`); only the guest side is proven.
 - containerd shim sockets in the host-wide `/run/containerd/s`
   directory (`storage.shim_socket_dir_shared`).
 - Startup recovery and orphan reconciliation of a real backend, and any

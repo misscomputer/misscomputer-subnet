@@ -41,7 +41,7 @@ log_mib=$((log_max_size_mib * log_max_file))
   mcsbx_die 'data filesystem leaves no lane disk budget after overhead'
 (( lease_tasks >= sandboxes * lease_pids_max )) || mcsbx_die 'lease slice tasks do not cover sandboxes x per-lease pids'
 
-mcsbx_require_tools curl tar sha256sum df awk docker dockerd losetup mkfs.xfs mount umount findmnt \
+mcsbx_require_tools curl tar sha256sum df awk nft docker dockerd losetup mkfs.xfs mount umount findmnt \
   xfs_quota systemd-run systemctl python3 truncate stat
 [[ $(findmnt -n -o FSTYPE /sys/fs/cgroup) == cgroup2 ]] || mcsbx_die 'host is not cgroup v2'
 [[ $(uname -m) == x86_64 ]] || mcsbx_die 'pinned runsc and image require x86_64'
@@ -183,7 +183,29 @@ note lease_anchor 1
 systemctl set-property --runtime "$MCSBX_LEASE_SLICE" "CPUQuota=$((lease_cpu_millis / 10))%" \
   "MemoryMax=${lease_memory_mib}M" MemorySwapMax=0 "TasksMax=$lease_tasks"
 
-# 6. Profile: configured values only. Conformance and live preflight
+# 6. Engine egress (SR-27-01, contract D8 item 4). Container network=none
+#    does not constrain the daemon's own pulls. Every socket created in the
+#    engine slice may reach only the host resolver (127.0.0.53:53) and public
+#    unicast addresses: this-network, RFC1918, CGNAT, loopback, link-local
+#    (cloud metadata), benchmarking, multicast/reserved, IPv4-mapped, NAT64,
+#    ULA and IPv6 link-local/multicast are rejected. The rule matches the
+#    slice by cgroup ID, so it must be reloaded if the slice is recreated;
+#    preflight sees a stale rule because nft then prints a number instead of
+#    the slice name. Registry hostname allowlisting is not provided.
+cat > "$root/engine-egress.nft" <<NFT
+table inet $MCSBX_EGRESS_TABLE {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+    socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter reject with icmpx admin-prohibited
+    socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" ip6 daddr { ::/127, ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8 } counter reject with icmpx admin-prohibited
+  }
+}
+NFT
+nft -f "$root/engine-egress.nft"
+note egress_table 1
+
+# 7. Profile: configured values only. Conformance and live preflight
 #    re-observe every one of them; nothing here is proof.
 python3 - "$root" <<PY
 import json, sys
@@ -197,7 +219,7 @@ profile = {
     'runtime': {'name': 'runsc', 'path': root + '/bin/runsc', 'sha256': '$runsc_sha256',
                 'sentry_path': '$sentry_path', 'sentry_sha256': '$sentry_sha256',
                 'args': ['--systemd-cgroup', '--overlay2=none'], 'release': '$MCSBX_RUNSC_RELEASE'},
-    'engine': {'docker_version': '$MCSBX_DOCKER_VERSION'},
+    'engine': {'docker_version': '$MCSBX_DOCKER_VERSION', 'egress_table': '$MCSBX_EGRESS_TABLE'},
     'cgroup_root': '/sys/fs/cgroup',
     'lease_slice': '$MCSBX_LEASE_SLICE', 'engine_slice': '$MCSBX_ENGINE_SLICE',
     'aggregate': {'cpu_millis': $lease_cpu_millis, 'memory_mib': $lease_memory_mib, 'pids': $lease_tasks,

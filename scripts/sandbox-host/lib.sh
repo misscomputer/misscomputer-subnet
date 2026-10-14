@@ -23,6 +23,7 @@ readonly MCSBX_CONTAINERD_UNIT=mcsbxcontainerd.service
 readonly MCSBX_DOCKERD_UNIT=mcsbxdockerd.service
 readonly MCSBX_NAMESPACE=mc-sandbox
 readonly MCSBX_PLUGINS_NAMESPACE=mc-sandbox-plugins
+readonly MCSBX_EGRESS_TABLE=mcsbx_engine_egress
 
 mcsbx_die() { echo "SANDBOX-HOST FAILED: $*" >&2; exit 1; }
 
@@ -53,9 +54,13 @@ mcsbx_require_disposable() {
   return 0
 }
 
+# The root is always <RUNNER_TEMP>/mcsbx: teardown removes it recursively, so
+# no caller-chosen path is accepted.
 mcsbx_root() {
-  local root=${MC_SANDBOX_HOST_ROOT:-${RUNNER_TEMP:-/nonexistent}/mcsbx}
-  [[ $root == /* && $root != *[[:space:]]* && ${#root} -le 48 ]] || mcsbx_die "root path $root must be absolute, without spaces, at most 48 bytes (unix socket length)"
+  local temp=${RUNNER_TEMP:-}
+  [[ $temp == /* && $temp != / && $temp != *[[:space:]]* && $temp != *..* ]] || mcsbx_die "RUNNER_TEMP must be a clean absolute directory, got '$temp'"
+  local root=${temp%/}/mcsbx
+  [[ ${#root} -le 48 ]] || mcsbx_die "root path $root exceeds 48 bytes (unix socket length)"
   printf '%s\n' "$root"
 }
 

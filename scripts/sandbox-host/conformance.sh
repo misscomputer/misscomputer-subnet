@@ -13,13 +13,15 @@ repo=$(cd "$here/../.." && pwd)
 # shellcheck source=scripts/sandbox-host/lib.sh
 source "$here/lib.sh"
 mcsbx_require_disposable
-mcsbx_require_tools docker python3 findmnt xfs_quota systemctl nsenter ip stat df awk sha256sum readlink timeout git
+mcsbx_require_tools docker nft curl python3 findmnt xfs_quota systemctl nsenter ip stat df awk sha256sum readlink timeout git
 
 root=$(mcsbx_root)
 profile=$root/profile.json
 [[ -f $profile ]] || mcsbx_die "no profile at $profile; run provision-disposable.sh first"
 python3 "$here/report.py" check-profile "$profile" || mcsbx_die 'profile is invalid'
-out_dir=${MC_SANDBOX_HOST_REPORT_DIR:-${RUNNER_TEMP:-/tmp}/mcsbx-report}
+observer=${MC_SANDBOX_HOST_OBSERVER:-}
+[[ -x $observer ]] || mcsbx_die 'MC_SANDBOX_HOST_OBSERVER must name the built cmd/sandbox-host-observe binary'
+out_dir=${RUNNER_TEMP}/mcsbx-report
 mkdir -p "$out_dir"
 ledger=$out_dir/checks.jsonl
 report_path=$out_dir/sandbox-host-preflight.conformance.json
@@ -37,6 +39,7 @@ flat = {
     'runsc_path': p['runtime']['path'], 'runsc_sha256': p['runtime']['sha256'],
     'sentry_path': p['runtime']['sentry_path'], 'sentry_sha256': p['runtime']['sentry_sha256'],
     'runsc_args': json.dumps(p['runtime']['args']), 'docker_version': p['engine']['docker_version'],
+    'engine_egress_table': p['engine']['egress_table'],
     'cgroup_root': p['cgroup_root'], 'lease_slice': p['lease_slice'], 'engine_slice': p['engine_slice'],
 }
 for key, value in p['aggregate'].items():
@@ -281,22 +284,42 @@ disk_required_mib=$(( p_agg_disk_mib + p_agg_sandboxes * (p_agg_image_max_mib + 
   bad "profile cpu=$p_agg_cpu_millis mem=$p_agg_memory_mib pids=$p_agg_pids disk+overhead=$disk_required_mib vs observed cpu=$slice_cpu_millis mem=$slice_mem_mib pids=$slice_pids fs=$((data_size / MIB))"
 ok "profile cpu=$p_agg_cpu_millis mem=$p_agg_memory_mib pids=$p_agg_pids within observed slice cpu=$slice_cpu_millis mem=$slice_mem_mib pids=$slice_pids; disk $p_agg_disk_mib + $p_agg_sandboxes x ($p_agg_image_max_mib image + $p_agg_log_mib log) + $p_agg_engine_overhead_mib engine + $p_agg_image_reserve_mib reserve = $disk_required_mib <= observed fs $((data_size / MIB)) MiB"
 
+# ---- Engine egress -----------------------------------------------------------
+"$observer" -profile "$profile" preflight > "$work/observer-preflight.json"
+observer_check() {  # id file -> "status<TAB>evidence"
+  python3 -c 'import json,sys; c=[c for c in json.load(open(sys.argv[2])) if c["id"]==sys.argv[1]]; print(c[0]["status"] + "\t" + c[0]["evidence"] if c else "absent\t")' "$1" "$2"
+}
+begin network.engine_egress_restricted observed_state
+IFS=$'\t' read -r egress_status egress_evidence < <(observer_check network.engine_egress_restricted "$work/observer-preflight.json")
+[[ $egress_status == pass ]] || bad "pkg/sandboxhost: $egress_status $egress_evidence"
+ok "pkg/sandboxhost read back: $egress_evidence"
+gap network.engine_pull_egress_public_unrestricted 'engine sockets may reach any public unicast address; no registry hostname allowlist or egress proxy'
+
 gap storage.images_cache_unreserved "image/layer/pull bytes share the ${p_agg_data_fs_mib} MiB data fs; ${p_agg_image_reserve_mib} MiB image reserve is arithmetic, not a quota"
 gap network.public_allowlist_unsupported 'only network=none is provisioned and proven; backend must refuse public and allowlist'
 gap lease.image_volumes_refused 'engine has no per-lease quota for image VOLUMEs (see effect.image_volume_bypasses_quota); backend must refuse such images'
 
 # ---- One lease instance ----------------------------------------------------
 docker pull --quiet --platform linux/amd64 "$MCSBX_IMAGE" >/dev/null
-image_id=$(docker image inspect --format '{{.Id}}' "$MCSBX_IMAGE")
 docker image inspect --format '{{json .RepoDigests}}' "$MCSBX_IMAGE" | grep -qF "$MCSBX_IMAGE_DIGEST" || mcsbx_die 'pulled image digest differs from pin'
 
-lease_run() {  # name memory_mib pids writable_mib [extra docker args...] -- command...
+# The backend (pkg/sandboxbackend) starts the image's own user and command
+# with CapDrop ALL, no CapAdd, ipc private and no-new-privileges. The probe
+# image is the pinned BusyBox with a default command, so lease containers
+# below are created exactly that way, with no user or command override.
+docker create --name mcsbx-probe-base --label mcsbx.conformance=1 "$MCSBX_IMAGE" true >/dev/null
+docker commit --change 'CMD ["sh","-c","yes mcsbx-conformance | head -c 4000000; touch /tmp/logs-done; exec sleep 900"]' \
+  mcsbx-probe-base mcsbx/lease-probe:conformance >/dev/null
+docker rm mcsbx-probe-base >/dev/null
+image_id=$(docker image inspect --format '{{.Id}}' mcsbx/lease-probe:conformance)
+
+lease_run() {  # name memory_mib pids writable_mib: the backend's create flags, image default user and command
   local name=$1 mem=$2 pids=$3 writable=$4
-  shift 4
   docker run --detach --name "$name" --label mcsbx.conformance=1 --runtime runsc --platform linux/amd64 \
     --network none --cgroup-parent "$p_lease_slice" --cpus 1 --memory "${mem}m" --memory-swap "${mem}m" \
     --pids-limit "$pids" --storage-opt "size=${writable}m" --cap-drop ALL --security-opt no-new-privileges \
-    --user 65534:65534 --log-driver json-file --log-opt max-size=1m --log-opt max-file=2 "$@" >/dev/null
+    --ipc private --restart no --log-driver json-file --log-opt max-size=1m --log-opt max-file=2 \
+    mcsbx/lease-probe:conformance >/dev/null
 }
 sentry_pid() {
   local pid
@@ -306,7 +329,7 @@ sentry_pid() {
 }
 
 container=mcsbx-lease-main
-lease_run "$container" 512 64 64 "$MCSBX_IMAGE" sh -c 'yes mcsbx-conformance | head -c 4000000; touch /tmp/logs-done; sleep 900'
+lease_run "$container" 512 64 64
 for _ in {1..30}; do docker exec "$container" test -e /tmp/logs-done >/dev/null 2>&1 && break; sleep 1; done
 
 begin lease.engine_config_matches configured
@@ -317,15 +340,16 @@ item = json.load(open(sys.argv[1], encoding='utf-8'))[0]
 host = item['HostConfig']
 want = {'Runtime': 'runsc', 'NetworkMode': 'none', 'CgroupParent': sys.argv[2], 'Memory': 536870912,
         'MemorySwap': 536870912, 'PidsLimit': 64, 'NanoCpus': 1000000000, 'Privileged': False,
-        'CapDrop': ['ALL'], 'Binds': None, 'StorageOpt': {'size': '64m'},
+        'CapDrop': ['ALL'], 'Binds': None, 'StorageOpt': {'size': '64m'}, 'IpcMode': 'private',
         'LogConfig': {'Type': 'json-file', 'Config': {'max-file': '2', 'max-size': '1m'}}}
 bad = [f'{k}={host.get(k)!r}' for k, v in want.items() if host.get(k) != v]
 if 'no-new-privileges' not in (host.get('SecurityOpt') or []): bad.append('SecurityOpt')
 if host.get('Devices') or host.get('DeviceRequests'): bad.append('Devices')
 if item['Mounts'] or host.get('Mounts'): bad.append('Mounts')
 if item['Image'] != sys.argv[3]: bad.append('Image')
-if item['Config']['User'] != '65534:65534': bad.append('User')
-print('BAD ' + ' '.join(bad) if bad else 'runtime=runsc network=none parent=%s cpu=1 mem=swap=512MiB pids=64 storage=64m logs=1m*2 mounts=none caps=none nnp' % sys.argv[2])
+if item['Config']['User'] != '' or item['Config']['Cmd'] is not None and item['Config']['Cmd'][:2] != ['sh', '-c']: bad.append('User/Cmd override')
+if host.get('CapAdd'): bad.append('CapAdd')
+print('BAD ' + ' '.join(bad) if bad else 'backend create flags: runtime=runsc network=none parent=%s cpu=1 mem=swap=512MiB pids=64 storage=64m logs=1m*2 ipc=private mounts=none CapDrop=ALL CapAdd=none nnp; image default user and command' % sys.argv[2])
 PY
 )
 [[ $config_view != BAD* ]] || bad "$config_view"
@@ -371,6 +395,21 @@ links=$(nsenter --net="/proc/$pid/ns/net" ip -o link show | awk -F': ' '{print $
 routes=$( { nsenter --net="/proc/$pid/ns/net" ip -4 route show table all; nsenter --net="/proc/$pid/ns/net" ip -6 route show table all; } | grep -v ' dev lo' || true)
 [[ $links == 'lo ' && -z $routes ]] || bad "host netns links=$links non-lo routes=$routes"
 ok "host-side netns of PID $pid: links=$links; no route off lo"
+
+begin conformance.go_observer_matches observed_state
+"$observer" -profile "$profile" instance -pid "$pid" > "$work/observer-instance.json"
+disagree=$(python3 - "$work/observer-preflight.json" "$work/observer-instance.json" <<'PY'
+import json, sys
+bad = []
+for path in sys.argv[1:]:
+    for c in json.load(open(path)):
+        if c['status'] not in ('pass', 'gap'):
+            bad.append(f"{c['id']}={c['status']}:{c['evidence'][:160]}")
+print('; '.join(bad))
+PY
+)
+[[ -z $disagree ]] || bad "pkg/sandboxhost on this host: $disagree"
+ok "pkg/sandboxhost Preflight ($(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$work/observer-preflight.json") checks) and ObserveInstance(PID $pid) pass every lane2-owned check on this host"
 
 begin lease.sandbox_interfaces_lo_only observed_state
 interfaces=$(docker exec "$container" awk 'NR > 2 {sub(/:.*/, ""); gsub(/ /, ""); print}' /proc/net/dev | tr '\n' ' ')
@@ -435,7 +474,7 @@ icmp_view=
 for family in -4 -6; do
   target=1.1.1.1; [[ $family == -6 ]] && target=2606:4700:4700::1111
   if icmp=$(timeout 20 docker run --rm --label mcsbx.conformance=1 --network none --cap-drop ALL --cap-add NET_RAW --user 0 \
-      --memory 128m --memory-swap 128m --pids-limit 16 "$MCSBX_IMAGE" ping "$family" -c 1 -W 2 "$target" 2>&1); then
+      --memory 256m --memory-swap 256m --pids-limit 64 "$MCSBX_IMAGE" ping "$family" -c 1 -W 2 "$target" 2>&1); then
     bad "icmp $family reached $target: $icmp"
   fi
   case $icmp in
@@ -477,6 +516,44 @@ kill "$listener" >/dev/null 2>&1; wait "$listener" 2>/dev/null || true
 [[ $seen == 1 ]] || bad "host listener saw $seen connections (1 is the host-side control)"
 ok "host listeners 127.0.0.1:18089 and $host_addr:18089 saw only the host control; sandbox 127.0.0.1 refused by its own loopback; host address had no route"
 
+begin effect.engine_egress_blocked observed_effect
+# The daemon itself pulls. Docker treats 127.0.0.0/8 as an insecure registry
+# (plain HTTP), so without the egress rule this pull would reach the host
+# listener. A caller-side control proves the listener counts connections.
+reject_count() { nft list table inet "$p_engine_egress_table" | awk '/reject/ {for (i=1; i<=NF; i++) if ($i == "packets") s += $(i+1)} END {print s+0}'; }
+python3 - "$work/egress.count" "$host_addr" <<'PY' &
+import selectors, socket, sys, time
+count_path, host_addr = sys.argv[1:]
+sel = selectors.DefaultSelector()
+for addr in ('127.0.0.1', host_addr):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((addr, 18090)); s.listen(16); s.setblocking(False); sel.register(s)
+open(count_path, 'w').write('0\n')
+seen, deadline = 0, time.time() + 120
+while time.time() < deadline:
+    for key, _ in sel.select(timeout=0.5):
+        conn, _ = key.fileobj.accept(); conn.close(); seen += 1
+        open(count_path, 'w').write(f'{seen}\n')
+PY
+egress_listener=$!
+for _ in {1..20}; do [[ -s $work/egress.count ]] && break; sleep 0.25; done
+curl -s -o /dev/null --max-time 2 http://127.0.0.1:18090/ || true
+sleep 0.5
+[[ $(cat "$work/egress.count") == 1 ]] || bad 'caller-side control connection to the listener was not counted'
+rejects_before=$(reject_count)
+pull_view=
+for ref in 127.0.0.1:18090/mcsbx/probe:none "$host_addr:18090/mcsbx/probe:none" 169.254.169.254/mcsbx/probe:none; do
+  if out=$(timeout 60 docker pull "$ref" 2>&1); then bad "engine pulled $ref"; fi
+  pull_view+="$ref: $(tail -1 <<< "$out" | cut -c1-120); "
+done
+sleep 1
+seen=$(cat "$work/egress.count")
+kill "$egress_listener" >/dev/null 2>&1; wait "$egress_listener" 2>/dev/null || true
+rejects_after=$(reject_count)
+[[ $seen == 1 ]] || bad "engine pulls reached the host listeners ($((seen - 1)) connections)"
+(( rejects_after > rejects_before )) || bad "egress reject counters did not move ($rejects_before -> $rejects_after); failures not attributable to the rule"
+ok "engine pulls never connected (listeners saw only the control); reject counters $rejects_before -> $rejects_after; pinned docker.io pull succeeded; $pull_view"
+
 begin effect.writable_layer_quota observed_effect
 quota_bytes=$((64 * MIB))
 if docker exec --user 0 "$container" dd if=/dev/zero of=/quota-proof bs=1048576 count=192 > "$work/dd.log" 2>&1; then bad 'wrote past the 64 MiB writable layer'; fi
@@ -501,7 +578,7 @@ main_pid=$pid main_cg=$child_cg
 
 begin effect.guest_pids_limit observed_effect
 container=mcsbx-lease-pids
-lease_run "$container" 256 64 64 "$MCSBX_IMAGE" sleep 900
+lease_run "$container" 256 64 64
 docker exec "$container" sh -c 'n=0; while [ $n -lt 200 ]; do sleep 120 & n=$((n+1)); done; wait' > "$work/pids.log" 2>&1 &
 spawner=$!
 sleep 8
@@ -522,7 +599,7 @@ docker rm -f "$container" >/dev/null
 
 begin effect.tmp_bounded_by_memory observed_effect
 container=mcsbx-lease-tmp
-lease_run "$container" 256 64 64 "$MCSBX_IMAGE" sleep 900
+lease_run "$container" 256 64 64
 tpid=$(sentry_pid "$container")
 tcg=$(proc_cgroup "$tpid")
 tmp_rc=0
@@ -547,8 +624,8 @@ slice_max=$(cg "$lease_cg" memory.max)
 child_mib=$(( slice_max * 3 / 4 / MIB ))
 fill_mib=$(( slice_max * 55 / 100 / MIB ))
 before=$(awk '$1 == "max" || $1 == "oom" {s+=$2} END {print s+0}' "$p_cgroup_root$lease_cg/memory.events.local")
-lease_run mcsbx-lease-agg-a "$child_mib" 64 64 "$MCSBX_IMAGE" sleep 900
-lease_run mcsbx-lease-agg-b "$child_mib" 64 64 "$MCSBX_IMAGE" sleep 900
+lease_run mcsbx-lease-agg-a "$child_mib" 64 64
+lease_run mcsbx-lease-agg-b "$child_mib" 64 64
 cg_a=$(proc_cgroup "$(sentry_pid mcsbx-lease-agg-a)"); cg_b=$(proc_cgroup "$(sentry_pid mcsbx-lease-agg-b)")
 peak_file=$work/agg-peaks
 ( while :; do
@@ -599,8 +676,63 @@ ok "anonymous volume $volume_source accepted $volume_written bytes past the ${p_
 docker rm -f -v "$container" >/dev/null
 docker image rm mcsbx/volume-probe:conformance >/dev/null
 
+begin effect.image_device_nodes_inert observed_effect
+# The data filesystem is not nodev, so device nodes in an image layer become
+# host device files under the data root. Put a layer with /dev/mem, /dev/kmsg,
+# /dev/null and the data filesystem's own block device into a lease image
+# (dockerd extracts it, as it would a pulled layer) and require every open
+# from the guest to fail, as root and as nobody. A successful write to the
+# block device would corrupt the data filesystem; that only fails this
+# disposable run.
+data_dev=$(findmnt -n -o SOURCE --mountpoint "$p_data_root")
+read -r data_major data_minor < <(stat -L -c '%t %T' "$data_dev")
+python3 - "$work/devnodes.tar" "$((16#$data_major))" "$((16#$data_minor))" <<'PY'
+import sys, tarfile
+out, major, minor = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with tarfile.open(out, 'w') as tar:
+    d = tarfile.TarInfo('devprobe'); d.type = tarfile.DIRTYPE; d.mode = 0o755; tar.addfile(d)
+    for name, kind, maj, mnr in (('mem', tarfile.CHRTYPE, 1, 1), ('kmsg', tarfile.CHRTYPE, 1, 11),
+                                 ('null', tarfile.CHRTYPE, 1, 3), ('datafs', tarfile.BLKTYPE, major, minor)):
+        node = tarfile.TarInfo('devprobe/' + name); node.type = kind; node.mode = 0o666
+        node.devmajor, node.devminor = maj, mnr
+        tar.addfile(node)
+PY
+docker create --name mcsbx-devnode-base --label mcsbx.conformance=1 mcsbx/lease-probe:conformance >/dev/null
+docker cp - mcsbx-devnode-base:/ < "$work/devnodes.tar"
+docker commit mcsbx-devnode-base mcsbx/devnode-probe:conformance >/dev/null
+docker rm mcsbx-devnode-base >/dev/null
+host_nodes=$(find "$p_docker_root/overlay2" -path '*/diff/devprobe/*' \( -type c -o -type b \) | wc -l)
+(( host_nodes >= 4 )) || bad "image layer did not materialize device nodes on the data filesystem ($host_nodes found)"
+container=mcsbx-lease-devnode
+docker run --detach --name "$container" --label mcsbx.conformance=1 --runtime runsc --platform linux/amd64 \
+  --network none --cgroup-parent "$p_lease_slice" --cpus 1 --memory 256m --memory-swap 256m --pids-limit 64 \
+  --storage-opt size=64m --cap-drop ALL --security-opt no-new-privileges --ipc private --restart no \
+  --log-driver json-file --log-opt max-size=1m --log-opt max-file=2 mcsbx/devnode-probe:conformance >/dev/null
+data_sum_before=$(dd if="$data_dev" bs=1M count=1 status=none | sha256sum | awk '{print $1}')
+dev_view=
+for user in 0 65534; do
+  for op in read:mem read:kmsg read:datafs write:datafs write:null; do
+    node=/devprobe/${op#*:}
+    if [[ ${op%%:*} == read ]]; then cmd=(dd "if=$node" of=/dev/null bs=512 count=1)
+    else cmd=(dd if=/dev/zero "of=$node" bs=512 count=1 seek=1 conv=notrunc); fi
+    if out=$(timeout 15 docker exec --user "$user" "$container" "${cmd[@]}" 2>&1); then bad "uid $user $op succeeded: $out"; fi
+    first=$(head -1 <<< "$out")
+    refused=0
+    for reason in 'Operation not permitted' 'Permission denied' 'No such device or address' 'No such device' 'Not supported' 'Function not implemented'; do
+      [[ $first == "dd: can't open '$node': $reason" ]] && refused=1
+    done
+    (( refused )) || bad "uid $user $op failed otherwise: $first"
+    dev_view+="uid$user $op: ${first#*: }; "
+  done
+done
+data_sum_after=$(dd if="$data_dev" bs=1M count=1 status=none | sha256sum | awk '{print $1}')
+[[ $data_sum_before == "$data_sum_after" ]] || bad 'data filesystem head changed during device-node probes'
+docker rm -f "$container" >/dev/null
+docker image rm mcsbx/devnode-probe:conformance >/dev/null
+ok "$host_nodes host device nodes from the image layer; every guest open failed: $dev_view data fs head unchanged"
+
 begin effect.cleanup_instance_absent observed_effect
-docker image rm "$MCSBX_IMAGE" >/dev/null
+docker image rm mcsbx/lease-probe:conformance "$MCSBX_IMAGE" >/dev/null
 for _ in {1..30}; do [[ ! -e /proc/$main_pid && ! -e $p_cgroup_root$main_cg ]] && break; sleep 1; done
 leftover="containers=$(docker ps -aq | wc -l) volumes=$(docker volume ls -q | wc -l) images=$(docker images -q | wc -l)"
 children=$(find "$p_cgroup_root$lease_cg" -mindepth 1 -maxdepth 1 -type d -printf '%f ' | sed 's/mcsbxleaseanchor.service //')
