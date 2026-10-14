@@ -3,6 +3,11 @@
 package sandbox_test
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,35 +48,68 @@ func TestValidOpPath(t *testing.T) {
 	}
 }
 
-// The exec payload is digest-bound bytes that two parsers must read the same
-// way: strict members, no duplicates, no trailing data, and env {} (OPS-D1).
-func TestDecodeExecCommand(t *testing.T) {
-	good := `{"argv":["sh","-c","echo hi"],"cwd":"/","env":{},"stdin_b64":"aGk="}`
-	command, err := sandbox.DecodeExecCommand([]byte(good))
+// The exec payload is digest-bound bytes that every reader must decode to
+// the same members. The vectors are the cross-language contract: case-variant
+// or duplicate member names, invalid UTF-8 or lone surrogates, non-canonical
+// base64 and per-exec env must all be refused (lane 7 SR-28-01, SR-28-02).
+func TestExecPayloadVectors(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "sandbox-ops-v1-exec-payload-vectors.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(command.StdinBytes()) != "hi" || command.Argv[2] != "echo hi" {
-		t.Fatalf("decoded %+v", command)
+	var vectors struct {
+		Accept []struct {
+			Name       string   `json:"name"`
+			PayloadB64 string   `json:"payload_b64"`
+			Argv       []string `json:"argv"`
+			Cwd        string   `json:"cwd"`
+			Stdin      *string  `json:"stdin_b64"`
+		} `json:"accept"`
+		Reject []struct {
+			Name       string `json:"name"`
+			PayloadB64 string `json:"payload_b64"`
+		} `json:"reject"`
 	}
-	for name, payload := range map[string]string{
-		"env value":          `{"argv":["sh"],"cwd":"/","env":{"API_KEY":"secret"},"stdin_b64":null}`,
-		"env null":           `{"argv":["sh"],"cwd":"/","env":null,"stdin_b64":null}`,
-		"missing stdin":      `{"argv":["sh"],"cwd":"/","env":{}}`,
-		"unknown member":     `{"argv":["sh"],"cwd":"/","env":{},"stdin_b64":null,"tty":true}`,
-		"duplicate member":   `{"argv":["sh"],"argv":["rm","-rf","/"],"cwd":"/","env":{},"stdin_b64":null}`,
-		"nested duplicate":   `{"argv":["sh"],"cwd":"/","env":{"A":"1","A":"2"},"stdin_b64":null}`,
-		"trailing data":      `{"argv":["sh"],"cwd":"/","env":{},"stdin_b64":null} {}`,
-		"empty argv":         `{"argv":[],"cwd":"/","env":{},"stdin_b64":null}`,
-		"empty program":      `{"argv":[""],"cwd":"/","env":{},"stdin_b64":null}`,
-		"NUL in argument":    `{"argv":["sh","a\u0000b"],"cwd":"/","env":{},"stdin_b64":null}`,
-		"relative cwd":       `{"argv":["sh"],"cwd":"tmp","env":{},"stdin_b64":null}`,
-		"non-canonical b64":  `{"argv":["sh"],"cwd":"/","env":{},"stdin_b64":"aGk"}`,
-		"array not object":   `[]`,
-		"oversized argument": `{"argv":["` + strings.Repeat("a", sandbox.MaxExecArgBytes+1) + `"],"cwd":"/","env":{},"stdin_b64":null}`,
-	} {
-		if _, err := sandbox.DecodeExecCommand([]byte(payload)); err == nil {
-			t.Errorf("%s payload accepted", name)
+	if err := json.Unmarshal(raw, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	if len(vectors.Accept) == 0 || len(vectors.Reject) == 0 {
+		t.Fatal("payload vectors are empty")
+	}
+	decode := func(name, encoded string) []byte {
+		payload, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatalf("%s: vector payload_b64: %v", name, err)
+		}
+		return payload
+	}
+	for _, vector := range vectors.Accept {
+		command, err := sandbox.DecodeExecCommand(decode(vector.Name, vector.PayloadB64))
+		if err != nil {
+			t.Errorf("accept %q refused: %v", vector.Name, err)
+			continue
+		}
+		if !slices.Equal(command.Argv, vector.Argv) || command.Cwd != vector.Cwd || len(command.Env) != 0 ||
+			(command.Stdin == nil) != (vector.Stdin == nil) || (command.Stdin != nil && *command.Stdin != *vector.Stdin) {
+			t.Errorf("accept %q decoded %+v", vector.Name, command)
 		}
 	}
+	for _, vector := range vectors.Reject {
+		if command, err := sandbox.DecodeExecCommand(decode(vector.Name, vector.PayloadB64)); err == nil {
+			t.Errorf("reject %q accepted as argv=%q cwd=%q", vector.Name, command.Argv, command.Cwd)
+		}
+	}
+}
+
+// Truncated or garbage input never panics the payload decoder.
+func FuzzDecodeExecCommand(f *testing.F) {
+	f.Add([]byte(`{"argv":["a"],"cwd":"/","env":{},"stdin_b64":null}`))
+	f.Add([]byte(`{"argv":["\ud83d\ude00"],"cwd":"/","env":{},"stdin_b64":null} "\`))
+	f.Add([]byte(`{"argv":["\ud83d\`))
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		command, err := sandbox.DecodeExecCommand(payload)
+		if err == nil && command.Validate() != nil {
+			t.Fatal("decoded an invalid command")
+		}
+	})
 }

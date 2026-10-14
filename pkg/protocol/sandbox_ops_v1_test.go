@@ -91,7 +91,7 @@ func baseOpReceipt(t *testing.T, request protocol.SandboxOpRequestV1) protocol.S
 	}
 	return protocol.SandboxOpReceiptV1{
 		DocumentDigest: digest, Generation: request.Generation, LeaseID: request.LeaseID, MinerID: request.MinerID,
-		ObservedAt: stamp(opNow.Add(time.Second)), Op: request.Op, OpID: protocol.SandboxOpIDV1(request), SandboxID: request.SandboxID,
+		ObservedAt: stamp(opNow.Add(2 * time.Minute)), Op: request.Op, OpID: protocol.SandboxOpIDV1(request), SandboxID: request.SandboxID,
 		Schema: protocol.SandboxOpReceiptSchema, SchemaVersion: 1, Stage: sandbox.OpStageCompleted, Subnet: request.Subnet,
 	}
 }
@@ -130,17 +130,95 @@ func withResult(r *protocol.SandboxOpReceiptV1, body []byte, next uint64) {
 }
 
 type sandboxOpsVectorSet struct {
-	ExecPayload     string          `json:"exec_start_payload"`
-	ExecRead        json.RawMessage `json:"exec_read"`
-	ExecReadReceipt json.RawMessage `json:"exec_read_receipt"`
-	ExecReadResult  string          `json:"exec_read_result"`
-	ExecStart       json.RawMessage `json:"exec_start"`
-	ExecStartDigest string          `json:"exec_start_digest"`
-	FileList        json.RawMessage `json:"file_list"`
-	FileListReceipt json.RawMessage `json:"file_list_receipt"`
-	FileListResult  string          `json:"file_list_result"`
-	LeaseDigest     string          `json:"lease_digest"`
-	OpID            string          `json:"exec_start_op_id"`
+	ExecPayload      string          `json:"exec_start_payload"`
+	ExecRead         json.RawMessage `json:"exec_read"`
+	ExecReadReceipt  json.RawMessage `json:"exec_read_receipt"`
+	ExecReadResult   string          `json:"exec_read_result"`
+	ExecStart        json.RawMessage `json:"exec_start"`
+	ExecStartDigest  string          `json:"exec_start_digest"`
+	FileList         json.RawMessage `json:"file_list"`
+	FileListReceipt  json.RawMessage `json:"file_list_receipt"`
+	FileListResult   string          `json:"file_list_result"`
+	FileWrite        json.RawMessage `json:"file_write"`
+	FileWritePayload string          `json:"file_write_payload"`
+	FileWriteReceipt json.RawMessage `json:"file_write_receipt"`
+	LeaseDigest      string          `json:"lease_digest"`
+	Negative         []opNegative    `json:"negative"`
+	OpID             string          `json:"exec_start_op_id"`
+	RefusedReceipt   json.RawMessage `json:"exec_start_refused_receipt"`
+}
+
+// opNegative is a document every implementation must refuse. Except for the
+// duplicate-member case, its signature is valid for its kind's domain and
+// bound key, so the refusal must come from decoding or validation.
+type opNegative struct {
+	Document       string `json:"document"`
+	Kind           string `json:"kind"`
+	Name           string `json:"name"`
+	SignatureValid bool   `json:"signature_valid"`
+}
+
+// resignedMembers returns document's canonical members after mutate, signed
+// over the mutated members under domain, bypassing validation.
+func resignedMembers(t *testing.T, key ed25519.PrivateKey, domain string, document any, mutate func(map[string]any)) string {
+	t.Helper()
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var members map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(&members); err != nil {
+		t.Fatal(err)
+	}
+	mutate(members)
+	members["signature"] = hex.EncodeToString(ed25519.Sign(key, signedMessage(t, domain, members)))
+	return string(canonicalJSON(t, members))
+}
+
+func opNegatives(t *testing.T, validator, miner ed25519.PrivateKey, lease protocol.SandboxLeaseV1) []opNegative {
+	t.Helper()
+	read := signedOp(t, validator, unsignedOp(t, lease, sandbox.OpFileRead))
+	stat := signedOp(t, validator, unsignedOp(t, lease, sandbox.OpFileStat))
+	start := signedOp(t, validator, unsignedOp(t, lease, sandbox.OpExecStart))
+	remove := signedOp(t, validator, unsignedOp(t, lease, sandbox.OpFileRemove))
+	request := func(name string, document protocol.SandboxOpRequestV1, mutate func(map[string]any)) opNegative {
+		return opNegative{Name: name, Kind: "request", SignatureValid: true,
+			Document: resignedMembers(t, validator, protocol.SandboxOpRequestSigningDomain, document, mutate)}
+	}
+	receipt := func(name string, document protocol.SandboxOpReceiptV1, mutate func(map[string]any)) opNegative {
+		return opNegative{Name: name, Kind: "receipt", SignatureValid: true,
+			Document: resignedMembers(t, miner, protocol.SandboxOpReceiptSigningDomain, document, mutate)}
+	}
+	duplicate := string(canonicalJSON(t, read))
+	duplicate = `{"path":"/etc/shadow",` + duplicate[1:]
+	return []opNegative{
+		request("request case-variant member", read, func(m map[string]any) { m["PATH"] = "/etc/shadow" }),
+		{Name: "request duplicate member", Kind: "request", Document: duplicate},
+		request("request path traversal", read, func(m map[string]any) { m["path"] = "/workspace/../etc/shadow" }),
+		request("request path with a control byte", read, func(m map[string]any) { m["path"] = "/work\tspace" }),
+		request("request member the op does not use", stat, func(m map[string]any) { m["limit"] = 1 }),
+		request("request missing member", stat, func(m map[string]any) { delete(m, "recursive") }),
+		request("request window over 60 s", stat, func(m map[string]any) { m["expires_at"] = stamp(opNow.Add(61 * time.Second)) }),
+		request("request offset past 2^53-1", read, func(m map[string]any) { m["offset"] = json.Number("9007199254740992") }),
+		request("request exec_id of another lease", signedOp(t, validator, unsignedOp(t, lease, sandbox.OpExecCancel)), func(m map[string]any) {
+			m["exec_id"] = "sbx-" + strings.Repeat("1e", 16) + "-5Fminer-g1-" + strings.Repeat("b2", 16) + "-op-" + strings.Repeat("e5", 16)
+		}),
+		receipt("receipt stage does not answer op", baseOpReceipt(t, start), func(m map[string]any) {}),
+		receipt("receipt case-variant member", opReceipt(t, miner, remove, nil), func(m map[string]any) { m["Stage"] = "failed" }),
+		receipt("receipt result on a non-read op", opReceipt(t, miner, remove, nil), func(m map[string]any) {
+			m["result_digest"], m["next_offset"] = protocol.SandboxContentDigestV1(nil), 0
+		}),
+		receipt("receipt unknown error code", opReceipt(t, miner, remove, nil), func(m map[string]any) {
+			m["stage"], m["error_code"] = "refused", "tenant_mismatch"
+		}),
+		receipt("receipt exec ended after observed_at", opReceipt(t, miner, start, func(r *protocol.SandboxOpReceiptV1) {
+			r.Stage, r.Exec = sandbox.OpStageExited, exitedExec(0, 0)
+		}), func(m map[string]any) {
+			m["exec"].(map[string]any)["ended_at"] = stamp(opNow.Add(time.Hour))
+		}),
+	}
 }
 
 // The op documents are pinned as cross-language vectors from the same test
@@ -179,11 +257,24 @@ func TestSandboxOpDocumentsMatchGoldenVectors(t *testing.T) {
 		withResult(r, listing, 2)
 	})
 
+	writePayload := []byte("print('hello')\n")
+	write := unsignedOp(t, lease, sandbox.OpFileWrite)
+	write.OpNonce, write.PayloadDigest, write.PayloadBytes = strings.Repeat("c5", 16), str(protocol.SandboxContentDigestV1(writePayload)), uint64(len(writePayload))
+	write = signedOp(t, validator, write)
+	writeReceipt := opReceipt(t, miner, write, func(r *protocol.SandboxOpReceiptV1) {
+		r.File = &sandbox.FileInfo{Mode: 0o644, Size: uint64(len(writePayload)), Type: sandbox.FileTypeFile}
+	})
+	refused := opReceipt(t, miner, start, func(r *protocol.SandboxOpReceiptV1) {
+		r.Stage, r.ErrorCode = sandbox.OpStageRefused, str("sandbox_exited")
+	})
+
 	got := sandboxOpsVectorSet{
 		ExecStart: canonicalJSON(t, start), ExecStartDigest: startDigest, ExecPayload: string(payload), OpID: protocol.SandboxOpIDV1(start),
 		ExecRead: canonicalJSON(t, read), ExecReadReceipt: canonicalJSON(t, readReceipt), ExecReadResult: string(output),
 		FileList: canonicalJSON(t, list), FileListReceipt: canonicalJSON(t, listReceipt), FileListResult: string(listing),
-		LeaseDigest: leaseDigest,
+		LeaseDigest: leaseDigest, FileWrite: canonicalJSON(t, write), FileWritePayload: string(writePayload),
+		FileWriteReceipt: canonicalJSON(t, writeReceipt), RefusedReceipt: canonicalJSON(t, refused),
+		Negative: opNegatives(t, validator, miner, lease),
 	}
 	rendered, err := json.MarshalIndent(got, "", "  ")
 	if err != nil {
@@ -207,11 +298,12 @@ func TestSandboxOpDocumentsMatchGoldenVectors(t *testing.T) {
 	if err := json.Unmarshal(want, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	var decodedStart, decodedRead, decodedList protocol.SandboxOpRequestV1
-	var decodedReadReceipt, decodedListReceipt protocol.SandboxOpReceiptV1
+	var decodedStart, decodedRead, decodedList, decodedWrite protocol.SandboxOpRequestV1
+	var decodedReadReceipt, decodedListReceipt, decodedWriteReceipt, decodedRefused protocol.SandboxOpReceiptV1
 	for raw, document := range map[*json.RawMessage]organic.Validator{
 		&vectors.ExecStart: &decodedStart, &vectors.ExecRead: &decodedRead, &vectors.FileList: &decodedList,
 		&vectors.ExecReadReceipt: &decodedReadReceipt, &vectors.FileListReceipt: &decodedListReceipt,
+		&vectors.FileWrite: &decodedWrite, &vectors.FileWriteReceipt: &decodedWriteReceipt, &vectors.RefusedReceipt: &decodedRefused,
 	} {
 		if err := organic.DecodeStrict(*raw, document); err != nil {
 			t.Fatalf("decode pinned vector: %v", err)
@@ -222,18 +314,47 @@ func TestSandboxOpDocumentsMatchGoldenVectors(t *testing.T) {
 	}
 	validatorKey, minerKey := validator.Public().(ed25519.PublicKey), miner.Public().(ed25519.PublicKey)
 	for name, err := range map[string]error{
-		"start":        protocol.VerifySandboxOpRequestV1Signature(decodedStart, validatorKey),
-		"read":         protocol.VerifySandboxOpRequestV1Signature(decodedRead, validatorKey),
-		"list":         protocol.VerifySandboxOpRequestV1Signature(decodedList, validatorKey),
-		"read receipt": protocol.VerifySandboxOpReceiptV1(decodedReadReceipt, minerKey),
-		"list receipt": protocol.VerifySandboxOpReceiptV1(decodedListReceipt, minerKey),
-		"start fence":  protocol.SandboxOpTargetsLeaseV1(decodedStart, lease),
-		"payload":      protocol.SandboxOpPayloadMatchesV1(decodedStart, []byte(vectors.ExecPayload)),
-		"read answers": protocol.SandboxOpReceiptAnswersV1(decodedReadReceipt, decodedRead, []byte(vectors.ExecReadResult)),
-		"list answers": protocol.SandboxOpReceiptAnswersV1(decodedListReceipt, decodedList, []byte(vectors.FileListResult)),
+		"start":         protocol.VerifySandboxOpRequestV1Signature(decodedStart, validatorKey),
+		"read":          protocol.VerifySandboxOpRequestV1Signature(decodedRead, validatorKey),
+		"list":          protocol.VerifySandboxOpRequestV1Signature(decodedList, validatorKey),
+		"read receipt":  protocol.VerifySandboxOpReceiptV1(decodedReadReceipt, minerKey),
+		"list receipt":  protocol.VerifySandboxOpReceiptV1(decodedListReceipt, minerKey),
+		"start fence":   protocol.SandboxOpTargetsLeaseV1(decodedStart, lease),
+		"payload":       protocol.SandboxOpPayloadMatchesV1(decodedStart, []byte(vectors.ExecPayload)),
+		"read answers":  protocol.SandboxOpReceiptAnswersV1(decodedReadReceipt, decodedRead, []byte(vectors.ExecReadResult)),
+		"list answers":  protocol.SandboxOpReceiptAnswersV1(decodedListReceipt, decodedList, []byte(vectors.FileListResult)),
+		"write payload": protocol.SandboxOpPayloadMatchesV1(decodedWrite, []byte(vectors.FileWritePayload)),
+		"write answers": protocol.SandboxOpReceiptAnswersV1(decodedWriteReceipt, decodedWrite, nil),
+		"refused":       protocol.SandboxOpReceiptAnswersV1(decodedRefused, decodedStart, nil),
+		"write receipt": protocol.VerifySandboxOpReceiptV1(decodedWriteReceipt, minerKey),
 	} {
 		if err != nil {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if len(vectors.Negative) == 0 {
+		t.Fatal("no negative vectors")
+	}
+	for _, negative := range vectors.Negative {
+		key, domain := validatorKey, protocol.SandboxOpRequestSigningDomain
+		var document organic.Validator = &protocol.SandboxOpRequestV1{}
+		if negative.Kind == "receipt" {
+			key, domain, document = minerKey, protocol.SandboxOpReceiptSigningDomain, &protocol.SandboxOpReceiptV1{}
+		}
+		if negative.SignatureValid {
+			var members map[string]any
+			decoder := json.NewDecoder(strings.NewReader(negative.Document))
+			decoder.UseNumber()
+			if err := decoder.Decode(&members); err != nil {
+				t.Fatalf("%s: %v", negative.Name, err)
+			}
+			signature, _ := hex.DecodeString(members["signature"].(string))
+			if !ed25519.Verify(key, signedMessage(t, domain, members), signature) {
+				t.Fatalf("%s: negative vector signature must be valid so the refusal is semantic", negative.Name)
+			}
+		}
+		if err := organic.DecodeStrict([]byte(negative.Document), document); err == nil {
+			t.Errorf("negative vector %q decoded and validated", negative.Name)
 		}
 	}
 }
@@ -379,12 +500,16 @@ func TestSandboxOpRequestBounds(t *testing.T) {
 		"write past max file size": {sandbox.OpFileWrite, func(r *protocol.SandboxOpRequestV1) {
 			r.Offset, r.Mode = u64(sandbox.MaxFileWriteBytes-3), nil
 		}},
-		"mode setuid":        {sandbox.OpFileMkdir, func(r *protocol.SandboxOpRequestV1) { r.Mode = u32(0o4755) }},
-		"mkdir without mode": {sandbox.OpFileMkdir, func(r *protocol.SandboxOpRequestV1) { r.Mode = nil }},
-		"write to root":      {sandbox.OpFileWrite, func(r *protocol.SandboxOpRequestV1) { r.Path = str("/") }},
-		"remove root":        {sandbox.OpFileRemove, func(r *protocol.SandboxOpRequestV1) { r.Path = str("/") }},
-		"path traversal":     {sandbox.OpFileRead, func(r *protocol.SandboxOpRequestV1) { r.Path = str("/workspace/../etc/shadow") }},
-		"path relative":      {sandbox.OpFileRead, func(r *protocol.SandboxOpRequestV1) { r.Path = str("etc/passwd") }},
+		"exec_read offset past the retained cap": {sandbox.OpExecRead, func(r *protocol.SandboxOpRequestV1) { r.Offset = u64(sandbox.MaxExecOutputBytes + 1) }},
+		"file_read offset past 2^53-1":           {sandbox.OpFileRead, func(r *protocol.SandboxOpRequestV1) { r.Offset = u64(1 << 53) }},
+		"file_read offset wraps":                 {sandbox.OpFileRead, func(r *protocol.SandboxOpRequestV1) { r.Offset = u64(^uint64(0)) }},
+		"file_list cursor past the scan bound":   {sandbox.OpFileList, func(r *protocol.SandboxOpRequestV1) { r.Offset = u64(65537) }},
+		"mode setuid":                            {sandbox.OpFileMkdir, func(r *protocol.SandboxOpRequestV1) { r.Mode = u32(0o4755) }},
+		"mkdir without mode":                     {sandbox.OpFileMkdir, func(r *protocol.SandboxOpRequestV1) { r.Mode = nil }},
+		"write to root":                          {sandbox.OpFileWrite, func(r *protocol.SandboxOpRequestV1) { r.Path = str("/") }},
+		"remove root":                            {sandbox.OpFileRemove, func(r *protocol.SandboxOpRequestV1) { r.Path = str("/") }},
+		"path traversal":                         {sandbox.OpFileRead, func(r *protocol.SandboxOpRequestV1) { r.Path = str("/workspace/../etc/shadow") }},
+		"path relative":                          {sandbox.OpFileRead, func(r *protocol.SandboxOpRequestV1) { r.Path = str("etc/passwd") }},
 		"binding names other miner": {sandbox.OpFileStat, func(r *protocol.SandboxOpRequestV1) {
 			binding := *r.Subnet
 			binding.MinerHotkey = "5Fother"
@@ -564,6 +689,22 @@ func TestSandboxOpReceiptRules(t *testing.T) {
 			withResult(r, []byte{}, 0)
 			r.ResultBytes = sandbox.MaxChunkBytes + 1
 		}},
+		"ended_at after observed_at": {start, func(r *protocol.SandboxOpReceiptV1) {
+			r.Stage, r.Exec = sandbox.OpStageExited, exitedExec(0, 0)
+			r.Exec.EndedAt = str(stamp(opNow.Add(time.Hour)))
+		}},
+		"started_at after observed_at": {start, func(r *protocol.SandboxOpReceiptV1) {
+			r.Stage, r.Exec = sandbox.OpStageRunning, runningExec(0, 0)
+			r.Exec.StartedAt = stamp(opNow.Add(time.Hour))
+		}},
+		"next_offset past 2^53-1": {read, func(r *protocol.SandboxOpReceiptV1) {
+			r.Stage, r.Exec = sandbox.OpStageRunning, runningExec(0, 0)
+			withResult(r, []byte{}, 1<<53)
+		}},
+		"output total past 2^53-1": {start, func(r *protocol.SandboxOpReceiptV1) {
+			r.Stage, r.Exec = sandbox.OpStageRunning, runningExec(0, 0)
+			r.Exec.StdoutBytes = 1 << 53
+		}},
 		"op_id of another lease": {stat, func(r *protocol.SandboxOpReceiptV1) {
 			r.File = &sandbox.FileInfo{Type: sandbox.FileTypeDirectory}
 			r.OpID = "sbx-" + strings.Repeat("1e", 16) + "-op-" + strings.Repeat("d4", 16)
@@ -596,26 +737,32 @@ func TestSandboxExecNeverStartedOnlyAfterTheAdmissionWindow(t *testing.T) {
 		})
 	}
 	windowEnd := opNow.Add(30*time.Second + sandbox.IssueSkew)
-	if never, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd), read, start); err != nil || !never {
+	minerKey := miner.Public().(ed25519.PublicKey)
+	forged := notFound(read, windowEnd)
+	forged.Signature = strings.Repeat("ab", 64)
+	if never, err := protocol.SandboxExecNeverStartedV1(forged, read, start, minerKey); err == nil || never {
+		t.Fatalf("an unverified exec_not_found must not resolve the exec: %v %v", never, err)
+	}
+	if never, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd), read, start, minerKey); err != nil || !never {
 		t.Fatalf("exec_not_found at the window end must be definitive: %v %v", never, err)
 	}
-	if never, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd.Add(-time.Nanosecond)), read, start); err != nil || never {
+	if never, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd.Add(-time.Nanosecond)), read, start, minerKey); err != nil || never {
 		t.Fatalf("exec_not_found inside the window must not be definitive: %v %v", never, err)
 	}
 	running := opReceipt(t, miner, read, func(r *protocol.SandboxOpReceiptV1) {
 		r.Stage, r.Exec, r.ObservedAt = sandbox.OpStageRunning, runningExec(0, 0), stamp(windowEnd)
 		withResult(r, []byte{}, 0)
 	})
-	if never, err := protocol.SandboxExecNeverStartedV1(running, read, start); err != nil || never {
+	if never, err := protocol.SandboxExecNeverStartedV1(running, read, start, minerKey); err != nil || never {
 		t.Fatalf("a running exec is not a non-start: %v %v", never, err)
 	}
 	otherExec := unsignedOp(t, lease, sandbox.OpExecCancel)
 	otherExec.OpNonce = strings.Repeat("a9", 16)
 	otherExec = signedOp(t, validator, otherExec)
-	if _, err := protocol.SandboxExecNeverStartedV1(notFound(otherExec, windowEnd), otherExec, start); err == nil {
+	if _, err := protocol.SandboxExecNeverStartedV1(notFound(otherExec, windowEnd), otherExec, start, minerKey); err == nil {
 		t.Fatal("a read of another exec resolved this exec_start")
 	}
-	if _, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd), read, signedOp(t, validator, unsignedOp(t, lease, sandbox.OpFileStat))); err == nil {
+	if _, err := protocol.SandboxExecNeverStartedV1(notFound(read, windowEnd), read, signedOp(t, validator, unsignedOp(t, lease, sandbox.OpFileStat)), minerKey); err == nil {
 		t.Fatal("a non-exec op was resolved as an exec_start")
 	}
 }
@@ -696,5 +843,38 @@ func TestSandboxOpReceiptMustAnswerRequestAndResult(t *testing.T) {
 		if err == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+// Acceptance helpers take unverified, possibly hostile input: malformed
+// receipts are errors, never panics, and an exec_start answer may not claim
+// more retained output than the request allowed (lane 7 SR-28-04, SR-28-07).
+func TestSandboxOpAcceptanceRejectsMalformedInputs(t *testing.T) {
+	validator, miner, lease := opLease(t)
+	read := signedOp(t, validator, unsignedOp(t, lease, sandbox.OpExecRead))
+	malformed := baseOpReceipt(t, read)
+	malformed.ResultDigest, malformed.Signature = str(protocol.SandboxContentDigestV1(nil)), strings.Repeat("ab", 64)
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("malformed receipt panicked: %v", recovered)
+			}
+		}()
+		if protocol.SandboxOpReceiptAnswersV1(malformed, read, []byte{}) == nil {
+			t.Fatal("malformed receipt accepted")
+		}
+	}()
+	start := signedOp(t, validator, unsignedOp(t, lease, sandbox.OpExecStart))
+	overCap := opReceipt(t, miner, start, func(r *protocol.SandboxOpReceiptV1) {
+		r.Stage, r.Exec = sandbox.OpStageRunning, runningExec(*start.MaxOutputBytes+1, 0)
+	})
+	if protocol.SandboxOpReceiptAnswersV1(overCap, start, nil) == nil {
+		t.Fatal("exec_start answer retaining more than max_output_bytes was accepted")
+	}
+	atCap := opReceipt(t, miner, start, func(r *protocol.SandboxOpReceiptV1) {
+		r.Stage, r.Exec = sandbox.OpStageRunning, runningExec(*start.MaxOutputBytes, 0)
+	})
+	if err := protocol.SandboxOpReceiptAnswersV1(atCap, start, nil); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -60,7 +60,7 @@ The op ID is `<lease_id>-op-<op_nonce>`. Optional members are present
 | `exec_id` | `exec_read`, `exec_cancel` | an op ID of this lease (prefix `<lease_id>-op-`) |
 | `path` | every `file_*` | path rules below; `/` only for `file_stat`, `file_list` |
 | `payload_digest`, `payload_bytes` | `exec_start`, `file_write` | `sha256:` of the payload, 1..524288 bytes; `payload_bytes` is 0 otherwise |
-| `offset` | `exec_read`, `file_read`, `file_write` (bytes), `file_list` (entries) | `file_write` offset + bytes <= 256 MiB |
+| `offset` | `exec_read`, `file_read`, `file_write` (bytes), `file_list` (entries) | `exec_read` <= 16 MiB (the retained cap); `file_read` <= 2^53-1; `file_list` <= 65536; `file_write` offset + bytes <= 256 MiB |
 | `limit` | `exec_read`, `file_read` (1..524288 bytes), `file_list` (1..1000 entries) | |
 | `stream` | `exec_read` | `stdout` or `stderr` |
 | `timeout_ms` | `exec_start` | 1000..86400000 |
@@ -130,6 +130,10 @@ receipt that contradicts an exact request is miner fraud evidence.
   `file_write` never rewrites, `exec_cancel` is idempotent. The receipt
   reports current state (an exec may have moved from `running` to
   `exited`). Reads are side-effect free and recomputed.
+- The miner admission check (`now < expires_at`) and the durable op-record
+  insert must be one atomic step, or the time must be re-checked after the
+  insert. Otherwise an honest miner could sign `exec_not_found` for an
+  `exec_start` and then start it.
 - The same `op_id` with a different document is signer equivocation:
   `409 sandbox_conflict`, no receipt.
 - An op record is kept at least until `expires_at` plus the 30 s skew, after
@@ -149,10 +153,11 @@ request's `expires_at` plus the 30 s skew; no layer persists or logs them.
 - **After the window** the request is inadmissible:
   - `exec_start` is resolved with `exec_read` or `exec_cancel` naming
     `exec_id = op_id`. The miner records every admitted `exec_start` before
-    any effect and keeps the record until lease cleanup, so an
+    any effect and keeps the record until lease cleanup. An
     `exec_not_found` receipt signed at or after the start's `expires_at`
-    plus the skew is a definitive non-start
-    (`SandboxExecNeverStartedV1`). An earlier `exec_not_found` is not
+    plus the skew is therefore a definitive non-start.
+    `SandboxExecNeverStartedV1` checks this, and verifies the receipt
+    signature itself. An earlier `exec_not_found` is not
     definitive, because the start may still be in flight. A miner that later
     reports that exec as started has signed a contradiction.
   - `file_write` is reported to the tenant as `outcome_unknown` (a gateway
@@ -191,8 +196,29 @@ request's `expires_at` plus the 30 s skew; no layer persists or logs them.
 `{"argv": [...], "cwd": "/...", "env": {}, "stdin_b64": null | "<base64>"}`:
 1..1024 arguments of at most 32 KiB without NUL (256 KiB total), a `cwd`
 under the path rules, `env` always the empty object, and at most 256 KiB of
-canonical base64 stdin. Decoding is strict: every member present, no
-unknown or duplicate member at any depth, no trailing data.
+canonical base64 stdin.
+
+The payload bytes are bound by `payload_digest`, and parsers in other
+languages (gateway policy, audit) read them too. Every reader must therefore
+decode the same members, and decoding is strict:
+
+- exactly one JSON object whose member names are **byte-exactly** `argv`,
+  `cwd`, `env` and `stdin_b64`, all present. Case variants such as `ARGV`
+  or `Cwd` are refused, because a case-insensitive decoder would otherwise
+  let them override the real member;
+- no duplicate key at any depth, and no trailing data;
+- valid UTF-8, and no unpaired surrogate escape (`\ud800` alone, or a low
+  surrogate first). Decoders that silently substitute U+FFFD would
+  otherwise disagree;
+- `stdin_b64` is standard padded base64 that re-encodes to itself: no CR,
+  LF, spaces, URL alphabet, missing padding or non-zero padding bits.
+
+`pkg/sandbox/testdata/sandbox-ops-v1-exec-payload-vectors.json` holds the
+accept and reject vectors as exact bytes, for every implementation to run.
+Signed op documents use the canonical decoding rule of every other signed
+document. Negative request and receipt vectors are in
+`pkg/protocol/testdata/sandbox-ops-v1-vectors.json`, signed validly, so the
+refusal must come from decoding or validation.
 
 Per-exec environment is not part of v1: every customer variable goes
 through the lease's `secret_env`, which is refused until sealed delivery
@@ -239,7 +265,9 @@ security design review, and the helper slice must meet them:
   root-owned and not group- or other-writable; and the configured SHA-256.
   The engine readback must equal exactly that one mount. With ops off,
   create and readback stay byte-identical (`Mounts == []`).
-- **Invocation:** the image default user (never 0), not privileged, empty
+- **Invocation:** the image default user: the engine `User` is left empty
+  and never overridden. If the image's default user is root, the helper
+  runs as root inside the sandbox, as the workload does. Not privileged, empty
   environment, no TTY, the fixed absolute helper path as `argv[0]`, never
   `sh -c`.
 - **Untrusted output:** customer code with the same uid can kill, ptrace or
@@ -257,6 +285,15 @@ security design review, and the helper slice must meet them:
   entrypoint in v1. An implicit entrypoint override is rejected. Images
   whose own process exits answer `sandbox_exited`. A helper-init keepalive
   needs a signed lease v2 member.
+- **Image-controlled mount target:** the image may already contain
+  `/.misscomputer` as a symlink (to `..`, `/proc/self/root`, `/usr/bin`), a
+  regular file, or a directory holding a fake helper. The backend must not
+  assume the target is benign. The mount must resolve inside the sandbox
+  root filesystem (gVisor resolves mounts in the sentry). A conflict that
+  makes create fail is a non-fault refusal, not `runtime_start_failed`.
+  The helper path must still run the pinned binary, which is checked by
+  hashing it inside the guest. Probe D5-P9 covers each of these cases, and
+  the pass condition is that the host filesystem is untouched.
 - **Gate:** the resolver's `openat2` behavior, the mount's immutability
   from guest root, and process-group kill must be proven inside the pinned
   runsc release before any miner advertises `sandbox-ops-v1`. If `openat2`
@@ -282,6 +319,14 @@ daemon or an exec-create API error not caused by container state.
 A malformed, unsigned or inadmissible request, or a payload that does not
 match its binding, is refused with a stable code and no receipt. Ops are
 score-neutral, so attribution is diagnostic only.
+
+Receipt error codes are not constrained per op, and attribution is
+self-reported by the miner: a miner can label its own fault
+`sandbox_op_failed`. Exec status fields are bounded only loosely: retained
+output must stay within the protocol cap and, for `exec_start`, within
+`max_output_bytes`. Start and end times must lie at or before
+`observed_at`. None of these fields may ever feed scoring. The gateway
+re-caps them and does not trust them for accounting.
 
 ## Visibility
 

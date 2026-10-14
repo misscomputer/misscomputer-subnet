@@ -41,7 +41,7 @@ var (
 
 // MaxDirectoryScan bounds the names one file_list reads to sort a
 // directory; a larger directory is refused rather than listed partially.
-const MaxDirectoryScan = 65536
+const MaxDirectoryScan = sandbox.MaxListCursor
 
 // MaxRemoveDepth bounds the directory nesting a recursive file_remove
 // descends, and so the descriptors it holds open at once.

@@ -199,6 +199,20 @@ func (m opMembers) check(r SandboxOpRequestV1) error {
 	if m.maxOutput && (*r.MaxOutputBytes < sandbox.MinExecOutputBytes || *r.MaxOutputBytes > sandbox.MaxExecOutputBytes) {
 		return errors.New("exec max_output_bytes is out of bounds")
 	}
+	if m.offset {
+		bound := uint64(sandbox.MaxSafeInteger)
+		switch r.Op {
+		case sandbox.OpExecRead:
+			bound = sandbox.MaxExecOutputBytes
+		case sandbox.OpFileList:
+			bound = sandbox.MaxListCursor
+		case sandbox.OpFileWrite:
+			bound = sandbox.MaxFileWriteBytes
+		}
+		if *r.Offset > bound {
+			return errors.New("sandbox op offset is out of bounds")
+		}
+	}
 	switch r.Op {
 	case sandbox.OpFileWrite:
 		// Offset 0 creates or truncates and needs the permission bits; a
@@ -291,9 +305,6 @@ func (r SandboxOpReceiptV1) validateUnsigned() error {
 			return errors.New("timed out file op must report op_deadline_exceeded")
 		}
 	}
-	if err := r.validateExec(execOp); err != nil {
-		return err
-	}
 	fileInfo := (r.Op == sandbox.OpFileWrite || r.Op == sandbox.OpFileStat || r.Op == sandbox.OpFileMkdir) && r.Stage == sandbox.OpStageCompleted
 	if fileInfo != (r.File != nil) {
 		return errors.New("op receipt file member must be present exactly for a completed write, stat or mkdir")
@@ -306,19 +317,23 @@ func (r SandboxOpReceiptV1) validateUnsigned() error {
 		return errors.New("op receipt result is present exactly for a successful read or list")
 	}
 	if result {
-		if !organic.ValidDigest(*r.ResultDigest) || r.ResultBytes > sandbox.MaxChunkBytes {
+		if !organic.ValidDigest(*r.ResultDigest) || r.ResultBytes > sandbox.MaxChunkBytes || *r.NextOffset > sandbox.MaxSafeInteger {
 			return errors.New("op receipt result binding is invalid")
 		}
 	} else if r.ResultBytes != 0 || r.EOF {
 		return errors.New("op receipt without a result declares result bytes or eof")
 	}
-	if _, err := parseStaticTime(r.ObservedAt); err != nil {
+	observed, err := parseStaticTime(r.ObservedAt)
+	if err != nil {
+		return err
+	}
+	if err := r.validateExec(execOp, observed); err != nil {
 		return err
 	}
 	return validateSandboxBinding(r.Subnet, r.MinerID)
 }
 
-func (r SandboxOpReceiptV1) validateExec(execOp bool) error {
+func (r SandboxOpReceiptV1) validateExec(execOp bool, observed time.Time) error {
 	wantState, sessionStage := execStateOfStage[r.Stage]
 	switch {
 	case !execOp || r.Stage == sandbox.OpStageRefused:
@@ -340,18 +355,21 @@ func (r SandboxOpReceiptV1) validateExec(execOp bool) error {
 		}
 	}
 	e := r.Exec
-	if _, err := parseStaticTime(e.StartedAt); err != nil {
-		return err
+	started, err := parseStaticTime(e.StartedAt)
+	if err != nil || started.After(observed) {
+		return errors.New("exec started_at is invalid or after observed_at")
 	}
 	if (e.State == sandbox.ExecStateRunning) != (e.EndedAt == nil) {
 		return errors.New("exec ended_at is present exactly for a terminal exec")
 	}
 	if e.EndedAt != nil {
-		started, _ := parseStaticTime(e.StartedAt)
 		ended, err := parseStaticTime(*e.EndedAt)
-		if err != nil || ended.Before(started) {
-			return errors.New("exec ended_at is invalid")
+		if err != nil || ended.Before(started) || ended.After(observed) {
+			return errors.New("exec ended_at is invalid or outside started_at..observed_at")
 		}
+	}
+	if e.StdoutBytes > sandbox.MaxSafeInteger || e.StderrBytes > sandbox.MaxSafeInteger {
+		return errors.New("exec output totals exceed 2^53-1")
 	}
 	if (e.State == sandbox.ExecStateExited) != (e.ExitCode != nil) || (e.ExitCode != nil && (*e.ExitCode < 0 || *e.ExitCode > 255)) {
 		return errors.New("exec exit_code is present exactly for an exited exec, 0..255")
@@ -423,7 +441,17 @@ func SandboxOpTargetsLeaseV1(r SandboxOpRequestV1, lease SandboxLeaseV1) error {
 
 // SandboxOpReceiptAnswersV1 is the validator's acceptance check of a receipt
 // and the result bytes that came with it, against the complete request.
+//
+// It validates both documents first, so malformed input is an error, never
+// a panic. It does not verify the receipt signature: callers verify with
+// VerifySandboxOpReceiptV1 against the bound miner service key.
 func SandboxOpReceiptAnswersV1(r SandboxOpReceiptV1, request SandboxOpRequestV1, result []byte) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	if err := r.Validate(); err != nil {
+		return err
+	}
 	digest, err := SandboxOpDigestV1(request)
 	if err != nil {
 		return err
@@ -432,6 +460,10 @@ func SandboxOpReceiptAnswersV1(r SandboxOpReceiptV1, request SandboxOpRequestV1,
 		r.SandboxID != request.SandboxID || r.Generation != request.Generation || r.MinerID != request.MinerID ||
 		!sameSandboxParties(r.Subnet, request.Subnet) {
 		return errors.New("sandbox op receipt does not answer the request")
+	}
+	if request.Op == sandbox.OpExecStart && r.Exec != nil &&
+		(r.Exec.StdoutRetained > *request.MaxOutputBytes || r.Exec.StderrRetained > *request.MaxOutputBytes) {
+		return errors.New("sandbox exec_start receipt retains more output than max_output_bytes")
 	}
 	if r.ResultDigest == nil {
 		if result != nil {
@@ -470,8 +502,9 @@ func SandboxOpReceiptAnswersV1(r SandboxOpReceiptV1, request SandboxOpRequestV1,
 }
 
 // SandboxExecNeverStartedV1 is the definitive non-start rule for an
-// exec_start whose outcome is unknown (contract D13). It holds only when
-// readReceipt is a verified, accepted answer to readRequest; readRequest is
+// exec_start whose outcome is unknown (contract D13). It verifies
+// readReceipt against minerKey, the subnet-bound miner service key, and
+// holds only when the receipt is an accepted answer to readRequest; readRequest is
 // an exec_read or exec_cancel naming start's op ID on the same lease;
 // the receipt refuses with exec_not_found; and the miner signed it at or
 // after start.expires_at plus the issue skew. From then on start is
@@ -481,7 +514,13 @@ func SandboxOpReceiptAnswersV1(r SandboxOpReceiptV1, request SandboxOpRequestV1,
 // An earlier exec_not_found is not definitive: start may still be in
 // flight. A miner that later reports start as started has signed a
 // contradiction of this receipt.
-func SandboxExecNeverStartedV1(readReceipt SandboxOpReceiptV1, readRequest, start SandboxOpRequestV1) (bool, error) {
+func SandboxExecNeverStartedV1(readReceipt SandboxOpReceiptV1, readRequest, start SandboxOpRequestV1, minerKey ed25519.PublicKey) (bool, error) {
+	if err := start.Validate(); err != nil {
+		return false, err
+	}
+	if err := VerifySandboxOpReceiptV1(readReceipt, minerKey); err != nil {
+		return false, err
+	}
 	if start.Op != sandbox.OpExecStart || (readRequest.Op != sandbox.OpExecRead && readRequest.Op != sandbox.OpExecCancel) ||
 		readRequest.ExecID == nil || *readRequest.ExecID != SandboxOpIDV1(start) || readRequest.LeaseID != start.LeaseID ||
 		readRequest.LeaseDigest != start.LeaseDigest || !sameSandboxParties(readRequest.Subnet, start.Subnet) {

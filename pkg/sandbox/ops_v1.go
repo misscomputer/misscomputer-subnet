@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // sandbox-ops-v1 (docs/sandbox-ops-v1.md) is a separately versioned
@@ -50,20 +50,27 @@ const (
 // Bounds of the ops extension. Payload and result bytes travel base64 in a
 // bridge envelope capped at 1 MiB, so one chunk is at most 512 KiB raw.
 const (
-	MaxChunkBytes       = 512 << 10
-	MaxFileWriteBytes   = 256 << 20
-	MaxListEntries      = 1000
-	MinExecTimeoutMS    = 1000
-	MaxExecTimeoutMS    = 24 * 60 * 60 * 1000
-	MinExecOutputBytes  = 1 << 10
-	MaxExecOutputBytes  = 16 << 20
-	MaxRunningExecs     = 16
-	MaxExecSessions     = 1024
-	MaxExecArgs         = 1024
-	MaxExecArgBytes     = 32 << 10
-	MaxExecArgvBytes    = 256 << 10
-	MaxExecStdinBytes   = 256 << 10
-	MaxPathBytes        = 4096
+	MaxChunkBytes      = 512 << 10
+	MaxFileWriteBytes  = 256 << 20
+	MaxListEntries     = 1000
+	MinExecTimeoutMS   = 1000
+	MaxExecTimeoutMS   = 24 * 60 * 60 * 1000
+	MinExecOutputBytes = 1 << 10
+	MaxExecOutputBytes = 16 << 20
+	MaxRunningExecs    = 16
+	MaxExecSessions    = 1024
+	MaxExecArgs        = 1024
+	MaxExecArgBytes    = 32 << 10
+	MaxExecArgvBytes   = 256 << 10
+	MaxExecStdinBytes  = 256 << 10
+	MaxPathBytes       = 4096
+	// MaxSafeInteger bounds every unbounded byte offset or count in an op
+	// document, so no cursor arithmetic can wrap and every value survives
+	// JSON consumers that use IEEE doubles.
+	MaxSafeInteger = 1<<53 - 1
+	// MaxListCursor bounds a file_list entry cursor: the helper refuses a
+	// directory with more entries than this rather than list it partially.
+	MaxListCursor       = 65536
 	MaxPathComponent    = 255
 	MaxFileModeBits     = 0o777
 	ExecStdout          = "stdout"
@@ -143,8 +150,8 @@ func ValidOp(value string) bool {
 // slash. The root "/" is valid only where allowRoot is set (stat and list).
 //
 // Syntax is not containment: a valid path may still name a symlink. How a
-// path resolves (always inside the sandbox root) is the backend's duty; see
-// pkg/sandbox/fsroot for the reference resolver.
+// path resolves (always inside the sandbox root) is the in-sandbox helper's
+// duty; see cmd/sandbox-ops-helper/internal/fsroot.
 func ValidOpPath(path string, allowRoot bool) error {
 	if len(path) == 0 || len(path) > MaxPathBytes || path[0] != '/' {
 		return errors.New("sandbox path must be absolute and at most 4096 bytes")
@@ -205,8 +212,10 @@ func (c ExecCommand) Validate() error {
 		return fmt.Errorf("exec %w", err)
 	}
 	if c.Stdin != nil {
+		// Strict decoding still skips CR and LF, so canonical form is
+		// checked by re-encoding: one stdin has exactly one encoding.
 		decoded, err := base64.StdEncoding.Strict().DecodeString(*c.Stdin)
-		if err != nil || len(decoded) > MaxExecStdinBytes {
+		if err != nil || len(decoded) > MaxExecStdinBytes || base64.StdEncoding.EncodeToString(decoded) != *c.Stdin {
 			return errors.New("exec stdin_b64 is not canonical base64 of at most 256 KiB")
 		}
 	}
@@ -222,38 +231,113 @@ func (c ExecCommand) StdinBytes() []byte {
 	return decoded
 }
 
-// DecodeExecCommand strictly decodes and validates an exec_start payload:
-// exactly one JSON object, no unknown or duplicate members, every member
-// present.
+// execMembers are the exec payload members, matched byte-exactly.
+var execMembers = []string{"argv", "cwd", "env", "stdin_b64"}
+
+// DecodeExecCommand strictly decodes and validates an exec_start payload.
+// The bytes are bound by payload_digest and may be read by parsers in other
+// languages (gateway policy, audit), so every reader must see the same
+// members: exactly one JSON object whose member names are byte-exactly
+// argv, cwd, env and stdin_b64 (no case variants, which encoding/json would
+// otherwise fold onto a struct field), no duplicate key at any depth, valid
+// UTF-8 with no unpaired surrogate escape, and no trailing data.
 func DecodeExecCommand(payload []byte) (ExecCommand, error) {
-	var command ExecCommand
 	if len(payload) == 0 || len(payload) > MaxChunkBytes {
-		return command, errors.New("exec payload size is invalid")
+		return ExecCommand{}, errors.New("exec payload size is invalid")
+	}
+	if !utf8.Valid(payload) {
+		return ExecCommand{}, errors.New("exec payload is not valid UTF-8")
 	}
 	if err := rejectDuplicateMembers(payload); err != nil {
-		return command, err
+		return ExecCommand{}, err
 	}
-	var present map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &present); err != nil {
-		return command, errors.New("exec payload must be a JSON object")
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &members); err != nil || members == nil {
+		return ExecCommand{}, errors.New("exec payload must be a JSON object")
 	}
-	for _, member := range []string{"argv", "cwd", "env", "stdin_b64"} {
-		if _, ok := present[member]; !ok {
-			return command, errors.New("exec payload member " + member + " is missing")
+	if err := rejectUnpairedSurrogates(payload); err != nil {
+		return ExecCommand{}, err
+	}
+	if len(members) != len(execMembers) {
+		return ExecCommand{}, errors.New("exec payload must hold exactly argv, cwd, env and stdin_b64")
+	}
+	for _, name := range execMembers {
+		if _, ok := members[name]; !ok {
+			return ExecCommand{}, errors.New("exec payload member " + name + " is missing")
 		}
 	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&command); err != nil {
-		return ExecCommand{}, errors.New("exec payload is invalid")
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return ExecCommand{}, errors.New("exec payload has trailing data")
+	var command ExecCommand
+	for name, target := range map[string]any{"argv": &command.Argv, "cwd": &command.Cwd, "env": &command.Env, "stdin_b64": &command.Stdin} {
+		if err := json.Unmarshal(members[name], target); err != nil {
+			return ExecCommand{}, errors.New("exec payload member " + name + " has the wrong type")
+		}
 	}
 	if err := command.Validate(); err != nil {
 		return ExecCommand{}, err
 	}
 	return command, nil
+}
+
+// rejectUnpairedSurrogates refuses a \uD800-\uDFFF escape that is not a
+// high surrogate immediately followed by a low one. encoding/json would
+// silently replace it with U+FFFD, so two parsers could disagree on the
+// string. Call it only on syntactically valid JSON.
+func rejectUnpairedSurrogates(payload []byte) error {
+	inString := false
+	for index := 0; index < len(payload); index++ {
+		switch character := payload[index]; {
+		case character == '"':
+			inString = !inString
+		case inString && character == '\\':
+			index++
+			if index >= len(payload) {
+				return errors.New("exec payload has an invalid escape")
+			}
+			if payload[index] != 'u' {
+				continue
+			}
+			code, ok := hexEscape(payload, index+1)
+			if !ok {
+				return errors.New("exec payload has an invalid unicode escape")
+			}
+			index += 4
+			switch {
+			case code >= 0xdc00 && code <= 0xdfff:
+				return errors.New("exec payload has an unpaired surrogate escape")
+			case code >= 0xd800 && code <= 0xdbff:
+				if index+2 >= len(payload) || payload[index+1] != '\\' || payload[index+2] != 'u' {
+					return errors.New("exec payload has an unpaired surrogate escape")
+				}
+				low, ok := hexEscape(payload, index+3)
+				if !ok || low < 0xdc00 || low > 0xdfff {
+					return errors.New("exec payload has an unpaired surrogate escape")
+				}
+				index += 6
+			}
+		}
+	}
+	return nil
+}
+
+func hexEscape(payload []byte, start int) (rune, bool) {
+	if start+4 > len(payload) {
+		return 0, false
+	}
+	var code rune
+	for _, digit := range payload[start : start+4] {
+		code <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			code |= rune(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			code |= rune(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			code |= rune(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return code, true
 }
 
 // rejectDuplicateMembers refuses a JSON value with a repeated object key at
