@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -446,6 +447,45 @@ func TestSandboxCommitReplayStartsOrphanedPendingLease(t *testing.T) {
 	}
 }
 
+// A create that completes after the hard expiry cannot turn a durable
+// pending lease into a ready sandbox, even if admission preceded expiry.
+func TestSandboxCreateFinishingAfterExpiryDestroysSandbox(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	r := f.reservation(1)
+	if receipt, err := f.lane.Reserve(ctx, r, f.request()); err != nil || receipt.Stage != sandbox.StageHeld {
+		t.Fatalf("reserve: stage=%s err=%v", receipt.Stage, err)
+	}
+	l := f.lease(r, func(l *protocol.SandboxLeaseV1) {
+		l.LeaseExpiresAt = stamp(f.now.Add(2 * time.Second))
+	})
+	leaseID := protocol.SandboxLeaseIDV1(l)
+	var clock atomic.Int64
+	clock.Store(f.now.UnixNano())
+	f.lane.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	f.backend.createGate = make(chan struct{})
+	type result struct {
+		receipt protocol.SandboxReceiptV1
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		receipt, err := f.lane.Commit(ctx, l, f.request())
+		done <- result{receipt, err}
+	}()
+	waitLease(t, f, leaseID, "pending")
+	clock.Store(f.now.Add(2 * time.Second).UnixNano())
+	close(f.backend.createGate)
+	got := <-done
+	f.check(got.receipt, got.err, protocol.SandboxLeaseSchema, l, sandbox.StageExpired, "")
+	if live, _, destroyed := f.backend.state(); live != 0 || len(destroyed) != 1 {
+		t.Fatalf("expired create left sandbox running: live=%d destroyed=%v", live, destroyed)
+	}
+	if record, found, err := f.store.Lease(ctx, leaseID); err != nil || !found || record.Status != "expired" {
+		t.Fatalf("expired create durable state: %+v found=%v err=%v", record, found, err)
+	}
+}
+
 // A release that lands while the sandbox is still being created fences the
 // identity at once; the sandbox is destroyed after create returns and the
 // lease ends released, not running.
@@ -620,6 +660,42 @@ func TestNewSandboxLaneRequiresAnEnforcedDedicatedBudget(t *testing.T) {
 			})
 			if (err == nil) != test.ok {
 				t.Fatalf("NewSandboxLane error = %v, want ok=%t", err, test.ok)
+			}
+		})
+	}
+}
+
+// A cgroup limit read through a symlink can describe a different subtree
+// (or an ordinary file), while the sandbox subtree remains unlimited.
+func TestNewSandboxLaneRejectsSymlinkedCgroupLimits(t *testing.T) {
+	for _, name := range []string{"directory", "cpu.max", "memory.max"} {
+		t.Run(name, func(t *testing.T) {
+			f := newSBFixture(t)
+			root := t.TempDir()
+			writeCgroup(t, root, "400000 100000", fmt.Sprint(8192<<20))
+			dir := filepath.Join(root, sbCgroup)
+			if name == "directory" {
+				outside := filepath.Join(t.TempDir(), "finite-cgroup")
+				if err := os.Rename(dir, outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, dir); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				limit := filepath.Join(dir, name)
+				outside := filepath.Join(t.TempDir(), name)
+				if err := os.Rename(limit, outside); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(outside, limit); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := NewSandboxLane(context.Background(), f.agent(), f.store, f.backend, SandboxLaneConfig{
+				Budget: sbBudget, CgroupRoot: root, AgentCgroup: "/system.slice/miner-agent.service", DeploymentCgroup: "/system.slice/deployment-v4.slice",
+			}); err == nil {
+				t.Fatal("accepted finite limits outside the selected sandbox cgroup")
 			}
 		})
 	}
