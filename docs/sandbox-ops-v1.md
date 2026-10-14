@@ -4,7 +4,8 @@ Status: **proposed contract, standalone code only, off by default, not
 customer-ready.** This slice adds the vocabulary (`pkg/sandbox/ops_v1.go`),
 the two signed documents and their validation (`pkg/protocol/sandbox_ops_v1.go`),
 cross-language vectors (`pkg/protocol/testdata/sandbox-ops-v1-vectors.json`)
-and the reference in-sandbox path resolver (`pkg/sandbox/fsroot`). No miner
+and the helper's in-sandbox path resolver
+(`cmd/sandbox-ops-helper/internal/fsroot`). No miner
 route, flag, capability, durable table, backend method, helper binary or
 neuron transport exists yet, and no running binary behaves differently.
 
@@ -207,7 +208,9 @@ exists, and an exec-level `env` would bypass that rule.
 - Resolution happens **inside the sandbox isolation boundary** (in the
   gVisor sentry), never on the host: no host-side access to a container's
   overlay trees, no `docker cp`, no host-side resolver over those trees.
-- Inside the sandbox, `pkg/sandbox/fsroot` resolves with
+- Inside the sandbox, the helper's resolver
+  (`cmd/sandbox-ops-helper/internal/fsroot`; only the helper can import it,
+  and its `Open` takes no directory and opens `/`) resolves with
   `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`: symlinks follow
   container semantics (absolute targets are relative to the sandbox root,
   `..` never rises above it), procfs magic links are refused, a final
@@ -218,13 +221,46 @@ exists, and an exec-level `env` would bypass that rule.
   refused without blocking. Without `openat2` it refuses with
   `ops_unsupported`; there is no fallback.
 
-How the in-sandbox helper reaches a sandbox started from an arbitrary
-public image is still an open design item. The proposal is a pinned,
-read-only, single-binary mount, present only when ops are enabled. Keeping
-the container alive after its own command exits is also undecided (helper
-as PID 1, or a lease v2 member). This slice ships no helper and no mount.
-Until both are decided, an op against an exited container answers
-`sandbox_exited`.
+## In-sandbox helper (later slice, requirements)
+
+File operations and exec run through one helper binary inside the sandbox.
+Docker cannot kill an exec instance, so the helper is also what kills a
+whole process group at a deadline and caps output at the producer. This
+slice ships no helper and no mount. These requirements come from the
+security design review, and the helper slice must meet them:
+
+- **Delivery:** a root-owned, read-only `0555` host **directory** containing
+  only the helper, bind-mounted read-only, `nosuid`, `nodev`, `rprivate`
+  at `/.misscomputer`, and only when ops are enabled. A directory
+  mountpoint cannot be renamed or replaced by guest root (`EBUSY`); a
+  single-file bind is not acceptable without probe evidence. Before every
+  create, the miner opens the source without following symlinks and checks:
+  a regular file owned by uid 0 with mode exactly `0555`; ancestors that are
+  root-owned and not group- or other-writable; and the configured SHA-256.
+  The engine readback must equal exactly that one mount. With ops off,
+  create and readback stay byte-identical (`Mounts == []`).
+- **Invocation:** the image default user (never 0), not privileged, empty
+  environment, no TTY, the fixed absolute helper path as `argv[0]`, never
+  `sh -c`.
+- **Untrusted output:** customer code with the same uid can kill, ptrace or
+  replace the helper process. The miner parses helper output with bounded
+  framing and a strict schema, re-applies every cap, and never logs payload
+  bytes.
+- **Kill path:** if the wrapper does not confirm after SIGTERM, 5 s and a
+  grace period, the miner sends one more cancel. It then reports
+  `timed_out` or `cancelled` and closes the stream, so no miner resource is
+  left unbounded.
+- **Build:** static Go, `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`,
+  pinned toolchain, published SHA-256. No network, configuration files or
+  environment-driven behavior. One size-capped request on stdin.
+- **Keepalive:** the helper is never PID 1 and never replaces the image
+  entrypoint in v1. An implicit entrypoint override is rejected. Images
+  whose own process exits answer `sandbox_exited`. A helper-init keepalive
+  needs a signed lease v2 member.
+- **Gate:** the resolver's `openat2` behavior, the mount's immutability
+  from guest root, and process-group kill must be proven inside the pinned
+  runsc release before any miner advertises `sandbox-ops-v1`. If `openat2`
+  is missing inside the sandbox, ops answer `ops_unsupported`.
 
 ## Error codes
 
@@ -233,7 +269,16 @@ Non-fault: `lease_not_running`, `lease_expired`, `released`,
 `path_exists`, `path_not_file`, `path_not_directory`, `path_refused`,
 `directory_not_empty`, `permission_denied`, `no_space`, `file_too_large`,
 `offset_mismatch`, `op_deadline_exceeded`, `ops_unsupported`,
-`sandbox_disabled`. Miner faults: `op_runtime_failed`, `miner_restart`.
+`sandbox_disabled`, `sandbox_op_failed`, `sandbox_resources_exhausted`.
+Miner faults: `op_runtime_failed`, `miner_restart`.
+
+Every failure that originates inside the sandbox is non-fault, because
+guest code shares the helper's identity and can frame the miner by killing
+or starving the helper. That covers a helper protocol error, exit or kill
+(`sandbox_op_failed`), and pids, memory or descriptor exhaustion of the lease
+(`sandbox_resources_exhausted`). `op_runtime_failed` is reserved for
+miner-side engine and transport failures, such as an unreachable dedicated
+daemon or an exec-create API error not caused by container state.
 A malformed, unsigned or inadmissible request, or a payload that does not
 match its binding, is refused with a stable code and no receipt. Ops are
 score-neutral, so attribution is diagnostic only.

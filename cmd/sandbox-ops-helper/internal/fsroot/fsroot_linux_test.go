@@ -2,7 +2,7 @@
 
 //go:build linux
 
-package fsroot_test
+package fsroot
 
 import (
 	"context"
@@ -15,13 +15,12 @@ import (
 	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
-	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox/fsroot"
 )
 
 // hostileTree builds <tmp>/outside/secret and a sandbox root whose links
 // point at it by absolute host path, by "..", and through a symlinked
 // directory. It returns the opened root, the root path and the outside dir.
-func hostileTree(t *testing.T) (*fsroot.Root, string, string) {
+func hostileTree(t *testing.T) (*Root, string, string) {
 	t.Helper()
 	base := t.TempDir()
 	outside := filepath.Join(base, "outside")
@@ -51,8 +50,8 @@ func hostileTree(t *testing.T) (*fsroot.Root, string, string) {
 	if err := os.WriteFile(filepath.Join(root, "workspace", "real.txt"), []byte("inside"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r, err := fsroot.Open(root)
-	if errors.Is(err, fsroot.ErrUnsupported) {
+	r, err := openAt(root)
+	if errors.Is(err, ErrUnsupported) {
 		t.Skip("kernel has no openat2 in-root resolution")
 	}
 	if err != nil {
@@ -62,7 +61,7 @@ func hostileTree(t *testing.T) (*fsroot.Root, string, string) {
 	return r, root, outside
 }
 
-func code(err error) string { return fsroot.Code(err) }
+func code(err error) string { return Code(err) }
 
 // Every symlink resolves as if the sandbox root were "/": no read, stat or
 // write reaches the host tree, while a legitimate in-root absolute link works.
@@ -272,8 +271,8 @@ func TestMkdir(t *testing.T) {
 // RESOLVE_NO_MAGICLINKS keeps it if that kernel behavior changes. Plain
 // openat2 without the resolve flags fails this test.
 func TestMagicLinksAreRefused(t *testing.T) {
-	r, err := fsroot.Open("/")
-	if errors.Is(err, fsroot.ErrUnsupported) {
+	r, err := Open()
+	if errors.Is(err, ErrUnsupported) {
 		t.Skip("kernel has no openat2 in-root resolution")
 	}
 	if err != nil {
@@ -290,6 +289,24 @@ func TestMagicLinksAreRefused(t *testing.T) {
 	for _, path := range []string{"/proc/self/root", "/proc/self/root/etc", "/proc/self/cwd", "/proc/self/exe"} {
 		if _, err := r.Stat(ctx, path); code(err) != "path_refused" {
 			t.Errorf("magic link %s: %v", path, err)
+		}
+	}
+}
+
+// Errors from the resolver originate inside the sandbox, where guest code
+// can starve or break the helper, so none of them may be a miner fault
+// (lane 7 B-6).
+func TestCodesNeverAttributeSandboxFailuresToTheMiner(t *testing.T) {
+	for err, want := range map[error]string{
+		errors.New("unrecognized"): sandbox.OpCodeSandboxFailed,
+		syscall.ENOMEM:             sandbox.OpCodeResourcesExhausted,
+		syscall.EMFILE:             sandbox.OpCodeResourcesExhausted,
+		context.DeadlineExceeded:   sandbox.OpCodeDeadline,
+		ErrUnsupported:             sandbox.OpCodeOpsUnsupport,
+	} {
+		got := Code(err)
+		if got != want || sandbox.OpErrorAttribution[got] {
+			t.Errorf("%v => %s (miner fault %v), want non-fault %s", err, got, sandbox.OpErrorAttribution[got], want)
 		}
 	}
 }

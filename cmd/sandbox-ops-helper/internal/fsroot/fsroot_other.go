@@ -15,7 +15,7 @@ import (
 type Root struct{}
 
 // Open always fails with ErrUnsupported outside Linux.
-func Open(string) (*Root, error) { return nil, ErrUnsupported }
+func Open() (*Root, error) { return nil, ErrUnsupported }
 
 func (*Root) Stat(context.Context, string) (sandbox.FileInfo, error) {
 	return sandbox.FileInfo{}, ErrUnsupported

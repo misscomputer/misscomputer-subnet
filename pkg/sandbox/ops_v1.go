@@ -88,34 +88,44 @@ const (
 	OpCodeOpsUnsupport  = "ops_unsupported"
 	OpCodeDeadline      = "op_deadline_exceeded"
 	OpCodeRuntimeFailed = "op_runtime_failed"
+	// OpCodeSandboxFailed and OpCodeResourcesExhausted report failures that
+	// originate inside the sandbox (lane 7 B-6): guest code shares the
+	// helper's identity and can kill, starve or break it, so they are never
+	// miner faults.
+	OpCodeSandboxFailed      = "sandbox_op_failed"
+	OpCodeResourcesExhausted = "sandbox_resources_exhausted"
 )
 
 // OpErrorAttribution maps every op receipt error code to whether it is
-// attributed to the miner. Customer state (missing paths, a full sandbox
-// disk), validator decisions and unsupported features are not miner faults.
-// Ops are score-neutral in v1; attribution is diagnostic evidence only.
+// attributed to the miner. Every failure that originates inside the sandbox
+// (customer state, a helper error, exit or kill, exhausted lease resources),
+// validator decisions and unsupported features are not miner faults; only
+// miner-side engine and transport failures (op_runtime_failed) and restart
+// are. Ops are score-neutral in v1; attribution is diagnostic only.
 var OpErrorAttribution = map[string]bool{
-	"lease_not_running":   false,
-	"sandbox_exited":      false,
-	"lease_expired":       false,
-	"released":            false,
-	"exec_not_found":      false,
-	"exec_limit_exceeded": false,
-	"path_not_found":      false,
-	"path_exists":         false,
-	"path_not_file":       false,
-	"path_not_directory":  false,
-	"path_refused":        false,
-	"directory_not_empty": false,
-	"permission_denied":   false,
-	"no_space":            false,
-	"file_too_large":      false,
-	"offset_mismatch":     false,
-	OpCodeDeadline:        false,
-	OpCodeOpsUnsupport:    false,
-	OpCodeOpsDisabled:     false,
-	OpCodeRuntimeFailed:   true,
-	"miner_restart":       true,
+	"lease_not_running":      false,
+	"sandbox_exited":         false,
+	"lease_expired":          false,
+	"released":               false,
+	"exec_not_found":         false,
+	"exec_limit_exceeded":    false,
+	"path_not_found":         false,
+	"path_exists":            false,
+	"path_not_file":          false,
+	"path_not_directory":     false,
+	"path_refused":           false,
+	"directory_not_empty":    false,
+	"permission_denied":      false,
+	"no_space":               false,
+	"file_too_large":         false,
+	"offset_mismatch":        false,
+	OpCodeDeadline:           false,
+	OpCodeOpsUnsupport:       false,
+	OpCodeOpsDisabled:        false,
+	OpCodeSandboxFailed:      false,
+	OpCodeResourcesExhausted: false,
+	OpCodeRuntimeFailed:      true,
+	"miner_restart":          true,
 }
 
 // ValidOp reports whether value is a v1 op kind.

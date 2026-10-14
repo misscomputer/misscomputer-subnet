@@ -28,9 +28,13 @@ type Root struct {
 	fd int
 }
 
-// Open opens dir as a sandbox root. It fails with ErrUnsupported when the
-// kernel cannot resolve paths in-root.
-func Open(dir string) (*Root, error) {
+// Open opens the sandbox root "/" from inside the sandbox. It is the only
+// constructor: the resolver never runs against any other directory (lane 7
+// R-1/B-9), in particular never against a container tree on the host. It
+// fails with ErrUnsupported when the kernel cannot resolve paths in-root.
+func Open() (*Root, error) { return openAt("/") }
+
+func openAt(dir string) (*Root, error) {
 	fd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err

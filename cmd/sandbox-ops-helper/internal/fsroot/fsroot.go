@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// Package fsroot is the reference resolver for sandbox-ops-v1 file
-// operations (docs/sandbox-ops-v1.md). Every path is resolved relative to a
+// Package fsroot is the in-sandbox resolver of the sandbox-ops-v1 helper
+// (cmd/sandbox-ops-helper) for file operations (docs/sandbox-ops-v1.md). Every path is resolved relative to a
 // root directory file descriptor with openat2(RESOLVE_IN_ROOT |
 // RESOLVE_NO_MAGICLINKS): symlinks are followed as if the root were "/",
 // ".." never rises above it, and procfs magic links are refused. A final
@@ -10,10 +10,11 @@
 // string is joined, cleaned or resolved in user space, so a concurrent
 // symlink swap cannot redirect an operation outside the root.
 //
-// In sandbox-ops-v1 it runs only inside the sandbox isolation boundary, in
-// the in-sandbox helper with root "/" (OPS-D5): host-side access to a
-// container's overlay trees, docker cp, or this resolver applied on the host
-// to those trees is not permitted. Inside the sandbox the boundary is the
+// It runs only inside the sandbox isolation boundary, in the helper, with
+// root "/" (OPS-D5, lane 7 R-1/B-9). Go's internal-package rule limits its
+// importers to the helper, and Open takes no directory. Host-side access to
+// a container's overlay trees, docker cp, or this resolver applied on the
+// host to those trees is not permitted. Inside the sandbox the boundary is the
 // sandbox itself; the resolver adds exact, race-free semantics (no
 // write-through of a final symlink, no magic links, no FIFO hangs). Where
 // openat2 is unavailable Open fails with ErrUnsupported; there is no
@@ -46,8 +47,7 @@ const MaxDirectoryScan = 65536
 // descends, and so the descriptors it holds open at once.
 const MaxRemoveDepth = 256
 
-// FS is the file-operation surface of one sandbox. Root implements it; an
-// in-sandbox helper may implement it too.
+// FS is the file-operation surface the helper serves.
 type FS interface {
 	Stat(ctx context.Context, path string) (sandbox.FileInfo, error)
 	ReadAt(ctx context.Context, path string, offset, limit uint64) (data []byte, size uint64, err error)

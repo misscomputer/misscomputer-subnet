@@ -10,9 +10,12 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
 )
 
-// Code maps an error from FS to its sandbox-ops-v1 receipt error code. An
-// error it does not recognize is op_runtime_failed, a miner fault: a backend
-// must not relabel its own failure as a customer condition.
+// Code maps an error from FS to its sandbox-ops-v1 receipt error code.
+// Every error here originates inside the sandbox, where guest code shares
+// the helper's identity and can starve or break it, so every code is
+// non-fault (lane 7 B-6): an unrecognized error is sandbox_op_failed, never
+// the miner fault op_runtime_failed, which is reserved for miner-side engine
+// and transport failures.
 func Code(err error) string {
 	switch {
 	case err == nil:
@@ -42,6 +45,9 @@ func Code(err error) string {
 		return "permission_denied"
 	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
 		return "no_space"
+	case errors.Is(err, syscall.ENOMEM), errors.Is(err, syscall.EAGAIN), errors.Is(err, syscall.EMFILE),
+		errors.Is(err, syscall.ENFILE):
+		return sandbox.OpCodeResourcesExhausted
 	}
-	return sandbox.OpCodeRuntimeFailed
+	return sandbox.OpCodeSandboxFailed
 }
