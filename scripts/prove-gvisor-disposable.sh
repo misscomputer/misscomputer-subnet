@@ -4,7 +4,9 @@
 # daemon or a miner host. This does not implement or enable SandboxBackend.
 set -Eeuo pipefail
 
-[[ ${MC_GVISOR_DISPOSABLE_RUNNER:-} == 1 && ${GITHUB_ACTIONS:-} == true && $EUID == 0 ]] || {
+# Accident guard, not a security boundary: these variables are caller-controlled.
+[[ ${MC_GVISOR_DISPOSABLE_RUNNER:-} == 1 && ${GITHUB_ACTIONS:-} == true &&
+   ${RUNNER_ENVIRONMENT:-} == github-hosted && $EUID == 0 ]] || {
   echo 'This gate requires the contained GitHub-hosted workflow as root.' >&2
   exit 1
 }
@@ -50,6 +52,7 @@ cleanup() {
     wait "$daemon_pid" >/dev/null 2>&1
   fi
   systemctl stop "$anchor" >/dev/null 2>&1
+  systemctl stop "$slice" >/dev/null 2>&1
   # Docker may retain its own null-netns bind mount below exec-root after
   # dockerd exits. Unmount only this gate's descendants, deepest first.
   while IFS= read -r target; do
@@ -82,10 +85,13 @@ curl --fail --silent --show-error --location --max-time 90 \
 printf '%s  %s\n' "$RUNSC_SHA256" "$gate_dir/gvisor.tar.bz2" | sha256sum --check --status || die 'runsc archive checksum mismatch'
 tar -xjf "$gate_dir/gvisor.tar.bz2" -C "$gate_dir/bin"
 chmod 0755 "$gate_dir/bin/runsc"
-report "runsc: $($gate_dir/bin/runsc --version | head -1); archive sha256=$RUNSC_SHA256"
+runsc_version=$("$gate_dir/bin/runsc" --version)
+report "runsc: ${runsc_version%%$'\n'*}; archive sha256=$RUNSC_SHA256"
 
-# Both the daemon and its image/cache/log data are confined to a disposable
-# finite XFS filesystem; project quota is needed for Docker overlay2 size.
+# The daemon's image/cache/log data root is a disposable finite XFS filesystem;
+# project quota is needed for Docker overlay2 size. Its exec-root and the
+# shared system containerd's state stay on the disposable runner disk, but the
+# daemon uses its own containerd namespaces, not the default engine's.
 truncate -s 3G "$gate_dir/docker.xfs"
 loop_device=$(losetup --find --show "$gate_dir/docker.xfs")
 mkfs.xfs -f "$loop_device" >/dev/null
@@ -105,6 +111,8 @@ with open(path, 'w', encoding='utf-8') as out:
         'hosts': ['unix://' + root + '/docker.sock'],
         'storage-driver': 'overlay2', 'bridge': 'none', 'iptables': False,
         'ip-forward': False, 'ip-masq': False,
+        'containerd-namespace': 'mc-gvisor-gate',
+        'containerd-plugins-namespace': 'mc-gvisor-gate-plugins',
         'exec-opts': ['native.cgroupdriver=systemd'],
         'runtimes': {'runsc': {'path': root + '/bin/runsc',
                                'runtimeArgs': ['--systemd-cgroup', '--overlay2=none']}},
@@ -129,7 +137,9 @@ systemctl set-property --runtime "$slice" CPUQuota=200% MemoryMax=1073741824 Tas
 slice_path=$(systemctl show --property=ControlGroup --value "$slice")
 [[ -n $slice_path && $slice_path != / ]] || die 'dedicated finite cgroup slice absent'
 [[ $(cat "/sys/fs/cgroup$slice_path/memory.max") == 1073741824 ]] || die 'aggregate memory limit absent'
-report "aggregate cgroup: $slice_path cpu.max=$(cat "/sys/fs/cgroup$slice_path/cpu.max") memory.max=$(cat "/sys/fs/cgroup$slice_path/memory.max")"
+[[ $(cat "/sys/fs/cgroup$slice_path/cpu.max") == '200000 100000' ]] || die 'aggregate CPU limit absent'
+[[ $(cat "/sys/fs/cgroup$slice_path/pids.max") == 512 ]] || die 'aggregate PID limit absent'
+report "aggregate cgroup: $slice_path cpu.max=$(cat "/sys/fs/cgroup$slice_path/cpu.max") memory.max=$(cat "/sys/fs/cgroup$slice_path/memory.max") pids.max=$(cat "/sys/fs/cgroup$slice_path/pids.max")"
 
 docker pull --platform linux/amd64 "$IMAGE" >/dev/null
 image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE")
@@ -183,14 +193,20 @@ read -r cpu_quota cpu_period < "/sys/fs/cgroup$child_path/cpu.max"
 report "actual runsc PID=$pid cgroup=$child_path cpu.max=$(cat "/sys/fs/cgroup$child_path/cpu.max") memory.max=$(cat "/sys/fs/cgroup$child_path/memory.max") pids.max=$(cat "/sys/fs/cgroup$child_path/pids.max")"
 
 docker exec "$container" sh -c 'command -v wget >/dev/null' || die 'network probe lacks wget'
+# Only a connect-level failure counts as blocked. An HTTP error status, such
+# as the 400 cloud metadata services return without their header, means the
+# address was reached.
 for address in 169.254.169.254 1.1.1.1; do
-  if timeout 8 docker exec "$container" wget -T 3 -q -O /dev/null "http://$address/" >/dev/null 2>&1; then
+  if probe_error=$(timeout 8 docker exec "$container" wget -T 3 -q -O /dev/null "http://$address/" 2>&1 >/dev/null); then
     die "network=none container reached $address"
   fi
+  [[ $probe_error == *"can't connect to remote host"* ]] || die "network probe to $address did not fail to connect: ${probe_error:-no error output}"
 done
+interfaces=$(docker exec "$container" awk 'NR > 2 {sub(/:.*/, ""); gsub(/ /, ""); print}' /proc/net/dev)
+[[ $interfaces == lo ]] || die "network=none sandbox exposes interfaces other than lo: ${interfaces//$'\n'/ }"
 docker exec "$container" true || die 'network negative control could not execute in a live container'
 [[ $(docker inspect --format '{{.State.Running}}' "$container") == true ]] || die 'container stopped during network proof'
-report 'network=none: metadata and public TCP attempts blocked'
+report 'network=none: only lo present; metadata and public TCP attempts failed to connect'
 
 # Docker overlay2 on XFS+pquota must return ENOSPC/EDQUOT before 192 MiB is
 # written to the 64 MiB writable layer. A mere StorageOpt field is not proof.
@@ -207,13 +223,19 @@ global_free=$(df -B1 --output=avail "$gate_dir/xfs" | awk 'NR == 2 {print $1}')
 [[ $global_free =~ ^[0-9]+$ ]] && (( global_free > 1024 * 1024 * 1024 )) || die "global XFS free space too low to attribute the disk failure to the per-container quota: $global_free"
 docker exec "$container" sh -c '[ "$(stat -c %d /)" = "$(stat -c %d /quota-proof)" ]' || die 'disk write did not target the rootfs layer'
 written=$(docker exec "$container" stat -c '%s' /quota-proof)
-(( written > 0 && written <= QUOTA_BYTES )) || die "writable-layer file size $written exceeds quota"
+(( written >= QUOTA_BYTES - 4 * 1024 * 1024 && written <= QUOTA_BYTES )) || die "writable-layer write stopped at $written bytes, not at the 64 MiB quota"
+# Docker also gives the container's init layer the same limit, so require the
+# one 64 MiB project whose usage reached that limit.
+quota_projects=$(xfs_quota -x -c 'report -p -b -N' "$gate_dir/xfs" | awk -v hard=$((QUOTA_BYTES / 1024)) '$4 == hard && $2 >= hard - 4096 {n++} END {print n+0}')
+[[ $quota_projects == 1 ]] || die "expected exactly one full XFS project with a 64 MiB hard limit, found $quota_projects"
 report "writable-layer quota: 64 MiB, dd stopped at $written bytes with ENOSPC/EDQUOT while global XFS still had $global_free free bytes"
 
 log_path=$(docker inspect --format '{{.LogPath}}' "$container")
 [[ $log_path == "$gate_dir/xfs/docker/"* ]] || die 'container log escaped finite data root'
 log_bytes=$(find "$(dirname "$log_path")" -maxdepth 1 -name "$(basename "$log_path")*" -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
 (( log_bytes > 0 && log_bytes <= 3 * 1024 * 1024 )) || die "bounded Docker logs absent or exceeded 3 MiB: $log_bytes"
+log_files=$(find "$(dirname "$log_path")" -maxdepth 1 -name "$(basename "$log_path")*" -type f | wc -l)
+[[ -f $log_path.1 && $log_files == 2 ]] || die "Docker log did not rotate to exactly max-file=2 files: $log_files"
 report "disk classes: rootfs writable layer <=$QUOTA_BYTES bytes (proven); logs=$log_bytes bytes (rotated, outside per-container quota); image/cache=$(docker image inspect --format '{{.Size}}' "$IMAGE") logical bytes (outside per-container quota); all reside on finite 3 GiB XFS daemon data root. This does NOT prove an aggregate SandboxBudget.DiskMiB."
 
 docker rm --force "$container" >/dev/null

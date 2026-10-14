@@ -26,9 +26,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xfsprogs=6.6.0-1ubuntu2.1
           printf 'Runner image: %s %s\n' "$ImageOS" "$ImageVersion"
+          printf 'Kernel: %s\n' "$(uname -r)"
+          systemctl --version | head -1
           docker version
           mkfs.xfs -V
       - name: Prove runsc and disk quota on isolated daemon
         env:
           MC_GVISOR_DISPOSABLE_RUNNER: "1"
-        run: sudo --preserve-env=MC_GVISOR_DISPOSABLE_RUNNER,GITHUB_ACTIONS,GITHUB_RUN_ID,GITHUB_STEP_SUMMARY,RUNNER_TEMP bash scripts/prove-gvisor-disposable.sh
+        run: sudo --preserve-env=MC_GVISOR_DISPOSABLE_RUNNER,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_RUN_ID,GITHUB_STEP_SUMMARY,RUNNER_TEMP bash scripts/prove-gvisor-disposable.sh
