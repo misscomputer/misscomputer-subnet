@@ -83,7 +83,9 @@ truncate -s "${data_fs_mib}M" "$root/data.xfs"
 loop_device=$(losetup --find --show "$root/data.xfs")
 note loop_device "$loop_device"
 mkfs.xfs -q -f "$loop_device"
-mount -t xfs -o prjquota,nodev,nosuid "$loop_device" "$root/data"
+# No nodev: Docker's overlay2 quota control opens a block-device node it
+# creates under the data root (backingFsBlockDev) for quotactl.
+mount -t xfs -o prjquota,nosuid "$loop_device" "$root/data"
 note data_mounted 1
 mount -t tmpfs -o "size=${run_tmpfs_mib}m,mode=0700,nodev,nosuid" mcsbx-run "$root/run"
 note run_mounted 1

@@ -38,7 +38,7 @@ security boundary: all of it is caller-controlled.
 
 | Component | Disposable lab | Why |
 | --- | --- | --- |
-| Data filesystem | 4 GiB XFS loop file, `prjquota,nodev,nosuid` | aggregate bound for images, pull temp, writable layers, logs, anonymous volumes and containerd content; project quota makes overlay2 `size` real |
+| Data filesystem | 4 GiB XFS loop file, `prjquota,nosuid` (not `nodev`: overlay2 quota control needs its device node) | aggregate bound for images, pull temp, writable layers, logs, anonymous volumes and containerd content; project quota makes overlay2 `size` real |
 | Run root | 64 MiB tmpfs | engine socket, exec-root, containerd state and socket, runsc state |
 | containerd | dedicated instance, root on the data filesystem, state and socket on the run root, CRI disabled, namespaces `mc-sandbox`/`mc-sandbox-plugins` | no shared containerd metadata, content or socket with the host's default engine |
 | dockerd | dedicated instance on `<run>/docker/docker.sock` (0660 root:root), Docker 28.0.4, overlay2 classic store (containerd snapshotter off) | own data root, socket and containerd |
