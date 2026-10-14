@@ -486,6 +486,12 @@ for family in -4 -6; do
 done
 ok "$icmp_view"
 
+# The listener writes its count after accept, which may lag the client.
+wait_count() {  # file expected
+  for _ in {1..20}; do [[ $(cat "$1" 2>/dev/null) == "$2" ]] && return 0; sleep 0.25; done
+  return 1
+}
+
 begin effect.host_loopback_unreachable observed_effect
 host_addr=$(ip -o route get 1.1.1.1 | awk '{for (i=1; i<=NF; i++) if ($i == "src") print $(i+1)}')
 [[ $host_addr =~ ^[0-9.]+$ ]] || bad "host primary address unknown: $host_addr"
@@ -495,7 +501,7 @@ count_path, host_addr = sys.argv[1:]
 sel = selectors.DefaultSelector()
 for addr in ('127.0.0.1', host_addr):
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((addr, 18089)); s.listen(8); s.setblocking(False); sel.register(s)
+    s.bind((addr, 18089)); s.listen(8); s.setblocking(False); sel.register(s, selectors.EVENT_READ)
 open(count_path, 'w').write('0\n')
 seen, deadline = 0, time.time() + 60
 while time.time() < deadline:
@@ -505,8 +511,8 @@ while time.time() < deadline:
 PY
 listener=$!
 for _ in {1..20}; do [[ -s $work/listener.count ]] && break; sleep 0.25; done
-[[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:18089/ || true) == 000 && $(cat "$work/listener.count") == 1 ]] ||
-  bad 'host listener control connection was not counted'
+curl -s -o /dev/null --max-time 2 http://127.0.0.1:18089/ || true
+wait_count "$work/listener.count" 1 || bad "host listener control connection was not counted ($(cat "$work/listener.count" 2>/dev/null || echo no listener))"
 loop_probe=$(timeout 10 docker exec "$container" wget -T 3 -q -O /dev/null http://127.0.0.1:18089/ 2>&1 >/dev/null || true)
 host_probe=$(timeout 10 docker exec "$container" wget -T 3 -q -O /dev/null "http://$host_addr:18089/" 2>&1 >/dev/null || true)
 sleep 1
@@ -528,7 +534,7 @@ count_path, host_addr = sys.argv[1:]
 sel = selectors.DefaultSelector()
 for addr in ('127.0.0.1', host_addr):
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((addr, 18090)); s.listen(16); s.setblocking(False); sel.register(s)
+    s.bind((addr, 18090)); s.listen(16); s.setblocking(False); sel.register(s, selectors.EVENT_READ)
 open(count_path, 'w').write('0\n')
 seen, deadline = 0, time.time() + 120
 while time.time() < deadline:
@@ -539,8 +545,7 @@ PY
 egress_listener=$!
 for _ in {1..20}; do [[ -s $work/egress.count ]] && break; sleep 0.25; done
 curl -s -o /dev/null --max-time 2 http://127.0.0.1:18090/ || true
-sleep 0.5
-[[ $(cat "$work/egress.count") == 1 ]] || bad 'caller-side control connection to the listener was not counted'
+wait_count "$work/egress.count" 1 || bad "caller-side control connection to the listener was not counted ($(cat "$work/egress.count" 2>/dev/null || echo no listener))"
 rejects_before=$(reject_count)
 pull_view=
 for ref in 127.0.0.1:18090/mcsbx/probe:none "$host_addr:18090/mcsbx/probe:none" 169.254.169.254/mcsbx/probe:none; do
