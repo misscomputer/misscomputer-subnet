@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -91,6 +92,12 @@ const (
 	sandboxCreateTimeout  = 5 * time.Minute
 	sandboxStateTimeout   = 30 * time.Second
 	sandboxCleanupTimeout = 5 * time.Minute
+	// sandboxCommitAnswer bounds how long Commit waits for a sandbox to start
+	// before it answers accepted. It stays well below the shortest transport
+	// hop between the validator runtime and this agent (about two minutes),
+	// so a slow image pull is a pending lease the validator polls by
+	// replaying the lease, never an unknown outcome.
+	sandboxCommitAnswer = 60 * time.Second
 )
 
 // SandboxRefusal is a backend failure that is not attributed to the miner,
@@ -109,6 +116,9 @@ type SandboxLane struct {
 	budget  sandbox.Capacity
 	now     func() time.Time
 	locks   sandboxLocks
+	starts  sandboxStarts
+	// answerWithin is sandboxCommitAnswer.
+	answerWithin time.Duration
 }
 
 // NewSandboxLane enables the lane only with a backend that runs sandboxes
@@ -141,7 +151,7 @@ func NewSandboxLane(ctx context.Context, agent *Agent, store *durable.SandboxLea
 	if !budget.Within(limits) {
 		return nil, fmt.Errorf("sandbox budget %+v exceeds what the backend enforces %+v", budget, limits)
 	}
-	return &SandboxLane{agent: agent, store: store, backend: backend, budget: budget, now: time.Now}, nil
+	return &SandboxLane{agent: agent, store: store, backend: backend, budget: budget, now: time.Now, answerWithin: sandboxCommitAnswer}, nil
 }
 
 // SandboxInstanceName is the deterministic backend name of a lease.
@@ -209,9 +219,13 @@ func (l *SandboxLane) Reserve(ctx context.Context, r protocol.SandboxReservation
 
 // Commit commits a verified lease to its hold, starts its sandbox on the
 // first acceptance, and resumes a pending lease on replay. The lease is
-// durable as pending before the backend is asked to create anything. Runtime
-// work is bounded but does not inherit the HTTP request's cancellation: a
-// disconnected validator cannot strand a lease after that durable write.
+// durable as pending before the backend is asked to create anything. The
+// start runs in the background under the lease lock and does not inherit
+// the HTTP request's cancellation, so a disconnected validator cannot
+// strand a lease after that durable write. Commit answers the start's
+// outcome if it ends within answerWithin, and otherwise the durable stage
+// (accepted while pending); an exact replay waits for the same start again
+// instead of starting another.
 func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1, req SandboxRequest) (protocol.SandboxReceiptV1, error) {
 	now := l.now().UTC()
 	if err := protocol.VerifyBoundSandboxLeaseV1(lease, req.ValidatorKey, now, req.CurrentBlock, req.Network, req.NetUID, req.CallerHotkey, req.MinerHotkey, req.MinerUID); err != nil {
@@ -221,16 +235,75 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 		return protocol.SandboxReceiptV1{}, err
 	}
 	leaseID := protocol.SandboxLeaseIDV1(lease)
-	unlock := l.locks.lock(leaseID)
-	outcome, err := l.store.CommitLease(ctx, lease, now)
-	if err == nil && (outcome.Start || outcome.Stage == sandbox.StageAccepted) {
-		outcome, err = l.start(ctx, lease, leaseID)
+	deadline := time.Now().Add(l.answerWithin)
+	var unlock func()
+	for {
+		if started := l.starts.running(leaseID); started != nil {
+			l.await(started)
+			return l.answerCommit(ctx, lease)
+		}
+		var ok bool
+		if unlock, ok = l.locks.tryLock(leaseID); ok {
+			break
+		}
+		// The lease is being committed or torn down by another caller.
+		// Once it is durable, its durable stage answers without the lock.
+		if time.Now().After(deadline) {
+			if _, found, err := l.store.Lease(ctx, leaseID); err != nil {
+				return protocol.SandboxReceiptV1{}, err
+			} else if found {
+				return l.answerCommit(ctx, lease)
+			}
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return protocol.SandboxReceiptV1{}, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	unlock()
+	outcome, err := l.store.CommitLease(ctx, lease, now)
+	if err != nil || !(outcome.Start || outcome.Stage == sandbox.StageAccepted) {
+		unlock()
+		if err != nil {
+			return protocol.SandboxReceiptV1{}, err
+		}
+		return l.receipt(protocol.SandboxLeaseSchema, lease, lease.SandboxID, lease.Generation, lease.Subnet, outcome, l.now().UTC())
+	}
+	started := l.starts.begin(leaseID)
+	workCtx := context.WithoutCancel(ctx)
+	go func() {
+		defer unlock()
+		if _, err := l.start(workCtx, lease, leaseID); err != nil {
+			slog.Warn("sandbox start", "lease_id", leaseID, "error", err)
+		}
+		l.starts.end(leaseID, started)
+	}()
+	l.await(started)
+	return l.answerCommit(ctx, lease)
+}
+
+// await waits for a start to end, at most answerWithin.
+func (l *SandboxLane) await(started <-chan struct{}) {
+	timer := time.NewTimer(l.answerWithin)
+	defer timer.Stop()
+	select {
+	case <-started:
+	case <-timer.C:
+	}
+}
+
+// answerCommit answers a lease from its durable stage.
+func (l *SandboxLane) answerCommit(ctx context.Context, lease protocol.SandboxLeaseV1) (protocol.SandboxReceiptV1, error) {
+	answerCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sandboxStateTimeout)
+	defer cancel()
+	now := l.now().UTC()
+	outcome, err := l.store.CommitLease(answerCtx, lease, now)
 	if err != nil {
 		return protocol.SandboxReceiptV1{}, err
 	}
-	return l.receipt(protocol.SandboxLeaseSchema, lease, lease.SandboxID, lease.Generation, lease.Subnet, outcome, l.now().UTC())
+	return l.receipt(protocol.SandboxLeaseSchema, lease, lease.SandboxID, lease.Generation, lease.Subnet, outcome, now)
 }
 
 // start runs the sandbox of a lease that was just written as pending and
@@ -390,7 +463,8 @@ func (l *SandboxLane) Recover(ctx context.Context) error {
 // destroyOrphans destroys every backend sandbox whose lease is unknown or
 // terminal. Each is re-read under its lease lock, so a sandbox whose lease
 // Commit is creating concurrently is never mistaken for an orphan: Commit
-// writes the lease as pending under the same lock before Create runs.
+// writes the lease as pending under the same lock before Create runs, and
+// a lease whose lock is held is skipped until the next sweep.
 func (l *SandboxLane) destroyOrphans(ctx context.Context) error {
 	instances, err := l.backend.Instances(ctx)
 	if err != nil {
@@ -403,7 +477,11 @@ func (l *SandboxLane) destroyOrphans(ctx context.Context) error {
 			// A sandbox the backend cannot tie to a lease is never live.
 			key = "instance:" + instance.Name
 		}
-		unlock := l.locks.lock(key)
+		unlock, ok := l.locks.tryLock(key)
+		if !ok {
+			// Busy: being started or destroyed, so not an orphan now.
+			continue
+		}
 		live := false
 		if key == instance.LeaseID {
 			record, found, err := l.store.Lease(ctx, instance.LeaseID)
@@ -424,10 +502,17 @@ func (l *SandboxLane) destroyOrphans(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// destroyAll tears down every record whose lease is not busy. A busy lease
+// is being started (its start tears it down once it sees the cleanup) or
+// destroyed by another caller; it is reported as pending, not waited for.
 func (l *SandboxLane) destroyAll(ctx context.Context, records []durable.SandboxLeaseRecord, now time.Time) error {
 	var errs []error
 	for _, record := range records {
-		unlock := l.locks.lock(record.LeaseID)
+		unlock, ok := l.locks.tryLock(record.LeaseID)
+		if !ok {
+			errs = append(errs, fmt.Errorf("sandbox %s is busy", record.LeaseID))
+			continue
+		}
 		if err := l.teardown(ctx, record.LeaseID, SandboxInstanceName(record.LeaseID), now); err != nil {
 			errs = append(errs, err)
 		}
@@ -449,7 +534,30 @@ type sandboxLock struct {
 }
 
 func (s *sandboxLocks) lock(key string) func() {
+	entry := s.acquire(key)
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		s.release(key, entry)
+	}
+}
+
+// tryLock locks key only if no one holds it.
+func (s *sandboxLocks) tryLock(key string) (func(), bool) {
+	entry := s.acquire(key)
+	if !entry.mu.TryLock() {
+		s.release(key, entry)
+		return nil, false
+	}
+	return func() {
+		entry.mu.Unlock()
+		s.release(key, entry)
+	}, true
+}
+
+func (s *sandboxLocks) acquire(key string) *sandboxLock {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.locks == nil {
 		s.locks = map[string]*sandboxLock{}
 	}
@@ -459,15 +567,48 @@ func (s *sandboxLocks) lock(key string) func() {
 		s.locks[key] = entry
 	}
 	entry.refs++
-	s.mu.Unlock()
-	entry.mu.Lock()
-	return func() {
-		entry.mu.Unlock()
-		s.mu.Lock()
-		entry.refs--
-		if entry.refs == 0 {
-			delete(s.locks, key)
-		}
-		s.mu.Unlock()
+	return entry
+}
+
+func (s *sandboxLocks) release(key string, entry *sandboxLock) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry.refs--
+	if entry.refs == 0 {
+		delete(s.locks, key)
 	}
+}
+
+// sandboxStarts tracks the lease starts running in the background; each
+// channel closes when its start ends.
+type sandboxStarts struct {
+	mu       sync.Mutex
+	inflight map[string]chan struct{}
+}
+
+func (s *sandboxStarts) begin(leaseID string) chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight == nil {
+		s.inflight = map[string]chan struct{}{}
+	}
+	started := make(chan struct{})
+	s.inflight[leaseID] = started
+	return started
+}
+
+func (s *sandboxStarts) end(leaseID string, started chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inflight, leaseID)
+	close(started)
+}
+
+func (s *sandboxStarts) running(leaseID string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if started, ok := s.inflight[leaseID]; ok {
+		return started
+	}
+	return nil
 }

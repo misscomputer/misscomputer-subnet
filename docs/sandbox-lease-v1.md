@@ -161,6 +161,14 @@ including refused and failed receipts.
   failed create answers `runtime_start_failed`; a backend may answer a
   non-fault code such as `image_unavailable` but can never relabel its own
   fault. Every sandbox name is `runtime.InstanceName(lease_id)`.
+- **Bounded answer:** the start runs in the background under the lease's
+  lock. Commit answers its outcome if it ends within 60 seconds, otherwise
+  `accepted` (the lease is `pending`), well inside the roughly two-minute
+  transport hops, so a slow image pull is never an unknown outcome. The
+  validator polls by replaying the exact lease. A replay during the start
+  waits for that start again, up to the same bound, and never starts a
+  second sandbox; afterwards it answers `ready`, `failed` or the lease's
+  terminal stage.
 - **Release, Sweep, Recover:** each moves leases to `cleanup` durably, then
   destroys their sandboxes. A failed destroy keeps the lease in `cleanup`,
   still consuming capacity, until a later sweep (every 10 seconds) destroys
@@ -173,8 +181,11 @@ including refused and failed receipts.
   release. A lease or renewal receipt for a lease in `cleanup` reports the
   lease's terminal intent (for example `released`) and is not a cleanup
   acknowledgement: validators free capacity only on a release receipt or
-  after the lease expiry plus grace. A release that lands while a sandbox is being created waits for the
-  create to return and then destroys it. Restart recovery destroys every
+  after the lease expiry plus grace. A release that lands while a sandbox is being created does not wait: the
+  fence is durable, the release answers `503 cleanup_pending`, the start
+  destroys its sandbox once it sees the fence, and a replay of the release is
+  acknowledged. Sweep and orphan reconciliation likewise skip a lease whose
+  start or teardown is in progress, and retry it on the next sweep. Restart recovery destroys every
   sandbox that may exist before the agent serves.
 - **Backend interface (`SandboxBackend`):** `Budget`, `Unsupported`,
   `Create` (idempotent per instance name), `Destroy` (idempotent),

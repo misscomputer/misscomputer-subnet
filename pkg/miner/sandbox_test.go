@@ -519,9 +519,11 @@ func TestSandboxCreateFinishingAfterExpiryDestroysSandbox(t *testing.T) {
 	}
 }
 
-// A release that lands while the sandbox is still being created fences the
-// identity at once; the sandbox is destroyed after create returns and the
-// lease ends released, not running.
+// A release that lands while a sandbox is being created does not wait for
+// the create: the fence is durable at once and the release answers
+// ErrSandboxCleanupPending. The create then sees the fence, destroys its
+// sandbox and answers released, and a replay of the release is
+// acknowledged.
 func TestSandboxReleaseDuringCreateDestroysTheSandbox(t *testing.T) {
 	f := newSBFixture(t)
 	ctx := context.Background()
@@ -536,29 +538,55 @@ func TestSandboxReleaseDuringCreateDestroysTheSandbox(t *testing.T) {
 		receipt protocol.SandboxReceiptV1
 		err     error
 	}
-	committed, released := make(chan result, 1), make(chan result, 1)
+	committed := make(chan result, 1)
 	go func() {
 		receipt, err := f.lane.Commit(ctx, l, f.request())
 		committed <- result{receipt, err}
 	}()
 	waitLease(t, f, leaseID, "pending")
 	release := f.release(r)
-	go func() {
-		receipt, err := f.lane.Release(ctx, release, f.request())
-		released <- result{receipt, err}
-	}()
+	if receipt, err := f.lane.Release(ctx, release, f.request()); !errors.Is(err, ErrSandboxCleanupPending) {
+		t.Fatalf("release during create answered %s/%v, want ErrSandboxCleanupPending without waiting", receipt.Stage, err)
+	}
 	waitLease(t, f, leaseID, "cleanup")
 	close(f.backend.createGate)
 
 	commit := <-committed
 	f.check(commit.receipt, commit.err, protocol.SandboxLeaseSchema, l, sandbox.StageReleased, "")
-	rel := <-released
-	f.check(rel.receipt, rel.err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
+	receipt, err = f.lane.Release(ctx, release, f.request())
+	f.check(receipt, err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
 	if live, created, destroyed := f.backend.state(); live != 0 || len(created) != 1 || len(destroyed) == 0 {
 		t.Fatalf("live=%d created=%v destroyed=%v", live, created, destroyed)
 	}
 	if record, _, _ := f.store.Lease(ctx, leaseID); record.Status != "released" {
 		t.Fatalf("lease status %q, want released", record.Status)
+	}
+}
+
+// A create slower than the answer budget is answered accepted, so no
+// transport hop times out on it. Replays while it runs answer accepted
+// without a second create; once it finishes, a replay answers ready.
+func TestSandboxSlowCreateAnswersAcceptedAndReplayAnswersReady(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	f.lane.answerWithin = 20 * time.Millisecond
+	f.backend.createGate = make(chan struct{})
+	r := f.reservation(1)
+	receipt, err := f.lane.Reserve(ctx, r, f.request())
+	f.check(receipt, err, protocol.SandboxReservationSchema, r, sandbox.StageHeld, "")
+	l := f.lease(r, nil)
+	receipt, err = f.lane.Commit(ctx, l, f.request())
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageAccepted, "")
+	receipt, err = f.lane.Commit(ctx, l, f.request())
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageAccepted, "")
+
+	close(f.backend.createGate)
+	waitLease(t, f, protocol.SandboxLeaseIDV1(l), "running")
+	f.lane.answerWithin = time.Minute
+	receipt, err = f.lane.Commit(ctx, l, f.request())
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+	if live, created, _ := f.backend.state(); live != 1 || len(created) != 1 {
+		t.Fatalf("live=%d creates=%v, want one sandbox created once", live, created)
 	}
 }
 
