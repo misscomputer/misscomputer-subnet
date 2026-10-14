@@ -485,7 +485,8 @@ type hostConfig struct {
 	} `json:"RestartPolicy"`
 	Binds   []string `json:"Binds"`
 	Devices []any    `json:"Devices"`
-	// The backend sets none of these; each must stay at its empty default.
+	// Init is set to false; the backend sets none of the rest, and each
+	// must stay at its empty default.
 	Init              *bool             `json:"Init"`
 	Sysctls           map[string]string `json:"Sysctls"`
 	Tmpfs             map[string]string `json:"Tmpfs"`
@@ -669,6 +670,9 @@ func (b *GVisor) createBody(s spec, imageID string) map[string]any {
 			"CapDrop": s.host.CapDrop, "CapAdd": s.host.CapAdd, "SecurityOpt": s.host.SecurityOpt,
 			"IpcMode": s.host.IpcMode, "RestartPolicy": map[string]any{"Name": "no"},
 			"Privileged": false, "ReadonlyRootfs": false, "AutoRemove": false, "PublishAllPorts": false,
+			// Explicit, because the daemon applies its own init default
+			// when Init is unset: the image's process is PID 1.
+			"Init": false,
 		},
 	}
 }
@@ -903,7 +907,7 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 		return fmt.Errorf("sandbox %s has privileges, mounts, devices or a restart policy", c.Name)
 	case !sameSet(h.CapDrop, s.host.CapDrop) || !sameSet(h.CapAdd, s.host.CapAdd) || !sameSet(h.SecurityOpt, s.host.SecurityOpt):
 		return fmt.Errorf("sandbox %s capabilities or security options differ from the sandbox spec", c.Name)
-	case (h.Init != nil && *h.Init) || len(h.Sysctls) != 0 || len(h.Tmpfs) != 0 || len(h.Annotations) != 0 ||
+	case h.Init == nil || *h.Init || len(h.Sysctls) != 0 || len(h.Tmpfs) != 0 || len(h.Annotations) != 0 ||
 		len(h.DeviceCgroupRules) != 0 || len(h.DeviceRequests) != 0 || len(h.VolumesFrom) != 0 || h.VolumeDriver != "" ||
 		len(h.Links) != 0 || len(h.GroupAdd) != 0 || len(h.ExtraHosts) != 0 || len(h.DNS) != 0 || len(h.DNSOptions) != 0 ||
 		len(h.DNSSearch) != 0 || h.OomScoreAdj != 0:

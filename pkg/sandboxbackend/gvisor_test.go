@@ -424,6 +424,7 @@ func TestCreateRunsTheLeaseUnderGVisorAndDestroyRemovesEverything(t *testing.T) 
 	for key, want := range map[string]any{
 		"Runtime": "runsc", "NetworkMode": "none", "CgroupParent": testSlice, "Privileged": false,
 		"NanoCpus": float64(1_000_000_000), "Memory": float64(1 << 30), "MemorySwap": float64(1 << 30), "PidsLimit": float64(256),
+		"Init": false,
 	} {
 		if hostConfig[key] != want {
 			t.Errorf("HostConfig.%s = %v, want %v", key, hostConfig[key], want)
@@ -685,6 +686,7 @@ func TestCreateRejectsSandboxesThatDoNotEnforceTheLease(t *testing.T) {
 		}, want: "namespaces, ports"},
 		{name: "engine added a capability", applied: func(c *engineContainer) { c.Host["CapAdd"] = []any{"CAP_NET_ADMIN"} }, want: "capabilities"},
 		{name: "engine added an init process", applied: func(c *engineContainer) { c.Host["Init"] = true }, want: "host settings"},
+		{name: "engine left init to the daemon default", applied: func(c *engineContainer) { delete(c.Host, "Init") }, want: "host settings"},
 		{name: "engine passed runtime annotations", applied: func(c *engineContainer) {
 			c.Host["Annotations"] = map[string]any{"dev.gvisor.flag.network": "host"}
 		}, want: "host settings"},

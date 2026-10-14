@@ -94,8 +94,10 @@ Container: created from the verified engine image ID with runtime runsc,
 equal, so none), pids and writable-layer quota (`StorageOpt size`),
 `json-file` logs of two files within the per-sandbox log allowance,
 `CapDrop ALL` with no capability added (any addition needs a security review),
-`no-new-privileges`, private IPC, PID, UTS, user and cgroup namespaces, no
-published ports, mounts, devices, privileges or restart policy, and labels
+`no-new-privileges`, private IPC, PID, UTS, user and cgroup namespaces,
+`Init` explicitly false (so no daemon default init is added and the image's
+own process is PID 1), no published ports, mounts, devices, privileges or
+restart policy, and labels
 binding it to the lease ID, lease digest and image. The image's own
 entrypoint, command and default user run unchanged; that user may be root
 inside the gVisor sentry but holds no capabilities.
