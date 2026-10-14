@@ -644,25 +644,38 @@ gap lease.guest_pids_host_task_semantics "the lease pids limit bounds the sentry
 docker rm -f "$container" >/dev/null
 
 begin effect.tmp_bounded_by_memory observed_effect
+# gVisor's /tmp is memory-backed. Writing twice the lease memory must not
+# complete; the host-side memory events of the sandbox cgroup, sampled while
+# the write runs (the cgroup disappears if the sandbox is killed), attribute
+# the stop to the lease memory limit.
 container=mcsbx-lease-tmp
 lease_run "$container" 256 64 64
 tpid=$(sentry_pid "$container")
 tcg=$(proc_cgroup "$tpid")
+( while :; do
+    cat "$p_cgroup_root$tcg/memory.events.local" > "$work/tmp.events.tmp" 2>/dev/null && mv "$work/tmp.events.tmp" "$work/tmp.events"
+    cat "$p_cgroup_root$tcg/memory.peak" > "$work/tmp.peak.tmp" 2>/dev/null && mv "$work/tmp.peak.tmp" "$work/tmp.peak"
+    sleep 0.1
+  done ) &
+sampler=$!
 tmp_rc=0
 timeout 120 docker exec --user 0 "$container" dd if=/dev/zero of=/tmp/fill bs=1048576 count=512 > "$work/tmp.log" 2>&1 || tmp_rc=$?
+sleep 2
+kill "$sampler" >/dev/null 2>&1 || true; wait "$sampler" 2>/dev/null || true; sampler=
 running=$(docker inspect --format '{{.State.Running}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' "$container")
-events_raw=$(cat "$p_cgroup_root$tcg/memory.events.local" 2>/dev/null || echo 'cgroup gone')
-events=$(tr '\n' ' ' <<< "$events_raw")
-peak=$(cat "$p_cgroup_root$tcg/memory.peak" 2>/dev/null || echo 0)
-tmp_written=$(timeout 10 docker exec "$container" stat -c %s /tmp/fill 2>/dev/null || echo 0)
-if [[ $running == true* ]]; then
+events=$(tr '\n' ' ' < "$work/tmp.events" 2>/dev/null || echo 'never sampled')
+limit_events=$(awk '$1 == "max" || $1 == "oom" || $1 == "oom_kill" {s+=$2} END {print s+0}' "$work/tmp.events" 2>/dev/null || echo 0)
+peak=$(cat "$work/tmp.peak" 2>/dev/null || echo 0)
+tmp_written=$(timeout 10 docker exec "$container" stat -c %s /tmp/fill 2>/dev/null || true)
+[[ $tmp_written =~ ^[0-9]+$ ]] || tmp_written=unavailable
+if [[ $running == true* && $tmp_written != unavailable ]]; then
   (( tmp_rc != 0 && tmp_written < 512 * MIB )) || bad "512 MiB /tmp write completed under 256 MiB memory: rc=$tmp_rc size=$tmp_written"
-  max_events=$(awk '$1 == "max" || $1 == "oom" {s+=$2} END {print s+0}' <<< "$events_raw")
-  (( max_events > 0 || peak >= 256 * MIB * 9 / 10 )) || bad "write failed without reaching the memory limit: events=$events peak=$peak"
+  tmp_outcome="write failed at $tmp_written bytes, sandbox alive"
 else
-  [[ $running == *oom=true* || $running == *exit=137 ]] || [[ $events == *'oom_kill '[1-9]* ]] || bad "container stopped for another reason: $running events=$events"
+  tmp_outcome="sandbox stopped ($running) during the write"
 fi
-ok "dd rc=$tmp_rc written=$tmp_written state=$running memory.events.local=$events peak=$peak"
+(( limit_events > 0 || peak >= 256 * MIB * 9 / 10 )) || bad "$tmp_outcome without reaching the memory limit: events=$events peak=$peak dd: $(tail -1 "$work/tmp.log")"
+ok "$tmp_outcome; dd rc=$tmp_rc; sandbox memory.events.local=$events peak=$peak of 268435456"
 docker rm -f "$container" >/dev/null
 
 begin effect.aggregate_memory_slice observed_effect
