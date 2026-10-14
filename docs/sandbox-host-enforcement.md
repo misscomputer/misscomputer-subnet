@@ -152,7 +152,7 @@ remains.
 - Image cache reservation, registry pull egress restriction (container
   `network=none` does not constrain the daemon's pulls), `public` and
   `allowlist` egress, secret delivery, exec and file transfer.
-- containerd 1.7 shim sockets in the host-wide `/run/containerd/s`
+- containerd shim sockets in the host-wide `/run/containerd/s`
   directory (`storage.shim_socket_dir_shared`).
 - Startup recovery and orphan reconciliation of a real backend, and any
   live miner path. No activation may be inferred from a green job.

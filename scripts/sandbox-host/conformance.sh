@@ -587,5 +587,5 @@ for _ in {1..30}; do [[ ! -e /proc/$main_pid && ! -e $p_cgroup_root$main_cg ]] &
 leftover="containers=$(docker ps -aq | wc -l) volumes=$(docker volume ls -q | wc -l) images=$(docker images -q | wc -l)"
 children=$(find "$p_cgroup_root$lease_cg" -mindepth 1 -maxdepth 1 -type d -printf '%f ' | sed 's/mcsbxleaseanchor.service //')
 [[ $leftover == 'containers=0 volumes=0 images=0' && -z $children && ! -e /proc/$main_pid ]] || bad "$leftover lease children=$children main sentry alive=$([[ -e /proc/$main_pid ]] && echo yes || echo no)"
-gap storage.shim_socket_dir_shared "containerd 1.7 shim sockets live in host-wide /run/containerd/s ($(find /run/containerd/s -maxdepth 1 -type s 2>/dev/null | wc -l) present after cleanup)"
+gap storage.shim_socket_dir_shared "containerd shim sockets live in host-wide /run/containerd/s ($(find /run/containerd/s -maxdepth 1 -type s 2>/dev/null | wc -l) present after cleanup)"
 ok "$leftover; no lease child cgroups; data root used $(du -sb "$p_docker_root" | awk '{print $1}') bytes"

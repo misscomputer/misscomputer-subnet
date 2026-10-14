@@ -51,11 +51,13 @@ jobs:
         if: always()
         run: |
           sudo chown -R "$(id -u)" "$RUNNER_TEMP/mcsbx-report" 2>/dev/null || true
-          python3 scripts/sandbox-host/report.py validate "$RUNNER_TEMP/mcsbx-report/sandbox-host-preflight.conformance.json"
+          report=$RUNNER_TEMP/mcsbx-report/sandbox-host-preflight.conformance.json
+          [[ -f $report ]] || { echo 'no report: conformance did not run (provisioning failed)'; exit 1; }
+          python3 scripts/sandbox-host/report.py validate "$report"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: sandbox-host-preflight-${{ github.event.pull_request.head.sha }}
           path: ${{ runner.temp }}/mcsbx-report/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30

@@ -91,13 +91,13 @@ mkdir -m 0711 "$root/data/docker" "$root/data/containerd" "$root/run/docker" "$r
 
 # 3. Dedicated containerd: own root on the data filesystem, own state and
 #    socket on the run tmpfs, CRI disabled. Shim sockets still live in the
-#    host-wide /run/containerd/s directory (containerd 1.7 hardcodes it); the
+#    host-wide /run/containerd/s directory (containerd hardcodes it); the
 #    names hash this daemon's socket path and are recorded as unenforced.
 cat > "$root/containerd.toml" <<EOF
-version = 2
+version = 3
 root = "$root/data/containerd"
 state = "$root/run/containerd/state"
-disabled_plugins = ["io.containerd.grpc.v1.cri"]
+disabled_plugins = ["io.containerd.grpc.v1.cri", "io.containerd.cri.v1.runtime", "io.containerd.cri.v1.images"]
 [grpc]
   address = "$root/run/containerd/containerd.sock"
 [ttrpc]
