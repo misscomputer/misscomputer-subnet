@@ -64,7 +64,7 @@
     {"id": "effect.aggregate_memory_slice", "class": "observed_effect", "owner": "lane2", "modes": ["conformance"], "what": "two leases whose own limits are not reached are stopped by the aggregate lease slice memory limit"},
     {"id": "effect.default_lease_parent", "class": "observed_effect", "owner": "lane2", "modes": ["conformance"], "what": "a container started without an explicit cgroup parent or storage size still lands in the lease slice with the default writable-layer quota"},
     {"id": "effect.image_volume_bypasses_quota", "class": "observed_effect", "owner": "lane2", "modes": ["conformance"], "what": "negative control: an image-declared volume accepts writes beyond the writable-layer quota, proving lease.image_volumes_refused is necessary"},
-    {"id": "effect.image_device_nodes_inert", "class": "observed_effect", "owner": "lane2", "modes": ["conformance"], "what": "device nodes from an image layer (mem, kmsg, null and the data filesystem's block device) exist on the host data filesystem, yet every guest open fails as root and nonroot and the data filesystem is unchanged"},
+    {"id": "effect.image_device_nodes_inert", "class": "observed_effect", "owner": "lane2", "modes": ["conformance"], "what": "device nodes from an image layer exist on the host data filesystem, yet every guest open of a host-only device (mem, port, kmsg, the data filesystem's block device) fails as root and nonroot and the data filesystem is unchanged; a write to a null node (1:3, also emulated by gVisor) is recorded as context"},
     {"id": "effect.cleanup_instance_absent", "class": "observed_effect", "owner": "lane2", "modes": ["conformance"], "what": "after destroy, containers, volumes, images, sentry processes and child cgroups are gone"}
   ]
 }

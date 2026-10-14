@@ -748,7 +748,8 @@ begin effect.image_device_nodes_inert observed_effect
 # host device files under the data root. Put a layer with /dev/mem, /dev/kmsg,
 # /dev/null and the data filesystem's own block device into a lease image
 # (dockerd extracts it, as it would a pulled layer) and require every open
-# from the guest to fail, as root and as nobody. A successful write to the
+# to a host-only device (mem, port, kmsg, the block device) from the guest to
+# fail, as root and as nobody. A successful write to the
 # block device would corrupt the data filesystem; that only fails this
 # disposable run.
 data_dev=$(findmnt -n -o SOURCE --mountpoint "$p_data_root")
@@ -758,8 +759,9 @@ import sys, tarfile
 out, major, minor = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 with tarfile.open(out, 'w') as tar:
     d = tarfile.TarInfo('devprobe'); d.type = tarfile.DIRTYPE; d.mode = 0o755; tar.addfile(d)
-    for name, kind, maj, mnr in (('mem', tarfile.CHRTYPE, 1, 1), ('kmsg', tarfile.CHRTYPE, 1, 11),
-                                 ('null', tarfile.CHRTYPE, 1, 3), ('datafs', tarfile.BLKTYPE, major, minor)):
+    for name, kind, maj, mnr in (('mem', tarfile.CHRTYPE, 1, 1), ('port', tarfile.CHRTYPE, 1, 4),
+                                 ('kmsg', tarfile.CHRTYPE, 1, 11), ('null', tarfile.CHRTYPE, 1, 3),
+                                 ('datafs', tarfile.BLKTYPE, major, minor)):
         node = tarfile.TarInfo('devprobe/' + name); node.type = kind; node.mode = 0o666
         node.devmajor, node.devminor = maj, mnr
         tar.addfile(node)
@@ -769,7 +771,7 @@ docker cp - mcsbx-devnode-base:/ < "$work/devnodes.tar"
 docker commit mcsbx-devnode-base mcsbx/devnode-probe:conformance >/dev/null
 docker rm mcsbx-devnode-base >/dev/null
 host_nodes=$(find "$p_docker_root/overlay2" -path '*/diff/devprobe/*' \( -type c -o -type b \) | wc -l)
-(( host_nodes >= 4 )) || bad "image layer did not materialize device nodes on the data filesystem ($host_nodes found)"
+(( host_nodes >= 5 )) || bad "image layer did not materialize device nodes on the data filesystem ($host_nodes found)"
 container=mcsbx-lease-devnode
 docker run --detach --name "$container" --label mcsbx.conformance=1 --runtime runsc --platform linux/amd64 \
   --network none --cgroup-parent "$p_lease_slice" --cpus 1 --memory 256m --memory-swap 256m --pids-limit 64 \
@@ -778,7 +780,7 @@ docker run --detach --name "$container" --label mcsbx.conformance=1 --runtime ru
 data_sum_before=$(dd if="$data_dev" bs=1M count=1 status=none | sha256sum | awk '{print $1}')
 dev_view=
 for user in 0 65534; do
-  for op in read:mem read:kmsg read:datafs write:datafs write:null; do
+  for op in read:mem read:port read:kmsg read:datafs write:datafs; do
     node=/devprobe/${op#*:}
     if [[ ${op%%:*} == read ]]; then cmd=(dd "if=$node" of=/dev/null bs=512 count=1)
     else cmd=(dd if=/dev/zero "of=$node" bs=512 count=1 seek=1 conv=notrunc); fi
@@ -791,12 +793,19 @@ for user in 0 65534; do
     (( refused )) || bad "uid $user $op failed otherwise: $first"
     dev_view+="uid$user $op: ${first#*: }; "
   done
+  # 1:3 is a device number gVisor also emulates; a write that succeeds is
+  # recorded as context only (host or emulated null is harmless either way).
+  if null_out=$(timeout 15 docker exec --user "$user" "$container" dd if=/dev/zero of=/devprobe/null bs=512 count=1 2>&1); then
+    dev_view+="uid$user write:null succeeded (context, not a finding); "
+  else
+    dev_view+="uid$user write:null: $(head -1 <<< "$null_out" | cut -c1-80); "
+  fi
 done
 data_sum_after=$(dd if="$data_dev" bs=1M count=1 status=none | sha256sum | awk '{print $1}')
 [[ $data_sum_before == "$data_sum_after" ]] || bad 'data filesystem head changed during device-node probes'
 docker rm -f "$container" >/dev/null
 docker image rm mcsbx/devnode-probe:conformance >/dev/null
-ok "$host_nodes host device nodes from the image layer; every guest open failed: $dev_view data fs head unchanged"
+ok "$host_nodes host device nodes from the image layer; every guest open of a host-only device failed: $dev_view data fs head unchanged"
 
 begin effect.cleanup_instance_absent observed_effect
 docker image rm mcsbx/lease-probe:conformance "$MCSBX_IMAGE" >/dev/null
