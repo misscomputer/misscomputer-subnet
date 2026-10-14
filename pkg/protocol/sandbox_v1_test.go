@@ -542,21 +542,41 @@ func TestSandboxReceiptRejectsDocumentContradictions(t *testing.T) {
 		}
 	})
 	renewal := sandboxRenewal(t, validator, miner, lease, 1, sandboxNow.Add(15*time.Minute))
-	t.Run("stale renewal sequence", func(t *testing.T) {
-		stale := sandboxReceipt(t, miner, renewal.Subnet, renewal, protocol.SandboxRenewalSchema, sandbox.StageReady, nil, &leaseID)
-		if err := protocol.SandboxReceiptAnswersV1(stale, renewal); err == nil {
-			t.Fatal("signed receipt with stale sequence confirmed the renewal")
-		}
-		// A terminal reply can accurately report that the renewal was not
-		// applied and therefore still carry the prior durable sequence.
-		stale.Stage, stale.Signature = sandbox.StageExpired, ""
-		if err := protocol.SignSandboxReceiptV1(&stale, miner); err != nil {
-			t.Fatal(err)
-		}
-		if err := protocol.SandboxReceiptAnswersV1(stale, renewal); err != nil {
-			t.Fatalf("terminal reply with prior sequence: %v", err)
-		}
-	})
+	for _, tc := range []struct {
+		name    string
+		stage   string
+		leaseID string
+		seq     uint64
+		accept  bool
+	}{
+		{"ready with stale sequence", sandbox.StageReady, leaseID, 0, false},
+		{"accepted with stale sequence", sandbox.StageAccepted, leaseID, 0, false},
+		{"ready with wrong lease", sandbox.StageReady, otherID, 1, false},
+		{"expired with future sequence", sandbox.StageExpired, leaseID, 2, false},
+		{"ready with exact sequence", sandbox.StageReady, leaseID, 1, true},
+		{"accepted with exact sequence", sandbox.StageAccepted, leaseID, 1, true},
+		// A terminal reply can report that the renewal was not applied and
+		// therefore still carry the prior durable sequence.
+		{"expired with prior sequence", sandbox.StageExpired, leaseID, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			receipt := sandboxReceipt(t, miner, renewal.Subnet, renewal, protocol.SandboxRenewalSchema, tc.stage, nil, &tc.leaseID)
+			receipt.RenewalSeq, receipt.Signature = tc.seq, ""
+			if err := protocol.SignSandboxReceiptV1(&receipt, miner); err != nil {
+				t.Fatal(err)
+			}
+			if err := protocol.VerifySandboxReceiptV1(receipt, miner.Public().(ed25519.PublicKey)); err != nil {
+				t.Fatalf("receipt was not otherwise valid: %v", err)
+			}
+			err := protocol.SandboxReceiptAnswersV1(receipt, renewal)
+			if tc.accept && err != nil {
+				t.Fatalf("consistent receipt rejected: %v", err)
+			}
+			if !tc.accept && err == nil {
+				t.Fatal("contradictory signed receipt answered the renewal")
+			}
+		})
+	}
 }
 
 // Admission binds every validator document to its window, the issuing
