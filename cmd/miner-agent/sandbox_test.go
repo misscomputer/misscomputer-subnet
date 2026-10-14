@@ -196,12 +196,11 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	if err := decodeJSON(bytes.NewReader(response.Body.Bytes()), &answer); err != nil {
 		t.Fatalf("reservation response %d: %v %s", response.Code, err, response.Body.String())
 	}
-	digest, _ := protocol.SandboxDigestV1(held)
 	if err := protocol.VerifySandboxReceiptV1(answer.Receipt, minerPublic); err != nil {
 		t.Fatal(err)
 	}
 	if answer.Receipt.Stage != sandbox.StageHeld || answer.RequestID != "req-1" ||
-		protocol.SandboxReceiptAnswersV1(answer.Receipt, protocol.SandboxReservationSchema, digest, held.SandboxID, minerHotkey, 1, binding) != nil {
+		protocol.SandboxReceiptAnswersV1(answer.Receipt, held) != nil {
 		t.Fatalf("reservation receipt %+v", answer.Receipt)
 	}
 
@@ -230,7 +229,7 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	// A release whose sandbox cannot be destroyed yet is a retryable bridge
 	// error, not a released receipt; its replay is acknowledged once the
 	// sandbox is gone.
-	digest, _ = protocol.SandboxDigestV1(held)
+	digest, _ := protocol.SandboxDigestV1(held)
 	image := "sha256:" + strings.Repeat("c4", 32)
 	lease := protocol.SandboxLeaseV1{
 		AssignmentNonce: strings.Repeat("c3", 16), Env: map[string]string{}, Generation: 1, ImageDigest: image,
