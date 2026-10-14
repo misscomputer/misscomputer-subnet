@@ -381,7 +381,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?)`, leaseID, holdID, lease.SandboxID
 // returns false when a release, expiry or restart moved the lease first; the
 // caller must then tear the runtime down.
 func (l *SandboxLeases) MarkLeaseRunning(ctx context.Context, leaseID string, now time.Time) (bool, error) {
-	result, err := l.db.ExecContext(ctx, `UPDATE sandbox_leases SET status='running',updated_at_ns=? WHERE lease_id=? AND status='pending'`, now.UnixNano(), leaseID)
+	result, err := l.db.ExecContext(ctx, `UPDATE sandbox_leases SET status='running',updated_at_ns=? WHERE lease_id=? AND status='pending' AND lease_expires_at_ns > ?`, now.UnixNano(), leaseID, now.UnixNano())
 	if err != nil {
 		return false, err
 	}

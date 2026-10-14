@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -444,6 +445,45 @@ func TestSandboxCommitReplayStartsOrphanedPendingLease(t *testing.T) {
 	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
 	if live, created, _ := f.backend.state(); live != 1 || len(created) != 1 {
 		t.Fatalf("replayed pending lease: live=%d creates=%v, want one live sandbox", live, created)
+	}
+}
+
+// A create that completes after the hard expiry cannot turn a durable
+// pending lease into a ready sandbox, even if admission preceded expiry.
+func TestSandboxCreateFinishingAfterExpiryDestroysSandbox(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	r := f.reservation(1)
+	if receipt, err := f.lane.Reserve(ctx, r, f.request()); err != nil || receipt.Stage != sandbox.StageHeld {
+		t.Fatalf("reserve: stage=%s err=%v", receipt.Stage, err)
+	}
+	l := f.lease(r, func(l *protocol.SandboxLeaseV1) {
+		l.LeaseExpiresAt = stamp(f.now.Add(2 * time.Second))
+	})
+	leaseID := protocol.SandboxLeaseIDV1(l)
+	var clock atomic.Int64
+	clock.Store(f.now.UnixNano())
+	f.lane.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	f.backend.createGate = make(chan struct{})
+	type result struct {
+		receipt protocol.SandboxReceiptV1
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		receipt, err := f.lane.Commit(ctx, l, f.request())
+		done <- result{receipt, err}
+	}()
+	waitLease(t, f, leaseID, "pending")
+	clock.Store(f.now.Add(2*time.Second + sandbox.Grace + time.Second).UnixNano())
+	close(f.backend.createGate)
+	got := <-done
+	f.check(got.receipt, got.err, protocol.SandboxLeaseSchema, l, sandbox.StageExpired, "")
+	if live, _, destroyed := f.backend.state(); live != 0 || len(destroyed) != 1 {
+		t.Fatalf("expired create left sandbox running: live=%d destroyed=%v", live, destroyed)
+	}
+	if record, found, err := f.store.Lease(ctx, leaseID); err != nil || !found || record.Status != "expired" {
+		t.Fatalf("expired create durable state: %+v found=%v err=%v", record, found, err)
 	}
 }
 

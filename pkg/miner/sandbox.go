@@ -211,18 +211,18 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 	unlock := l.locks.lock(leaseID)
 	outcome, err := l.store.CommitLease(ctx, lease, now)
 	if err == nil && (outcome.Start || outcome.Stage == sandbox.StageAccepted) {
-		outcome, err = l.start(ctx, lease, leaseID, now)
+		outcome, err = l.start(ctx, lease, leaseID)
 	}
 	unlock()
 	if err != nil {
 		return protocol.SandboxReceiptV1{}, err
 	}
-	return l.receipt(protocol.SandboxLeaseSchema, lease, lease.SandboxID, lease.Generation, lease.Subnet, outcome, now)
+	return l.receipt(protocol.SandboxLeaseSchema, lease, lease.SandboxID, lease.Generation, lease.Subnet, outcome, l.now().UTC())
 }
 
 // start runs the sandbox of a lease that was just written as pending and
 // answers with its durable stage.
-func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, leaseID string, now time.Time) (durable.SandboxOutcome, error) {
+func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, leaseID string) (durable.SandboxOutcome, error) {
 	instance := SandboxInstanceName(leaseID)
 	code := l.unsupported(lease)
 	workCtx := context.WithoutCancel(ctx)
@@ -231,17 +231,32 @@ func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, 
 		err := l.backend.Create(createCtx, instance, lease)
 		cancel()
 		if err == nil {
-			// When a release or sweep moved the lease to cleanup while the
-			// sandbox started, the lease stays in cleanup: that caller is
-			// waiting on this lease's lock and destroys the sandbox next.
+			completedAt := l.now().UTC()
+			// A release or sweep can move the lease to cleanup during
+			// creation; promotion to running must then fail.
 			stateCtx, stateCancel := context.WithTimeout(workCtx, sandboxStateTimeout)
-			_, stateErr := l.store.MarkLeaseRunning(stateCtx, leaseID, now)
+			running, stateErr := l.store.MarkLeaseRunning(stateCtx, leaseID, completedAt)
+			stateCancel()
 			if stateErr == nil {
-				outcome, err := l.store.CommitLease(stateCtx, lease, now)
-				stateCancel()
+				if !running {
+					// A slow create may finish after expiry, even though the
+					// lease was live when first admitted. The same path also
+					// finishes a release that arrived during creation.
+					cleanupCtx, cleanupCancel := context.WithTimeout(workCtx, sandboxCleanupTimeout)
+					stateErr = l.store.BeginLeaseCleanup(cleanupCtx, leaseID, "expired", nil, completedAt)
+					if stateErr == nil {
+						_ = l.teardown(cleanupCtx, leaseID, instance, completedAt)
+					}
+					cleanupCancel()
+				}
+				if stateErr != nil {
+					return durable.SandboxOutcome{}, stateErr
+				}
+				answerCtx, answerCancel := context.WithTimeout(workCtx, sandboxStateTimeout)
+				outcome, err := l.store.CommitLease(answerCtx, lease, completedAt)
+				answerCancel()
 				return outcome, err
 			}
-			stateCancel()
 			err = stateErr
 		}
 		code = "runtime_start_failed"
@@ -254,12 +269,13 @@ func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, 
 	}
 	cleanupCtx, cleanupCancel := context.WithTimeout(workCtx, sandboxCleanupTimeout)
 	defer cleanupCancel()
-	if err := l.store.BeginLeaseCleanup(cleanupCtx, leaseID, "failed", &code, now); err != nil {
+	completedAt := l.now().UTC()
+	if err := l.store.BeginLeaseCleanup(cleanupCtx, leaseID, "failed", &code, completedAt); err != nil {
 		return durable.SandboxOutcome{}, err
 	}
-	_ = l.teardown(cleanupCtx, leaseID, instance, now)
+	_ = l.teardown(cleanupCtx, leaseID, instance, completedAt)
 	// An exact replay of the lease answers from the durable row.
-	return l.store.CommitLease(cleanupCtx, lease, now)
+	return l.store.CommitLease(cleanupCtx, lease, completedAt)
 }
 
 // unsupported is the non-fault refusal of a lease the lane or backend
