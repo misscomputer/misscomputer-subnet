@@ -37,11 +37,11 @@ done
 # per-sandbox image and log bytes, image reserve and engine overhead are
 # operator overhead outside the lane disk budget.
 log_mib=$((log_max_size_mib * log_max_file))
-lane_disk_mib=$((data_fs_mib - sandboxes * (image_max_mib + log_mib) - engine_overhead_mib - image_reserve_mib))
-(( lane_disk_mib > 0 )) || mcsbx_die 'data filesystem leaves no lane disk budget after overhead'
+(( data_fs_mib > sandboxes * (image_max_mib + log_mib) + engine_overhead_mib + image_reserve_mib )) ||
+  mcsbx_die 'data filesystem leaves no lane disk budget after overhead'
 (( lease_tasks >= sandboxes * lease_pids_max )) || mcsbx_die 'lease slice tasks do not cover sandboxes x per-lease pids'
 
-mcsbx_require_tools curl tar sha256sum docker dockerd losetup mkfs.xfs mount umount findmnt \
+mcsbx_require_tools curl tar sha256sum df awk docker dockerd losetup mkfs.xfs mount umount findmnt \
   xfs_quota systemd-run systemctl python3 truncate stat
 [[ $(findmnt -n -o FSTYPE /sys/fs/cgroup) == cgroup2 ]] || mcsbx_die 'host is not cgroup v2'
 [[ $(uname -m) == x86_64 ]] || mcsbx_die 'pinned runsc and image require x86_64'
@@ -96,6 +96,12 @@ mount -t xfs -o prjquota,nosuid "$loop_device" "$root/data"
 note data_mounted 1
 mount -t tmpfs -o "size=${run_tmpfs_mib}m,mode=0700,nodev,nosuid" mcsbx-run "$root/run"
 note run_mounted 1
+# The lane disk budget comes from the filesystem's OBSERVED size: XFS keeps
+# part of the device for its log and metadata (a 4096 MiB device showed 4032
+# MiB), and conformance compares the budget against what statfs reports.
+observed_fs_mib=$(( $(df -B1 --output=size "$root/data" | awk 'NR == 2 {print $1}') / 1048576 ))
+lane_disk_mib=$((observed_fs_mib - sandboxes * (image_max_mib + log_mib) - engine_overhead_mib - image_reserve_mib))
+(( lane_disk_mib > 0 )) || mcsbx_die "observed data filesystem ${observed_fs_mib} MiB leaves no lane disk budget"
 mkdir -m 0711 "$root/data/docker" "$root/data/containerd" "$root/run/docker" "$root/run/containerd" "$root/run/exec"
 
 # 3. Dedicated containerd: own root on the data filesystem, own state and
