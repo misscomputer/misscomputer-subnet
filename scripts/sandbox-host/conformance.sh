@@ -586,21 +586,29 @@ main_pid=$pid main_cg=$child_cg
 
 begin effect.guest_pids_limit observed_effect
 # gVisor runs guest processes as sentry tasks; the lease pids limit is the
-# sandbox cgroup's pids.max, i.e. host threads of the sentry. A guest that
-# spawns past it may get EAGAIN or may terminate its own sandbox. Either is
-# containment; which one happened is recorded, and the host-side pids.events
-# counter attributes it to the task limit.
+# sandbox cgroup's pids.max, i.e. host threads of the sentry. A guest spawn
+# storm must stay contained: the sandbox's host tasks never exceed pids.max,
+# and either guest fork fails or only that sandbox stops while the lease
+# slice and engine survive. Hosted runs showed the sandbox terminating
+# (WaitPID EOF) with pids.events max sometimes 1 and sometimes 0, so the
+# cause of termination is recorded, not claimed.
 container=mcsbx-lease-pids
 lease_run "$container" 256 64 64
 ppid=$(sentry_pid "$container")
 pcg=$(proc_cgroup "$ppid")
-( while :; do cat "$p_cgroup_root$pcg/pids.events" > "$work/pids.events.tmp" 2>/dev/null && mv "$work/pids.events.tmp" "$work/pids.events"; sleep 0.2; done ) &
+pids_limit=$(cg "$pcg" pids.max)
+( while :; do
+    cat "$p_cgroup_root$pcg/pids.events" > "$work/pids.events.tmp" 2>/dev/null && mv "$work/pids.events.tmp" "$work/pids.events"
+    cat "$p_cgroup_root$pcg/pids.current" >> "$work/pids.current" 2>/dev/null
+    sleep 0.05
+  done ) &
 sampler=$!
 docker exec "$container" sh -c 'n=0; while [ $n -lt 200 ]; do sleep 120 & n=$((n+1)); done; echo "spawned=$n"; wait' > "$work/pids.log" 2>&1 &
 spawner=$!
 sleep 8
 kill "$sampler" >/dev/null 2>&1 || true; wait "$sampler" 2>/dev/null || true; sampler=
 pids_max_events=$(awk '$1 == "max" {print $2}' "$work/pids.events" 2>/dev/null || true)
+pids_peak=$(sort -n "$work/pids.current" 2>/dev/null | tail -1 || true)
 full_id=$(docker inspect --format '{{.Id}}' "$container")
 state=$(docker inspect --format '{{.State.Running}} exit={{.State.ExitCode}}' "$container")
 state_dir=$(python3 - "$root/bin/" "$full_id" <<'PY'
@@ -630,17 +638,17 @@ fi
 kill "$spawner" >/dev/null 2>&1 || true; wait "$spawner" 2>/dev/null || true
 fork_errors=$(grep -Eci "can't fork|Resource temporarily unavailable" "$work/pids.log" || true)
 spawn_tail=$(tail -2 "$work/pids.log" | tr '\n' ' ' | cut -c1-200)
-mcsbx_finite "${pids_max_events:-0}" || bad "host task limit never reached (pids.events max=${pids_max_events:-none}); state=$state spawner: $spawn_tail"
+[[ $pids_peak =~ ^[0-9]+$ && $pids_limit =~ ^[0-9]+$ ]] && (( pids_peak <= pids_limit )) || bad "sandbox host tasks peaked at ${pids_peak:-unsampled} over pids.max ${pids_limit:-unknown}"
 if [[ $state == true* ]]; then
   [[ $guest_procs =~ ^[0-9]+$ ]] && (( guest_procs <= 64 && fork_errors > 0 )) ||
     bad "sandbox survived but guest processes=$guest_procs fork errors=$fork_errors spawner: $spawn_tail"
   pids_outcome="guest fork failed with EAGAIN; runsc ps counts $guest_procs guest processes"
 else
-  pids_outcome="sandbox terminated ($state) when its host task limit was hit; spawner: $spawn_tail"
+  pids_outcome="sandbox terminated ($state; pids.events max=${pids_max_events:-unsampled}, cause not attributed); spawner: $spawn_tail"
 fi
 [[ -d $p_cgroup_root$lease_cg ]] && systemctl is-active --quiet "$MCSBX_DOCKERD_UNIT" || bad 'lease slice or engine did not survive the guest spawn storm'
-ok "200 spawns under pids 64: host pids.events max=$pids_max_events; $pids_outcome; lease slice and engine intact"
-gap lease.guest_pids_host_task_semantics "the lease pids limit bounds the sentry's host tasks, not guest processes; exceeding it may terminate the sandbox instead of returning EAGAIN (this run: ${pids_outcome:0:200})"
+ok "200 spawns under pids 64: sandbox host tasks peaked at $pids_peak <= pids.max $pids_limit; $pids_outcome; lease slice and engine intact"
+gap lease.guest_pids_host_task_semantics "the lease pids limit bounds the sentry's host tasks, not guest processes; a guest spawn storm may terminate the sandbox instead of failing fork with EAGAIN (this run: ${pids_outcome:0:200})"
 docker rm -f "$container" >/dev/null
 
 begin effect.tmp_bounded_by_memory observed_effect
