@@ -587,24 +587,43 @@ main_pid=$pid main_cg=$child_cg
 begin effect.guest_pids_limit observed_effect
 container=mcsbx-lease-pids
 lease_run "$container" 256 64 64
-docker exec "$container" sh -c 'n=0; while [ $n -lt 200 ]; do sleep 120 & n=$((n+1)); done; wait' > "$work/pids.log" 2>&1 &
+docker exec "$container" sh -c 'n=0; while [ $n -lt 200 ]; do sleep 120 & n=$((n+1)); done; echo "spawned=$n"; wait' > "$work/pids.log" 2>&1 &
 spawner=$!
 sleep 8
 # Count guest processes from outside the sandbox with runsc's own state, so
-# the count needs no free slot inside a sandbox that is at its limit.
+# the count needs no free slot inside a sandbox that is at its limit. The
+# state root is the --root argument of this container's runsc processes.
 full_id=$(docker inspect --format '{{.Id}}' "$container")
-# runsc keeps <root>/<container id>/ state; find that root below the run root.
-state_dir=$(find "$p_run_root" -maxdepth 7 -name "$full_id*" -path '*runsc*' 2>/dev/null | head -1 || true)
-state_dir=${state_dir%/*}
+state_dir=$(python3 - "$root/bin/" "$full_id" <<'PY'
+import os, sys
+bindir, cid = sys.argv[1:]
+for pid in filter(str.isdigit, os.listdir('/proc')):
+    try:
+        if not os.readlink(f'/proc/{pid}/exe').startswith(bindir):
+            continue
+        args = open(f'/proc/{pid}/cmdline', 'rb').read().decode(errors='replace').split('\0')
+    except OSError:
+        continue
+    if cid not in ' '.join(args):
+        continue
+    for i, arg in enumerate(args):
+        if arg.startswith('--root='):
+            print(arg.split('=', 1)[1]); raise SystemExit
+        if arg == '--root' and i + 1 < len(args):
+            print(args[i + 1]); raise SystemExit
+PY
+)
 guest_procs=unavailable
 if [[ -n $state_dir ]]; then
-  guest_procs=$(timeout 20 "$p_runsc_path" --root "$state_dir" ps --format json "$full_id" 2>/dev/null |
+  guest_procs=$(timeout 20 "$p_runsc_path" --root "$state_dir" ps --format json "$full_id" 2>"$work/runsc-ps.err" |
     python3 -c 'import json,sys; print(len(json.load(sys.stdin) or []))' 2>/dev/null || echo unavailable)
 fi
 kill "$spawner" >/dev/null 2>&1 || true; wait "$spawner" 2>/dev/null || true
 fork_errors=$(grep -Eci "can't fork|Resource temporarily unavailable|No child processes" "$work/pids.log" || true)
-[[ $guest_procs =~ ^[0-9]+$ ]] && (( guest_procs <= 64 && fork_errors > 0 )) || bad "guest processes=$guest_procs (runsc root ${state_dir:-not found}) fork errors=$fork_errors"
-ok "runsc ps: guest processes=$guest_procs <= 64 after 200 spawn attempts; fork errors=$fork_errors"
+spawn_tail=$(tail -3 "$work/pids.log" | tr '\n' ' ')
+[[ $guest_procs =~ ^[0-9]+$ ]] && (( guest_procs <= 64 && fork_errors > 0 )) ||
+  bad "guest processes=$guest_procs (runsc root ${state_dir:-not found}; ps: $(head -c 200 "$work/runsc-ps.err" 2>/dev/null || true)) fork errors=$fork_errors spawner: $spawn_tail"
+ok "runsc ps: guest processes=$guest_procs <= 64 after 200 spawn attempts; fork errors=$fork_errors; spawner: $spawn_tail"
 docker rm -f "$container" >/dev/null
 
 begin effect.tmp_bounded_by_memory observed_effect
