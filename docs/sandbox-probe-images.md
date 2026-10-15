@@ -1,7 +1,8 @@
 # Sandbox probe images
 
 Status: **not published.** The builder, the pins and a manual publication
-workflow are reviewed here. Nothing is pushed until an org owner decides to
+workflow are reviewed here. Nothing is pushed until the repository's owner,
+the GitHub user account `misscomputer` (not an organisation), decides to
 publish and to make the package public.
 
 `GVisor.Create` pulls every image by digest from a public registry: the
@@ -59,6 +60,7 @@ review.
   - The job runs in the `probe-publication` environment (see Owner steps).
   - Before it touches the registry, it reads the environment's settings with the job token (`actions: read`) and refuses unless all of these hold:
     - at least one required reviewer;
+    - "Prevent self-review" on, so the person who dispatches a run cannot approve it;
     - administrators cannot bypass;
     - deployments are allowed from exactly the branch `main`.
 
@@ -67,7 +69,7 @@ review.
   - It rebuilds and verifies the layout as above.
   - It installs oras 1.3.4, checked against its pinned SHA-256.
   - With the job's `GITHUB_TOKEN` (`packages: write`, `contents: read`; no personal token or stored secret), it copies each pinned manifest to `ghcr.io/misscomputer/sandbox-probes:<probe>-v1`. `oras cp --from-oci-layout` copies the manifest, config and layer bytes unchanged, so the pushed digests are the pinned ones. Then it resolves every pin by digest and by tag.
-  - It never overwrites a tag that names another digest. Only a definite "not found" counts as an absent tag; any other lookup failure stops the run.
+  - It never overwrites a tag that names another digest. A tag counts as absent only when oras answers exactly `Error response from registry: failed to resolve digest: <repository>:<tag>: not found` (or, for a local layout dry run, `Error: failed to resolve digest: not found`). Any other lookup failure stops the run, including one whose text merely contains "not found", such as a missing credential helper.
   - Its record (run, oras version and checksum, pushed digests) is uploaded as an artifact.
 - **`check-public` mode** has no write permission and uses no credentials. It reads every pinned manifest, every blob it names and every `<probe>-v1` tag anonymously, and requires their SHA-256 digests to match. A re-pointed tag therefore fails it.
 
@@ -78,16 +80,16 @@ from being cleaned up as untagged; identity is always the digest.
 
 These are outside the repository.
 
-- **Environment (before any dispatch):** in the repository's settings under Environments, an org owner or repository admin creates `probe-publication` with:
-  - **Required reviewers:** at least one person or team who will not dispatch the run. Turn on "Prevent self-review".
+- **Environment (before any dispatch):** in the repository's settings under Environments, the repository owner (the user `misscomputer`) or a repository admin creates `probe-publication` with:
+  - **Required reviewers:** at least one person or team who will not dispatch the run. Turn on "Prevent self-review". A dispatcher cannot approve their own run, so publishing needs a second person with read access to the repository. With only the owner's account, add a collaborator first; turning self-review prevention off makes the publish job refuse to run.
   - **Allow administrators to bypass configured protection rules:** off.
   - **Deployment branches and tags:** "Selected branches and tags", with exactly one rule: the branch `main`.
   - **No environment secrets or variables:** the job uses only its own token.
 
-  The publish job checks the first three settings and stops if any is missing.
-- **Visibility:** an org owner sets `ghcr.io/misscomputer/sandbox-probes` to
-  public in the package settings, once the organisation allows public
-  packages. The token cannot do this.
+  The publish job checks the reviewer, self-review, bypass and branch settings and stops if any is missing.
+- **Visibility:** the package belongs to the user account `misscomputer`.
+  After the first publish, that account sets `ghcr.io/misscomputer/sandbox-probes`
+  to public in the package settings. The job token cannot do this.
 - **Repository link:** the owner links the package to this repository in the
   package settings. Adding `org.opencontainers.image.source` or any other
   label at push time would change the manifest bytes and therefore the
