@@ -101,6 +101,19 @@ registry credentials are supported.
 For an index digest the engine records the index digest and the image
 (config) ID it ran; the chosen platform manifest digest is not recorded.
 
+Deadlines (contract D15(d)): the lane gives `Create` one create budget.
+The registry phase (resolving the registry host and the pull) runs until
+that budget's deadline minus a fixed local-step reserve of 2 minutes;
+running past that pull deadline is `image_unavailable`. The steps after a
+pull (image inspection, container create, the start slot and start, the
+engine and kernel readbacks, and the D23 re-inspection, 2 s settle and
+removal) run under their own deadline of the full reserve, started fresh
+when the pull returns, so however long the registry makes the pull last it
+cannot shorten them; running past that local deadline is a miner fault. The
+pull share plus the reserve never exceed the budget, and a budget no larger
+than the reserve is refused as a miner fault before any engine call. An
+explicit cancellation of the lane's context still stops the local steps.
+
 Container: created from the verified engine image ID with runtime runsc,
 `NetworkMode=none`, cgroup parent the slice, the lease's CPU, memory (swap
 equal, so none), pids and writable-layer quota (`StorageOpt size`),

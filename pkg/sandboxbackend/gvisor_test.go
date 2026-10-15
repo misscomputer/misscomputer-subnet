@@ -98,6 +98,9 @@ type fakeEngine struct {
 	dropInspect func(*engineContainer) bool
 	failDelete  bool
 	starts      int
+	// pullDelay holds every pull answer that long, without blocking other
+	// requests; a pull the client gives up on stores nothing.
+	pullDelay time.Duration
 }
 
 func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
@@ -178,6 +181,16 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		// The image is stored before the stream is answered, as when a pull
 		// completes before the client reads its progress, unless the stream
 		// reports an error.
+		if e.pullDelay > 0 {
+			e.mu.Unlock()
+			select {
+			case <-time.After(e.pullDelay):
+				e.mu.Lock()
+			case <-r.Context().Done():
+				e.mu.Lock()
+				return
+			}
+		}
 		if image.PullDrop {
 			// The daemon gives no answer: no status line reaches the client.
 			panic(http.ErrAbortHandler)
@@ -574,7 +587,12 @@ func TestCreateReplayStartsCreatedContainerAndRejectsAnotherLeases(t *testing.T)
 	lease := testLease(nil)
 	instance := instanceOf(lease)
 	h.engine.applied = func(c *engineContainer) { c.Status = "created" }
-	if err := b.createContainer(ctx, instance, lease, mustDigest(t, lease)); err != nil {
+	budget, err := b.newCreateBudget(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer budget.close()
+	if err := b.createContainer(budget, instance, lease, mustDigest(t, lease)); err != nil {
 		t.Fatal(err)
 	}
 	h.engine.applied = nil
