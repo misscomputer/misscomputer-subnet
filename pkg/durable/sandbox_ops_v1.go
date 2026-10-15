@@ -1,0 +1,345 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package durable
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
+)
+
+// Durable admission for sandbox-ops-v1 (docs/sandbox-ops-v1.md; contract
+// D13; review SR-28-05; docs/sandbox-ops-v1-durability.md). This is an
+// inert development slice. Nothing in the miner, its startup or its
+// transport calls it, and Open never creates its tables. Its tables and
+// semantics are provisional until the ops contract freezes.
+//
+// What it guarantees:
+//
+//   - every admitted op, including every exec_start, is recorded by op_id
+//     and document digest before the caller may cause any effect
+//     (write-ahead);
+//   - admission is one transaction. It covers the request window, the
+//     lease fence, the lease state and expiry, the exec caps, and the
+//     insert, all decided with one clock reading taken inside that
+//     transaction;
+//   - an exec lookup reports the in-transaction time it decided at, so a
+//     receipt can carry that time as observed_at.
+//
+// What it does not decide: which wire refusal code a lease state maps to,
+// how an in-flight exec_start replay is answered, who writes exec
+// transitions or when, restart recovery, and file_write completion. Nor
+// does it prune: the retention bounds conflict. The durability doc lists
+// these as U1, U3, U4, U5, U6 and U7. Records therefore grow until that is
+// decided, which is acceptable only while nothing calls this code.
+//
+// Rows hold identities, digests, states and times only, never a path,
+// argv, payload or result.
+const sandboxOpsSchema = `
+CREATE TABLE IF NOT EXISTS sandbox_ops (
+  op_id TEXT PRIMARY KEY,
+  lease_id TEXT NOT NULL REFERENCES sandbox_leases(lease_id),
+  op TEXT NOT NULL CHECK(op IN ('exec_start','exec_read','exec_cancel','file_write','file_read','file_stat','file_list','file_remove','file_mkdir')),
+  document_digest TEXT NOT NULL,
+  validator_hotkey TEXT NOT NULL,
+  expires_at_ns INTEGER NOT NULL,
+  admitted_at_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sandbox_execs (
+  exec_id TEXT PRIMARY KEY REFERENCES sandbox_ops(op_id),
+  lease_id TEXT NOT NULL REFERENCES sandbox_leases(lease_id),
+  state TEXT NOT NULL CHECK(state IN ('admitted','running','exited','cancelled','timed_out','failed')),
+  error_code TEXT CHECK((state='failed') = (error_code IS NOT NULL)),
+  admitted_at_ns INTEGER NOT NULL,
+  updated_at_ns INTEGER NOT NULL
+);
+-- The per-lease caps count every exec row of the lease.
+CREATE INDEX IF NOT EXISTS sandbox_execs_by_lease ON sandbox_execs(lease_id, state);`
+
+// ErrSandboxOpForeign reports an op request that does not target the
+// stored lease it names: another validator, another generation, a sibling
+// lease or an unknown lease_id. Nothing is recorded.
+var ErrSandboxOpForeign = errors.New("sandbox op does not target a lease of this miner")
+
+// ErrSandboxOpExpired reports an op request whose window had closed when
+// the store decided, although an earlier admission check passed (SR-28-05).
+// Nothing is recorded.
+var ErrSandboxOpExpired = errors.New("sandbox op request window closed before admission")
+
+// ErrSandboxExecTransition reports an exec state change that would move a
+// terminal exec, or move a running exec back to admitted.
+var ErrSandboxExecTransition = errors.New("sandbox exec state transition is not allowed")
+
+// SandboxOps is the durable admission state of the ops extension.
+type SandboxOps struct {
+	db    *sql.DB
+	clock func() time.Time
+}
+
+// EnableSandboxOps creates the ops tables, if absent, in a store whose
+// sandbox lease lane is enabled. It is the only path that creates them; it
+// reads the lease tables and never writes them. clock is read inside each
+// transaction, after the store's single connection is held.
+func (l *SandboxLeases) EnableSandboxOps(ctx context.Context, clock func() time.Time) (*SandboxOps, error) {
+	if clock == nil {
+		return nil, errors.New("sandbox ops admission requires a clock")
+	}
+	if _, err := l.db.ExecContext(ctx, sandboxOpsSchema); err != nil {
+		return nil, fmt.Errorf("migrate sandbox ops tables: %w", err)
+	}
+	return &SandboxOps{db: l.db, clock: clock}, nil
+}
+
+// SandboxOpLeaseState is the raw durable state of the lease an op targets.
+// The store reports it when the lease cannot run ops. Mapping it to a wire
+// refusal code is the caller's decision (U1).
+type SandboxOpLeaseState struct {
+	Status        string
+	CleanupStatus *string
+	ExpiresAt     time.Time
+}
+
+// SandboxOpAdmission is the durable decision on one op request. At most one
+// of Replay, Unavailable and Limited is set; when none is, the op was
+// admitted now.
+type SandboxOpAdmission struct {
+	// DecidedAt is the in-transaction clock reading of this decision.
+	DecidedAt time.Time
+	// AdmittedAt is the decision time of the first admission; zero when
+	// nothing was admitted.
+	AdmittedAt time.Time
+	// Replay is true when this exact document was admitted before.
+	Replay bool
+	// Start is true only on the first admission of an exec_start. Its exec
+	// record is durable, and the caller may now ask the backend to start
+	// it. It is never true on a replay or a refusal.
+	Start bool
+	// Unavailable holds the raw lease state when the lease is not running
+	// or has expired at DecidedAt. Nothing was recorded.
+	Unavailable *SandboxOpLeaseState
+	// Limited is true when an exec_start would exceed the lease's
+	// non-terminal exec cap or its session cap. Nothing was recorded.
+	Limited bool
+}
+
+// AdmitOp decides one verified op request in a single transaction. The
+// caller has already run VerifyBoundSandboxOpRequestV1 and the miner
+// identity check. The store re-validates the shape, fences the request to
+// the exact stored lease, and re-decides the window and lease liveness
+// with its own clock, so a window that closes between those checks and
+// this call is refused here.
+func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV1) (SandboxOpAdmission, error) {
+	if err := req.Validate(); err != nil {
+		return SandboxOpAdmission{}, err
+	}
+	digest, err := protocol.SandboxOpDigestV1(req)
+	if err != nil {
+		return SandboxOpAdmission{}, err
+	}
+	opID := protocol.SandboxOpIDV1(req)
+	expires := sandboxTime(req.ExpiresAt)
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SandboxOpAdmission{}, err
+	}
+	defer tx.Rollback()
+	// The store has one connection, so this transaction excludes every
+	// other durable read and write. This reading therefore orders the
+	// decision against every exec lookup.
+	now := o.clock()
+	decision := SandboxOpAdmission{DecidedAt: now}
+
+	state, err := sandboxOpLeaseTx(ctx, tx, req)
+	if err != nil {
+		return SandboxOpAdmission{}, err
+	}
+	var existingDigest string
+	var admitted int64
+	err = tx.QueryRowContext(ctx, `SELECT document_digest,admitted_at_ns FROM sandbox_ops WHERE op_id=?`, opID).Scan(&existingDigest, &admitted)
+	switch {
+	case err == nil && existingDigest != digest:
+		return SandboxOpAdmission{}, ErrSandboxConflict
+	case err == nil:
+		decision.Replay, decision.AdmittedAt = true, time.Unix(0, admitted).UTC()
+		return decision, tx.Commit()
+	case !errors.Is(err, sql.ErrNoRows):
+		return SandboxOpAdmission{}, err
+	}
+	if !now.Before(expires) {
+		return SandboxOpAdmission{}, ErrSandboxOpExpired
+	}
+	if state.Status != "running" || !now.Before(state.ExpiresAt) {
+		decision.Unavailable = &state
+		return decision, tx.Commit()
+	}
+	start := req.Op == sandbox.OpExecStart
+	if start {
+		var live, sessions int
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(state IN ('admitted','running')),0),COUNT(*) FROM sandbox_execs WHERE lease_id=?`,
+			req.LeaseID).Scan(&live, &sessions); err != nil {
+			return SandboxOpAdmission{}, err
+		}
+		if live >= sandbox.MaxRunningExecs || sessions >= sandbox.MaxExecSessions {
+			decision.Limited = true
+			return decision, tx.Commit()
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sandbox_ops(op_id,lease_id,op,document_digest,validator_hotkey,expires_at_ns,admitted_at_ns) VALUES(?,?,?,?,?,?,?)`,
+		opID, req.LeaseID, req.Op, digest, sandboxValidator(req.Subnet), expires.UnixNano(), now.UnixNano()); err != nil {
+		return SandboxOpAdmission{}, err
+	}
+	if start {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sandbox_execs(exec_id,lease_id,state,admitted_at_ns,updated_at_ns) VALUES(?,?,'admitted',?,?)`,
+			opID, req.LeaseID, now.UnixNano(), now.UnixNano()); err != nil {
+			return SandboxOpAdmission{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return SandboxOpAdmission{}, err
+	}
+	decision.AdmittedAt, decision.Start = now, start
+	return decision, nil
+}
+
+// sandboxOpLeaseTx loads the lease req names and fences req to it.
+func sandboxOpLeaseTx(ctx context.Context, tx *sql.Tx, req protocol.SandboxOpRequestV1) (SandboxOpLeaseState, error) {
+	var state SandboxOpLeaseState
+	var expires int64
+	var payload []byte
+	err := tx.QueryRowContext(ctx, `SELECT status,cleanup_status,lease_expires_at_ns,lease_json FROM sandbox_leases WHERE lease_id=?`, req.LeaseID).
+		Scan(&state.Status, &state.CleanupStatus, &expires, &payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return state, ErrSandboxOpForeign
+	}
+	if err != nil {
+		return state, err
+	}
+	var lease protocol.SandboxLeaseV1
+	if err := json.Unmarshal(payload, &lease); err != nil {
+		return state, fmt.Errorf("decode sandbox lease: %w", err)
+	}
+	if err := protocol.SandboxOpTargetsLeaseV1(req, lease); err != nil {
+		return state, ErrSandboxOpForeign
+	}
+	state.ExpiresAt = time.Unix(0, expires).UTC()
+	return state, nil
+}
+
+// SandboxExecLookup is the durable answer to an exec_read or exec_cancel.
+type SandboxExecLookup struct {
+	// DecidedAt is the in-transaction clock reading of this lookup. A
+	// receipt that answers exec_not_found from this lookup must carry
+	// exactly this observed_at, never a later time.
+	DecidedAt time.Time
+	// Unavailable holds the raw lease state when the lease is not running
+	// or has expired at DecidedAt. The exec was not looked up.
+	Unavailable *SandboxOpLeaseState
+	// Found reports whether an exec_start with this exec_id was admitted
+	// on the lease. It is false exactly when no such record exists.
+	Found      bool
+	State      string
+	ErrorCode  *string
+	AdmittedAt time.Time
+}
+
+// LookupExec reports whether the exec named by a verified exec_read or
+// exec_cancel was admitted on its lease. Its clock reading is ordered
+// against every AdmitOp, because both hold the store's only connection.
+// Suppose a lookup finds nothing at DecidedAt >= expires_at plus the skew of
+// the exec_start. Then no later admission of that exec_start can happen,
+// because AdmitOp refuses at or after expires_at by the same clock.
+func (o *SandboxOps) LookupExec(ctx context.Context, req protocol.SandboxOpRequestV1) (SandboxExecLookup, error) {
+	if err := req.Validate(); err != nil {
+		return SandboxExecLookup{}, err
+	}
+	if req.ExecID == nil {
+		return SandboxExecLookup{}, errors.New("sandbox exec lookup needs an exec_read or exec_cancel request")
+	}
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SandboxExecLookup{}, err
+	}
+	defer tx.Rollback()
+	now := o.clock()
+	state, err := sandboxOpLeaseTx(ctx, tx, req)
+	if err != nil {
+		return SandboxExecLookup{}, err
+	}
+	lookup := SandboxExecLookup{DecidedAt: now}
+	if state.Status != "running" || !now.Before(state.ExpiresAt) {
+		lookup.Unavailable = &state
+		return lookup, tx.Commit()
+	}
+	var admitted int64
+	err = tx.QueryRowContext(ctx, `SELECT state,error_code,admitted_at_ns FROM sandbox_execs WHERE exec_id=? AND lease_id=?`, *req.ExecID, req.LeaseID).
+		Scan(&lookup.State, &lookup.ErrorCode, &admitted)
+	switch {
+	case err == nil:
+		lookup.Found, lookup.AdmittedAt = true, time.Unix(0, admitted).UTC()
+	case !errors.Is(err, sql.ErrNoRows):
+		return SandboxExecLookup{}, err
+	}
+	return lookup, tx.Commit()
+}
+
+var sandboxExecTerminal = map[string]bool{
+	sandbox.ExecStateExited: true, sandbox.ExecStateCancelled: true, sandbox.ExecStateTimedOut: true, sandbox.ExecStateFailed: true,
+}
+
+// RecordExecState stores a transition supplied by the caller. It does not
+// decide when or why one happens (U4). It only guards monotonicity:
+// admitted may become running or terminal, running may become terminal, a
+// terminal state never changes, and repeating the current state is a
+// no-op. failed carries a known op error code; no other state does.
+func (o *SandboxOps) RecordExecState(ctx context.Context, execID, state string, code *string) error {
+	switch {
+	case state == sandbox.ExecStateFailed:
+		if code == nil {
+			return errors.New("a failed sandbox exec needs an error code")
+		}
+		if _, known := sandbox.OpErrorAttribution[*code]; !known {
+			return errors.New("sandbox exec error code is unknown")
+		}
+	case state == sandbox.ExecStateRunning || sandboxExecTerminal[state]:
+		if code != nil {
+			return errors.New("only a failed sandbox exec carries an error code")
+		}
+	default:
+		return errors.New("sandbox exec state is invalid")
+	}
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := o.clock()
+	var current string
+	var currentCode *string
+	err = tx.QueryRowContext(ctx, `SELECT state,error_code FROM sandbox_execs WHERE exec_id=?`, execID).Scan(&current, &currentCode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("sandbox exec %q is unknown", execID)
+	}
+	if err != nil {
+		return err
+	}
+	switch {
+	case current == state && sameCode(currentCode, code):
+		return tx.Commit()
+	case sandboxExecTerminal[current], state == sandbox.ExecStateRunning && current != "admitted":
+		return ErrSandboxExecTransition
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE sandbox_execs SET state=?,error_code=?,updated_at_ns=? WHERE exec_id=?`, state, code, now.UnixNano(), execID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func sameCode(left, right *string) bool {
+	return (left == nil) == (right == nil) && (left == nil || *left == *right)
+}
