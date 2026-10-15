@@ -260,8 +260,11 @@ The oversized registry error proof (`TestEnginePullOversizedRegistryErrorOnDispo
 and the independent `scripts/sandbox-host/probe-oversized-pull.py`) serves
 its registry on `127.0.0.1`, which the engine egress table rejects. The job
 opens exactly `127.0.0.1` unprivileged TCP for the engine slice for that
-step only, records the rule handle, removes it, diffs the table against its
-state before the exception and re-runs `network.engine_egress_restricted`.
+step only, as a rule commented `mcsbx-lab-loopback-exception`. An
+EXIT/INT/TERM trap removes it on every path out of the step, the step then
+diffs the table against its state before the exception and re-runs
+`network.engine_egress_restricted`, and a separate `always()` step removes
+any leftover commented rule (and fails if it found one) before later steps.
 The independent probe records the real dockerd's raw `/images/create`
 answer (status, longest progress line, whether a line carries the registry
 body); the backend test's own assertion is its classification of that

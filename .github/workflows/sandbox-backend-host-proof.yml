@@ -3,7 +3,8 @@ name: sandbox backend on disposable host
 # DEP-3: run the gVisor backend's own env-gated integration test, at a pinned
 # reviewed source SHA, on a host provisioned by scripts/sandbox-host from this
 # PR's exact head. GitHub-hosted only; the host is discarded with the VM.
-# The backend SHA is a reviewed pin: changing it is a reviewed change.
+# The backend SHA is a reviewed pin: changing it is a reviewed change. It
+# names a main commit that contains the merged backend (INT-29-04).
 on:
   pull_request:
     types: [labeled]
@@ -12,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: f434bb4c172f07882a6f0889145e7891565b1a33
+  BACKEND_SHA: 104284b23c8b13e492d19b146a3d39c323393eff
 
 jobs:
   backend-on-host:
@@ -127,8 +128,17 @@ jobs:
           # The engine slice may not reach loopback. Both oversized-error
           # proofs serve their registry on 127.0.0.1, so open exactly
           # 127.0.0.1 unprivileged TCP for the engine slice, for this step only.
-          handle=$(sudo nft -a -e insert rule inet "$table" output socket cgroupv2 level 1 '"mcsbxengine.slice"' ip daddr 127.0.0.1 tcp dport 1024-65535 accept | sed -n 's/.*# handle \([0-9][0-9]*\)$/\1/p')
+          # The exception carries a comment so the always() step below can find
+          # and remove it if this step is cut short (SR-29-01, INT-29-03); an
+          # EXIT/INT/TERM trap removes it on every other path out of this step.
+          handle=$(sudo nft -a -e insert rule inet "$table" output socket cgroupv2 level 1 '"mcsbxengine.slice"' ip daddr 127.0.0.1 tcp dport 1024-65535 accept comment '"mcsbx-lab-loopback-exception"' | sed -n 's/.*# handle \([0-9][0-9]*\)$/\1/p')
           [[ $handle =~ ^[0-9]+$ ]] || { echo 'could not open the scoped loopback exception'; exit 1; }
+          close_exception() {
+            if [[ -n ${handle:-} ]]; then
+              sudo nft delete rule inet "$table" output handle "$handle" && handle=
+            fi
+          }
+          trap close_exception EXIT INT TERM
           echo "scoped loopback exception: rule handle $handle" | tee -a "$GITHUB_STEP_SUMMARY"
           rc=0
           echo '### Independent: raw answer of the real dockerd' | tee -a "$GITHUB_STEP_SUMMARY"
@@ -137,16 +147,28 @@ jobs:
           echo '### Backend: TestEnginePullOversizedRegistryErrorOnDisposableHost' | tee -a "$GITHUB_STEP_SUMMARY"
           docker_host=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json")
           sudo env MC_SANDBOX_BACKEND_IT=1 MC_SANDBOX_DOCKER_HOST="$docker_host" \
-            "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestEnginePullOversizedRegistryErrorOnDisposableHost$' -test.v -test.count 1 -test.timeout 10m \
+            timeout 600 "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestEnginePullOversizedRegistryErrorOnDisposableHost$' -test.v -test.count 1 -test.timeout 9m \
             2>&1 | tee "$RUNNER_TEMP/oversized-test.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          test_rc=${PIPESTATUS[0]}
+          (( test_rc == 0 )) || { echo "backend oversized test exited $test_rc"; rc=1; }
           grep -qx -- '--- PASS: TestEnginePullOversizedRegistryErrorOnDisposableHost.*' "$RUNNER_TEMP/oversized-test.log" || rc=1
-          sudo nft delete rule inet "$table" output handle "$handle"
+          close_exception
           sudo nft list table inet "$table" | strip > "$RUNNER_TEMP/egress-after.nft"
           diff -u "$RUNNER_TEMP/egress-before.nft" "$RUNNER_TEMP/egress-after.nft" || { echo 'egress table not restored'; rc=1; }
           # shellcheck disable=SC2024 # the report file is runner-owned on purpose
           sudo "$RUNNER_TEMP/sandbox-host-observe" -profile "$RUNNER_TEMP/profile.json" preflight > "$RUNNER_TEMP/preflight-after-exception.json"
           python3 -c 'import json,sys; c=[c for c in json.load(open(sys.argv[1])) if c["id"]=="network.engine_egress_restricted"][0]; print("after exception:", c["status"], c["evidence"]); sys.exit(c["status"]!="pass")' "$RUNNER_TEMP/preflight-after-exception.json" | tee -a "$GITHUB_STEP_SUMMARY" || rc=1
           exit "$rc"
+      - name: Verify the loopback exception is gone
+        if: always()
+        run: |
+          [[ -s $RUNNER_TEMP/profile.json ]] || exit 0
+          table=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["engine"]["egress_table"])' "$RUNNER_TEMP/profile.json")
+          sudo nft list table inet "$table" >/dev/null 2>&1 || exit 0
+          left=$(sudo nft -a list table inet "$table" | sed -n 's/.*mcsbx-lab-loopback-exception.*# handle \([0-9][0-9]*\)$/\1/p')
+          for handle in $left; do sudo nft delete rule inet "$table" output handle "$handle"; done
+          if [[ -n $left ]]; then echo "loopback exception was still present (handles: $left); removed" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          echo 'loopback exception absent before later steps' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Record command-failure behaviour of engine and runsc (no attribution)
         if: always()
         run: |
