@@ -204,17 +204,22 @@ sees the engine's PIDs and network namespace.
   `SO_PEERCRED` of one connection made by the check and closed without
   sending a byte. The kernel reports PID 0 when the listener is not visible
   in the caller's PID namespace, which fails the check. The PID must also hold
-  the listening socket in the configured procfs (`net/unix` and fd tables),
-  so a PID number from another namespace cannot name a different process.
+  the listening socket: the socket's inode is read from the listener's own
+  `<proc>/<pid>/net/unix` and must appear in that PID's fd table in the
+  configured procfs, so a PID number from another namespace cannot name a
+  different process.
 - Identity of a namespace: the nsfs `(st_dev, st_ino)` of
   `<proc>/self/ns/{pid,net}` and `<proc>/<dockerd>/ns/{pid,net}`. The
   `kind:[inode]` text is evidence only.
 - Fail closed: a refused connection, missing peer credentials, a listener
   that is not a holder, an unreadable namespace file (reading another
   process's `ns` needs ptrace-read access, in practice root) or a mismatch.
-  On a real kernel, a listener in another network namespace usually fails
-  the holder step, because `net/unix` lists only the caller's network
-  namespace.
+  Reading the listener's own `net/unix` makes a caller in another network
+  namespace fail as a network namespace difference, not as a missing holder.
+- Namespace controls: the conformance job also runs the observer as root
+  in the host namespaces (must pass), under `unshare -n` (must fail with
+  `caller net namespace`) and under `unshare -p -f --mount-proc` (must fail
+  with `SO_PEERCRED PID 0`). Their outputs are uploaded with the report.
 
 Gating disposition: like every non-gap check, a fail makes the preflight
 verdict fail, so `OpenFromProfile` refuses and an agent started with
@@ -235,9 +240,8 @@ decisions:
   activation-gating.
 - Profile v2 `engine.daemon_config` and an `ObserveInstance` typed vanished
   signal (pidfd) are separate proposals, not part of this change.
-- Not proven: the PID-0 branch (it needs a listener in an ancestor or sibling
-  PID namespace), a containerised agent with the host procfs mounted
-  elsewhere, and any production host.
+- Not proven: a containerised agent with the host procfs mounted elsewhere,
+  and any production host.
 
 ## Engine egress readback (INT-27-07)
 

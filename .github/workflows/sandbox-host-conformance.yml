@@ -50,6 +50,35 @@ jobs:
           MC_SANDBOX_HOST_DISPOSABLE: "1"
           MC_SANDBOX_HOST_OBSERVER: ${{ runner.temp }}/sandbox-host-observe
         run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,MC_SANDBOX_HOST_OBSERVER,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,GITHUB_RUN_ID,ImageOS,ImageVersion bash scripts/sandbox-host/conformance.sh
+      - name: Namespace controls for host.agent_shares_engine_namespaces
+        run: |
+          # The observer as root in the host namespaces, then in a new network
+          # namespace and in a new PID namespace. Each must give its own cause.
+          profile=$RUNNER_TEMP/mcsbx/profile.json
+          out=$RUNNER_TEMP/mcsbx-report
+          sudo mkdir -p "$out"
+          observe() { sudo "$@" "$RUNNER_TEMP/sandbox-host-observe" -profile "$profile" preflight; }
+          observe env > "$RUNNER_TEMP/ns-host.json"
+          observe unshare -n > "$RUNNER_TEMP/ns-unshare-n.json"
+          observe unshare -p -f --mount-proc > "$RUNNER_TEMP/ns-unshare-p.json"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, sys
+          root = sys.argv[1]
+          want = {
+              'host': ('pass', ' net net:['),
+              'unshare-n': ('fail', 'caller net namespace'),
+              'unshare-p': ('fail', "not visible in the caller's PID namespace (SO_PEERCRED PID 0)"),
+          }
+          bad = []
+          for name, (status, text) in want.items():
+              checks = [c for c in json.load(open(f'{root}/ns-{name}.json')) if c['id'] == 'host.agent_shares_engine_namespaces']
+              got = checks[0] if len(checks) == 1 else {'status': 'absent', 'evidence': ''}
+              print(f"{name}: {got['status']}: {got['evidence']}")
+              if got['status'] != status or text not in got['evidence']:
+                  bad.append(name)
+          sys.exit(1 if bad else 0)
+          PY
+          sudo cp "$RUNNER_TEMP"/ns-host.json "$RUNNER_TEMP"/ns-unshare-n.json "$RUNNER_TEMP"/ns-unshare-p.json "$out/"
       - name: Teardown and verify cleanup
         if: always()
         env:
