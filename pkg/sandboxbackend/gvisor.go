@@ -903,12 +903,21 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 		case engineStatus(err) != 0:
 			// The engine answered the pull with a failure. Registry answers
 			// and transport failures to the registry reach the backend only
-			// as engine messages whose text the registry can choose, so none
-			// is the miner's fault (contract D15). Running out of space after
-			// pullHeadroom held is the image outgrowing its limit.
+			// as engine messages whose text, and length, the registry can
+			// choose, so none is the miner's fault (contract D15(c)), nor is
+			// a progress stream that breaks off or never completes. Running
+			// out of space after pullHeadroom held is the image outgrowing
+			// its limit.
+			if status := engineStatus(err); status >= 200 && status <= 299 {
+				// The stream failed after the engine accepted the pull,
+				// which may have stored the image.
+				if discardErr := b.discardImage(ctx, name+"@"+lease.ImageDigest); discardErr != nil {
+					return "", discardErr
+				}
+			}
 			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 		}
-		// The dedicated daemon did not answer: the miner's fault.
+		// The dedicated daemon gave no answer: the miner's fault.
 		return "", fmt.Errorf("pull %s: %w", lease.ImageReference, err)
 	}
 	imageID, size, err := b.verifiedImage(ctx, name+"@"+lease.ImageDigest, lease)

@@ -49,6 +49,9 @@ type engineImage struct {
 	Cmd          []string
 	PullStatus   int
 	PullMessages []string
+	// PullDrop closes the connection before the engine answers the pull;
+	// PullBreakOff closes it after PullMessages, mid-stream.
+	PullDrop, PullBreakOff bool
 }
 
 type engineContainer struct {
@@ -166,6 +169,10 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		// The image is stored before the stream is answered, as when a pull
 		// completes before the client reads its progress, unless the stream
 		// reports an error.
+		if image.PullDrop {
+			// The daemon gives no answer: no status line reaches the client.
+			panic(http.ErrAbortHandler)
+		}
 		failed := false
 		for _, line := range image.PullMessages {
 			failed = failed || strings.Contains(line, `"error"`)
@@ -176,6 +183,12 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		for _, line := range image.PullMessages {
 			fmt.Fprintln(w, line)
+		}
+		if image.PullBreakOff {
+			// Send what was written, then drop the connection without
+			// ending the chunked answer.
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
 		}
 	case r.Method == http.MethodGet && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/json"):
 		name := strings.TrimSuffix(strings.TrimPrefix(p, "/images/"), "/json")
@@ -720,6 +733,14 @@ func TestCreateServesAnExitBesideOtherSandboxes(t *testing.T) {
 	})
 }
 
+// dockerdErrorLine is the line dockerd writes for a pull error once its
+// answer has started (moby streamformatter.FormatError): the error text
+// twice, as errorDetail.message and error.
+func dockerdErrorLine(message string) string {
+	line, _ := json.Marshal(map[string]any{"errorDetail": map[string]string{"message": message}, "error": message})
+	return string(line)
+}
+
 func mustDigest(t *testing.T, lease protocol.SandboxLeaseV1) string {
 	t.Helper()
 	digest, err := protocol.SandboxDigestV1(lease)
@@ -812,7 +833,18 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 			i.RepoDigests = []string{"evil/busybox@" + testImageDigest}
 		}, fault: "is not recorded as"},
 		{name: "data root lacks the pull reserve", config: func(c *Config) { c.ImageMaxMiB = 1 << 40 }, fault: "a pull reserves"},
-		{name: "daemon breaks off the progress stream", image: func(i *engineImage) { i.PullMessages = []string{`{"error":`} }, fault: "decode docker pull progress"},
+		// Once the engine answered the pull, nothing in its progress stream
+		// is evidence about the miner (D15(c)): the registry chooses the
+		// text, and so the length, of the errors the engine relays.
+		{name: "registry error line longer than the reader bound", image: func(i *engineImage) {
+			i.PullMessages = []string{i.PullMessages[0], dockerdErrorLine("unknown: " + strings.Repeat("A", 600<<10))}
+		}, code: "image_unavailable"},
+		{name: "undecodable progress line", image: func(i *engineImage) { i.PullMessages = []string{`{"error":`} }, code: "image_unavailable"},
+		{name: "progress stream breaks off mid-pull", image: func(i *engineImage) {
+			i.PullMessages, i.PullBreakOff = i.PullMessages[:1], true
+		}, code: "image_unavailable"},
+		{name: "progress stream ends before the pull completes", image: func(i *engineImage) { i.PullMessages = i.PullMessages[:1] }, code: "image_unavailable"},
+		{name: "daemon gives no answer to the pull", image: func(i *engineImage) { i.PullDrop = true }, fault: "docker engine POST /images/create"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newHost(t)

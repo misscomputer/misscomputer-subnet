@@ -148,6 +148,14 @@ var errPullTooLarge = errors.New("image download exceeds the per-image limit")
 // once the compressed sizes the engine reports for distinct layers sum to
 // more than maxBytes. Compressed sizes are a lower bound on the stored
 // image, so the caller still checks the unpacked size after the pull.
+//
+// Once the engine has answered the request, every failure of its progress
+// stream is an *engineError carrying that answer's status: an error line,
+// a line that does not decode or exceeds the reader bound, a stream that
+// breaks off, and one that ends before the engine reports completion. The
+// registry chooses the text, and so the length, of what the engine relays,
+// so none of these is evidence about the miner (contract D15(c)). Only a
+// request the daemon gives no answer to is not an *engineError.
 func (e *engine) pull(ctx context.Context, name, digest string, maxBytes int64) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -158,18 +166,29 @@ func (e *engine) pull(ctx context.Context, name, digest string, maxBytes int64) 
 		return err
 	}
 	defer resp.Body.Close()
+	answered := func(message string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &engineError{Status: resp.StatusCode, Message: bounded(message)}
+	}
 	layers := map[string]int64{}
 	var total int64
+	completed := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64<<10), maxPullMessageBytes)
 	for scanner.Scan() {
 		var message pullMessage
 		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
-			return fmt.Errorf("decode docker pull progress: %w", err)
+			return answered("decode docker pull progress: " + err.Error())
 		}
 		if message.Error != "" {
-			return &engineError{Status: http.StatusOK, Message: bounded(message.Error)}
+			return answered(message.Error)
 		}
+		// The engine's last line of a pull that succeeded ("Status:
+		// Downloaded newer image for ..." or "Status: Image is up to date
+		// for ...").
+		completed = completed || strings.HasPrefix(message.Status, "Status: ")
 		if size := message.ProgressDetail.Total; message.ID != "" && size > layers[message.ID] {
 			total += size - layers[message.ID]
 			layers[message.ID] = size
@@ -179,10 +198,10 @@ func (e *engine) pull(ctx context.Context, name, digest string, maxBytes int64) 
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("read docker pull progress: %w", err)
+		return answered("read docker pull progress: " + err.Error())
+	}
+	if !completed {
+		return answered("docker pull progress ended before the pull completed")
 	}
 	return nil
 }

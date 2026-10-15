@@ -89,8 +89,14 @@ D19). A refused image is removed. Every pull failure the engine reports is `imag
 registry answers of any status, transport failures to the registry, a pull
 that outlasts the create budget, and running out of space after the
 headroom check passed, because the engine relays registry-chosen text and
-only the headroom check is local evidence about the miner's disk. A daemon
-that does not answer or breaks its progress stream is a miner fault. No
+only the headroom check is local evidence about the miner's disk. Once the
+engine has answered the pull, every failure of its progress stream is
+`image_unavailable` too (contract D15(c)): a line longer than the 1 MiB
+reader bound (the registry chooses the length of the error text the engine
+relays), a line that does not decode, a stream that breaks off, and one that
+ends before the engine's final `Status:` line. An image such a pull may have
+stored is removed. A daemon that gives no answer to the pull request (no
+HTTP status) is a miner fault. No
 registry credentials are supported.
 For an index digest the engine records the index digest and the image
 (config) ID it ran; the chosen platform manifest digest is not recorded.
@@ -171,6 +177,11 @@ container uses it; a missing container is success.
   from customer code, not customer code from the operator.
 
 ## Disposable-host proof
+
+`TestEnginePullOversizedRegistryErrorOnDisposableHost` (same gate) has the
+real daemon pull from a loopback registry that answers every blob request
+with a 600 KiB error body, and requires an engine-answered classification.
+It needs the daemon to reach a registry on 127.0.0.1 over HTTP.
 
 `TestGVisorLaneOnDisposableHost` (skipped unless `MC_SANDBOX_BACKEND_IT=1`)
 opens the backend against the real host, then drives the real lane with
