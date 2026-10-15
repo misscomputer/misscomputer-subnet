@@ -34,15 +34,29 @@ func TestCreateAttributesAStartTheEngineRefused(t *testing.T) {
 			return http.StatusInternalServerError, message
 		}
 	}
-	// reference scripts a host process outside the slice whose arguments
-	// and cgroup are given; "%s" is the engine's container ID.
-	reference := func(pid, cmdline, cgroup string) func(*host, string) {
+	// reference scripts a host process outside the slice with the given
+	// executable (a function of the host, "" for none), arguments and
+	// cgroup; "%s" is the engine's container ID.
+	reference := func(pid string, exe func(*host) string, cmdline, cgroup string) func(*host, string) {
 		return func(h *host, id string) {
 			dir := filepath.Join(h.config.ProcRoot, pid)
 			writeFile(h.t, filepath.Join(dir, "cmdline"), strings.ReplaceAll(cmdline, "%s", id))
 			writeFile(h.t, filepath.Join(dir, "cgroup"), "0::"+strings.ReplaceAll(cgroup, "%s", id)+"\n")
+			if exe != nil {
+				if err := os.Symlink(exe(h), filepath.Join(dir, "exe")); err != nil {
+					h.t.Fatal(err)
+				}
+			}
 		}
 	}
+	runsc := func(h *host) string { return h.config.RunscPath }
+	// operatorTool is a program that is neither runsc nor the sentry.
+	operatorTool := func(h *host) string {
+		tool := filepath.Join(h.t.TempDir(), "docker")
+		writeFile(h.t, tool, "operator tool")
+		return tool
+	}
+	deleted := func(h *host) string { return filepath.Join(h.t.TempDir(), "runsc (deleted)") }
 	for _, test := range []struct {
 		name    string
 		applied func(*engineContainer)
@@ -87,14 +101,22 @@ func TestCreateAttributesAStartTheEngineRefused(t *testing.T) {
 		{name: "process remains below the slice", refuse: neverStarted(startFailure), setup: func(h *host, _ string) {
 			writeFile(h.t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "docker-x.scope", "cgroup.procs"), "4243\n")
 		}, want: "processes remain", decision: "fault: processes of the instance remain"},
-		{name: "runtime process in the engine slice names the container", refuse: neverStarted(startFailure),
-			setup: reference("5000", "runsc\x00--root\x00/run/runsc\x00delete\x00%s\x00", "/mc-engine.slice/containerd.service"),
+		{name: "runsc in the engine slice names the container", refuse: neverStarted(startFailure),
+			setup: reference("5000", runsc, "runsc\x00--root\x00/run/runsc\x00delete\x00%s\x00", "/mc-engine.slice/containerd.service"),
+			want:  "refer to container", decision: "fault: processes of the instance remain"},
+		{name: "process with a deleted executable names the container", refuse: neverStarted(startFailure),
+			setup: reference("5003", deleted, "runsc\x00delete\x00%s\x00", "/mc-engine.slice/containerd.service"),
 			want:  "refer to container", decision: "fault: processes of the instance remain"},
 		{name: "process cgroup outside the slice names the container", refuse: neverStarted(startFailure),
-			setup: reference("5001", "sleep\x00", "/system.slice/docker-%s.scope"),
+			setup: reference("5001", nil, "sleep\x00", "/system.slice/docker-%s.scope"),
 			want:  "refer to container", decision: "fault: processes of the instance remain"},
+		// An operator's shell or tool may name the container it inspects;
+		// its arguments are not a process of the instance.
+		{name: "operator tool names the container", refuse: neverStarted(startFailure),
+			setup:    reference("5004", operatorTool, "docker\x00logs\x00%s\x00", "/user.slice/session-1.scope"),
+			decision: "never_started"},
 		{name: "host process table unreadable", refuse: neverStarted(startFailure), setup: func(h *host, _ string) {
-			if err := os.MkdirAll(filepath.Join(h.config.ProcRoot, "5002", "cmdline"), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Join(h.config.ProcRoot, "5002", "cgroup"), 0o755); err != nil {
 				h.t.Fatal(err)
 			}
 		}, want: "host processes unreadable", decision: "fault: host processes unreadable"},
@@ -143,43 +165,59 @@ func TestCreateAttributesAStartTheEngineRefused(t *testing.T) {
 	}
 }
 
-// The runtime tears down a failed start asynchronously: a process naming
-// the container that is gone within the settle bound does not make the
-// never-started failure a fault, and the record shows what was observed.
+// The runtime tears down a failed start asynchronously: a runtime process
+// naming the container, or a process entry that cannot be read, that is
+// gone within the settle bound does not make the never-started failure a
+// fault, and the record shows what was finally observed.
 func TestCreateWaitsForAFailedStartToSettle(t *testing.T) {
-	h := newHost(t)
-	lease := testLease(nil)
-	instance := instanceOf(lease)
-	containerID := containerIDOf(instance)
-	dir := filepath.Join(h.config.ProcRoot, "5000")
-	h.engine.refuseStart = func(c *engineContainer) (int, string) {
-		c.Error = startFailure
-		writeFile(t, filepath.Join(dir, "cmdline"), "runsc\x00delete\x00"+containerID+"\x00")
-		writeFile(t, filepath.Join(dir, "cgroup"), "0::/mc-engine.slice/containerd.service\n")
-		time.AfterFunc(200*time.Millisecond, func() { _ = os.RemoveAll(dir) })
-		return http.StatusInternalServerError, startFailure
-	}
-	records := captureAttributions(t)
-	if err := h.backend().Create(context.Background(), instance, lease); refusalCode(err) != "image_unavailable" {
-		t.Fatalf("create = %v, want image_unavailable once the runtime settled", err)
-	}
-	got := records()
-	if len(got) != 1 {
-		t.Fatalf("records = %v, want one", got)
-	}
-	record := got[0]
-	settled, err := time.ParseDuration(record["settled"].(string))
-	if err != nil || settled < 200*time.Millisecond || settled > startSettleBound {
-		t.Fatalf("settled %v (%v), want between the process exit and the bound", record["settled"], err)
-	}
-	for key, want := range map[string]any{
-		"decision": "never_started", "start_status": float64(http.StatusInternalServerError), "reinspect_answered": true,
-		"running": false, "pid": float64(0), "slice_quiet": true, "runtime_references": nil, "cleaned_up": true,
-		"settle_bound": startSettleBound.String(), "per_process_checks": "not_run",
+	for name, transient := range map[string]func(h *host, dir, containerID string){
+		"runsc naming the container exits": func(h *host, dir, containerID string) {
+			writeFile(t, filepath.Join(dir, "cmdline"), "runsc\x00delete\x00"+containerID+"\x00")
+			writeFile(t, filepath.Join(dir, "cgroup"), "0::/mc-engine.slice/containerd.service\n")
+			if err := os.Symlink(h.config.RunscPath, filepath.Join(dir, "exe")); err != nil {
+				t.Error(err)
+			}
+		},
+		"unreadable process entry goes away": func(_ *host, dir, _ string) {
+			if err := os.MkdirAll(filepath.Join(dir, "cgroup"), 0o755); err != nil {
+				t.Error(err)
+			}
+		},
 	} {
-		if record[key] != want {
-			t.Errorf("record %s = %v, want %v", key, record[key], want)
-		}
+		t.Run(name, func(t *testing.T) {
+			h := newHost(t)
+			lease := testLease(nil)
+			instance := instanceOf(lease)
+			dir := filepath.Join(h.config.ProcRoot, "5000")
+			h.engine.refuseStart = func(c *engineContainer) (int, string) {
+				c.Error = startFailure
+				transient(h, dir, containerIDOf(instance))
+				time.AfterFunc(200*time.Millisecond, func() { _ = os.RemoveAll(dir) })
+				return http.StatusInternalServerError, startFailure
+			}
+			records := captureAttributions(t)
+			if err := h.backend().Create(context.Background(), instance, lease); refusalCode(err) != "image_unavailable" {
+				t.Fatalf("create = %v, want image_unavailable once the runtime settled", err)
+			}
+			got := records()
+			if len(got) != 1 {
+				t.Fatalf("records = %v, want one", got)
+			}
+			record := got[0]
+			settled, err := time.ParseDuration(record["settled"].(string))
+			if err != nil || settled < 200*time.Millisecond || settled > startSettleBound {
+				t.Fatalf("settled %v (%v), want between the entry going away and the bound", record["settled"], err)
+			}
+			for key, want := range map[string]any{
+				"decision": "never_started", "start_status": float64(http.StatusInternalServerError), "reinspect_answered": true,
+				"running": false, "pid": float64(0), "slice_quiet": true, "runtime_references": nil, "scan_error": "",
+				"cleaned_up": true, "settle_bound": startSettleBound.String(), "per_process_checks": "not_run",
+			} {
+				if record[key] != want {
+					t.Errorf("record %s = %v, want %v", key, record[key], want)
+				}
+			}
+		})
 	}
 }
 

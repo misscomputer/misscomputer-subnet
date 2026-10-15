@@ -364,8 +364,9 @@ type host struct {
 	socket string
 	config Config
 	sentry string
-	// sentryFile is the sentry binary as Open would have hashed it.
-	sentryFile os.FileInfo
+	// sentryFile and runscFile are the binaries as Open would have hashed
+	// them.
+	sentryFile, runscFile os.FileInfo
 	// dns answers registry host lookups; a host it lacks does not resolve.
 	dns map[string][]netip.Addr
 }
@@ -409,6 +410,9 @@ func newHost(t *testing.T) *host {
 	if h.sentryFile, err = os.Stat(sentry); err != nil {
 		t.Fatal(err)
 	}
+	if h.runscFile, err = os.Stat(runsc); err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "pids.max"), "4096\n")
 	h.process(sentry, "/mc.slice/"+testSlice+"/docker-1.scope", testLease(nil).Resources)
 	return h
@@ -439,7 +443,7 @@ func (h *host) process(exe, cgroup string, r sandbox.Resources) {
 // it directly; TestOpenRefusesUnverifiableHosts covers Open.
 func (h *host) backend() *GVisor {
 	return &GVisor{
-		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry, sandboxFile: h.sentryFile,
+		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry, sandboxFile: h.sentryFile, runscFile: h.runscFile,
 		lookup: func(_ context.Context, name string) ([]netip.Addr, error) {
 			if addresses, ok := h.dns[name]; ok {
 				return addresses, nil
