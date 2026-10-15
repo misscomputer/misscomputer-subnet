@@ -239,6 +239,14 @@ profile. A skipped test fails the job. While the test runs,
 every live sandbox the backend creates (engine settings, sentry executable
 and cgroup, cgroup limit files including exact `cpu.max`,
 `pkg/sandboxhost.ObserveInstance` and the XFS project quota) and the job
-requires them to match the lease. It proves the backend's preflight,
+requires them to match the lease; a sandbox whose sentry disappears during
+observation is reported as disappeared with its engine state, never as a
+mismatch. `scripts/sandbox-host/probe-command-failures.py` then records,
+without interpreting any text, what the engine and runsc report for a
+missing command, a non-executable command, a wrong-architecture ELF and a
+command that runs and exits: the create/start response, `State` (`Error`,
+`Pid`, `ExitCode`, `StartedAt`, `FinishedAt`), the gVisor processes and
+their cgroups seen during creation, and what remains before and after
+removal. It proves the backend's preflight,
 create, idempotent replay, release-after-destroy and restart recovery on this
 host for those two SHAs only; it does not wire `--sandbox-leases on`.

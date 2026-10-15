@@ -22,6 +22,7 @@ import sys
 import time
 from typing import Any
 
+STATE_KEYS = ("Status", "Running", "Pid", "ExitCode", "Error", "StartedAt", "FinishedAt")
 HOST_KEYS = (
     "Runtime",
     "NetworkMode",
@@ -63,6 +64,7 @@ def observe(
         return None
     record: dict[str, Any] = {
         "id": cid,
+        "state": {key: item["State"].get(key) for key in STATE_KEYS},
         "observed_at": time.time(),
         "image": item["Config"]["Image"],
         "labels": item["Config"].get("Labels") or {},
@@ -85,6 +87,16 @@ def observe(
         ).stdout
     except (OSError, StopIteration, ValueError) as exc:
         record["error"] = f"{type(exc).__name__}: {exc}"
+    # A sentry that is gone by the end of the observation makes every field
+    # read after it vanished meaningless: record that, never a mismatch.
+    if not os.path.exists(f"/proc/{pid}"):
+        record["disappeared"] = True
+        after = run("docker", "-H", profile["docker_host"], "inspect", cid)
+        try:
+            gone = json.loads(after.stdout)[0]["State"]
+            record["state_after"] = {key: gone.get(key) for key in STATE_KEYS}
+        except (ValueError, IndexError, KeyError):
+            record["state_after"] = {"inspect": "container no longer exists"}
     return record
 
 
@@ -113,8 +125,17 @@ def summarize(profile_path: str, out: str) -> int:
     if os.path.exists(out):
         with open(out, encoding="utf-8") as handle:
             records = [json.loads(line) for line in handle if line.strip()]
+    for record in records:
+        if record.get("disappeared"):
+            print(
+                f"DISAPPEARED sandbox {record['id'][:12]} image={record['image'][:60]} "
+                f"pid={record['pid']} state={record.get('state')} "
+                f"state_after={record.get('state_after')} captured exe={record.get('exe')} "
+                f"cgroup={record.get('cgroup')} error={record.get('error')}"
+            )
+    records = [r for r in records if not r.get("disappeared")]
     if not records:
-        print("FAIL: no live backend sandbox was observed")
+        print("FAIL: no backend sandbox stayed alive for a complete observation")
         return 1
     failures = 0
     lease_cgroup = "/" + profile["lease_slice"] + "/"

@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: 630c89bfca87b556a78ce8eae0df8fdc8d1046f1
+  BACKEND_SHA: 1f396ff9e85f0ebbfa4880bc1c1bf473fbe60c9b
 
 jobs:
   backend-on-host:
@@ -117,6 +117,16 @@ jobs:
           children=$(sudo find /sys/fs/cgroup/mcsbxlease.slice -mindepth 1 -maxdepth 1 -type d -name 'docker-*' | wc -l)
           echo "after test: containers=$left lease sandbox cgroups=$children" | tee -a "$GITHUB_STEP_SUMMARY"
           [[ $left == 0 && $children == 0 ]]
+      - name: Record command-failure behaviour of engine and runsc (no attribution)
+        if: always()
+        run: |
+          [[ -s $RUNNER_TEMP/profile.json ]] || { echo 'host was not provisioned'; exit 1; }
+          sock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json")
+          image=docker.io/library/busybox@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          sudo docker -H "$sock" pull --quiet --platform linux/amd64 "$image"
+          sudo python3 host/scripts/sandbox-host/probe-command-failures.py "$RUNNER_TEMP/profile.json" "$image" "$RUNNER_TEMP/command-failures.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo chmod 0644 "$RUNNER_TEMP/command-failures.json"
+          sudo docker -H "$sock" image rm "$image" >/dev/null
       - name: Teardown and verify cleanup
         if: always()
         env:
@@ -131,5 +141,6 @@ jobs:
             ${{ runner.temp }}/preflight-checks.json
             ${{ runner.temp }}/profile.json
             ${{ runner.temp }}/backend-instances.jsonl
+            ${{ runner.temp }}/command-failures.json
           if-no-files-found: warn
           retention-days: 30
