@@ -21,16 +21,17 @@ var egressDenied = []string{
 }
 
 // listEgress returns `nft -j list table inet <name>` (json) or
-// `nft list table inet <name>` (text). The JSON is the structural source of
-// truth; nft 1.0.9 omits the socket cgroupv2 level from JSON, so the text
-// listing is read only to confirm "level 1" on every rule.
+// `nft -a list table inet <name>` (text with rule handles). The JSON is the
+// structural source of truth; nft 1.0.9 omits the socket cgroupv2 level from
+// JSON, so the text listing confirms "level 1" on every rule and is bound to
+// the JSON by rule handle.
 func (h Host) listEgress(name string, asJSON bool) (string, error) {
 	if h.ListNFTable != nil {
 		return h.ListNFTable(name, asJSON)
 	}
-	args := []string{"list", "table", "inet", name}
+	args := []string{"-a", "list", "table", "inet", name}
 	if asJSON {
-		args = append([]string{"-j"}, args...)
+		args = []string{"-j", "list", "table", "inet", name}
 	}
 	out, err := exec.Command("nft", args...).Output()
 	if err != nil {
@@ -61,6 +62,7 @@ func egressRestricted(jsonListing, textListing, table, engineSlice string) error
 		return fmt.Errorf("egress table JSON: %w", err)
 	}
 	var rules []json.RawMessage
+	var handles []int
 	chains := 0
 	for _, object := range doc.Nftables {
 		if len(object) != 1 {
@@ -97,6 +99,7 @@ func egressRestricted(jsonListing, textListing, table, engineSlice string) error
 					return fmt.Errorf("unexpected rule object (comments and other members are refused): %s", body)
 				}
 				rules = append(rules, r.Expr)
+				handles = append(handles, r.Handle)
 			default:
 				return fmt.Errorf("egress table holds a %s object", kind)
 			}
@@ -135,21 +138,37 @@ func egressRestricted(jsonListing, textListing, table, engineSlice string) error
 			return fmt.Errorf("engine egress does not reject %s", text)
 		}
 	}
-	// JSON does not carry the cgroupv2 level; the text listing must show
-	// exactly four socket matches, all at level 1 for the slice by name.
+	return textMatches(textListing, table, slice, handles)
+}
+
+// textMatches requires the `nft -a list` text to consist of the table and
+// chain framing plus exactly the four rules, each at cgroupv2 level 1 for the
+// slice by name, carrying the rule handles of the JSON listing in order. Any
+// other line (flags, comments, extra objects) is refused (INT-33-01), and the
+// handles bind the two listings to the same rules (INT-33-02).
+func textMatches(textListing, table, slice string, handles []int) error {
 	want := `socket cgroupv2 level 1 "` + slice + `" `
-	count := 0
-	for _, line := range strings.Split(textListing, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "socket cgroupv2") {
-			if !strings.HasPrefix(line, want) {
-				return fmt.Errorf("rule does not match %s at cgroupv2 level 1: %s", slice, line)
+	var seen []int
+	for _, raw := range strings.Split(textListing, "\n") {
+		line := strings.TrimSpace(raw)
+		body, handle, hasHandle := strings.Cut(line, " # handle ")
+		switch {
+		case line == "" || line == "}":
+		case hasHandle && body == "table inet "+table+" {":
+		case hasHandle && body == "chain output {":
+		case line == "type filter hook output priority filter; policy accept;":
+		case hasHandle && strings.HasPrefix(body, want):
+			var n int
+			if _, err := fmt.Sscanf(handle, "%d", &n); err != nil || fmt.Sprint(n) != handle {
+				return fmt.Errorf("rule line with malformed handle: %s", line)
 			}
-			count++
+			seen = append(seen, n)
+		default:
+			return fmt.Errorf("unexpected line in the egress table text listing: %s", line)
 		}
 	}
-	if count != 4 {
-		return fmt.Errorf("text listing shows %d engine-slice rules, want 4", count)
+	if !reflect.DeepEqual(seen, handles) {
+		return fmt.Errorf("text listing rule handles %v differ from the JSON listing %v", seen, handles)
 	}
 	return nil
 }

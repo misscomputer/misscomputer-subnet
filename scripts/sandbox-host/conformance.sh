@@ -325,7 +325,8 @@ for variant in "$repo"/pkg/sandboxhost/testdata/egress/*.nft; do
   fi
   readback_view+="$name=$status "
 done
-(( refused >= 12 )) || bad "only $refused unsafe variants were exercised"
+expected=$(( $(find "$repo"/pkg/sandboxhost/testdata/egress -name '*.nft' | wc -l) - 1 ))
+(( refused == expected && refused >= 18 )) || bad "exercised $refused of $expected unsafe variants"
 nft list table inet "$scratch" >/dev/null 2>&1 && bad "scratch table $scratch left behind"
 ok "real nft on this host: provisioned form passes, all $refused unsafe variants refused: $readback_view"
 

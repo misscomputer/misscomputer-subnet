@@ -1,0 +1,12 @@
+table inet mcsbx_engine_egress {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    socket cgroupv2 level 1 "@SLICE@" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+    socket cgroupv2 level 1 "@SLICE@" fib daddr type local counter reject with icmpx admin-prohibited
+    socket cgroupv2 level 1 "@SLICE@" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter reject with icmpx admin-prohibited
+    socket cgroupv2 level 1 "@SLICE@" ip6 daddr { ::/127, ::ffff:0:0/96, 64:ff9b::/96, 64:ff9b:1::/48, fc00::/7, fe80::/10, ff00::/8 } counter reject with icmpx admin-prohibited
+  }
+  chain natout {
+    type nat hook output priority -100; policy accept;
+  }
+}

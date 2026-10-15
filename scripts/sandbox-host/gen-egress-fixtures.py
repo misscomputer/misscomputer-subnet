@@ -74,6 +74,21 @@ def variants(base: str) -> dict[str, str]:
         "f3_missing_local_nat64": base.replace(v6, v6.replace(" 64:ff9b:1::/48,", "", 1), 1),
         "extra_chain": base.rstrip().rstrip("}")
         + "  chain extra {\n    type filter hook output priority filter; policy accept;\n  }\n}\n",
+        # SR-33-01: each structural guard on its own.
+        "fifth_rule_after_rejects": base.replace(
+            v6, f"{v6}\n    {MATCH} ip daddr 152.236.4.60 accept", 1
+        ),
+        "second_chain_nat_output": base.rstrip().rstrip("}")
+        + "  chain natout {\n    type nat hook output priority -100; policy accept;\n  }\n}\n",
+        "rule_with_comment": base.replace(fib, f'{fib} comment "lab"', 1),
+        "named_counter": base.replace(policy, policy, 1)
+        .replace(f"table inet {TABLE} {{", f"table inet {TABLE} {{\n  counter engine {{ }}", 1)
+        .replace(fib, fib.replace(" counter ", ' counter name "engine" ', 1), 1),
+        "policy_drop": base.replace("policy accept;", "policy drop;", 1),
+        # INT-33-01: a dormant table holds its rules but enforces none of them.
+        "dormant_table": base.replace(
+            f"table inet {TABLE} {{", f"table inet {TABLE} {{\n  flags dormant;", 1
+        ),
     }
     for name, text in out.items():
         if name != "provisioned" and text == base:
@@ -91,7 +106,8 @@ def main(argv: list[str]) -> int:
         (OUT / f"{name}.nft").write_text(template, encoding="utf-8")
         loaded = template.replace("@SLICE@", slice_path)
         script = (
-            'nft -f - && nft -j list table inet "$1" && echo "@@TEXT@@" && nft list table inet "$1"'
+            'nft -f - && nft -j list table inet "$1"'
+            ' && echo "@@TEXT@@" && nft -a list table inet "$1"'
         )
         result = subprocess.run(  # noqa: S603,S607 - fixed nft commands in a private netns
             ["unshare", "-n", "sh", "-c", script, "sh", TABLE],  # noqa: S607
@@ -103,6 +119,10 @@ def main(argv: list[str]) -> int:
         if result.returncode != 0:
             raise SystemExit(f"{name}: nft refused the variant: {result.stderr.strip()}")
         listing_json, listing_text = result.stdout.split("@@TEXT@@\n", 1)
+        # Trailing blanks are not significant to either listing (nft 1.0.9
+        # leaves one where it truncates a dormant table's JSON).
+        listing_json = "\n".join(line.rstrip() for line in listing_json.split("\n"))
+        listing_text = "\n".join(line.rstrip() for line in listing_text.split("\n"))
         (OUT / f"{name}.json").write_text(
             listing_json.replace(slice_path, ENGINE), encoding="utf-8"
         )

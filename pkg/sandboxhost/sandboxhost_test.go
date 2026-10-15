@@ -445,6 +445,28 @@ func TestEgressReadbackRefusesStaleOrMissingTables(t *testing.T) {
 			}
 			return strings.ReplaceAll(textListing, `"mcsbxengine.slice"`, "4242"), nil
 		},
+		// nft 1.0.9 truncates the JSON of a dormant table (recorded in
+		// testdata/egress/dormant_table.json), so each dormant guard is also
+		// exercised alone with a well-formed listing (INT-33-01).
+		"dormant flag in JSON only": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return strings.Replace(jsonListing, `"name": "mcsbx_engine_egress", "handle": 1}`, `"name": "mcsbx_engine_egress", "handle": 1, "flags": "dormant"}`, 1), nil
+			}
+			return textListing, nil
+		},
+		"dormant flag in text only": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return jsonListing, nil
+			}
+			return strings.Replace(textListing, "# handle 1\n", "# handle 1\n\tflags dormant\n", 1), nil
+		},
+		// The text listing must describe the same rules as the JSON (INT-33-02).
+		"text handles differ from JSON": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return jsonListing, nil
+			}
+			return strings.Replace(textListing, "admin-prohibited # handle 4", "admin-prohibited # handle 40", 1), nil
+		},
 		"named set object": func(_ string, asJSON bool) (string, error) {
 			if asJSON {
 				return strings.Replace(jsonListing, `{"chain":`, `{"set": {"family": "inet", "name": "x", "table": "mcsbx_engine_egress"}}, {"chain":`, 1), nil
