@@ -134,8 +134,11 @@ type GVisor struct {
 	runscFile fs.FileInfo
 	// lookup resolves a registry host before any pull.
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
-	mu     sync.Mutex
-	images map[string]*imageLock
+	// localReserve is the part of the create budget the steps after a pull
+	// run under; zero means localStepReserve (contract D15(d)).
+	localReserve time.Duration
+	mu           sync.Mutex
+	images       map[string]*imageLock
 	// startSlot admits one sandbox at a time from its start through its
 	// verification, so a sandbox whose workload exited is never checked
 	// while another is starting and has processes the engine does not yet
@@ -626,14 +629,24 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	if code := b.Unsupported(lease); code != "" {
 		return &miner.SandboxRefusal{Code: code}
 	}
-	existing, found, err := b.inspect(ctx, instanceID)
+	budget, err := b.newCreateBudget(ctx)
+	if err != nil {
+		return err
+	}
+	defer budget.close()
+	existing, found, err := b.inspect(budget.local(), instanceID)
 	if err != nil {
 		return err
 	}
 	if !found {
-		if err := b.createContainer(ctx, instanceID, lease, leaseDigest); err != nil {
+		if err := b.createContainer(budget, instanceID, lease, leaseDigest); err != nil {
 			return err
 		}
+	}
+	// Every step from here runs under the local deadline that started when
+	// the last pull returned (or at the start, without a pull).
+	ctx = budget.local()
+	if !found {
 		if existing, found, err = b.inspect(ctx, instanceID); err != nil {
 			return err
 		} else if !found {
@@ -933,6 +946,76 @@ func readBounded(file string, limit int64) (string, error) {
 	return string(raw), nil
 }
 
+// localStepReserve is the part of the create budget kept for the steps
+// after a pull (contract D15(d)): image inspection, container create, the
+// start slot and start, the engine and kernel readbacks, and the D23
+// re-inspection, settle (startSettleBound) and removal. Those normally take
+// seconds; a hung engine call is cut by this reserve rather than by its own
+// two-minute answer timeout. The pull gets the budget minus this reserve.
+const localStepReserve = 2 * time.Minute
+
+// createBudget splits the deadline the lane gives Create (contract
+// D15(d)): the registry phase runs until the budget's deadline minus the
+// local reserve, and the local steps run under their own deadline of that
+// reserve, started fresh when a pull returns, so a pull cannot consume
+// them. Pull share plus local reserve never exceed the budget.
+type createBudget struct {
+	parent       context.Context
+	pullDeadline time.Time // zero when the lane gave no deadline
+	reserve      time.Duration
+	localCtx     context.Context
+	cancelLocal  func()
+}
+
+func (b *GVisor) newCreateBudget(parent context.Context) (*createBudget, error) {
+	reserve := b.localReserve
+	if reserve <= 0 {
+		reserve = localStepReserve
+	}
+	budget := &createBudget{parent: parent, reserve: reserve}
+	if deadline, ok := parent.Deadline(); ok {
+		if left := time.Until(deadline); left <= reserve {
+			return nil, fmt.Errorf("create budget of %v leaves no pull share beside the %v local-step reserve", left.Round(time.Millisecond), reserve)
+		}
+		budget.pullDeadline = deadline.Add(-reserve)
+	}
+	budget.restartLocal()
+	return budget, nil
+}
+
+// pull returns the context of the registry phase.
+func (c *createBudget) pull() (context.Context, context.CancelFunc) {
+	if c.pullDeadline.IsZero() {
+		return context.WithCancel(c.parent)
+	}
+	return context.WithDeadline(c.parent, c.pullDeadline)
+}
+
+// restartLocal starts a fresh local deadline. It does not inherit the
+// lane's deadline, only an explicit cancellation of the lane's context.
+func (c *createBudget) restartLocal() {
+	c.close()
+	local, cancel := context.WithTimeout(context.WithoutCancel(c.parent), c.reserve)
+	stop := context.AfterFunc(c.parent, func() {
+		if errors.Is(c.parent.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	c.localCtx = local
+	c.cancelLocal = func() {
+		stop()
+		cancel()
+	}
+}
+
+func (c *createBudget) local() context.Context { return c.localCtx }
+
+func (c *createBudget) close() {
+	if c.cancelLocal != nil {
+		c.cancelLocal()
+	}
+}
+
 // errProcessVanished marks a kernel readback that found no process to read:
 // the engine reported none running, or its /proc or cgroup entries were gone.
 var errProcessVanished = errors.New("sandbox process vanished")
@@ -1064,12 +1147,13 @@ func (b *GVisor) exited(c inspectedContainer) error {
 // does not start, its container. The image lock spans the image check and
 // the container creation, so a concurrent Destroy cannot remove the image
 // in between.
-func (b *GVisor) createContainer(ctx context.Context, instanceID string, lease protocol.SandboxLeaseV1, leaseDigest string) error {
+func (b *GVisor) createContainer(budget *createBudget, instanceID string, lease protocol.SandboxLeaseV1, leaseDigest string) error {
 	for attempt := 1; ; attempt++ {
-		imageID, err := b.pullImage(ctx, lease)
+		imageID, err := b.pullImage(budget, lease)
 		if err != nil {
 			return err
 		}
+		ctx := budget.local()
 		unlock := b.lockImage(imageID)
 		missing := false
 		if _, _, err := b.verifiedImage(ctx, imageID, lease); engineStatus(err) == http.StatusNotFound {
@@ -1121,19 +1205,34 @@ func (b *GVisor) createBody(s spec, imageID string) map[string]any {
 
 // pullImage pulls the lease's image by digest and returns its engine ID
 // once verifiedImage accepts it.
-func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (string, error) {
+func (b *GVisor) pullImage(budget *createBudget, lease protocol.SandboxLeaseV1) (string, error) {
 	name, err := normalizedRepository(lease.ImageReference)
 	if err != nil {
 		return "", &miner.SandboxRefusal{Code: "image_unavailable"}
-	}
-	if err := b.publicRegistry(ctx, name); err != nil {
-		return "", err
 	}
 	limit := int64(b.config.ImageMaxMiB) << 20
 	if err := b.pullHeadroom(); err != nil {
 		return "", err
 	}
-	if err := b.engine.pull(ctx, name, lease.ImageDigest, limit); err != nil {
+	// The registry phase (resolving its host and the pull itself) runs
+	// under the pull deadline: the registry controls how long it takes.
+	pullCtx, cancelPull := budget.pull()
+	defer cancelPull()
+	pullExpired := func() bool {
+		return errors.Is(pullCtx.Err(), context.DeadlineExceeded) && budget.parent.Err() == nil
+	}
+	if err := b.publicRegistry(pullCtx, name); err != nil {
+		if pullExpired() {
+			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
+		}
+		return "", err
+	}
+	err = b.engine.pull(pullCtx, name, lease.ImageDigest, limit)
+	// The steps after the pull get the whole local reserve, however long
+	// the pull took.
+	budget.restartLocal()
+	ctx := budget.local()
+	if err != nil {
 		switch {
 		case errors.Is(err, errPullTooLarge):
 			// The pull may have completed before it was stopped.
@@ -1141,11 +1240,12 @@ func (b *GVisor) pullImage(ctx context.Context, lease protocol.SandboxLeaseV1) (
 				return "", discardErr
 			}
 			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
-		case errors.Is(ctx.Err(), context.DeadlineExceeded):
-			// The registry did not deliver the image within the create budget.
+		case pullExpired():
+			// The registry did not deliver the image within the pull
+			// deadline (contract D15(d)).
 			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
-		case ctx.Err() != nil:
-			return "", ctx.Err()
+		case pullCtx.Err() != nil:
+			return "", pullCtx.Err()
 		case engineStatus(err) != 0:
 			// The engine answered the pull with a failure. Registry answers
 			// and transport failures to the registry reach the backend only

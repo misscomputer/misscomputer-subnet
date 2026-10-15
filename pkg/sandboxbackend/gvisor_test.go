@@ -98,6 +98,29 @@ type fakeEngine struct {
 	dropInspect func(*engineContainer) bool
 	failDelete  bool
 	starts      int
+	// pullDelay holds every pull answer that long, without blocking other
+	// requests; a pull the client gives up on stores nothing.
+	pullDelay time.Duration
+	// inspectDelay and imageRemovalDelay hold every container inspection
+	// and image removal answer that long, the same way.
+	inspectDelay, imageRemovalDelay time.Duration
+}
+
+// hold waits d with the engine lock released, as a daemon still working on
+// an answer; it reports false when the client gave up first, with the lock
+// held again either way.
+func (e *fakeEngine) hold(r *http.Request, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	e.mu.Unlock()
+	defer e.mu.Lock()
+	select {
+	case <-time.After(d):
+		return true
+	case <-r.Context().Done():
+		return false
+	}
 }
 
 func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
@@ -178,6 +201,9 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		// The image is stored before the stream is answered, as when a pull
 		// completes before the client reads its progress, unless the stream
 		// reports an error.
+		if !e.hold(r, e.pullDelay) {
+			return
+		}
 		if image.PullDrop {
 			// The daemon gives no answer: no status line reaches the client.
 			panic(http.ErrAbortHandler)
@@ -212,6 +238,9 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		reply(w, 200, map[string]any{"Id": image.ID, "RepoDigests": image.RepoDigests, "Os": image.Os, "Architecture": image.Arch,
 			"Size": image.Size, "Config": map[string]any{"Volumes": image.Volumes, "Entrypoint": image.Entrypoint, "Cmd": image.Cmd}})
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/images/"):
+		if !e.hold(r, e.imageRemovalDelay) {
+			return
+		}
 		id := strings.TrimPrefix(p, "/images/")
 		if _, ok := e.images[id]; !ok {
 			reply(w, 404, map[string]string{"message": "No such image"})
@@ -310,6 +339,9 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		if e.dropInspect != nil && e.dropInspect(c) {
 			panic(http.ErrAbortHandler)
+		}
+		if !e.hold(r, e.inspectDelay) {
+			return
 		}
 		pid := 0
 		if c.Status == "running" {
@@ -574,7 +606,12 @@ func TestCreateReplayStartsCreatedContainerAndRejectsAnotherLeases(t *testing.T)
 	lease := testLease(nil)
 	instance := instanceOf(lease)
 	h.engine.applied = func(c *engineContainer) { c.Status = "created" }
-	if err := b.createContainer(ctx, instance, lease, mustDigest(t, lease)); err != nil {
+	budget, err := b.newCreateBudget(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer budget.close()
+	if err := b.createContainer(budget, instance, lease, mustDigest(t, lease)); err != nil {
 		t.Fatal(err)
 	}
 	h.engine.applied = nil
