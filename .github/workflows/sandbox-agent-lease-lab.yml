@@ -18,9 +18,12 @@ permissions:
 
 env:
   AGENT_SHA: 1c0c26d47ed68824a35e0e36fbcdc408f8ca1208
-  # nginx:stable-alpine OCI index, resolved 2026-10-15: default command runs
-  # until stopped, no image VOLUMEs, about 28 MB compressed (linux/amd64).
-  LEASE_IMAGE: docker.io/library/nginx@sha256:ed84151ed2d47ef93c0939eb9b9754c6990db6092cd2081e11988a47a83d47ea
+  # rancher/mirrored-pause:3.10 manifest list, resolved 2026-10-15: entrypoint
+  # /pause waits for a signal and does nothing else (no network use), user
+  # 65535:65535, no image VOLUMEs, about 0.3 MB (linux/amd64). Run 38702841136
+  # used nginx:stable-alpine, whose process exited 1 about 0.2 s after the
+  # ready receipt; its logs were not captured.
+  LEASE_IMAGE: docker.io/rancher/mirrored-pause@sha256:ee6521f290b2168b6e0935a181d4cff9be1ac3f505666ef0e3c98fae8199917a
   MINER_HOTKEY: 5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty
   VALIDATOR_HOTKEY: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
 
@@ -139,7 +142,8 @@ jobs:
             -agent http://127.0.0.1:19101 -secret "$RUNNER_TEMP/agent/bridge.secret" -service-key "$RUNNER_TEMP/agent/service.key" \
             -network mock -netuid 1 -miner "$MINER_HOTKEY" -validator "$VALIDATOR_HOTKEY" -image "$LEASE_IMAGE" \
             -cpu 1000 -memory 1024 -disk 5120 -pids 64 | tee -a "$GITHUB_STEP_SUMMARY"
-          sleep 3
+          # The workload must still run 10 s after the ready receipt.
+          sleep 10
           "${engine[@]}" ps -a --no-trunc --format '{{.ID}} {{.Names}} {{.Status}}' | tee "$RUNNER_TEMP/lab-out/engine-ps.txt" | tee -a "$GITHUB_STEP_SUMMARY"
           ids=$("${engine[@]}" ps -aq)
           if [[ -n $ids ]]; then
@@ -152,6 +156,15 @@ jobs:
               print(f"container {c['Name']} image={c['Image'][:19]} runtime={h['Runtime']} network={h['NetworkMode']} cgroup_parent={h.get('CgroupParent')} "
                     f"status={s['Status']} running={s['Running']} pid={s['Pid']} memory={h['Memory']} nano_cpus={h['NanoCpus']} pids_limit={h['PidsLimit']} "
                     f"readonly_rootfs={h.get('ReadonlyRootfs')} storage_opt={h.get('StorageOpt')} mounts={len(c.get('Mounts') or [])}")
+          PY
+            # Lab image output only (no secret is delivered to the sandbox).
+            # shellcheck disable=SC2086 # ids are engine container ids
+            for id in $ids; do "${engine[@]}" logs --tail 50 "$id" > "$RUNNER_TEMP/lab-out/sandbox-$id.log" 2>&1 || true; done
+            python3 - "$RUNNER_TEMP/lab-out/engine-inspect.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          for c in json.load(open(sys.argv[1])):
+              s = c['State']
+              print(f"state (ExitCode/FinishedAt informational only): status={s['Status']} exit_code={s['ExitCode']} error={s['Error']!r} started={s['StartedAt']} finished={s['FinishedAt']} oom={s['OOMKilled']}")
           PY
             pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["State"]["Pid"])' "$RUNNER_TEMP/lab-out/engine-inspect.json")
             if [[ $pid -gt 0 ]]; then
@@ -166,14 +179,19 @@ jobs:
           python3 host/scripts/sandbox-host/lab/parse_agent_log.py "$RUNNER_TEMP/lab-out/agent.log" "$RUNNER_TEMP/lab-out" > "$RUNNER_TEMP/lab-out/reports.txt"
           grep -E '^instance' "$RUNNER_TEMP/lab-out/reports.txt" | tee -a "$GITHUB_STEP_SUMMARY" || true
           grep -E 'sandbox (start|exit) attribution|sandbox start|create budget| WARN | ERROR ' "$RUNNER_TEMP/lab-out/agent.log" | cut -c1-400 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          python3 - "$RUNNER_TEMP/lease-state.json" "$RUNNER_TEMP/lab-out/instance-reports.json" <<'PY'
+          # The state file is root-only (it holds the lab validator key).
+          sudo python3 - "$RUNNER_TEMP/lease-state.json" "$RUNNER_TEMP/lab-out/instance-reports.json" "$RUNNER_TEMP/lab-out/engine-inspect.json" <<'PY'
           import json, sys
           state = json.load(open(sys.argv[1]))
           stages = [r['stage'] for r in state['receipts']]
           instances = json.load(open(sys.argv[2]))
           running = [r for r in instances if r.get('decision') == 'running' and r['verdict'] == 'pass']
-          print(f"receipt stages={stages} instance reports={[(r.get('decision'), r['verdict']) for r in instances]}")
-          sys.exit(0 if stages[:1] == ['held'] and stages[-1] == 'ready' and running else 1)
+          try:
+              live = [c for c in json.load(open(sys.argv[3])) if c['State']['Running'] and c['State']['Pid'] > 0]
+          except (OSError, ValueError):
+              live = []
+          print(f"receipt stages={stages} instance reports={[(r.get('decision'), r['verdict']) for r in instances]} running containers 10 s after ready={len(live)}")
+          sys.exit(0 if stages[:1] == ['held'] and stages[-1] == 'ready' and running and len(live) == 1 else 1)
           PY
       - name: Release the lease and verify the sandbox is gone
         run: |
