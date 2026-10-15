@@ -104,7 +104,11 @@ For an index digest the engine records the index digest and the image
 Deadlines (contract D15(d)): the lane gives `Create` one create budget.
 The registry phase (resolving the registry host and the pull) runs until
 that budget's deadline minus a fixed local-step reserve of 2 minutes;
-running past that pull deadline is `image_unavailable`. The steps after a
+running past that pull deadline is `image_unavailable`. dockerd sends a
+pull's response headers only with its first progress line, after the
+registry-controlled ping, token and manifest steps, so the pull request
+waits for them until the pull deadline; every other Engine API call keeps
+its 2-minute answer timeout. The steps after a
 pull (image inspection, container create, the start slot and start, the
 engine and kernel readbacks, and the D23 re-inspection, 2 s settle and
 removal) run under their own deadline of the full reserve, started fresh

@@ -30,22 +30,41 @@ const (
 // engine is a minimal Docker Engine API client bound to one unix socket. It
 // carries no credentials and never falls back to another daemon.
 type engine struct {
-	client *http.Client
-	base   string
+	// client serves the local calls, each bounded by an answer timeout.
+	// pullClient serves pulls only: dockerd sends a pull's response headers
+	// with its first progress line, after registry-controlled steps (ping,
+	// token, manifest), so a pull is bounded by its pull deadline (contract
+	// D15(d)) rather than by the local answer timeout.
+	client, pullClient *http.Client
+	base               string
 }
 
+// engineAnswerTimeout bounds how long a local Engine API call may wait for
+// the daemon's response headers.
+const engineAnswerTimeout = 2 * time.Minute
+
 func newEngine(socket string) *engine {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var dialer net.Dialer
-			return dialer.DialContext(ctx, "unix", socket)
-		},
-		DisableCompression:    true,
-		MaxIdleConns:          4,
-		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 2 * time.Minute,
+	return newEngineWithAnswerTimeout(socket, engineAnswerTimeout)
+}
+
+func newEngineWithAnswerTimeout(socket string, answerTimeout time.Duration) *engine {
+	transport := func(headerTimeout time.Duration) *http.Transport {
+		return &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", socket)
+			},
+			DisableCompression:    true,
+			MaxIdleConns:          4,
+			IdleConnTimeout:       30 * time.Second,
+			ResponseHeaderTimeout: headerTimeout,
+		}
 	}
-	return &engine{client: &http.Client{Transport: transport}, base: "http://docker/" + engineAPIVersion}
+	return &engine{
+		client:     &http.Client{Transport: transport(answerTimeout)},
+		pullClient: &http.Client{Transport: transport(0)},
+		base:       "http://docker/" + engineAPIVersion,
+	}
 }
 
 // engineError is a non-2xx Engine API answer.
@@ -67,6 +86,10 @@ func engineStatus(err error) int {
 }
 
 func (e *engine) request(ctx context.Context, method, path string, query url.Values, body any) (*http.Response, error) {
+	return e.requestWith(ctx, e.client, method, path, query, body)
+}
+
+func (e *engine) requestWith(ctx context.Context, client *http.Client, method, path string, query url.Values, body any) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)
@@ -86,7 +109,7 @@ func (e *engine) request(ctx context.Context, method, path string, query url.Val
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := e.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("docker engine %s %s: %w", method, path, err)
 	}
@@ -159,7 +182,7 @@ var errPullTooLarge = errors.New("image download exceeds the per-image limit")
 func (e *engine) pull(ctx context.Context, name, digest string, maxBytes int64) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	resp, err := e.request(ctx, http.MethodPost, "/images/create", url.Values{
+	resp, err := e.requestWith(ctx, e.pullClient, http.MethodPost, "/images/create", url.Values{
 		"fromImage": {name}, "tag": {digest}, "platform": {"linux/amd64"},
 	}, nil)
 	if err != nil {

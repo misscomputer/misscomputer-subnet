@@ -135,6 +135,20 @@ func TestCreateBudgetEdges(t *testing.T) {
 			t.Fatalf("engine pulled %d times and created %d containers", h.engine.pulls, len(h.engine.created))
 		}
 	})
+	t.Run("cancellation during the pull", func(t *testing.T) {
+		h := newHost(t)
+		h.engine.pullDelay = 2 * time.Second
+		b := h.backend()
+		b.localReserve = 5 * time.Second
+		lease := testLease(nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		time.AfterFunc(200*time.Millisecond, cancel)
+		begun := time.Now()
+		err := b.Create(ctx, instanceOf(lease), lease)
+		if !errors.Is(err, context.Canceled) || refusalCode(err) != "" || time.Since(begun) > time.Second {
+			t.Fatalf("create = %v after %v, want the cancellation promptly, not a refusal", err, time.Since(begun))
+		}
+	})
 	t.Run("cancellation during a local step", func(t *testing.T) {
 		h := newHost(t)
 		h.engine.holdStart = func(*engineContainer) <-chan struct{} { return heldFor(2 * time.Second) }
@@ -149,4 +163,79 @@ func TestCreateBudgetEdges(t *testing.T) {
 			t.Fatalf("create = %v after %v, want the cancellation promptly", err, time.Since(begun))
 		}
 	})
+}
+
+// dockerd sends a pull's response headers only with its first progress
+// line, after the registry-controlled ping, token and manifest steps, so
+// the pull waits for them until its pull deadline, not for the local
+// answer timeout; every local call keeps that timeout (lane 8 INT-34-01).
+func TestCreatePullIsBoundedByItsShareNotTheAnswerTimeout(t *testing.T) {
+	const budget, reserve, answer = 900 * time.Millisecond, 300 * time.Millisecond, 100 * time.Millisecond
+	for _, test := range []struct {
+		name          string
+		pull, inspect time.Duration
+		want          string
+	}{
+		{name: "daemon withholds the pull's headers within the share", pull: budget - reserve - 200*time.Millisecond, want: "ready"},
+		{name: "daemon withholds the pull's headers past the share", pull: budget - 100*time.Millisecond, want: "image_unavailable"},
+		{name: "local call waits longer than the answer timeout", inspect: answer + 150*time.Millisecond, want: "awaiting response headers"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHost(t)
+			h.engine.pullDelay, h.engine.inspectDelay = test.pull, test.inspect
+			b := h.backend()
+			b.engine = newEngineWithAnswerTimeout(h.socket, answer)
+			b.localReserve = reserve
+			lease := testLease(nil)
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			err := b.Create(ctx, instanceOf(lease), lease)
+			switch {
+			case test.want == "ready" && err != nil:
+				t.Fatalf("create = %v, want ready", err)
+			case test.want == "image_unavailable" && refusalCode(err) != "image_unavailable":
+				t.Fatalf("create = %v, want image_unavailable", err)
+			case test.want != "ready" && test.want != "image_unavailable" &&
+				(err == nil || refusalCode(err) != "" || !strings.Contains(err.Error(), test.want)):
+				t.Fatalf("create = %v, want a miner fault containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+// A refused pull ending just inside its share still has its stored image
+// removed under the fresh local deadline, even when the removal outlasts
+// what is left of the share (lane 7 SR-34-01).
+func TestCreateDiscardsARefusedPullUnderTheLocalReserve(t *testing.T) {
+	const budget, reserve = 900 * time.Millisecond, 300 * time.Millisecond
+	key := "docker.io/library/busybox@" + testImageDigest
+	for name, refused := range map[string]func(*engineImage){
+		"progress stream breaks off": func(i *engineImage) { i.PullMessages, i.PullBreakOff = i.PullMessages[:1], true },
+		"download exceeds the image limit": func(i *engineImage) {
+			i.PullMessages = []string{
+				`{"id":"a","status":"Downloading","progressDetail":{"total":40000000}}`,
+				`{"id":"b","status":"Downloading","progressDetail":{"total":40000000}}`,
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHost(t)
+			image := h.engine.catalog[key]
+			refused(&image)
+			h.engine.catalog[key] = image
+			h.engine.pullDelay = budget - reserve - 40*time.Millisecond
+			h.engine.imageRemovalDelay = 150 * time.Millisecond
+			b := h.backend()
+			b.localReserve = reserve
+			lease := testLease(nil)
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			if err := b.Create(ctx, instanceOf(lease), lease); refusalCode(err) != "image_unavailable" {
+				t.Fatalf("create = %v, want image_unavailable", err)
+			}
+			if len(h.engine.images) != 0 {
+				t.Fatalf("refused pull left %d images", len(h.engine.images))
+			}
+		})
+	}
 }
