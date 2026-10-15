@@ -204,16 +204,21 @@ func TestSandboxOpAdmissionIsWriteAheadAndReplaySafe(t *testing.T) {
 	if err != nil || !first.Start || first.Replay || !first.AdmittedAt.Equal(at) {
 		t.Fatalf("first admission %+v %v", first, err)
 	}
-	f.clock.set(at.Add(5 * time.Second))
-	replay, err := f.ops.AdmitOp(ctx, start)
-	if err != nil || replay.Start || !replay.Replay || !replay.AdmittedAt.Equal(at) {
-		t.Fatalf("replay %+v %v", replay, err)
+	// A recorded op is a replay before its window is checked: the window
+	// closing between the bound admission check and the store does not turn
+	// a replay into an unanswered expiry (SR-39-02 Y9).
+	for _, when := range []time.Duration{5 * time.Second, 31 * time.Second} {
+		f.clock.set(at.Add(when))
+		replay, err := f.ops.AdmitOp(ctx, start)
+		if err != nil || replay.Start || !replay.Replay || !replay.AdmittedAt.Equal(at) {
+			t.Fatalf("replay %v after admission: %+v %v", when, replay, err)
+		}
 	}
 	other := f.op(t, sandbox.OpExecStart, 1, at, func(r *protocol.SandboxOpRequestV1) { r.TimeoutMS = u64p(1000) })
 	if _, err := f.ops.AdmitOp(ctx, other); !errors.Is(err, ErrSandboxConflict) {
 		t.Fatalf("equivocating exec_start: %v", err)
 	}
-	stat := f.op(t, sandbox.OpFileStat, 3, at, nil)
+	stat := f.op(t, sandbox.OpFileStat, 3, f.clock.read(), nil)
 	if decision, err := f.ops.AdmitOp(ctx, stat); err != nil || decision.Start || decision.Replay {
 		t.Fatalf("file_stat %+v %v", decision, err)
 	}
@@ -318,6 +323,7 @@ func TestSandboxExecCapsHoldUnderConcurrency(t *testing.T) {
 	var wait sync.WaitGroup
 	var mu sync.Mutex
 	outcomes := map[string]int{}
+	var limited []protocol.SandboxOpRequestV1
 	for n := range 20 {
 		request := f.op(t, sandbox.OpExecStart, 1000+n, at, nil)
 		wait.Add(1)
@@ -333,6 +339,7 @@ func TestSandboxExecCapsHoldUnderConcurrency(t *testing.T) {
 				outcomes["start"]++
 			case decision.Limited:
 				outcomes["limited"]++
+				limited = append(limited, request)
 			}
 		}()
 	}
@@ -353,7 +360,20 @@ func TestSandboxExecCapsHoldUnderConcurrency(t *testing.T) {
 	if finished != sandbox.MaxRunningExecs {
 		t.Fatalf("finished %d admitted execs", finished)
 	}
-	for n := sandbox.MaxRunningExecs; n < sandbox.MaxExecSessions; n++ {
+	// A cap refusal records nothing, so the same document admitted once a
+	// slot is free starts the exec; it is not a replay that never starts
+	// (SR-39-02 Y22).
+	if ops, _ := opRows(t, f.store); ops != sandbox.MaxRunningExecs {
+		t.Fatalf("%d op rows after %d refusals", ops, len(limited))
+	}
+	retry, err := f.ops.AdmitOp(ctx, limited[0])
+	if err != nil || !retry.Start || retry.Replay {
+		t.Fatalf("refused exec_start retried after a slot freed: %+v %v", retry, err)
+	}
+	if err := f.ops.RecordExecState(ctx, protocol.SandboxOpIDV1(limited[0]), sandbox.ExecStateExited, nil); err != nil {
+		t.Fatal(err)
+	}
+	for n := sandbox.MaxRunningExecs + 1; n < sandbox.MaxExecSessions; n++ {
 		decision, err := f.ops.AdmitOp(ctx, f.op(t, sandbox.OpExecStart, 5000+n, at, nil))
 		if err != nil || !decision.Start {
 			t.Fatalf("session %d: %+v %v", n, decision, err)
@@ -458,6 +478,7 @@ func TestSandboxExecStateIsMonotonic(t *testing.T) {
 		{first, sandbox.ExecStateRunning, nil, true},
 		{first, sandbox.ExecStateTimedOut, nil, true},
 		{second, sandbox.ExecStateFailed, nil, true},
+		{second, sandbox.ExecStateFailed, sandboxCode("not_an_op_code"), true},
 		{second, sandbox.ExecStateExited, &code, true},
 		{second, "admitted", nil, true},
 		{second, sandbox.ExecStateFailed, &code, false},
