@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Lab harness, not part of this repository's build: the disposable-host
+// lease lab copies it into a checkout of the pinned agent source as
+// cmd/mcsbx-lab-lease/main.go. It plays the miner neuron towards a running
+// miner agent: it signs a lab validator's sandbox documents with a key it
+// generates, wraps them in the bridge envelope with binding_verified (the
+// neuron's job) and HMAC-signs each request with the bridge secret. Every
+// receipt is verified against the agent's service key.
+//
+//	mcsbx-lab-lease lease   STATE
+//	mcsbx-lab-lease release STATE
+//
+// Flags (lease): -agent URL -secret FILE -service-key FILE -network NAME
+// -netuid N -miner HOTKEY -validator HOTKEY -image REF@DIGEST -cpu -memory
+// -disk -pids. STATE keeps the validator key and documents for release.
+package main
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/misscomputer/misscomputer-subnet/pkg/bridge"
+	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
+	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
+	"github.com/misscomputer/misscomputer-subnet/pkg/service"
+)
+
+const synapse = "subnet-sandbox-synapse.v1"
+
+type state struct {
+	Agent        string                          `json:"agent"`
+	SecretFile   string                          `json:"secret_file"`
+	MinerPublic  string                          `json:"miner_public"`
+	Network      string                          `json:"network"`
+	NetUID       uint16                          `json:"netuid"`
+	Validator    string                          `json:"validator"`
+	ValidatorKey string                          `json:"validator_key"`
+	Binding      *protocol.StaticSubnetBindingV1 `json:"binding"`
+	Reservation  protocol.SandboxReservationV1   `json:"reservation"`
+	Lease        protocol.SandboxLeaseV1         `json:"lease"`
+	Receipts     []protocol.SandboxReceiptV1     `json:"receipts"`
+}
+
+type envelope struct {
+	Protocol         string                   `json:"protocol"`
+	RequestID        string                   `json:"request_id"`
+	CurrentBlock     uint64                   `json:"current_block"`
+	CallerHotkey     string                   `json:"caller_hotkey"`
+	BindingVerified  bool                     `json:"binding_verified"`
+	ValidatorBinding neuron.ServiceKeyBinding `json:"validator_binding"`
+	Document         any                      `json:"document"`
+}
+
+type answer struct {
+	Protocol  string                    `json:"protocol"`
+	RequestID string                    `json:"request_id"`
+	Receipt   protocol.SandboxReceiptV1 `json:"receipt"`
+}
+
+func main() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "usage: mcsbx-lab-lease lease|release STATE [flags]")
+		os.Exit(2)
+	}
+	var err error
+	switch os.Args[1] {
+	case "lease":
+		err = lease(os.Args[2], os.Args[3:])
+	case "release":
+		err = release(os.Args[2])
+	default:
+		err = fmt.Errorf("unknown command %q", os.Args[1])
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "FAIL:", err)
+		os.Exit(1)
+	}
+}
+
+func lease(path string, args []string) error {
+	flags := flag.NewFlagSet("lease", flag.ContinueOnError)
+	agent := flags.String("agent", "http://127.0.0.1:19101", "agent bridge URL")
+	secretFile := flags.String("secret", "", "bridge secret file")
+	keyFile := flags.String("service-key", "", "agent service key file (read only)")
+	network := flags.String("network", "mock", "agent network")
+	netuid := flags.Uint("netuid", 1, "agent netuid")
+	miner := flags.String("miner", "", "agent hotkey")
+	validator := flags.String("validator", "", "lab validator hotkey")
+	image := flags.String("image", "", "image reference name@sha256:digest")
+	cpu := flags.Int("cpu", sandbox.MinCPUMillis, "lease cpu millis")
+	memory := flags.Int("memory", sandbox.MinMemoryMiB, "lease memory MiB")
+	disk := flags.Int("disk", sandbox.MinDiskMiB, "lease disk MiB")
+	pids := flags.Int("pids", sandbox.MinPIDs, "lease pids")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	_, digest, ok := strings.Cut(*image, "@")
+	if !ok || !strings.HasPrefix(digest, "sha256:") {
+		return errors.New("-image must be name@sha256:digest")
+	}
+	minerPrivate, err := service.LoadOrCreateSigningKey(*keyFile)
+	if err != nil {
+		return err
+	}
+	minerPublic := minerPrivate.Public().(ed25519.PublicKey)
+	validatorPublic, validatorPrivate, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	s := state{
+		Agent: *agent, SecretFile: *secretFile, MinerPublic: hex.EncodeToString(minerPublic), Network: *network,
+		NetUID: uint16(*netuid), Validator: *validator, ValidatorKey: hex.EncodeToString(validatorPrivate),
+		Binding: &protocol.StaticSubnetBindingV1{
+			Network: *network, NetUID: uint16(*netuid), ValidatorHotkey: *validator, MinerHotkey: *miner,
+			MinerAxonURL: "http://127.0.0.1:8091", MinerTransport: neuron.TransportHTTP, ChainBlock: 100, Epoch: 1, ExpiresAtBlock: 112,
+			ValidatorServicePublicKey: hex.EncodeToString(validatorPublic), MinerServicePublicKey: hex.EncodeToString(minerPublic),
+		},
+	}
+	resources := sandbox.Resources{CPUMillis: *cpu, MemoryMiB: *memory, DiskMiB: *disk, PIDs: *pids}
+	s.Reservation = protocol.SandboxReservationV1{
+		Generation: 1, HoldExpiresAt: *protocol.StaticTime(now.Add(time.Minute)), IssuedAt: *protocol.StaticTime(now), MinerID: *miner,
+		ReservationNonce: hex.EncodeToString(validatorPublic[:16]), Resources: resources,
+		SandboxID: "sbx-" + hex.EncodeToString(validatorPublic[16:32])[:32], Schema: protocol.SandboxReservationSchema, SchemaVersion: 1,
+		Subnet: s.Binding, WorkloadKind: sandbox.WorkloadKind,
+	}
+	if err := protocol.SignSandboxReservationV1(&s.Reservation, validatorPrivate); err != nil {
+		return err
+	}
+	held, err := s.post("/v1/sandbox/reservations", "reserve", s.Reservation)
+	if err != nil {
+		return err
+	}
+	if held.Stage != sandbox.StageHeld {
+		return s.save(path, fmt.Errorf("reservation stage %s", held.Stage))
+	}
+	reservationDigest, err := protocol.SandboxDigestV1(s.Reservation)
+	if err != nil {
+		return err
+	}
+	s.Lease = protocol.SandboxLeaseV1{
+		AssignmentNonce: hex.EncodeToString(validatorPublic[8:24]), Env: map[string]string{}, Generation: 1, ImageDigest: digest,
+		ImageReference: *image, Isolation: sandbox.IsolationGVisor, IssuedAt: *protocol.StaticTime(now),
+		LeaseExpiresAt: *protocol.StaticTime(now.Add(10 * time.Minute)), MinerID: *miner,
+		Network:           sandbox.NetworkPolicy{Mode: sandbox.NetworkNone, Allow: []string{}},
+		ReservationDigest: reservationDigest, Resources: resources, SandboxID: s.Reservation.SandboxID,
+		Schema: protocol.SandboxLeaseSchema, SchemaVersion: 1,
+		SecretEnv: sandbox.SecretEnv{Delivery: sandbox.SecretDeliveryNone, Names: []string{}}, Subnet: s.Binding, WorkloadKind: sandbox.WorkloadKind,
+	}
+	if err := protocol.SignSandboxLeaseV1(&s.Lease, validatorPrivate); err != nil {
+		return err
+	}
+	// The agent answers within its commit window; an accepted lease is
+	// replayed exactly until it leaves accepted (bounded).
+	deadline := time.Now().Add(6 * time.Minute)
+	for {
+		receipt, err := s.post("/v1/sandbox/leases", "commit", s.Lease)
+		if err != nil {
+			return s.save(path, err)
+		}
+		if receipt.Stage != sandbox.StageAccepted {
+			break
+		}
+		if time.Now().After(deadline) {
+			return s.save(path, errors.New("lease still accepted after 6 minutes"))
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return s.save(path, nil)
+}
+
+func release(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var s state
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return err
+	}
+	keyBytes, err := hex.DecodeString(s.ValidatorKey)
+	if err != nil || len(keyBytes) != ed25519.PrivateKeySize {
+		return errors.New("state has no validator key")
+	}
+	document := protocol.SandboxReleaseV1{
+		Generation: 1, IssuedAt: *protocol.StaticTime(time.Now().UTC()), MinerID: s.Binding.MinerHotkey, Reason: sandbox.ReleaseCustomerDelete,
+		SandboxID: s.Reservation.SandboxID, Schema: protocol.SandboxReleaseSchema, SchemaVersion: 1, Subnet: s.Binding,
+	}
+	if err := protocol.SignSandboxReleaseV1(&document, ed25519.PrivateKey(keyBytes)); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		receipt, err := s.post("/v1/sandbox/releases", "release", document)
+		var retry *retryable
+		if errors.As(err, &retry) && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if err != nil {
+			return s.save(path, err)
+		}
+		if receipt.Stage != sandbox.StageReleased {
+			return s.save(path, fmt.Errorf("release stage %s", receipt.Stage))
+		}
+		return s.save(path, nil)
+	}
+}
+
+type retryable struct{ body string }
+
+func (r *retryable) Error() string { return "retryable: " + r.body }
+
+func (s *state) post(route, label string, document any) (protocol.SandboxReceiptV1, error) {
+	secret, err := bridge.LoadSecret(s.SecretFile, "")
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	validatorKey, _ := hex.DecodeString(s.ValidatorKey)
+	body, err := json.Marshal(envelope{
+		Protocol: synapse, RequestID: fmt.Sprintf("lab-%s-%d", label, time.Now().UnixNano()), CurrentBlock: 101,
+		CallerHotkey: s.Validator, BindingVerified: true,
+		ValidatorBinding: neuron.ServiceKeyBinding{
+			Protocol: neuron.ServiceBindingVersion, Role: "validator", Network: s.Network, NetUID: s.NetUID, Hotkey: s.Validator,
+			ServicePublicKey: hex.EncodeToString(ed25519.PrivateKey(validatorKey).Public().(ed25519.PublicKey)),
+			Transport:        neuron.TransportLocal, Generation: 1, ValidFromBlock: 100, ExpiresAtBlock: 200,
+		},
+		Document: document,
+	})
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	req, err := http.NewRequest(http.MethodPost, s.Agent+route, bytes.NewReader(body))
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if err := bridge.SignRequest(req, body, secret, time.Now()); err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	began := time.Now()
+	resp, err := (&http.Client{Timeout: 3 * time.Minute}).Do(req)
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	fmt.Printf("%s %s: HTTP %d in %v\n", label, route, resp.StatusCode, time.Since(began).Round(time.Millisecond))
+	if resp.StatusCode == http.StatusServiceUnavailable && bytes.Contains(raw, []byte(`"retryable":true`)) {
+		fmt.Printf("  %s\n", raw)
+		return protocol.SandboxReceiptV1{}, &retryable{string(raw)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return protocol.SandboxReceiptV1{}, fmt.Errorf("%s: HTTP %d %s", label, resp.StatusCode, raw)
+	}
+	var got answer
+	if err := json.Unmarshal(raw, &got); err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	minerPublic, _ := hex.DecodeString(s.MinerPublic)
+	if err := protocol.VerifySandboxReceiptV1(got.Receipt, ed25519.PublicKey(minerPublic)); err != nil {
+		return protocol.SandboxReceiptV1{}, fmt.Errorf("%s receipt signature: %w", label, err)
+	}
+	errorCode := "null"
+	if got.Receipt.ErrorCode != nil {
+		errorCode = *got.Receipt.ErrorCode
+	}
+	fmt.Printf("  receipt stage=%s error_code=%s sandbox=%s verified=agent-service-key\n", got.Receipt.Stage, errorCode, got.Receipt.SandboxID)
+	s.Receipts = append(s.Receipts, got.Receipt)
+	return got.Receipt, nil
+}
+
+func (s *state) save(path string, cause error) error {
+	raw, err := json.MarshalIndent(s, "", "  ")
+	if err == nil {
+		err = os.WriteFile(path, raw, 0o600)
+	}
+	if cause != nil {
+		return cause
+	}
+	return err
+}
