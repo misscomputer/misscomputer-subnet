@@ -189,6 +189,17 @@ including refused and failed receipts.
   acknowledged. Sweep and orphan reconciliation likewise skip a lease whose
   start or teardown is in progress, and retry it on the next sweep. Restart recovery destroys every
   sandbox that may exist before the agent serves.
+- **Shutdown:** on SIGTERM the lane closes while the API drains (15 seconds
+  for both). From then on a lease commit, release or sweep is
+  refused with the retryable bridge error `503 sandbox_lane_closed` and
+  nothing written, a Commit waiting for its start answers the lease's
+  durable stage, and a create in progress is cancelled without recording a
+  failed start. The lane waits for its in-flight starts, releases and
+  sweeps, and after the agent's replica cleanup a Recover with its own
+  60-second budget destroys every sandbox and ends pending and running
+  leases as `failed/miner_restart`. A start that ignores cancellation keeps
+  its lease locked; that Recover reports it busy and the next start's
+  recovery destroys it.
 - **Backend interface (`SandboxBackend`):** `Budget`, `Unsupported`,
   `Create` (idempotent per instance name), `Destroy` (idempotent),
   `Instances` (every sandbox the backend holds, with its lease ID) and

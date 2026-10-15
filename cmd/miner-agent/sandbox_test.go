@@ -261,6 +261,15 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	if err := decodeJSON(bytes.NewReader(response.Body.Bytes()), &answer); err != nil || answer.Receipt.Stage != sandbox.StageReleased || len(backend.live) != 0 {
 		t.Fatalf("replayed release: %d %s live=%d", response.Code, response.Body.String(), len(backend.live))
 	}
+	// Once shutdown closed the lane, documents are refused as retryable.
+	if err := service.sandbox.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response = serve(service.routes(), http.MethodPost, "/v1/sandbox/releases", envelope(release, nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"sandbox_lane_closed"`) ||
+		!strings.Contains(response.Body.String(), `"retryable":true`) {
+		t.Fatalf("release after the lane closed: %d %s", response.Code, response.Body.String())
+	}
 }
 
 // sandboxProfile writes a valid sandbox-host-profile.v1 document whose

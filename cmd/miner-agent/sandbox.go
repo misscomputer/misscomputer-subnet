@@ -192,6 +192,10 @@ func sandboxHandler[T any](a *api, apply func(context.Context, T, miner.SandboxR
 			bridge.WriteError(w, http.StatusConflict, "sandbox_conflict", err.Error(), false)
 			return
 		}
+		if errors.Is(err, miner.ErrSandboxLaneClosed) {
+			bridge.WriteError(w, http.StatusServiceUnavailable, "sandbox_lane_closed", err.Error(), true)
+			return
+		}
 		if errors.Is(err, miner.ErrSandboxCleanupPending) {
 			// The fence is durable; the release is acknowledged with a
 			// receipt only once its sandbox is destroyed.

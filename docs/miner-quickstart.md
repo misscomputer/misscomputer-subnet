@@ -378,6 +378,7 @@ Requires=docker.service
 EnvironmentFile=/etc/misscomputer-miner/agent.env
 ExecStart=/path/to/misscomputer-subnet/build/miner-agent --network finney --netuid <NETUID> --hotkey <hotkey-ss58> --uid <uid> --bridge-secret-file /etc/misscomputer-miner/bridge.secret --service-key-file /var/lib/misscomputer-miner/agent-service.key --state-db /var/lib/misscomputer-miner/agent-state.sqlite --docker-state-dir /var/lib/misscomputer-miner/oci --artifact-backend s3 --s3-endpoint <artifact-store-endpoint-url> --s3-bucket <artifact-bucket> --tls-certificate-sha256 <leaf-sha256>
 Restart=on-failure
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target
@@ -397,6 +398,16 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 ```
+
+**Stop timeout.** On SIGTERM the agent stops in phases with fixed budgets:
+up to 15 seconds to drain the API (the sandbox lane closes during the same
+window), then up to 30 seconds to clean up replicas, then, with
+`--sandbox-leases on`, up to 60 seconds to destroy sandboxes. That is at most
+105 seconds. Give the supervisor a stop timeout of at least 120 seconds
+(`TimeoutStopSec=120` above; for Docker or Compose, `--stop-timeout` or
+`stop_grace_period`). A shorter timeout kills the agent mid-cleanup; the
+next start cleans up what it left. This is a recommendation for the example
+units, not a statement about how any existing deployment is configured.
 
 Logs: `journalctl -u misscomputer-miner-agent -f` and
 `journalctl -u misscomputer-miner -f`.

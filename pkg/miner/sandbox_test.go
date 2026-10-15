@@ -46,7 +46,13 @@ type sbBackend struct {
 	unsupported string
 	createErr   error
 	destroyErr  error
-	createGate  chan struct{}
+	// createGate holds Create until it closes or the create is cancelled,
+	// like a pull in progress; stuckCreate holds it whatever its context.
+	createGate, stuckCreate chan struct{}
+	// destroyGate holds Destroy until it closes or the destroy is
+	// cancelled; destroying receives the instance as Destroy begins.
+	destroyGate chan struct{}
+	destroying  chan string
 }
 
 func newSBBackend() *sbBackend {
@@ -60,8 +66,14 @@ func (b *sbBackend) Budget(context.Context) (SandboxBudget, error) {
 func (b *sbBackend) Unsupported(protocol.SandboxLeaseV1) string { return b.unsupported }
 
 func (b *sbBackend) Create(ctx context.Context, instance string, lease protocol.SandboxLeaseV1) error {
+	if b.stuckCreate != nil {
+		<-b.stuckCreate
+	}
 	if b.createGate != nil {
-		<-b.createGate
+		select {
+		case <-b.createGate:
+		case <-ctx.Done():
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -78,6 +90,18 @@ func (b *sbBackend) Create(ctx context.Context, instance string, lease protocol.
 }
 
 func (b *sbBackend) Destroy(ctx context.Context, instance string) error {
+	if b.destroying != nil {
+		select {
+		case b.destroying <- instance:
+		default:
+		}
+	}
+	if b.destroyGate != nil {
+		select {
+		case <-b.destroyGate:
+		case <-ctx.Done():
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -833,5 +857,155 @@ func TestSandboxSweepDestroysOrphansAndKeepsLiveSandboxes(t *testing.T) {
 	defer f.backend.mu.Unlock()
 	if len(f.backend.live) != 1 || !f.backend.live[liveName] {
 		t.Fatalf("after sweep live sandboxes = %v, want only %s", f.backend.live, liveName)
+	}
+}
+
+// At shutdown the lane closes before Recover. A sweep that is tearing a
+// lease down is cancelled and waited for, so the shutdown Recover holds the
+// lease lock and destroys the sandbox instead of reporting it busy.
+func TestSandboxCloseWaitsForASweepBeforeRecover(t *testing.T) {
+	f := newSBFixture(t)
+	_, l, receipt, err := f.commitHeld(1, nil)
+	f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+	f.backend.destroyGate, f.backend.destroying = make(chan struct{}), make(chan string, 1)
+	// Past the lease's expiry and grace, the sweep moves it to cleanup and
+	// destroys its sandbox, which the destroy gate holds.
+	f.now = f.now.Add(24 * time.Hour)
+	swept := make(chan error, 1)
+	go func() { swept <- f.lane.Sweep(context.Background()) }()
+	<-f.backend.destroying
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.lane.Close(closeCtx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case err := <-swept:
+		if err == nil {
+			t.Fatal("the sweep's destroy finished although Close cancelled it")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the sweep was still destroying after Close")
+	}
+	close(f.backend.destroyGate)
+	if err := f.lane.Recover(context.Background()); err != nil {
+		t.Fatalf("shutdown recover: %v", err)
+	}
+	if live, _, _ := f.backend.state(); live != 0 {
+		t.Fatalf("%d sandboxes survive the shutdown recover", live)
+	}
+	if err := f.lane.Sweep(context.Background()); !errors.Is(err, ErrSandboxLaneClosed) {
+		t.Fatalf("sweep after close = %v, want ErrSandboxLaneClosed", err)
+	}
+}
+
+// A create in progress when the lane closes is cancelled, not recorded as
+// a failed start: Commit answers accepted at once, Close waits for the
+// start, and the shutdown Recover destroys the sandbox and ends the lease
+// as failed/miner_restart. Documents that arrive after Close are refused
+// without a durable write.
+func TestSandboxCloseCancelsStartsInProgress(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	f.backend.createGate = make(chan struct{})
+	r := f.reservation(1)
+	receipt, err := f.lane.Reserve(ctx, r, f.request())
+	f.check(receipt, err, protocol.SandboxReservationSchema, r, sandbox.StageHeld, "")
+	l := f.lease(r, nil)
+	leaseID := protocol.SandboxLeaseIDV1(l)
+	type result struct {
+		receipt protocol.SandboxReceiptV1
+		err     error
+	}
+	committed := make(chan result, 1)
+	go func() {
+		receipt, err := f.lane.Commit(ctx, l, f.request())
+		committed <- result{receipt, err}
+	}()
+	waitLease(t, f, leaseID, "pending")
+	// Held before the close, so only the closed lane refuses its commit.
+	other := f.reservation(2)
+	receipt, err = f.lane.Reserve(ctx, other, f.request())
+	f.check(receipt, err, protocol.SandboxReservationSchema, other, sandbox.StageHeld, "")
+
+	closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := f.lane.Close(closeCtx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case got := <-committed:
+		f.check(got.receipt, got.err, protocol.SandboxLeaseSchema, l, sandbox.StageAccepted, "")
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit kept waiting for its start after Close")
+	}
+	if record, _, _ := f.store.Lease(ctx, leaseID); record.Status != "pending" {
+		t.Fatalf("lease status %q after the cancelled start, want pending for Recover", record.Status)
+	}
+
+	if _, err := f.lane.Release(ctx, f.release(other), f.request()); !errors.Is(err, ErrSandboxLaneClosed) {
+		t.Fatalf("release after close = %v, want ErrSandboxLaneClosed", err)
+	}
+	late := f.lease(other, nil)
+	if _, err := f.lane.Commit(ctx, late, f.request()); !errors.Is(err, ErrSandboxLaneClosed) {
+		t.Fatalf("commit after close = %v, want ErrSandboxLaneClosed", err)
+	}
+	if _, found, err := f.store.Lease(ctx, protocol.SandboxLeaseIDV1(late)); err != nil || found {
+		t.Fatalf("commit after close wrote a lease: found=%v err=%v", found, err)
+	}
+
+	if err := f.lane.Recover(ctx); err != nil {
+		t.Fatalf("shutdown recover: %v", err)
+	}
+	restarted := f.newLane(f.agent())
+	again, err := restarted.Commit(ctx, l, f.request())
+	f.check(again, err, protocol.SandboxLeaseSchema, l, sandbox.StageFailed, "miner_restart")
+}
+
+// Close waits only until its context ends: a create that ignores
+// cancellation holds neither shutdown nor the Commit waiting for it, and
+// its lease stays locked, so the shutdown Recover reports it instead of
+// racing the create.
+func TestSandboxCloseIsBounded(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	f.backend.stuckCreate = make(chan struct{})
+	defer close(f.backend.stuckCreate)
+	r := f.reservation(1)
+	receipt, err := f.lane.Reserve(ctx, r, f.request())
+	f.check(receipt, err, protocol.SandboxReservationSchema, r, sandbox.StageHeld, "")
+	l := f.lease(r, nil)
+	type result struct {
+		receipt protocol.SandboxReceiptV1
+		err     error
+	}
+	committed := make(chan result, 1)
+	go func() {
+		receipt, err := f.lane.Commit(ctx, l, f.request())
+		committed <- result{receipt, err}
+	}()
+	waitLease(t, f, protocol.SandboxLeaseIDV1(l), "pending")
+
+	closeCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	closed := make(chan error, 1)
+	go func() { closed <- f.lane.Close(closeCtx) }()
+	select {
+	case err := <-closed:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("close = %v, want it to stop waiting at its deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close kept waiting past its deadline")
+	}
+	select {
+	case got := <-committed:
+		f.check(got.receipt, got.err, protocol.SandboxLeaseSchema, l, sandbox.StageAccepted, "")
+	case <-time.After(5 * time.Second):
+		t.Fatal("commit kept waiting for a start that ignores cancellation after Close")
+	}
+	if err := f.lane.Recover(ctx); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("shutdown recover = %v, want the still-running start's lease reported busy", err)
 	}
 }
