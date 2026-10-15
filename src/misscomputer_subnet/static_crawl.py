@@ -20,6 +20,9 @@ verdict leaves the incarnation unadmitted, with its evidence retained.
 
 from __future__ import annotations
 
+import os
+import re
+import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -78,6 +81,126 @@ INDEX_FETCH_TIMEOUT_SECONDS: Final = 10.0
 
 AdmissionVerdict = Literal["admitted", "incomplete", "refused", "rejected"]
 Signer = Callable[[bytes], bytes]
+
+
+def read_private_static_index_documents(
+    root: str,
+    target: StaticDeploymentTarget,
+    *,
+    deadline: float | None = None,
+) -> tuple[bytes | None, bytes | None]:
+    """Read only digest-addressed index objects from an operator-private spool.
+
+    No URLs or caller-provided relative paths are accepted. Linux openat with
+    O_NOFOLLOW pins every component; rechecking the chain refuses replacements
+    during a read. The spool and descendants must belong to this effective UID,
+    directories must be 0700, and singly-linked regular files 0400 or 0600.
+    Ancestors must be root/caller-owned and not group/world-writable (sticky
+    ancestors such as /tmp are permitted). The caller and root are trusted;
+    this is not protection from a compromised process with the same UID.
+
+    Missing, oversized, changed or unsafe objects are unavailable, never fetched
+    from the network. Authenticity still requires ingest_static_index afterwards.
+    """
+    if (
+        not isinstance(root, str)
+        or not root.startswith("/")
+        or root == "/"
+        or any(part in {"", ".", ".."} for part in root[1:].split("/"))
+        or "\x00" in root
+    ):
+        return None, None
+    if any(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+        for value in (target.site_digest, target.release_digest)
+    ):
+        return None, None
+
+    def read(key: str, maximum: int) -> bytes | None:
+        descriptors: list[int] = []
+        components = (*root[1:].split("/"), *key.split("/"))
+        private_start = len(root[1:].split("/"))
+        try:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            descriptors.append(os.open("/", flags | os.O_DIRECTORY))
+            for component in components[:-1]:
+                descriptors.append(
+                    os.open(component, flags | os.O_DIRECTORY, dir_fd=descriptors[-1])
+                )
+            snapshots = [os.fstat(fd) for fd in descriptors]
+            for index, metadata in enumerate(snapshots):
+                if not stat.S_ISDIR(metadata.st_mode):
+                    return None
+                if index >= private_start:
+                    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+                        return None
+                elif metadata.st_uid not in {0, os.geteuid()} or (
+                    stat.S_IMODE(metadata.st_mode) & 0o022 and not metadata.st_mode & stat.S_ISVTX
+                ):
+                    return None
+            descriptor = os.open(components[-1], flags | os.O_NONBLOCK, dir_fd=descriptors[-1])
+            descriptors.append(descriptor)
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) not in {0o400, 0o600}
+                or before.st_nlink != 1
+                or before.st_size > maximum
+            ):
+                return None
+            chunks: list[bytes] = []
+            remaining = maximum + 1
+            while remaining:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                chunk = os.read(descriptor, min(remaining, 65_536))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            after = os.fstat(descriptor)
+            # Include nanosecond timestamps: stat_result equality omits these.
+            if (
+                len(payload) > maximum
+                or before != after
+                or (before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                return None
+            for index, original in enumerate([*snapshots, before]):
+                current = os.fstat(descriptors[index])
+                if index:
+                    named = os.stat(
+                        components[index - 1],
+                        dir_fd=descriptors[index - 1],
+                        follow_symlinks=False,
+                    )
+                    if (named.st_dev, named.st_ino) != (current.st_dev, current.st_ino):
+                        return None
+                if (original.st_dev, original.st_ino, original.st_mode, original.st_uid) != (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mode,
+                    current.st_uid,
+                ):
+                    return None
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            return payload
+        except (OSError, ValueError, AttributeError):
+            return None
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    return (
+        read(static_index_manifest_key(target.site_digest), MAX_MANIFEST_BYTES),
+        read(static_index_release_key(target.release_digest), MAX_RELEASE_BYTES),
+    )
 
 
 def fetch_static_index_documents(

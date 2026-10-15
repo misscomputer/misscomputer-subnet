@@ -1429,7 +1429,7 @@ def execute_assignment_probe(
 
 def _run_with_static(
     static_run: StaticEpochRun,
-    pins: tuple[object, str, str],
+    pins: tuple[object, str, str | None],
     manifest: ActiveAssignmentManifestV2,
     policy: AssignmentManifestTrustPolicy,
     transport: ProbeTransport,
@@ -1587,6 +1587,7 @@ _STATIC_SINGLE_OPTIONS: Final = (
     "static-release-trust-policy-sha256",
     "static-server-implementation-digest",
     "static-index-origin",
+    "static-index-root",
     "static-manifest-archive-dir",
     "static-epoch-output",
     "static-journal",
@@ -1601,7 +1602,6 @@ _STATIC_REQUIRED: Final = (
     "static_release_trust_policy",
     "static_release_trust_policy_sha256",
     "static_server_implementation_digest",
-    "static_index_origin",
     "static_manifest_archive_dir",
     "static_epoch_output",
     "static_journal",
@@ -1629,6 +1629,8 @@ def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesC
     from .static_runtime import StaticSitesConfig, static_signature_sources
 
     if any(values[name] is None for name in _STATIC_REQUIRED):
+        _fail("usage")
+    if (values["static_index_origin"] is None) == (values["static_index_root"] is None):
         _fail("usage")
     manifest_file = cast(str | None, values["static_manifest_file"])
     manifest_digest = cast(str | None, values["static_manifest_sha256"])
@@ -1676,7 +1678,8 @@ def _static_config_from_arguments(arguments: argparse.Namespace) -> StaticSitesC
             cast(str, values["static_release_trust_policy_sha256"]),
         ),
         server_implementation_digest=cast(str, values["static_server_implementation_digest"]),
-        index_origin=cast(str, values["static_index_origin"]),
+        index_origin=cast(str | None, values["static_index_origin"]),
+        index_root=cast(str | None, values["static_index_root"]),
         manifest_archive_dir=cast(str, values["static_manifest_archive_dir"]),
         epoch_output=cast(str, values["static_epoch_output"]),
         journal=cast(str, values["static_journal"]),
