@@ -520,7 +520,14 @@ func (l *SandboxLane) Release(ctx context.Context, r protocol.SandboxReleaseV1, 
 		return protocol.SandboxReceiptV1{}, err
 	}
 	defer done()
-	outcome, teardown, err := l.store.Release(ctx, r, now)
+	// The fence and the occupancy read are short local steps that do not
+	// stop when Close cancels the release, so a release admitted before
+	// Close is answered cleanup_pending (fenced, destroy unfinished) or
+	// released, never with a bare cancellation. Only the destroy stops at
+	// Close; the shutdown Recover finishes it.
+	stateCtx, cancelState := context.WithTimeout(context.WithoutCancel(ctx), sandboxStateTimeout)
+	defer cancelState()
+	outcome, teardown, err := l.store.Release(stateCtx, r, now)
 	if err != nil {
 		return protocol.SandboxReceiptV1{}, err
 	}
@@ -528,7 +535,7 @@ func (l *SandboxLane) Release(ctx context.Context, r protocol.SandboxReleaseV1, 
 		if err := l.destroyAll(ctx, teardown, now); err != nil {
 			return protocol.SandboxReceiptV1{}, fmt.Errorf("%w: %v", ErrSandboxCleanupPending, err)
 		}
-		if outcome.Held, outcome.Active, err = l.store.Occupancy(ctx, now); err != nil {
+		if outcome.Held, outcome.Active, err = l.store.Occupancy(stateCtx, now); err != nil {
 			return protocol.SandboxReceiptV1{}, err
 		}
 	}
