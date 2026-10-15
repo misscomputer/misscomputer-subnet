@@ -191,6 +191,54 @@ remains.
 - Startup recovery and orphan reconciliation of a real backend, and any
   live miner path. No activation may be inferred from a green job.
 
+## Agent shares the engine's namespaces (candidate)
+
+`host.agent_shares_engine_namespaces` (observed_state, lane2, preflight
+mode) requires the caller (the miner agent in live preflight) to share the
+PID and network namespaces of the dedicated dockerd. The backend reads a
+sandbox's sentry through `/proc/<pid>` and its network namespace through
+`/proc/<pid>/ns/net`; both refer to the right process only when the agent
+sees the engine's PIDs and network namespace.
+
+- Identity of the daemon: the listener of the profile's engine socket, from
+  `SO_PEERCRED` of one connection made by the check and closed without
+  sending a byte. The kernel reports PID 0 when the listener is not visible
+  in the caller's PID namespace, which fails the check. The PID must also hold
+  the listening socket in the configured procfs (`net/unix` and fd tables),
+  so a PID number from another namespace cannot name a different process.
+- Identity of a namespace: the nsfs `(st_dev, st_ino)` of
+  `<proc>/self/ns/{pid,net}` and `<proc>/<dockerd>/ns/{pid,net}`. The
+  `kind:[inode]` text is evidence only.
+- Fail closed: a refused connection, missing peer credentials, a listener
+  that is not a holder, an unreadable namespace file (reading another
+  process's `ns` needs ptrace-read access, in practice root) or a mismatch.
+  On a real kernel, a listener in another network namespace usually fails
+  the holder step, because `net/unix` lists only the caller's network
+  namespace.
+
+Gating disposition: like every non-gap check, a fail makes the preflight
+verdict fail, so `OpenFromProfile` refuses and an agent started with
+`--sandbox-leases on` does not start. Nothing changes with the default
+`--sandbox-leases off`, because no preflight runs. Conformance does not list
+the ID; the observer's Preflight output, and so this check, is covered by
+`conformance.go_observer_matches`.
+
+Status: candidate. It adds one catalog entry, so the catalog digest changes
+from `4966837535c5d986840787e9ee8fbe1632865afa6e33e734d978a1874e2e3627`. No
+frozen binding (lane6) and no activation follows from it. Open dependency
+decisions:
+
+- lane1: the merged report gains one lane2 check when PR38 rebases. Lane1
+  tests that count checks, and any change to lane1's `/proc/<pid>` vanish
+  rule, need lane1 to agree.
+- lane6: whether to rebind the catalog digest, and whether the check is
+  activation-gating.
+- Profile v2 `engine.daemon_config` and an `ObserveInstance` typed vanished
+  signal (pidfd) are separate proposals, not part of this change.
+- Not proven: the PID-0 branch (it needs a listener in an ancestor or sibling
+  PID namespace), a containerised agent with the host procfs mounted
+  elsewhere, and any production host.
+
 ## Engine egress readback (INT-27-07)
 
 `network.engine_egress_restricted` parses `nft -j list table inet

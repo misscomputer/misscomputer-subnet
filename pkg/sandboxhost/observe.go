@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -19,7 +21,9 @@ import (
 // Host reads the kernel's view of this machine. Proc is the procfs mount of
 // the host PID namespace ("/proc" when empty; an agent in a container with
 // the host's procfs mounted elsewhere names that mount). Every read is
-// read-only; nothing is created, written or signalled.
+// read-only; nothing is written or signalled. The only connection made is
+// one to the dedicated engine socket, closed without sending a byte, to read
+// its listener's peer credentials.
 type Host struct {
 	Proc string
 	// ListNFTable returns `nft -j list table inet <name>` when asJSON is
@@ -117,6 +121,9 @@ func (h Host) Preflight(profile Profile, exclusive []string) []Check {
 		disjointErr = disjoint(lease, engine, append([]string{self}, exclusive...))
 	}
 	r.add("cgroup.disjoint_from_caller", disjointErr, fmt.Sprintf("%s and %s disjoint from caller %s and %v", lease, engine, self, exclusive))
+
+	shared, sharedErr := h.sharesEngineNamespaces(profile.DockerSocket())
+	r.add("host.agent_shares_engine_namespaces", sharedErr, shared)
 
 	mounts, mountErr := h.mounts()
 	quotaErr := mountErr
@@ -463,9 +470,36 @@ func sizedTmpfs(mounts []mount, runRoot string, sockets ...string) error {
 // socketOwnersIn finds the processes holding each listening unix socket
 // path and requires every one of them to be in cgroup.
 func (h Host) socketOwnersIn(cgroup string, sockets ...string) (string, error) {
-	raw, err := os.ReadFile(h.proc("net", "unix"))
+	owners, err := h.socketHolders(sockets...)
 	if err != nil {
 		return "", err
+	}
+	var evidence strings.Builder
+	for _, socket := range sockets {
+		if len(owners[socket]) == 0 {
+			return evidence.String(), fmt.Errorf("no visible process holds listening socket %s", socket)
+		}
+		for _, pid := range owners[socket] {
+			member, err := h.processCgroup(pid)
+			if err != nil {
+				return evidence.String(), err
+			}
+			if !within(member, cgroup) {
+				return evidence.String(), fmt.Errorf("PID %s holding %s is in %s, not %s", pid, socket, member, cgroup)
+			}
+			fmt.Fprintf(&evidence, "%s pid=%s cgroup=%s; ", path.Base(socket), pid, member)
+		}
+	}
+	return evidence.String(), nil
+}
+
+// socketHolders maps each unix socket path to the PIDs (in h.Proc) holding
+// a descriptor of the socket bound to it, read from net/unix and every
+// process's fd table. A process whose fd table is unreadable is skipped.
+func (h Host) socketHolders(sockets ...string) (map[string][]string, error) {
+	raw, err := os.ReadFile(h.proc("net", "unix"))
+	if err != nil {
+		return nil, err
 	}
 	inodes := map[string]string{}
 	for _, line := range strings.Split(string(raw), "\n")[1:] {
@@ -494,25 +528,109 @@ func (h Host) socketOwnersIn(cgroup string, sockets ...string) (string, error) {
 		}
 		return nil
 	}); err != nil {
+		return nil, err
+	}
+	return owners, nil
+}
+
+// engineDialTimeout bounds the connection made to read the engine socket's
+// peer credentials.
+const engineDialTimeout = 5 * time.Second
+
+// sharesEngineNamespaces requires the caller to share the PID and network
+// namespaces of the dedicated dockerd. The daemon is the listener of the
+// engine socket, identified by SO_PEERCRED of a connection to it (the kernel
+// reports PID 0 when the listener is not visible in the caller's PID
+// namespace) and confirmed in h.Proc as a holder of that listening socket, so
+// a PID number from another namespace cannot name a different process.
+// Namespace identity is the (st_dev, st_ino) pair of the nsfs files. Every
+// failure to connect, identify or read fails the check. The connection stays
+// open while the namespaces are read, so the listener cannot have exited.
+func (h Host) sharesEngineNamespaces(socket string) (string, error) {
+	conn, err := net.DialTimeout("unix", socket, engineDialTimeout)
+	if err != nil {
+		return "", fmt.Errorf("connect to engine socket %s: %w", socket, err)
+	}
+	defer conn.Close()
+	pid, err := peerPID(conn)
+	if err != nil {
+		return "", fmt.Errorf("peer credentials of %s: %w", socket, err)
+	}
+	if pid <= 0 {
+		return "", fmt.Errorf("listener of %s is not visible in the caller's PID namespace (SO_PEERCRED PID %d)", socket, pid)
+	}
+	peer := strconv.Itoa(pid)
+	holders, err := h.socketHolders(socket)
+	if err != nil {
 		return "", err
 	}
-	var evidence strings.Builder
-	for _, socket := range sockets {
-		if len(owners[socket]) == 0 {
-			return evidence.String(), fmt.Errorf("no visible process holds listening socket %s", socket)
-		}
-		for _, pid := range owners[socket] {
-			member, err := h.processCgroup(pid)
-			if err != nil {
-				return evidence.String(), err
-			}
-			if !within(member, cgroup) {
-				return evidence.String(), fmt.Errorf("PID %s holding %s is in %s, not %s", pid, socket, member, cgroup)
-			}
-			fmt.Fprintf(&evidence, "%s pid=%s cgroup=%s; ", path.Base(socket), pid, member)
-		}
+	held := false
+	for _, holder := range holders[socket] {
+		held = held || holder == peer
 	}
-	return evidence.String(), nil
+	if !held {
+		return "", fmt.Errorf("SO_PEERCRED PID %d of %s does not hold that listening socket in %s (holders %v)", pid, socket, h.proc(), holders[socket])
+	}
+	evidence := fmt.Sprintf("dockerd PID %d (SO_PEERCRED of %s, holder of its listening socket):", pid, socket)
+	for _, kind := range []string{"pid", "net"} {
+		self, err := namespaceOf(h.proc("self", "ns", kind))
+		if err != nil {
+			return "", fmt.Errorf("caller %s namespace: %w", kind, err)
+		}
+		theirs, err := namespaceOf(h.proc(peer, "ns", kind))
+		if err != nil {
+			return "", fmt.Errorf("dockerd PID %d %s namespace: %w", pid, kind, err)
+		}
+		if self.dev != theirs.dev || self.ino != theirs.ino {
+			return "", fmt.Errorf("caller %s namespace %s differs from dockerd PID %d %s", kind, self, pid, theirs)
+		}
+		evidence += fmt.Sprintf(" %s %s shared;", kind, self)
+	}
+	return evidence, nil
+}
+
+// peerPID is the SO_PEERCRED PID of a connected unix socket.
+func peerPID(conn net.Conn) (int, error) {
+	unixConn, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, errors.New("not a unix connection")
+	}
+	raw, err := unixConn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var cred *unix.Ucred
+	var credErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return 0, err
+	}
+	if credErr != nil {
+		return 0, credErr
+	}
+	return int(cred.Pid), nil
+}
+
+// namespace is the identity of a namespace: its nsfs device and inode, with
+// the kernel's "kind:[inode]" link text for evidence.
+type namespace struct {
+	dev, ino uint64
+	label    string
+}
+
+func (n namespace) String() string { return fmt.Sprintf("%s(dev=%d,ino=%d)", n.label, n.dev, n.ino) }
+
+func namespaceOf(file string) (namespace, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(file, &st); err != nil {
+		return namespace{}, fmt.Errorf("stat %s: %w", file, err)
+	}
+	label, err := os.Readlink(file)
+	if err != nil {
+		label = "?"
+	}
+	return namespace{dev: uint64(st.Dev), ino: st.Ino, label: label}, nil
 }
 
 func (h Host) eachPID(visit func(pid string) error) error {

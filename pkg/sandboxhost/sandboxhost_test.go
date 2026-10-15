@@ -5,8 +5,10 @@ package sandboxhost
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -238,7 +240,7 @@ func TestPreflightReadsActualSliceLimits(t *testing.T) {
 	}
 	// A temporary directory is neither cgroup2 nor xfs, and nothing listens
 	// on the engine sockets: those checks must fail, never pass vacuously.
-	for _, id := range []string{"host.cgroup2_mount_authentic", "storage.data_fs_xfs_prjquota", "storage.run_root_tmpfs_finite", "cgroup.engine_processes_member", "budget.within_observed"} {
+	for _, id := range []string{"host.cgroup2_mount_authentic", "storage.data_fs_xfs_prjquota", "storage.run_root_tmpfs_finite", "cgroup.engine_processes_member", "host.agent_shares_engine_namespaces", "budget.within_observed"} {
 		if c := find(checks, id); c.Status != StatusFail {
 			t.Errorf("%s: %+v", id, c)
 		}
@@ -299,6 +301,97 @@ func TestPreflightRequiresEngineSocketHoldersInEngineSlice(t *testing.T) {
 	got := find(Host{Proc: f.proc, ListNFTable: egressFixture(t, "provisioned")}.Preflight(profile, nil), "cgroup.engine_processes_member")
 	if got.Status != StatusFail || !strings.Contains(got.Evidence, "PID 11") || !strings.Contains(got.Evidence, "/system.slice/containerd.service") {
 		t.Fatalf("containerd outside the engine slice: %+v", got)
+	}
+}
+
+// The engine listener is this test process, so SO_PEERCRED names
+// os.Getpid(); the fake procfs supplies that PID's fd table and namespace
+// files. Namespace files are symlinks to real files, so identity is the
+// target's device and inode. The caller's and dockerd's links reach the
+// same inode through different names (a hard link), so equal link text is
+// never what makes them shared.
+func TestPreflightRequiresTheCallerInTheEngineListenersNamespaces(t *testing.T) {
+	dir, err := os.MkdirTemp("", "mcns") // short: unix socket paths are limited
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "docker.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() { // accept and drop, as dockerd would for an idle client
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	namespaces := map[string]string{}
+	for _, name := range []string{"pid", "net", "other"} {
+		namespaces[name] = filepath.Join(dir, name+"-ns")
+		if err := os.WriteFile(namespaces[name], nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(namespaces[name], namespaces[name]+"-alias"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	me := strconv.Itoa(os.Getpid())
+	shared := map[string]string{"pid": namespaces["pid"] + "-alias", "net": namespaces["net"] + "-alias"}
+	cases := map[string]struct {
+		holder string
+		peerNS map[string]string
+		want   string
+	}{
+		"shared":                        {me, shared, ""},
+		"network namespace differs":     {me, map[string]string{"pid": shared["pid"], "net": namespaces["other"]}, "caller net namespace"},
+		"PID namespace differs":         {me, map[string]string{"pid": namespaces["other"], "net": shared["net"]}, "caller pid namespace"},
+		"dockerd namespaces unreadable": {me, nil, "dockerd PID " + me + " pid namespace"},
+		// A listener PID that is not a holder in this procfs (for example a
+		// number from another PID namespace) must not be trusted.
+		"listener is not the holder": {"77", shared, "does not hold that listening socket"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeHost(t)
+			v := loadVectors(t)
+			v.Valid["cgroup_root"] = f.cgroup
+			v.Valid["docker_host"] = "unix://" + socket
+			profile, err := DecodeProfile(encode(t, v.Valid))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.write(f.proc, "net/unix", "Num RefCount Protocol Flags Type St Inode Path\n0: 00000002 00000000 00010000 0001 01 301 "+socket+"\n")
+			link := func(from, to string) {
+				if err := os.MkdirAll(filepath.Dir(from), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(to, from); err != nil {
+					t.Fatal(err)
+				}
+			}
+			link(filepath.Join(f.proc, c.holder, "fd", "3"), "socket:[301]")
+			link(filepath.Join(f.proc, "self", "ns", "pid"), namespaces["pid"])
+			link(filepath.Join(f.proc, "self", "ns", "net"), namespaces["net"])
+			for kind, target := range c.peerNS {
+				link(filepath.Join(f.proc, me, "ns", kind), target)
+			}
+			got := find(Host{Proc: f.proc, ListNFTable: egressFixture(t, "provisioned")}.Preflight(profile, nil), "host.agent_shares_engine_namespaces")
+			if c.want == "" {
+				if got.Status != StatusPass || got.Class != ObservedState || !strings.Contains(got.Evidence, "dockerd PID "+me) || !strings.Contains(got.Evidence, "net ") {
+					t.Fatalf("%+v", got)
+				}
+				return
+			}
+			if got.Status != StatusFail || !strings.Contains(got.Evidence, c.want) {
+				t.Fatalf("want fail with %q: %+v", c.want, got)
+			}
+		})
 	}
 }
 
