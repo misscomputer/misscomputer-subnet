@@ -89,6 +89,15 @@ type fakeEngine struct {
 	// in for a runtime whose processes exist before the engine reports the
 	// container running.
 	holdStart func(*engineContainer) <-chan struct{}
+	// refuseStart, when it returns a status, answers the start request
+	// with that error status and message instead of starting; -1 drops the
+	// connection without an answer. It may rewrite the container's state.
+	refuseStart func(*engineContainer) (int, string)
+	// dropInspect drops the connection of an inspection it returns true
+	// for; failDelete answers container removal with an error.
+	dropInspect func(*engineContainer) bool
+	failDelete  bool
+	starts      int
 }
 
 func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
@@ -229,7 +238,7 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			if len(filters["ancestor"]) > 0 && c.Image != filters["ancestor"][0] {
 				continue
 			}
-			list = append(list, map[string]any{"Id": "id-" + name, "Names": []string{"/" + name}, "Labels": c.Labels})
+			list = append(list, map[string]any{"Id": containerIDOf(name), "Names": []string{"/" + name}, "Labels": c.Labels})
 		}
 		reply(w, 200, list)
 	case r.Method == http.MethodPost && p == "/containers/create":
@@ -265,12 +274,21 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			e.applied(c)
 		}
 		e.containers[name] = c
-		reply(w, 201, map[string]any{"Id": "id-" + name, "Warnings": []string{}})
+		reply(w, 201, map[string]any{"Id": containerIDOf(name), "Warnings": []string{}})
 	case r.Method == http.MethodPost && strings.HasPrefix(p, "/containers/") && strings.HasSuffix(p, "/start"):
 		c, ok := e.containers[strings.TrimSuffix(strings.TrimPrefix(p, "/containers/"), "/start")]
 		if !ok {
 			reply(w, 404, map[string]string{"message": "No such container"})
 			return
+		}
+		e.starts++
+		if e.refuseStart != nil {
+			if status, message := e.refuseStart(c); status == -1 {
+				panic(http.ErrAbortHandler)
+			} else if status != 0 {
+				reply(w, status, map[string]string{"message": message})
+				return
+			}
 		}
 		if e.holdStart != nil {
 			if hold := e.holdStart(c); hold != nil {
@@ -290,6 +308,9 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			reply(w, 404, map[string]string{"message": "No such container"})
 			return
 		}
+		if e.dropInspect != nil && e.dropInspect(c) {
+			panic(http.ErrAbortHandler)
+		}
 		pid := 0
 		if c.Status == "running" {
 			pid = testPID
@@ -302,7 +323,7 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			finishedAt = "0001-01-01T00:00:00Z"
 		}
 		reply(w, 200, map[string]any{
-			"Id": "id-" + c.Name, "Name": "/" + c.Name, "Image": c.Image,
+			"Id": containerIDOf(c.Name), "Name": "/" + c.Name, "Image": c.Image,
 			"State":  map[string]any{"Status": c.Status, "Running": c.Status == "running", "Pid": pid, "Error": c.Error, "StartedAt": startedAt, "FinishedAt": finishedAt},
 			"Config": map[string]any{"Labels": c.Labels}, "HostConfig": c.Host, "Mounts": c.Mounts,
 		})
@@ -313,6 +334,10 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(p, "/containers/")
 		if _, ok := e.containers[name]; !ok {
 			reply(w, 404, map[string]string{"message": "No such container"})
+			return
+		}
+		if e.failDelete {
+			reply(w, 500, map[string]string{"message": "driver failed to remove root filesystem"})
 			return
 		}
 		delete(e.containers, name)
@@ -339,8 +364,9 @@ type host struct {
 	socket string
 	config Config
 	sentry string
-	// sentryFile is the sentry binary as Open would have hashed it.
-	sentryFile os.FileInfo
+	// sentryFile and runscFile are the binaries as Open would have hashed
+	// them.
+	sentryFile, runscFile os.FileInfo
 	// dns answers registry host lookups; a host it lacks does not resolve.
 	dns map[string][]netip.Addr
 }
@@ -384,6 +410,9 @@ func newHost(t *testing.T) *host {
 	if h.sentryFile, err = os.Stat(sentry); err != nil {
 		t.Fatal(err)
 	}
+	if h.runscFile, err = os.Stat(runsc); err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "pids.max"), "4096\n")
 	h.process(sentry, "/mc.slice/"+testSlice+"/docker-1.scope", testLease(nil).Resources)
 	return h
@@ -414,7 +443,7 @@ func (h *host) process(exe, cgroup string, r sandbox.Resources) {
 // it directly; TestOpenRefusesUnverifiableHosts covers Open.
 func (h *host) backend() *GVisor {
 	return &GVisor{
-		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry, sandboxFile: h.sentryFile,
+		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry, sandboxFile: h.sentryFile, runscFile: h.runscFile,
 		lookup: func(_ context.Context, name string) ([]netip.Addr, error) {
 			if addresses, ok := h.dns[name]; ok {
 				return addresses, nil
@@ -606,7 +635,7 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 			h.process(h.sentry, "/system.slice/docker-1.scope", resources)
 		}, want: "outside slice"},
 		{name: "exit time not after start", started: func(c *engineContainer) { c.Status, c.FinishedAt = "exited", c.StartedAt }, want: "is exited, not running"},
-		{name: "a process remains in its cgroup", started: exit, leftover: "docker-id-%s.scope", want: "processes remain"},
+		{name: "a process remains in its cgroup", started: exit, leftover: "docker-%s.scope", want: "processes remain"},
 		{name: "a process remains in another cgroup of the slice", started: exit, leftover: "runsc-sandbox.scope", want: "processes remain"},
 		{name: "another running sandbox keeps its processes", started: exit, leftover: "docker-1.scope", other: true},
 		{name: "exits under an unverified runtime", applied: func(c *engineContainer) { c.Host["Runtime"] = "runc" }, started: exit, want: "runtime is"},
@@ -629,7 +658,7 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 			}
 			lease := testLease(nil)
 			if test.leftover != "" {
-				dir := strings.ReplaceAll(test.leftover, "%s", "id-"+instanceOf(lease))
+				dir := strings.ReplaceAll(test.leftover, "%s", containerIDOf(instanceOf(lease)))
 				writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, dir, "cgroup.procs"), "4243\n")
 			}
 			if test.other {
@@ -736,6 +765,12 @@ func TestCreateServesAnExitBesideOtherSandboxes(t *testing.T) {
 // dockerdErrorLine is the line dockerd writes for a pull error once its
 // answer has started (moby streamformatter.FormatError): the error text
 // twice, as errorDetail.message and error.
+// containerIDOf is the fake engine's container ID for a container name: 64
+// hex digits like the engine's, which do not contain the name.
+func containerIDOf(name string) string {
+	return digestOf(name)
+}
+
 func dockerdErrorLine(message string) string {
 	line, _ := json.Marshal(map[string]any{"errorDetail": map[string]string{"message": message}, "error": message})
 	return string(line)

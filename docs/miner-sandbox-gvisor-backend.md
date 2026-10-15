@@ -141,6 +141,27 @@ starting while this check runs. The per-process checks are logged as `not_run`, 
 exited container is never restarted, and it keeps its lease, writable layer
 and logs until release or expiry.
 
+The engine configuration above is read back on the created container before
+the start request is sent; a container the engine did not configure as asked
+is never started. When the engine answers the start request with an error
+status, the failure is the image's (`image_unavailable`, contract D23) only
+when all of these hold: a fresh inspection is answered and shows the same
+container never started (not running, PID 0, no start time); its engine
+configuration still matches; no process remains below the slice outside
+other sandboxes' cgroups, no process anywhere on the host has the
+engine-assigned container ID in its cgroup path, and no runsc or sentry
+process (identified by the files Open hashed, not by name) has it in its
+arguments; other programs' arguments, such as an operator's `docker logs`,
+are not evidence. Both checks run every 50 ms for at most 2 s, because the
+runtime tears a failed start down asynchronously; a process entry that
+cannot be read is retried within that window and faults only if the scan
+never completes. Then removing the never-started container and its image
+succeeds. The decision reads no message text, exit code or exit time, and
+inspects no image layers. Anything else, including a start request the daemon
+gives no answer to, is a miner fault. Each such decision is logged as one
+`sandbox start attribution` record with every input it used; the per-instance
+report entry follows with the host-preflight package.
+
 `Create` is idempotent per instance name: a container already made for the
 same lease document is started if needed and verified again; one made for
 any other document is never adopted. `Destroy` removes the container and its

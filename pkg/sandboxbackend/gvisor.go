@@ -129,6 +129,9 @@ type GVisor struct {
 	// rewritten after Open is not accepted by path.
 	sandboxExe  string
 	sandboxFile fs.FileInfo
+	// runscFile is the runsc binary Open hashed; with sandboxFile it
+	// identifies runtime processes by file, not by name.
+	runscFile fs.FileInfo
 	// lookup resolves a registry host before any pull.
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 	mu     sync.Mutex
@@ -176,6 +179,7 @@ func Open(ctx context.Context, config Config) (*GVisor, error) {
 	if err != nil {
 		return nil, err
 	}
+	runscFile := file
 	if config.SentryPath != "" {
 		if file, err = verifyBinary(config.SentryPath, config.SentrySHA256); err != nil {
 			return nil, err
@@ -188,7 +192,7 @@ func Open(ctx context.Context, config Config) (*GVisor, error) {
 	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		return nil, err
 	}
-	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, sandboxFile: file, lookup: lookupHost}
+	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, sandboxFile: file, runscFile: runscFile, lookup: lookupHost}
 	if err := b.verifyDaemon(ctx); err != nil {
 		return nil, err
 	}
@@ -644,12 +648,24 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 		return err
 	}
 	defer release()
+	s := b.spec(lease, leaseDigest, existing.Config.Labels[LabelImageID])
 	if !existing.State.Running && !workloadExited(existing) {
 		if existing.State.Status != "created" {
 			return fmt.Errorf("sandbox %s is %s, not running", instanceID, existing.State.Status)
 		}
+		// The full engine configuration is read back before the start
+		// request (contract D23 precondition): a container the engine did
+		// not configure as asked is never started.
+		if err := b.verifyEngine(existing, s); err != nil {
+			return err
+		}
 		if err := b.engine.call(ctx, http.MethodPost, "/containers/"+url.PathEscape(instanceID)+"/start", nil, nil, nil); err != nil {
-			return fmt.Errorf("start sandbox %s: %w", instanceID, err)
+			startErr := fmt.Errorf("start sandbox %s: %w", instanceID, err)
+			if engineStatus(err) == 0 {
+				// The daemon gave no answer: the miner's fault.
+				return startErr
+			}
+			return b.startRefused(ctx, instanceID, existing.ID, s, startErr)
 		}
 		if existing, found, err = b.inspect(ctx, instanceID); err != nil {
 			return err
@@ -657,7 +673,6 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 			return fmt.Errorf("sandbox %s vanished after start", instanceID)
 		}
 	}
-	s := b.spec(lease, leaseDigest, existing.Config.Labels[LabelImageID])
 	if err := b.verifyEngine(existing, s); err != nil {
 		return err
 	}
@@ -691,6 +706,233 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	return b.exited(again)
 }
 
+// Settling of a start the engine refused: the runtime tears down the
+// processes of a failed start asynchronously, so the D23 process checks are
+// repeated every startSettleInterval for at most startSettleBound.
+const (
+	startSettleBound    = 2 * time.Second
+	startSettleInterval = 50 * time.Millisecond
+)
+
+// StartAttribution is the per-instance record of a start the engine
+// answered with an error (contract D23): the decision and every input it
+// was made from. It reads no message text, exit code or exit time.
+type StartAttribution struct {
+	Instance, ContainerID string
+	// Decision is "never_started" (non-fault image_unavailable) or
+	// "fault: <condition>".
+	Decision          string
+	StartStatus       int
+	ReinspectAnswered bool
+	Running           bool
+	Pid               int
+	StartedAt         string
+	SliceQuiet        bool
+	// RuntimeReferences are the host processes whose arguments or cgroup
+	// named the container ID at the last observation.
+	RuntimeReferences []int
+	// ScanError is the last host process scan failure, if the scan never
+	// completed.
+	ScanError   string
+	Settled     time.Duration
+	SettleBound time.Duration
+	CleanedUp   bool
+}
+
+func (r StartAttribution) log() {
+	slog.Info("sandbox start attribution", "sandbox", r.Instance, "container_id", r.ContainerID, "decision", r.Decision,
+		"start_status", r.StartStatus, "reinspect_answered", r.ReinspectAnswered, "running", r.Running, "pid", r.Pid,
+		"started_at", r.StartedAt, "slice_quiet", r.SliceQuiet, "runtime_references", r.RuntimeReferences,
+		"scan_error", r.ScanError, "settled", r.Settled.String(), "settle_bound", r.SettleBound.String(), "cleaned_up", r.CleanedUp,
+		"per_process_checks", "not_run")
+}
+
+// startRefused classifies a start request the engine answered with an
+// error (contract D23). The failure is the image's (image_unavailable) only
+// when a fresh inspection shows the workload never started, the engine
+// configuration still matches, no process of the instance remains below
+// the slice or anywhere on the host referring to the container, and the
+// never-started container is removed. Anything else is the miner's fault
+// and returns startErr. The caller holds the start slot.
+func (b *GVisor) startRefused(ctx context.Context, instanceID, containerID string, s spec, startErr error) error {
+	record := StartAttribution{Instance: instanceID, ContainerID: containerID, StartStatus: engineStatus(startErr), SettleBound: startSettleBound}
+	// Logged as decided, not as first built.
+	defer func() { record.log() }()
+	fault := func(condition string, err error) error {
+		record.Decision = "fault: " + condition
+		if err != nil {
+			return fmt.Errorf("%w (%s: %w)", startErr, condition, err)
+		}
+		return fmt.Errorf("%w (%s)", startErr, condition)
+	}
+	again, found, err := b.inspect(ctx, instanceID)
+	if err != nil || !found {
+		return fault("re-inspection not answered", err)
+	}
+	record.ReinspectAnswered = true
+	record.Running, record.Pid, record.StartedAt = again.State.Running, again.State.Pid, again.State.StartedAt
+	if again.ID != containerID || again.Config.Labels[LabelLeaseID] != s.labels[LabelLeaseID] || again.Config.Labels[LabelLeaseDigest] != s.labels[LabelLeaseDigest] {
+		return fault("another container", nil)
+	}
+	if !neverStarted(again) {
+		return fault("workload started", nil)
+	}
+	if err := b.verifyEngine(again, s); err != nil {
+		return fault("engine configuration", err)
+	}
+	begun := time.Now()
+	for {
+		quiet := b.sliceQuiet(ctx, instanceID)
+		references, refErr := b.runtimeReferences(containerID)
+		record.SliceQuiet, record.RuntimeReferences, record.ScanError = quiet == nil, references, ""
+		if quiet != nil && !errors.Is(quiet, errProcessesRemain) {
+			return fault("slice unreadable", quiet)
+		}
+		if refErr != nil {
+			record.ScanError = refErr.Error()
+		}
+		record.Settled = time.Since(begun)
+		if quiet == nil && refErr == nil && len(references) == 0 {
+			break
+		}
+		if record.Settled >= startSettleBound {
+			switch {
+			case refErr != nil:
+				// A scan that never completed cannot show nothing remains.
+				return fault("host processes unreadable", refErr)
+			case quiet == nil:
+				quiet = fmt.Errorf("host processes %v refer to container %s", references, containerID)
+			}
+			return fault("processes of the instance remain", quiet)
+		}
+		timer := time.NewTimer(startSettleInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fault("processes of the instance remain", ctx.Err())
+		case <-timer.C:
+		}
+	}
+	if err := b.Destroy(ctx, instanceID); err != nil {
+		return fault("cleanup", err)
+	}
+	record.CleanedUp = true
+	record.Decision = "never_started"
+	return &miner.SandboxRefusal{Code: "image_unavailable"}
+}
+
+// neverStarted reports an inspection showing a workload the engine never
+// started: not running, no PID, and no start time.
+func neverStarted(c inspectedContainer) bool {
+	if c.State.Running || c.State.Pid != 0 {
+		return false
+	}
+	if c.State.StartedAt == "" {
+		return true
+	}
+	started, err := time.Parse(time.RFC3339Nano, c.State.StartedAt)
+	return err == nil && started.IsZero()
+}
+
+// runtimeReferences returns the host processes of the instance outside
+// the slice walk: any process whose cgroup path contains the
+// engine-assigned container ID (generated by the engine at create; the
+// image cannot choose it), and any runtime process (the runsc or sentry
+// binary Open hashed, by file identity) whose command-line arguments
+// contain it. Arguments of other programs are not evidence: an operator's
+// shell or tool may name a container it inspects. A process that exits
+// during the scan is skipped; any other read failure is returned, and the
+// caller retries within the settle bound.
+func (b *GVisor) runtimeReferences(containerID string) ([]int, error) {
+	if len(containerID) < 12 {
+		return nil, fmt.Errorf("container ID %q is too short to match processes by", containerID)
+	}
+	entries, err := os.ReadDir(b.config.ProcRoot)
+	if err != nil {
+		return nil, err
+	}
+	var references []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		dir := filepath.Join(b.config.ProcRoot, entry.Name())
+		cgroup, err := readBounded(filepath.Join(dir, "cgroup"), 64<<10)
+		if gone(err) {
+			continue
+		} else if err != nil {
+			return nil, fmt.Errorf("process %d cgroup: %w", pid, err)
+		}
+		if strings.Contains(cgroup, containerID) {
+			references = append(references, pid)
+			continue
+		}
+		cmdline, err := readBounded(filepath.Join(dir, "cmdline"), 1<<20)
+		if gone(err) {
+			continue
+		} else if err != nil {
+			return nil, fmt.Errorf("process %d command line: %w", pid, err)
+		}
+		if !strings.Contains(cmdline, containerID) {
+			continue
+		}
+		runtime, alive, err := b.runtimeProcess(dir)
+		if err != nil {
+			return nil, fmt.Errorf("process %d executable: %w", pid, err)
+		}
+		if alive && runtime {
+			references = append(references, pid)
+		}
+	}
+	return references, nil
+}
+
+// runtimeProcess reports whether the process in dir executes the runsc or
+// sentry binary Open hashed, and whether it still exists. A process whose
+// executable was deleted or replaced cannot be told apart from a runtime
+// process, so it counts as one.
+func (b *GVisor) runtimeProcess(dir string) (runtime, alive bool, err error) {
+	exe := filepath.Join(dir, "exe")
+	file, err := os.Stat(exe)
+	if err == nil {
+		return os.SameFile(file, b.sandboxFile) || (b.runscFile != nil && os.SameFile(file, b.runscFile)), true, nil
+	}
+	if !gone(err) {
+		return false, false, err
+	}
+	if _, linkErr := os.Readlink(exe); linkErr == nil {
+		// The link reads but its target is gone: a deleted executable.
+		return true, true, nil
+	} else if gone(linkErr) {
+		return false, false, nil
+	} else {
+		return false, false, linkErr
+	}
+}
+
+// gone reports a /proc read of a process that no longer exists.
+func gone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ESRCH)
+}
+
+// readBounded reads file, failing if it is larger than limit.
+func readBounded(file string, limit int64) (string, error) {
+	handle, err := os.Open(file)
+	if err != nil {
+		return "", err
+	}
+	defer handle.Close()
+	raw, err := io.ReadAll(io.LimitReader(handle, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(raw)) > limit {
+		return "", fmt.Errorf("%s is larger than %d bytes", file, limit)
+	}
+	return string(raw), nil
+}
+
 // errProcessVanished marks a kernel readback that found no process to read:
 // the engine reported none running, or its /proc or cgroup entries were gone.
 var errProcessVanished = errors.New("sandbox process vanished")
@@ -714,6 +956,10 @@ func workloadExited(c inspectedContainer) bool {
 	return !c.State.Running && c.State.Pid == 0 && c.State.Status == "exited" && c.State.Error == "" &&
 		startErr == nil && finishErr == nil && started.Year() > 1 && finished.After(started)
 }
+
+// errProcessesRemain marks a slice that still holds processes outside other
+// sandboxes' cgroups.
+var errProcessesRemain = errors.New("processes remain below the slice")
 
 // acquireStart waits for the start slot; the returned func frees it.
 func (b *GVisor) acquireStart(ctx context.Context) (func(), error) {
@@ -771,7 +1017,7 @@ func (b *GVisor) sliceQuiet(ctx context.Context, instanceID string) error {
 			return err
 		}
 		if procs != "" {
-			return fmt.Errorf("sandbox %s exited but processes remain in cgroup %s", instanceID, cgroup)
+			return fmt.Errorf("%w: sandbox %s exited but processes remain in cgroup %s", errProcessesRemain, instanceID, cgroup)
 		}
 		return nil
 	})
