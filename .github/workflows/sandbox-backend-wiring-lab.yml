@@ -1,0 +1,195 @@
+name: sandbox backend wiring lab
+
+# Bounded lab pass for a pinned backend source SHA (WIRING_SHA) on a host
+# provisioned by scripts/sandbox-host from this PR's head: the combined
+# preflight of sandboxbackend.OpenFromProfile (positive and a negative
+# control), the miner agent with --sandbox-leases on (start, health, clean
+# stop) and the default-off refusal. GitHub-hosted only; nothing is
+# activated and the host is discarded with the VM.
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  WIRING_SHA: b1115a788e30ba59c247e3af2d34244b2c84867b
+
+jobs:
+  wiring-lab:
+    if: >-
+      github.event.label.name == 'run-sandbox-wiring-lab' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: host
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.WIRING_SHA }}
+          path: wiring
+          persist-credentials: false
+      - name: Record exact source pins
+        run: |
+          host_sha=$(git -C host rev-parse HEAD)
+          wiring_sha=$(git -C wiring rev-parse HEAD)
+          # shellcheck disable=SC2153 # WIRING_SHA is the workflow-level pin
+          [[ $wiring_sha == "$WIRING_SHA" ]] || { echo "wiring checkout $wiring_sha != pin $WIRING_SHA"; exit 1; }
+          printf 'host scripts: %s\nwiring source: %s\n' "$host_sha" "$wiring_sha" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.23.12"
+          cache: false
+      - name: Build the lab preflight harness and the miner agent from the pinned source
+        run: |
+          mkdir -p wiring/cmd/mcsbx-lab-preflight
+          cp host/scripts/sandbox-host/lab/openfromprofile.go.txt wiring/cmd/mcsbx-lab-preflight/main.go
+          (cd wiring && go build -trimpath -o "$RUNNER_TEMP/mcsbx-lab-preflight" ./cmd/mcsbx-lab-preflight)
+          (cd wiring && go build -trimpath -o "$RUNNER_TEMP/miner-agent" ./cmd/miner-agent)
+          (cd host && go build -trimpath -o "$RUNNER_TEMP/sandbox-host-observe" ./cmd/sandbox-host-observe)
+      - name: Install pinned XFS and nftables tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xfsprogs=6.6.0-1ubuntu2.1 nftables
+      - name: Provision dedicated engine
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+          MC_SANDBOX_HOST_DATA_FS_MIB: "8192"
+          MC_SANDBOX_HOST_LEASE_MEMORY_MIB: "2048"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,MC_SANDBOX_HOST_DATA_FS_MIB,MC_SANDBOX_HOST_LEASE_MEMORY_MIB,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/provision-disposable.sh
+      - name: Lab deployment cgroup (exists, holds nothing)
+        run: |
+          sudo systemd-run --quiet --unit mcsbxdeployanchor.service --slice mcsbxdeploy.slice --remain-after-exit /bin/true
+          sudo test -f /sys/fs/cgroup/mcsbxdeploy.slice/cgroup.procs
+          echo 'deployment cgroup: /mcsbxdeploy.slice (lab stand-in; no deployment.v4 replicas run in it)' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Combined preflight through OpenFromProfile
+        run: |
+          sudo "$RUNNER_TEMP/mcsbx-lab-preflight" "$RUNNER_TEMP/mcsbx/profile.json" "$RUNNER_TEMP/mcsbx/daemon.json" /mcsbxdeploy.slice | tee "$RUNNER_TEMP/openfromprofile-positive.json"
+          python3 - "$RUNNER_TEMP/openfromprofile-positive.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          r = d['report']
+          print(f"positive: opened={d['opened']} error={d['error']} verdict={r.get('verdict')} checks={len(r.get('checks', []))}")
+          print('| check | class | status | evidence |')
+          print('| --- | --- | --- | --- |')
+          for c in r.get('checks', []):
+              print(f"| {c['id']} | {c['class']} | {c['status']} | {c['evidence'][:140].replace('|', '/')} |")
+          sys.exit(0 if d['opened'] and r.get('verdict') == 'pass' and d['error'] is None else 1)
+          PY
+      - name: Negative control - an unsafe egress rule fails the combined report
+        run: |
+          table=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["engine"]["egress_table"])' "$RUNNER_TEMP/mcsbx/profile.json")
+          handle=$(sudo nft -a -e insert rule inet "$table" output socket cgroupv2 level 1 '"mcsbxengine.slice"' ip daddr 10.0.0.1 accept comment '"mcsbx-lab-negative-control"' | sed -n 's/.*# handle \([0-9][0-9]*\)$/\1/p')
+          [[ $handle =~ ^[0-9]+$ ]] || { echo 'could not insert the negative-control rule'; exit 1; }
+          trap 'sudo nft delete rule inet "$table" output handle "$handle"' EXIT
+          sudo "$RUNNER_TEMP/mcsbx-lab-preflight" "$RUNNER_TEMP/mcsbx/profile.json" "$RUNNER_TEMP/mcsbx/daemon.json" /mcsbxdeploy.slice | tee "$RUNNER_TEMP/openfromprofile-negative.json" >/dev/null
+          python3 - "$RUNNER_TEMP/openfromprofile-negative.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          r = d['report']
+          bad = [c for c in r.get('checks', []) if c['status'] not in ('pass', 'gap')]
+          print(f"negative: opened={d['opened']} verdict={r.get('verdict')} failing={[c['id'] for c in bad]}")
+          print(f"error: {d['error']}")
+          egress = [c for c in r.get('checks', []) if c['id'] == 'network.engine_egress_restricted']
+          # Pass needs the refusal and the egress check failing; any other
+          # failing check is reported above for review, not hidden.
+          ok = (not d['opened']) and d['error'] is not None and r.get('verdict') == 'fail' and bool(egress) and egress[0]['status'] == 'fail'
+          sys.exit(0 if ok else 1)
+          PY
+      - name: Miner agent with --sandbox-leases on (start, health, stop)
+        run: |
+          mkdir -p "$RUNNER_TEMP/agent/artifacts" "$RUNNER_TEMP/agent/docker-state"
+          engine=(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock")
+          before=$("${engine[@]}" ps -aq | wc -l)
+          # Per-run random bridge secret; nothing durable is stored.
+          (umask 077; openssl rand -hex 32 > "$RUNNER_TEMP/agent/bridge.secret")
+          # The runner user writes the log under RUNNER_TEMP; only the agent needs root.
+          # shellcheck disable=SC2024
+          sudo "$RUNNER_TEMP/miner-agent" --bridge-secret-file "$RUNNER_TEMP/agent/bridge.secret" \
+            --network local --netuid 1 --hotkey lab-hotkey --uid -1 \
+            --service-key-file "$RUNNER_TEMP/agent/service.key" --state-db "$RUNNER_TEMP/agent/state.db" \
+            --artifact-dir "$RUNNER_TEMP/agent/artifacts" --docker-state-dir "$RUNNER_TEMP/agent/docker-state" \
+            --miner-transport http --allow-insecure-mock-http --bind 127.0.0.1:19101 \
+            --sandbox-leases on --sandbox-host-profile "$RUNNER_TEMP/mcsbx/profile.json" \
+            --sandbox-deployment-cgroup /mcsbxdeploy.slice --sandbox-daemon-config "$RUNNER_TEMP/mcsbx/daemon.json" \
+            > "$RUNNER_TEMP/agent.log" 2>&1 &
+          sudo_pid=$!
+          ready=0
+          for _ in $(seq 1 120); do
+            if grep -q 'miner agent ready' "$RUNNER_TEMP/agent.log"; then ready=1; break; fi
+            if ! kill -0 "$sudo_pid" 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          agent_pid=$(pgrep -x -P "$sudo_pid" miner-agent | head -1 || true)
+          if [[ -z $agent_pid && $(cat "/proc/$sudo_pid/comm" 2>/dev/null) == miner-agent ]]; then agent_pid=$sudo_pid; fi
+          dockerd_pid=$(systemctl show --property=MainPID --value mcsbxdockerd.service)
+          {
+            echo "agent ready=$ready pid=${agent_pid:-none}"
+            if [[ -n $agent_pid ]]; then
+              echo "netns agent=$(sudo readlink /proc/"$agent_pid"/ns/net) dockerd=$(sudo readlink /proc/"$dockerd_pid"/ns/net)"
+              echo "pidns agent=$(sudo readlink /proc/"$agent_pid"/ns/pid) dockerd=$(sudo readlink /proc/"$dockerd_pid"/ns/pid)"
+              echo "agent cgroup=$(sudo cat /proc/"$agent_pid"/cgroup)"
+            fi
+            code=000
+            for _ in 1 2 3 4 5; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:19101/healthz || true)
+              [[ $code == 204 ]] && break
+              sleep 1
+            done
+            echo "healthz=$code"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # sudo relays SIGTERM to its child if the agent pid was not found.
+          sudo kill -TERM "${agent_pid:-$sudo_pid}" 2>/dev/null || true
+          for _ in $(seq 1 120); do kill -0 "$sudo_pid" 2>/dev/null || break; sleep 0.5; done
+          if kill -0 "$sudo_pid" 2>/dev/null; then
+            echo 'agent did not stop within 60s of SIGTERM; killing' | tee -a "$GITHUB_STEP_SUMMARY"
+            sudo pkill -KILL -x miner-agent || true
+          fi
+          agent_rc=0
+          wait "$sudo_pid" || agent_rc=$?
+          echo "agent exit status after SIGTERM: $agent_rc" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E 'sandbox host preflight report|miner agent ready|miner agent stopped| ERROR ' "$RUNNER_TEMP/agent.log" | cut -c1-400 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          left=$("${engine[@]}" ps -aq | wc -l)
+          echo "dedicated engine containers: before agent $before, after agent stop $left" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $ready == 1 && $agent_rc == 0 && $left == "$before" ]] && grep -q 'sandbox host preflight report.*verdict=pass' "$RUNNER_TEMP/agent.log"
+      - name: Default off - a sandbox setting without --sandbox-leases on is refused
+        run: |
+          rc=0
+          out=$(sudo "$RUNNER_TEMP/miner-agent" --bridge-secret-file "$RUNNER_TEMP/agent/bridge.secret" \
+            --network local --netuid 1 --hotkey lab-hotkey --uid -1 \
+            --service-key-file "$RUNNER_TEMP/agent/service.key" --state-db "$RUNNER_TEMP/agent/state-off.db" \
+            --artifact-dir "$RUNNER_TEMP/agent/artifacts" --docker-state-dir "$RUNNER_TEMP/agent/docker-state" \
+            --miner-transport http --allow-insecure-mock-http --bind 127.0.0.1:19102 \
+            --sandbox-host-profile "$RUNNER_TEMP/mcsbx/profile.json" 2>&1) || rc=$?
+          echo "default-off with a --sandbox-* flag: exit $rc: $(tail -1 <<< "$out" | cut -c1-300)" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $rc != 0 ]] && grep -q -- '--sandbox-\* settings require --sandbox-leases on' <<< "$out"
+      - name: Remove the lab deployment cgroup
+        if: always()
+        run: |
+          sudo systemctl stop mcsbxdeployanchor.service mcsbxdeploy.slice >/dev/null 2>&1 || true
+          ! test -e /sys/fs/cgroup/mcsbxdeploy.slice
+      - name: Teardown and verify cleanup
+        if: always()
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/teardown-disposable.sh
+      - name: Collect lab outputs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/lab-out"
+          for f in openfromprofile-positive.json openfromprofile-negative.json agent.log; do
+            [[ -e $RUNNER_TEMP/$f ]] && sudo cp "$RUNNER_TEMP/$f" "$RUNNER_TEMP/lab-out/"
+          done
+          sudo chmod -R a+r "$RUNNER_TEMP/lab-out"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sandbox-wiring-lab-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/lab-out/
+          if-no-files-found: warn
+          retention-days: 30
