@@ -46,27 +46,45 @@ scripts/sandbox-probes/publish-probes.sh layout OUT_DIR
 
 That rebuilds the layout and requires `build_probe_images.py --verify` to
 pass, so every blob matches a rebuild. It also requires the layout's nine
-references to equal the committed pins.
+references to equal the committed pins. The ordinary `ci` workflow runs this
+check, and shellcheck on the script, on every push and pull request. So a
+builder or manifest edit that does not reproduce the pins fails before
+review.
 
 ## Publication
 
 `.github/workflows/publish-sandbox-probes.yml` runs only on manual dispatch.
 
 - **`publish` mode:**
+  - The job runs in the `probe-publication` environment (see Owner steps).
+  - Before it touches the registry, it reads the environment's settings with the job token (`actions: read`) and refuses unless all of these hold:
+    - at least one required reviewer;
+    - administrators cannot bypass;
+    - deployments are allowed from exactly the branch `main`.
+
+    GitHub creates an environment named in a workflow, without any protection, if it does not exist yet. This check makes such a run fail.
   - It refuses unless it runs on `main` at the full commit SHA given as `expected_sha`.
   - It rebuilds and verifies the layout as above.
   - It installs oras 1.3.4, checked against its pinned SHA-256.
   - With the job's `GITHUB_TOKEN` (`packages: write`, `contents: read`; no personal token or stored secret), it copies each pinned manifest to `ghcr.io/misscomputer/sandbox-probes:<probe>-v1`. `oras cp --from-oci-layout` copies the manifest, config and layer bytes unchanged, so the pushed digests are the pinned ones. Then it resolves every pin by digest and by tag.
-  - It never overwrites a tag that names another digest.
+  - It never overwrites a tag that names another digest. Only a definite "not found" counts as an absent tag; any other lookup failure stops the run.
   - Its record (run, oras version and checksum, pushed digests) is uploaded as an artifact.
-- **`check-public` mode** has no write permission and uses no credentials. It reads every pinned manifest and every blob it names anonymously, and requires their SHA-256 digests to match.
+- **`check-public` mode** has no write permission and uses no credentials. It reads every pinned manifest, every blob it names and every `<probe>-v1` tag anonymously, and requires their SHA-256 digests to match. A re-pointed tag therefore fails it.
 
 A first run fails until the package is public. Tags only keep the versions
 from being cleaned up as untagged; identity is always the digest.
 
 ## Owner steps
 
-These are outside the repository:
+These are outside the repository.
+
+- **Environment (before any dispatch):** in the repository's settings under Environments, an org owner or repository admin creates `probe-publication` with:
+  - **Required reviewers:** at least one person or team who will not dispatch the run. Turn on "Prevent self-review".
+  - **Allow administrators to bypass configured protection rules:** off.
+  - **Deployment branches and tags:** "Selected branches and tags", with exactly one rule: the branch `main`.
+  - **No environment secrets or variables:** the job uses only its own token.
+
+  The publish job checks the first three settings and stops if any is missing.
 - **Visibility:** an org owner sets `ghcr.io/misscomputer/sandbox-probes` to
   public in the package settings, once the organisation allows public
   packages. The token cannot do this.
@@ -78,3 +96,17 @@ These are outside the repository:
   or contract version cites it, and for at least 180 days. Delete only by a
   later explicit decision, by digest. A changed image is a new builder
   revision with new `-v2` tags and pins, never an overwrite.
+
+## What the environment does not cover
+
+The environment's branch policy and required reviewers apply to jobs that name the environment. The job token's `packages: write` comes from the `permissions:` of whichever workflow file runs, not from the environment.
+
+A person with write access to this repository can therefore push a branch with a modified copy of this workflow, or any other workflow, that drops `environment:` and its checks, and dispatch it. That job's token can push tags and new digests to `ghcr.io/misscomputer/sandbox-probes`. This is the same capability every repository writer already has for any package this repository's workflows can write. No guard in a workflow file can remove it, because the writer controls the file.
+
+The consequences are bounded:
+- **The pinned bytes cannot change:** consumers (P3, the D23 lab) pull `repository@digest`, and a digest names the bytes.
+- **A re-pointed or new tag is detectable:** `check-public` reads every `<probe>-v1` tag and requires the pinned digest.
+
+Closing the gap server-side is an owner decision outside this change. Two options:
+- **Limit write access** to the repository to the people trusted to publish.
+- **Use a credential only the environment holds:** for example, a GitHub App installation token whose private key is an environment secret, used instead of the job token for the push. The owner then removes this repository's Actions access in the package settings ("Manage Actions access"). That access is what lets any job token of the repository write the package, and a workflow that first publishes the package receives it automatically. After that, a job outside the environment cannot push, whatever its `permissions:` say. This brings back a long-lived credential, which the current design avoids, and needs a change to the push step.
