@@ -234,6 +234,11 @@ host must still pass its own preflight.
 host with `pkg/sandboxhost`, and runs the backend's own env-gated
 `TestGVisorLaneOnDisposableHost` from a pinned, reviewed source SHA
 (`BACKEND_SHA`) with every `MC_SANDBOX_*` value derived from the emitted
-profile. A skipped test fails the job. It proves the backend's preflight,
+profile. A skipped test fails the job. While the test runs,
+`scripts/sandbox-host/observe-backend-instances.py` independently records
+every live sandbox the backend creates (engine settings, sentry executable
+and cgroup, cgroup limit files including exact `cpu.max`,
+`pkg/sandboxhost.ObserveInstance` and the XFS project quota) and the job
+requires them to match the lease. It proves the backend's preflight,
 create, idempotent replay, release-after-destroy and restart recovery on this
 host for those two SHAs only; it does not wire `--sandbox-leases on`.

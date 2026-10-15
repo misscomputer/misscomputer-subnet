@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: 95bac39df35235cd2a7b585540db473eddfc1b0c
+  BACKEND_SHA: 630c89bfca87b556a78ce8eae0df8fdc8d1046f1
 
 jobs:
   backend-on-host:
@@ -88,6 +88,13 @@ jobs:
               print(f'export {key}={shlex.quote(value)}')
           PY
           )"
+          # Independent lane-2 observation of every live sandbox the backend
+          # creates: engine settings, sentry exe and cgroup, limit files,
+          # pkg/sandboxhost ObserveInstance and XFS project quotas.
+          sudo python3 host/scripts/sandbox-host/observe-backend-instances.py watch \
+            "$RUNNER_TEMP/profile.json" "$RUNNER_TEMP/sandbox-host-observe" "$RUNNER_TEMP/backend-instances.jsonl" "$RUNNER_TEMP/observe.stop" &
+          watcher=$!
+          sleep 1
           sudo env MC_SANDBOX_BACKEND_IT=1 MC_SANDBOX_DEPLOYMENT_CGROUP=/mcsbxdeployment.slice \
             MC_SANDBOX_DOCKER_HOST="$MC_SANDBOX_DOCKER_HOST" MC_SANDBOX_RUNTIME="$MC_SANDBOX_RUNTIME" \
             MC_SANDBOX_RUNSC_PATH="$MC_SANDBOX_RUNSC_PATH" MC_SANDBOX_RUNSC_SHA256="$MC_SANDBOX_RUNSC_SHA256" \
@@ -95,7 +102,12 @@ jobs:
             MC_SANDBOX_DATA_ROOT="$MC_SANDBOX_DATA_ROOT" MC_SANDBOX_SLICE="$MC_SANDBOX_SLICE" \
             "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestGVisorLaneOnDisposableHost$' -test.v -test.count 1 -test.timeout 15m \
             2>&1 | tee "$RUNNER_TEMP/backend-test.log"
+          touch "$RUNNER_TEMP/observe.stop"
+          wait "$watcher" || true
           grep -qx -- '--- PASS: TestGVisorLaneOnDisposableHost.*' "$RUNNER_TEMP/backend-test.log" || { echo 'backend integration test did not pass (a skip is not a pass)'; exit 1; }
+      - name: Independent observations of the backend's live sandboxes
+        if: always()
+        run: python3 host/scripts/sandbox-host/observe-backend-instances.py summarize "$RUNNER_TEMP/profile.json" "$RUNNER_TEMP/backend-instances.jsonl" | tee -a "$GITHUB_STEP_SUMMARY"; exit "${PIPESTATUS[0]}"
       - name: Host state after the backend test
         if: always()
         run: |
@@ -118,5 +130,6 @@ jobs:
             ${{ runner.temp }}/backend-test.log
             ${{ runner.temp }}/preflight-checks.json
             ${{ runner.temp }}/profile.json
+            ${{ runner.temp }}/backend-instances.jsonl
           if-no-files-found: warn
           retention-days: 30
