@@ -33,7 +33,9 @@ class NoBridge:
         raise AssertionError("the authorization hop must not call the Go bridge")
 
 
-def neuron(tmp_path: Path) -> tuple[ValidatorNeuron, MockChain]:
+def neuron(
+    tmp_path: Path, operator_hotkeys: tuple[str, ...] = ()
+) -> tuple[ValidatorNeuron, MockChain]:
     chain = MockChain(
         network="local", netuid=24, own_uri="//ProbeHost", peers=(SELF, PEER_VALIDATOR, MINER)
     )
@@ -52,6 +54,7 @@ def neuron(tmp_path: Path) -> tuple[ValidatorNeuron, MockChain]:
             dendrite_retries=0,
             allow_private_axons=True,
             mock_http_axons=True,
+            operator_hotkeys=operator_hotkeys,
         ),
         chain,
     )
@@ -86,7 +89,7 @@ async def post(validator: ValidatorNeuron, body: bytes) -> httpx.Response:
 
 @pytest.mark.asyncio
 async def test_bridge_authorizes_only_permitted_validator_signatures(tmp_path: Path) -> None:
-    validator, chain = neuron(tmp_path)
+    validator, chain = neuron(tmp_path, (PEER_VALIDATOR.hotkey, MINER.hotkey))
     assert (await post(validator, authorization(PEER_VALIDATOR))).status_code == 503
     await validator.state.set(await chain.sync())
 
@@ -109,7 +112,7 @@ async def test_bridge_authorizes_only_permitted_validator_signatures(tmp_path: P
 async def test_registered_validator_can_authorize_probe_after_weight_inactivity(
     tmp_path: Path,
 ) -> None:
-    validator, chain = neuron(tmp_path)
+    validator, chain = neuron(tmp_path, (PEER_VALIDATOR.hotkey, MINER.hotkey))
     snapshot = await chain.sync()
     await validator.state.set(
         replace(
@@ -119,3 +122,14 @@ async def test_registered_validator_can_authorize_probe_after_weight_inactivity(
     )
     response = await post(validator, authorization(PEER_VALIDATOR))
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operator_hotkeys", [(), (SELF.hotkey,)])
+async def test_probe_without_operator_configuration_denies_permitted_signer(
+    tmp_path: Path, operator_hotkeys: tuple[str, ...]
+) -> None:
+    validator, chain = neuron(tmp_path, operator_hotkeys)
+    await validator.state.set(await chain.sync())
+    response = await post(validator, authorization(PEER_VALIDATOR))
+    assert response.status_code == 403, response.text

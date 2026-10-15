@@ -14,7 +14,7 @@ A miner is **two local processes** on one host:
                      │  HTTPS, self-signed leaf pinned by fingerprint
                      ▼
   misscomputer-miner  (Python axon, default 0.0.0.0:8091)
-    - btauth/1 request signatures, metagraph checks, validator permit + stake
+    - btauth/1 signatures, explicit operator allowlist, metagraph permit + stake
     - hotkey-signs the Go service key binding
                      │  HMAC-signed loopback bridge (shared bridge secret)
                      ▼
@@ -94,6 +94,7 @@ export MC_NETWORK=finney                 # SDK network name: finney (mainnet) or
 export MC_NETUID='<NETUID>'                # the subnet netuid from official announcements
 export MC_WALLET='<wallet-name>'
 export MC_HOTKEY='<hotkey-name>'
+export MC_OPERATOR_HOTKEY_SS58='<operator-hotkey-ss58-from-trusted-channel>'
 export MC_HOTKEY_SS58='<hotkey-ss58-address>'
 export MC_PUBLIC_IP='<public-numeric-ip>'
 export MC_AXON_PORT=8091
@@ -237,6 +238,7 @@ misscomputer-miner \
   --subtensor-network "$MC_NETWORK" \
   --wallet-name "$MC_WALLET" \
   --wallet-hotkey "$MC_HOTKEY" \
+  --operator-hotkey "$MC_OPERATOR_HOTKEY_SS58" \
   --uid "$MC_UID" \
   --axon-port "$MC_AXON_PORT" \
   --tls-cert-file /etc/misscomputer-miner/tls/current/miner.crt \
@@ -297,8 +299,11 @@ and confirm `axon=<your-ip>:<port>`.
 Once validators discover you, the axon's access log shows signed
 `POST /api/v1/capabilities` requests answered `200`, followed later by
 `/api/v1/deploy`, `/api/v1/status`, and `/runtime/...` traffic. Requests from
-callers without a validator permit or below `--min-validator-stake` are
-answered `403`; that is expected filtering, not a fault.
+callers not explicitly configured with `--operator-hotkey`, without a validator
+permit, or below `--min-validator-stake` are answered `403`. An unset/empty
+operator list denies all signed control requests, including capability discovery;
+health checks can still report ready. See [operator access](operator-access.md)
+before upgrading; stake or a Null consensus election never adds an operator.
 
 ## Values that must match
 
@@ -331,6 +336,7 @@ makes validators see `500 local Go identity is misconfigured`.
 | `--go-agent-url` | `http://127.0.0.1:9101` | |
 | `--bridge-secret-file` | required | ≥ 32 bytes |
 | `--state-db` | required | SQLite nonce/replay store |
+| `--operator-hotkey` (repeatable) | `$MC_OPERATOR_HOTKEYS` (comma-separated) or empty | Explicit caller allowlist; CLI replaces env; empty denies all |
 | `--min-validator-stake` | `1000.0` | Minimum caller TAO stake (validators also need a permit) |
 | `--sync-interval` | `12.0` seconds | Metagraph refresh |
 | `--max-concurrency` | `4` | Concurrent deploys; highest-stake callers go first |
@@ -392,7 +398,7 @@ After=misscomputer-miner-agent.service
 Requires=misscomputer-miner-agent.service
 
 [Service]
-ExecStart=/path/to/misscomputer-subnet/.venv/bin/misscomputer-miner --netuid <NETUID> --subtensor-network finney --wallet-name <wallet-name> --wallet-hotkey <hotkey-name> --uid <uid> --tls-cert-file /etc/misscomputer-miner/tls/current/miner.crt --tls-key-file /etc/misscomputer-miner/tls/current/miner.key --bridge-secret-file /etc/misscomputer-miner/bridge.secret --state-db /var/lib/misscomputer-miner/axon-nonces.sqlite
+ExecStart=/path/to/misscomputer-subnet/.venv/bin/misscomputer-miner --netuid <NETUID> --subtensor-network finney --wallet-name <wallet-name> --wallet-hotkey <hotkey-name> --operator-hotkey <operator-hotkey-ss58> --uid <uid> --tls-cert-file /etc/misscomputer-miner/tls/current/miner.crt --tls-key-file /etc/misscomputer-miner/tls/current/miner.key --bridge-secret-file /etc/misscomputer-miner/bridge.secret --state-db /var/lib/misscomputer-miner/axon-nonces.sqlite
 Restart=on-failure
 
 [Install]
