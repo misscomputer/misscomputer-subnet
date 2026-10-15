@@ -72,6 +72,7 @@ finish() {
   mapfile -t leftovers < <(timeout 30 docker ps -aq --filter label=mcsbx.conformance=1 2>/dev/null)
   if (( ${#leftovers[@]} )); then timeout 60 docker rm -f -v "${leftovers[@]}" >/dev/null 2>&1; fi
   [[ -n ${sampler:-} ]] && kill "$sampler" >/dev/null 2>&1
+  [[ -n ${probe_link:-} ]] && ip link del "$probe_link" >/dev/null 2>&1
   rm -rf -- "$work"
   local env_args=(
     "source_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
@@ -529,16 +530,27 @@ begin effect.engine_egress_blocked observed_effect
 # The daemon itself pulls. Docker treats 127.0.0.0/8 as an insecure registry
 # (plain HTTP), so without the egress rule this pull would reach the host
 # listener. A caller-side control proves the listener counts connections.
+# SR-27-08: on a miner the host's own public address is on an interface and
+# no fixed prefix covers it. A dummy interface gives this host such local
+# addresses outside every denied prefix (203.0.113.77, 2001:db8::77); only
+# the fib-local rule can stop the engine reaching them.
 reject_count() { nft list table inet "$p_engine_egress_table" | awk '/reject/ {for (i=1; i<=NF; i++) if ($i == "packets") s += $(i+1)} END {print s+0}'; }
+local_reject_count() { nft list table inet "$p_engine_egress_table" | awk '/fib daddr type local/ {for (i=1; i<=NF; i++) if ($i == "packets") s += $(i+1)} END {print s+0}'; }
+probe_link=mcsbxprobe0
+ip link add "$probe_link" type dummy
+ip addr add 203.0.113.77/32 dev "$probe_link"
+ip -6 addr add 2001:db8::77/128 dev "$probe_link" nodad
+ip link set "$probe_link" up
+[[ $(ip -o route get 203.0.113.77 | awk '{print $1}') == local ]] || bad '203.0.113.77 is not a local address of this host'
 python3 - "$work/egress.count" "$host_addr" <<'PY' &
 import selectors, socket, sys, time
 count_path, host_addr = sys.argv[1:]
 sel = selectors.DefaultSelector()
-for addr in ('127.0.0.1', host_addr):
-    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+for family, addr in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET, host_addr), (socket.AF_INET, '203.0.113.77'), (socket.AF_INET6, '2001:db8::77')):
+    s = socket.socket(family); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((addr, 18090)); s.listen(16); s.setblocking(False); sel.register(s, selectors.EVENT_READ)
 open(count_path, 'w').write('0\n')
-seen, deadline = 0, time.time() + 120
+seen, deadline = 0, time.time() + 180
 while time.time() < deadline:
     for key, _ in sel.select(timeout=0.5):
         conn, _ = key.fileobj.accept(); conn.close(); seen += 1
@@ -546,21 +558,38 @@ while time.time() < deadline:
 PY
 egress_listener=$!
 for _ in {1..20}; do [[ -s $work/egress.count ]] && break; sleep 0.25; done
+# Caller-side controls (outside the engine slice): all three local listeners count.
 curl -s -o /dev/null --max-time 2 http://127.0.0.1:18090/ || true
-wait_count "$work/egress.count" 1 || bad "caller-side control connection to the listener was not counted ($(cat "$work/egress.count" 2>/dev/null || echo no listener))"
+curl -s -o /dev/null --max-time 2 http://203.0.113.77:18090/ || true
+curl -g -s -o /dev/null --max-time 2 'http://[2001:db8::77]:18090/' || true
+wait_count "$work/egress.count" 3 || bad "caller-side control connections were not all counted ($(cat "$work/egress.count" 2>/dev/null || echo no listener))"
 rejects_before=$(reject_count)
+local_before=$(local_reject_count)
 pull_view=
-for ref in 127.0.0.1:18090/mcsbx/probe:none "$host_addr:18090/mcsbx/probe:none" 169.254.169.254/mcsbx/probe:none; do
+for ref in 127.0.0.1:18090/mcsbx/probe:none "$host_addr:18090/mcsbx/probe:none" 169.254.169.254/mcsbx/probe:none 203.0.113.77:18090/mcsbx/probe:none; do
   if out=$(timeout 60 docker pull "$ref" 2>&1); then bad "engine pulled $ref"; fi
   pull_view+="$ref: $(tail -1 <<< "$out" | cut -c1-120); "
+done
+# Any engine-slice socket, both families, to the host's own non-private address.
+slice_view=
+for url in http://203.0.113.77:18090/ 'http://[2001:db8::77]:18090/'; do
+  if systemd-run --quiet --wait --pipe --collect --slice "$MCSBX_ENGINE_SLICE" --property=TasksMax=16 \
+      curl -g -s -o /dev/null --max-time 5 "$url" >/dev/null 2>&1; then
+    bad "an engine-slice socket reached $url"
+  fi
+  slice_view+="engine-slice curl $url refused; "
 done
 sleep 1
 seen=$(cat "$work/egress.count")
 kill "$egress_listener" >/dev/null 2>&1 || true; wait "$egress_listener" 2>/dev/null || true
+ip link del "$probe_link"
+probe_link=
 rejects_after=$(reject_count)
-[[ $seen == 1 ]] || bad "engine pulls reached the host listeners ($((seen - 1)) connections)"
+local_after=$(local_reject_count)
+[[ $seen == 3 ]] || bad "engine traffic reached host listeners ($((seen - 3)) connections beyond the 3 controls)"
 (( rejects_after > rejects_before )) || bad "egress reject counters did not move ($rejects_before -> $rejects_after); failures not attributable to the rule"
-ok "engine pulls never connected (listeners saw only the control); reject counters $rejects_before -> $rejects_after; pinned docker.io pull succeeded; $pull_view"
+(( local_after > local_before )) || bad "fib-local reject counter did not move ($local_before -> $local_after); the host-address failures are not attributable to it"
+ok "engine pulls and engine-slice sockets never connected (listeners saw only the 3 controls); reject counters $rejects_before -> $rejects_after, fib-local $local_before -> $local_after; pinned docker.io pull succeeded; $pull_view$slice_view"
 
 begin effect.writable_layer_quota observed_effect
 quota_bytes=$((64 * MIB))

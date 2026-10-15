@@ -186,9 +186,11 @@ systemctl set-property --runtime "$MCSBX_LEASE_SLICE" "CPUQuota=$((lease_cpu_mil
 # 6. Engine egress (SR-27-01, contract D8 item 4). Container network=none
 #    does not constrain the daemon's own pulls. Every socket created in the
 #    engine slice may reach only the host resolver (127.0.0.53:53) and public
-#    unicast addresses: this-network, RFC1918, CGNAT, loopback, link-local
-#    (cloud metadata), benchmarking, multicast/reserved, IPv4-mapped, NAT64,
-#    ULA and IPv6 link-local/multicast are rejected. The rule matches the
+#    unicast addresses: every address of this host (fib daddr type local,
+#    including a public address on an interface), this-network, RFC1918,
+#    CGNAT, loopback, link-local (cloud metadata), benchmarking,
+#    multicast/reserved, IPv4-mapped, NAT64 (well-known and local-use), ULA
+#    and IPv6 link-local/multicast are rejected. The rule matches the
 #    slice by cgroup ID, so it must be reloaded if the slice is recreated;
 #    preflight sees a stale rule because nft then prints a number instead of
 #    the slice name. Registry hostname allowlisting is not provided.
@@ -197,8 +199,9 @@ table inet $MCSBX_EGRESS_TABLE {
   chain output {
     type filter hook output priority filter; policy accept;
     socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+    socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" fib daddr type local counter reject with icmpx admin-prohibited
     socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter reject with icmpx admin-prohibited
-    socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" ip6 daddr { ::/127, ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8 } counter reject with icmpx admin-prohibited
+    socket cgroupv2 level 1 "$MCSBX_ENGINE_SLICE" ip6 daddr { ::/127, ::ffff:0:0/96, 64:ff9b::/96, 64:ff9b:1::/48, fc00::/7, fe80::/10, ff00::/8 } counter reject with icmpx admin-prohibited
   }
 }
 NFT

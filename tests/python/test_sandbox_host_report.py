@@ -53,6 +53,19 @@ def test_complete_ledger_passes_and_names_every_gap(mode: str) -> None:
         assert "storage.images_cache_unreserved" in built["unenforced"]
 
 
+def test_unenforced_check_left_not_run_fails_the_verdict() -> None:
+    entries = [e for e in _complete("conformance") if e["id"] != "storage.images_cache_unreserved"]
+    built = report.build_report(entries, PROFILE, "conformance", {})
+    assert built["verdict"] == "fail"
+    assert "storage.images_cache_unreserved" in built["unenforced"]
+
+
+def test_duplicate_check_is_rejected() -> None:
+    entries = _complete("preflight")
+    with pytest.raises(report.ReportError, match="recorded twice"):
+        report.build_report(entries + entries[:1], PROFILE, "preflight", {})
+
+
 def test_unreached_check_is_not_run_and_fails_the_verdict() -> None:
     entries = [e for e in _complete("conformance") if e["id"] != "effect.writable_layer_quota"]
     built = report.build_report(entries, PROFILE, "conformance", {})

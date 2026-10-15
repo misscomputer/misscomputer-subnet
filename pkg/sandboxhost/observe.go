@@ -45,19 +45,26 @@ func (h Host) listEgressTable(name string) (string, error) {
 var egressDenied = []string{
 	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
 	"192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
-	"::/127", "::ffff:0:0/96", "64:ff9b::/96", "fc00::/7", "fe80::/10", "ff00::/8",
+	"::/127", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "ff00::/8",
 }
 
-// egressRestricted checks the listed table: an output hook, and reject
-// rules matching the engine slice by name (a stale cgroup ID prints as a
-// number) that together cover every denied prefix. Accept rules may only
-// admit the local resolver on port 53.
+// localReject is the rule body that rejects every address of this host,
+// whichever interface carries it (a public address on an interface is not
+// covered by any fixed prefix). It must apply to both families.
+const localReject = "fib daddr type local"
+
+// egressRestricted checks the listed table: an output hook; reject rules
+// matching the engine slice by name (a stale cgroup ID prints as a number)
+// that together cover every denied prefix; a reject rule for every local
+// address of the host in both families; and accept rules that only admit
+// the local resolver on port 53.
 func egressRestricted(listing, engineSlice string) error {
 	match := `socket cgroupv2 level 1 "` + engineSlice + `"`
 	if !strings.Contains(listing, "hook output") {
 		return errors.New("egress table has no output hook")
 	}
 	covered := map[netip.Prefix]bool{}
+	local := false
 	for _, line := range strings.Split(listing, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "socket cgroupv2") {
@@ -67,6 +74,12 @@ func egressRestricted(listing, engineSlice string) error {
 			return fmt.Errorf("rule does not match %s by name (stale cgroup?): %s", engineSlice, line)
 		}
 		switch {
+		case strings.Contains(line, " reject") && strings.Contains(line, localReject):
+			// Family-limited forms (ip/ip6/nfproto) would leave the other family open.
+			body := strings.TrimPrefix(line, match+" ")
+			if strings.HasPrefix(body, localReject+" ") {
+				local = true
+			}
 		case strings.Contains(line, " reject"):
 			// nft may print a prefix in another textual form (for example
 			// ::ffff:0.0.0.0/96), so compare parsed, masked prefixes.
@@ -84,6 +97,9 @@ func egressRestricted(listing, engineSlice string) error {
 		if !covered[netip.MustParsePrefix(text).Masked()] {
 			return fmt.Errorf("engine egress does not reject %s", text)
 		}
+	}
+	if !local {
+		return errors.New("engine egress does not reject the host's own addresses (fib daddr type local) for both families")
 	}
 	return nil
 }

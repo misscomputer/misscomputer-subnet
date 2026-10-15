@@ -50,7 +50,7 @@ security boundary: all of it is caller-controlled.
 | Runtime | gVisor `release-20261005.0` by archive SHA-256, registered as `runsc --systemd-cgroup --overlay2=none` | the overlay2 quota holds only with these arguments |
 | `mcsbxlease.slice` | `CPUQuota=200%`, `MemoryMax=1G`, `MemorySwapMax=0`, `TasksMax=1024` | aggregate lease CPU, memory, swap and host task budget |
 | `mcsbxengine.slice` | containerd and dockerd units, finite memory and tasks, swap 0 | engine, shim and gofer overhead never borrows the lease budget and never runs unbounded |
-| Engine egress | nft table `inet mcsbx_engine_egress`: sockets of the engine slice may reach the host resolver `127.0.0.53:53` and public unicast addresses only; loopback, this-network, RFC1918, CGNAT, link-local (metadata), benchmarking, multicast/reserved, IPv4-mapped, NAT64, ULA and IPv6 link-local/multicast are rejected | `network=none` does not constrain the daemon's own pulls; Docker always treats loopback registries as plain-HTTP |
+| Engine egress | nft table `inet mcsbx_engine_egress`: sockets of the engine slice may reach the host resolver `127.0.0.53:53` and public unicast addresses only; every address of this host (`fib daddr type local`, both families, including a public address on an interface), loopback, this-network, RFC1918, CGNAT, link-local (metadata), benchmarking, multicast/reserved, IPv4-mapped, NAT64 (well-known and local-use), ULA and IPv6 link-local/multicast are rejected | `network=none` does not constrain the daemon's own pulls; Docker always treats loopback registries as plain-HTTP |
 
 Slice names contain no `-`, so systemd creates no implicit parent slices.
 
@@ -148,8 +148,11 @@ so the live Go implementation, not only this script, is proven against a
 real kernel.
 
 Effects: the dedicated daemon's own pulls from `127.0.0.1`, the host's
-primary address and `169.254.169.254` never connect (listeners see only a
-caller-side control, the nft reject counters rise) while the pinned
+primary address, `169.254.169.254` and a non-private address local to this
+host (a dummy interface carrying `203.0.113.77` and `2001:db8::77`, which no
+fixed prefix covers), and engine-slice sockets to those local addresses in
+both families, never connect (listeners see only caller-side controls; the
+reject and fib-local counters rise) while the pinned
 `docker.io` pull succeeds. The data filesystem cannot be `nodev` (Docker's
 overlay2 quota control opens a device node it creates there), so device
 nodes in image layers become real host device files: an image layer with

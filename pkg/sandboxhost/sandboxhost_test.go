@@ -104,6 +104,38 @@ func TestBuildReportDerivesVerdictAndRejectsRelabelledEvidence(t *testing.T) {
 		t.Fatalf("missing check: %v", err)
 	}
 
+	// An unenforced check left not_run must fail the verdict (SR-27-10).
+	notRun := complete(ModePreflight)
+	for i := range notRun {
+		if notRun[i].Class == Unenforced {
+			notRun[i].Status = StatusNotRun
+			break
+		}
+	}
+	if report, err := BuildReport(ModePreflight, profile, notRun, Environment{}); err != nil || report.Passed() || RequirePass(report) == nil {
+		t.Fatalf("unenforced check not_run passed: %s, %v", report.Verdict, err)
+	}
+	if _, err := BuildReport(ModePreflight, profile, append(complete(ModePreflight), complete(ModePreflight)[0]), Environment{}); err == nil || !strings.Contains(err.Error(), "recorded twice") {
+		t.Fatalf("duplicate check accepted: %v", err)
+	}
+	// RequirePass derives the verdict; a decoded report claiming pass over a failed check is refused.
+	forged, err := BuildReport(ModePreflight, profile, complete(ModePreflight), Environment{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged.Checks[0].Status = StatusFail
+	raw, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Report
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Verdict != StatusPass || RequirePass(decoded) == nil {
+		t.Fatalf("decoded report with stored verdict %q over a failed check passed RequirePass", decoded.Verdict)
+	}
+
 	relabel := map[string]func([]Check){
 		"observation as setting": func(checks []Check) {
 			for i := range checks {
@@ -313,8 +345,9 @@ const egressListing = `table inet mcsbx_engine_egress {
 	chain output {
 		type filter hook output priority filter; policy accept;
 		socket cgroupv2 level 1 "mcsbxengine.slice" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
+		socket cgroupv2 level 1 "mcsbxengine.slice" fib daddr type local counter packets 0 bytes 0 reject with icmpx admin-prohibited
 		socket cgroupv2 level 1 "mcsbxengine.slice" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter packets 0 bytes 0 reject with icmpx admin-prohibited
-		socket cgroupv2 level 1 "mcsbxengine.slice" ip6 daddr { ::/127, ::ffff:0.0.0.0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8 } counter packets 0 bytes 0 reject with icmpx admin-prohibited
+		socket cgroupv2 level 1 "mcsbxengine.slice" ip6 daddr { ::/127, ::ffff:0.0.0.0/96, 64:ff9b::/96, 64:ff9b:1::/48, fc00::/7, fe80::/10, ff00::/8 } counter packets 0 bytes 0 reject with icmpx admin-prohibited
 	}
 }
 `
@@ -331,6 +364,22 @@ func TestPreflightReadsBackTheEngineEgressRestriction(t *testing.T) {
 		"metadata reachable": {strings.Replace(egressListing, "169.254.0.0/16, ", "", 1), nil, "169.254.0.0/16"},
 		"extra accept rule":  {strings.Replace(egressListing, "accept\n", "accept\n\t\tsocket cgroupv2 level 1 \"mcsbxengine.slice\" ip daddr 10.0.0.5 accept\n", 1), nil, "unexpected engine egress rule"},
 		"input hook only":    {strings.Replace(egressListing, "hook output", "hook input", 1), nil, "no output hook"},
+		// SR-27-08: a public address on a host interface is covered by no fixed prefix.
+		"host's own addresses reachable": {strings.Replace(egressListing, "\t\tsocket cgroupv2 level 1 \"mcsbxengine.slice\" fib daddr type local counter packets 0 bytes 0 reject with icmpx admin-prohibited\n", "", 1), nil, "fib daddr type local"},
+		"local reject for IPv4 only":     {strings.Replace(egressListing, "\"mcsbxengine.slice\" fib daddr", "\"mcsbxengine.slice\" meta nfproto ipv4 fib daddr", 1), nil, "fib daddr type local"},
+	}
+	// Every denied prefix is required on its own (SR-27-10).
+	for _, prefix := range egressDenied {
+		listing := egressListing
+		for _, form := range []string{prefix, strings.Replace(prefix, "::ffff:0:0/96", "::ffff:0.0.0.0/96", 1)} {
+			listing = strings.Replace(listing, " "+form+",", "", 1)
+			listing = strings.Replace(listing, ", "+form+" }", " }", 1)
+		}
+		cases["missing "+prefix] = struct {
+			listing string
+			err     error
+			want    string
+		}{listing, nil, "does not reject " + prefix}
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
