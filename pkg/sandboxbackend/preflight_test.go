@@ -5,6 +5,7 @@ package sandboxbackend
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandboxhost"
 )
 
@@ -239,10 +242,12 @@ func TestOpenFromProfileRefusesUnlessTheReportPasses(t *testing.T) {
 	}
 }
 
-// A served sandbox is observed by lane 2's instance checks and logged as
-// one instance report; a failed observation of a live process is a miner
-// fault, and one of a process that ended in between is the D11 path.
-func TestCreateObservesAndReportsTheInstance(t *testing.T) {
+// Every Create decision is logged as exactly one instance report, served,
+// refused or a miner fault (SR-38-01). The report carries each check as
+// last observed: the check a fault stopped at fails, a check whose process
+// was gone is not_run with that evidence, and lane 2's observation is kept
+// when the process vanishes after it.
+func TestCreateReportsEveryDecision(t *testing.T) {
 	scope := "/mc.slice/" + testSlice + "/docker-1.scope"
 	resources := testLease(nil).Resources
 	pass := func(int) []sandboxhost.Check {
@@ -251,15 +256,24 @@ func TestCreateObservesAndReportsTheInstance(t *testing.T) {
 			{ID: "lease.host_netns_lo_only_no_routes", Class: sandboxhost.ObservedState, Status: sandboxhost.StatusPass, Evidence: "only lo"},
 		}
 	}
-	netFails := func(h *host, removeProcess bool) func(int) []sandboxhost.Check {
+	exit := func(c *engineContainer) { c.Status, c.FinishedAt = "exited", "2026-10-14T12:00:02.5Z" }
+	// netFails fails lane 2's network check. With endProcess the process
+	// ends during the observation, and with recordExit the engine records
+	// its exit at once; without it the engine records it only after one
+	// more inspection showing it running, so the readback runs again.
+	netFails := func(h *host, endProcess, recordExit bool) func(int) []sandboxhost.Check {
 		return func(pid int) []sandboxhost.Check {
-			if removeProcess {
+			if endProcess {
 				if err := os.RemoveAll(filepath.Join(h.config.ProcRoot, strconv.Itoa(pid))); err != nil {
 					h.t.Fatal(err)
 				}
 				h.engine.mu.Lock()
 				for _, c := range h.engine.containers {
-					c.Status, c.FinishedAt = "exited", "2026-10-14T12:00:02.5Z"
+					if recordExit {
+						exit(c)
+					} else {
+						c.inspectedOnce = exit
+					}
 				}
 				h.engine.mu.Unlock()
 			}
@@ -268,65 +282,126 @@ func TestCreateObservesAndReportsTheInstance(t *testing.T) {
 			return checks
 		}
 	}
+	lanes := []string{"lease.engine_config_matches", "lease.sentry_pinned_exe", "lease.sentry_in_lease_child_cgroup",
+		"lease.child_limits_match", "lease.runtime_processes_in_finite_cgroups", "lease.host_netns_lo_only_no_routes"}
+	// statuses lists the six instance checks' statuses in lanes order.
+	statuses := func(values ...string) map[string]string {
+		out := map[string]string{}
+		for i, v := range values {
+			out[lanes[i]] = v
+		}
+		return out
+	}
 	for _, test := range []struct {
 		name     string
+		lease    func(*protocol.SandboxLeaseV1)
+		applied  func(*engineContainer)
+		started  func(*engineContainer)
+		refuse   func(*engineContainer) (int, string)
+		process  func(*host)
 		observe  func(h *host) func(int) []sandboxhost.Check
-		want     string // "" for served
-		decision string // the instance report's decision, "" for none
+		fault    string // "" unless Create must fail with a miner fault containing it
+		decision string
+		statuses map[string]string
+		// evidence maps a check to text its evidence must contain.
+		evidence map[string]string
+		observed bool // whether lane 2's observation may run
 	}{
-		{name: "observation passes", observe: func(*host) func(int) []sandboxhost.Check { return pass }, decision: "running"},
-		{name: "live process fails the observation", observe: func(h *host) func(int) []sandboxhost.Check { return netFails(h, false) },
-			want: "host observation lease.host_netns_lo_only_no_routes fail"},
-		{name: "process ends during the observation", observe: func(h *host) func(int) []sandboxhost.Check { return netFails(h, true) },
-			decision: "exited"},
+		{name: "served once the observation passes", decision: "running", observed: true,
+			statuses: statuses("pass", "pass", "pass", "pass", "pass", "pass")},
+		{name: "live process fails the observation", observe: func(h *host) func(int) []sandboxhost.Check { return netFails(h, false, false) },
+			fault: "host observation lease.host_netns_lo_only_no_routes fail", decision: "fault", observed: true,
+			statuses: statuses("pass", "pass", "pass", "pass", "pass", "fail"),
+			evidence: map[string]string{"lease.host_netns_lo_only_no_routes": "want only lo"}},
+		{name: "process ends during a failed observation", observe: func(h *host) func(int) []sandboxhost.Check { return netFails(h, true, true) },
+			decision: "exited", observed: true, statuses: statuses("pass", "pass", "pass", "pass", "pass", "fail"),
+			evidence: map[string]string{"lease.host_netns_lo_only_no_routes": "process directory gone after this observation"}},
+		// The readback after the process ended finds nothing to read; that
+		// must not erase what the first readback and observation saw.
+		{name: "process ends during a failed observation, exit recorded late", observe: func(h *host) func(int) []sandboxhost.Check {
+			return netFails(h, true, false)
+		}, decision: "exited", observed: true, statuses: statuses("pass", "pass", "pass", "pass", "pass", "fail"),
+			evidence: map[string]string{"lease.sentry_pinned_exe": "kernel readback matched", "lease.host_netns_lo_only_no_routes": "process directory gone"}},
+		{name: "unpinned binary", process: func(h *host) { h.process(h.config.RunscPath+"-other", scope, resources) },
+			fault: "not the pinned gVisor binary", decision: "fault",
+			statuses: statuses("pass", "fail", "not_run", "not_run", "not_run", "not_run"),
+			evidence: map[string]string{"lease.sentry_pinned_exe": "not the pinned gVisor binary", "lease.child_limits_match": "not reached"}},
+		{name: "limits differ", process: func(h *host) {
+			writeFile(h.t, filepath.Join(h.config.CgroupRoot, scope, "memory.max"), strconv.Itoa(2*resources.MemoryMiB<<20)+"\n")
+		}, fault: "kernel limits", decision: "fault", statuses: statuses("pass", "pass", "pass", "fail", "not_run", "not_run"),
+			evidence: map[string]string{"lease.child_limits_match": "memory.max="}},
+		{name: "engine ran another runtime", applied: func(c *engineContainer) { c.Host["Runtime"] = "runc" },
+			fault: "runtime is", decision: "fault", statuses: statuses("fail", "not_run", "not_run", "not_run", "not_run", "not_run"),
+			evidence: map[string]string{"lease.engine_config_matches": "runtime is"}},
+		{name: "workload exited before the readback", started: exit, decision: "exited",
+			statuses: statuses("pass", "not_run", "not_run", "not_run", "not_run", "not_run"),
+			evidence: map[string]string{"lease.sentry_pinned_exe": "not running"}},
+		{name: "start failed without an exit", started: func(c *engineContainer) { exit(c); c.Error = "OCI runtime start failed" },
+			fault: "did not exit by itself", decision: "fault", statuses: statuses("pass", "not_run", "not_run", "not_run", "not_run", "not_run"),
+			evidence: map[string]string{"lease.sentry_pinned_exe": "not running"}},
+		{name: "start refused before the workload started", refuse: func(c *engineContainer) (int, string) {
+			c.Error, c.FinishedAt = "exec: no such file or directory", "2026-10-15T00:38:35Z"
+			return http.StatusInternalServerError, c.Error
+		}, decision: "never_started", statuses: statuses("pass", "not_run", "not_run", "not_run", "not_run", "not_run")},
+		{name: "isolation refused before any container", lease: func(l *protocol.SandboxLeaseV1) { l.Isolation = sandbox.IsolationKata },
+			decision: "refused: isolation_unsupported", statuses: statuses("not_run", "not_run", "not_run", "not_run", "not_run", "not_run")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newHost(t)
 			h.process(h.sentry, scope, resources)
+			if test.process != nil {
+				test.process(h)
+			}
+			h.engine.applied, h.engine.started, h.engine.refuseStart = test.applied, test.started, test.refuse
 			b := h.backend()
 			layout := layoutFor(h)
 			profile := testProfile(h, layout)
-			b.profile, b.observeInstance = &profile, test.observe(h)
+			observe := pass
+			if test.observe != nil {
+				observe = test.observe(h)
+			}
+			observations := 0
+			b.profile, b.observeInstance = &profile, func(pid int) []sandboxhost.Check { observations++; return observe(pid) }
 			logs := captureLogs(t)
-			lease := testLease(nil)
+			lease := testLease(test.lease)
 			err := b.Create(context.Background(), instanceOf(lease), lease)
 			switch {
-			case test.want == "" && err != nil:
-				t.Fatalf("create = %v, want served", err)
-			case test.want != "" && (err == nil || refusalCode(err) != "" || !strings.Contains(err.Error(), test.want)):
-				t.Fatalf("create = %v, want a miner fault containing %q", err, test.want)
+			case test.fault == "" && err != nil && refusalCode(err) == "":
+				t.Fatalf("create = %v, want no miner fault", err)
+			case test.fault != "" && (err == nil || refusalCode(err) != "" || !strings.Contains(err.Error(), test.fault)):
+				t.Fatalf("create = %v, want a miner fault containing %q", err, test.fault)
+			}
+			if (observations > 0) != test.observed {
+				t.Errorf("lane 2 observed %d times, want observed=%v", observations, test.observed)
 			}
 			got := logs("sandbox instance report")
-			if exited := logs("sandbox exit attribution"); (test.decision == "exited") != (len(exited) == 1) {
-				t.Errorf("exit records %v, want one only when the process ended", exited)
-			}
-			if test.decision == "" {
-				if len(got) != 0 {
-					t.Fatalf("instance reports %v for a fault", got)
-				}
-				return
-			}
 			if len(got) != 1 || got[0]["decision"] != test.decision {
-				t.Fatalf("instance reports %v, want one %q", got, test.decision)
+				t.Fatalf("instance reports %v, want exactly one %q", got, test.decision)
+			}
+			if wantErr := ""; err != nil {
+				if got[0]["error"] != err.Error() {
+					t.Errorf("report error %q, want %q", got[0]["error"], err.Error())
+				}
+			} else if got[0]["error"] != wantErr {
+				t.Errorf("report error %q for a served create", got[0]["error"])
 			}
 			report := got[0]["report"].(map[string]any)
 			if report["mode"] != sandboxhost.ModeInstance || report["verdict"] == nil {
 				t.Fatalf("report %v is not an instance report", report)
 			}
-			statuses := map[string]string{}
+			checks := map[string]map[string]any{}
 			for _, raw := range report["checks"].([]any) {
 				c := raw.(map[string]any)
-				statuses[c["id"].(string)] = c["status"].(string)
+				checks[c["id"].(string)] = c
 			}
-			want := map[string]string{"lease.engine_config_matches": "pass", "lease.sentry_pinned_exe": "pass",
-				"lease.child_limits_match": "pass", "lease.host_netns_lo_only_no_routes": "pass"}
-			if test.decision == "exited" {
-				want = map[string]string{"lease.engine_config_matches": "pass", "lease.sentry_pinned_exe": "not_run",
-					"lease.child_limits_match": "not_run", "lease.host_netns_lo_only_no_routes": "not_run"}
+			for id, status := range test.statuses {
+				if checks[id]["status"] != status {
+					t.Errorf("instance report %s = %v, want %q", id, checks[id], status)
+				}
 			}
-			for id, status := range want {
-				if statuses[id] != status {
-					t.Errorf("instance report %s = %q, want %q", id, statuses[id], status)
+			for id, text := range test.evidence {
+				if evidence, _ := checks[id]["evidence"].(string); !strings.Contains(evidence, text) {
+					t.Errorf("instance report %s evidence %q, want it to contain %q", id, evidence, text)
 				}
 			}
 		})

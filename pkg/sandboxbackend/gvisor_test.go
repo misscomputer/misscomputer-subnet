@@ -67,6 +67,8 @@ type engineContainer struct {
 	// Error is the engine's start error; StartedAt and FinishedAt are the
 	// workload's start and exit times.
 	Error, StartedAt, FinishedAt string
+	// inspectedOnce rewrites the container after its next inspection only.
+	inspectedOnce func(*engineContainer)
 }
 
 // fakeEngine is a scripted Docker Engine API: images a pull may produce,
@@ -366,6 +368,10 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		})
 		if e.inspected != nil {
 			e.inspected(c)
+		}
+		if once := c.inspectedOnce; once != nil {
+			c.inspectedOnce = nil
+			once(c)
 		}
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/containers/"):
 		name := strings.TrimPrefix(p, "/containers/")

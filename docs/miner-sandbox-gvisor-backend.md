@@ -105,10 +105,17 @@ checks run once at startup; a binary or daemon changed later is caught only
 by the per-sandbox checks below.
 
 Every `Create` decision is also recorded:
-- **instance report:** a `sandbox instance report`, a
-  `sandbox-host-preflight.v1` report in instance mode, is logged. It holds
-  the backend's per-process checks (`not_run` when there was no process to
-  read) and `pkg/sandboxhost`'s observation of the live process.
+- **instance report:** exactly one `sandbox instance report`, a
+  `sandbox-host-preflight.v1` report in instance mode, is logged when
+  `Create` returns, whatever it decided: `running`, `exited`,
+  `never_started`, `refused: <code>` or `fault`, with the returned error.
+  It holds the engine configuration readback, the backend's per-process
+  checks and `pkg/sandboxhost`'s observation of the live process, each as
+  last seen. The check a fault stopped at is `fail` with its reason; one
+  whose process was gone is `not_run` with that evidence; later ones are
+  `not_run` (not reached). A check that ran keeps its result when a later
+  attempt finds no process, so an observation that failed just before the
+  process ended stays in the report.
 - **lane 2 observation on a live process:**
   - a failing observation is a miner fault;
   - a failing observation of a process that ended during it takes the D11

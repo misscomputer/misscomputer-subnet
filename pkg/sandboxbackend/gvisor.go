@@ -557,7 +557,9 @@ func (b *GVisor) spec(lease protocol.SandboxLeaseV1, leaseDigest, imageID string
 // needed and verified again. A refusal that is not the miner's fault (an
 // image the registry does not serve, or one the backend cannot account
 // for) is a *miner.SandboxRefusal.
-func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.SandboxLeaseV1) error {
+func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.SandboxLeaseV1) (err error) {
+	ev := &instanceEvidence{}
+	defer func() { b.logInstanceReport(instanceID, ev, err) }()
 	leaseDigest, err := protocol.SandboxDigestV1(lease)
 	if err != nil {
 		return err
@@ -570,13 +572,13 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 		return err
 	}
 	defer budget.close()
-	err = b.create(budget, instanceID, lease, leaseDigest)
+	err = b.create(budget, ev, instanceID, lease, leaseDigest)
 	budget.log(instanceID, err)
 	return err
 }
 
-// create runs Create under budget.
-func (b *GVisor) create(budget *createBudget, instanceID string, lease protocol.SandboxLeaseV1, leaseDigest string) error {
+// create runs Create under budget, recording what it observes in ev.
+func (b *GVisor) create(budget *createBudget, ev *instanceEvidence, instanceID string, lease protocol.SandboxLeaseV1, leaseDigest string) error {
 	existing, found, err := b.inspect(budget.local(), instanceID)
 	if err != nil {
 		return err
@@ -612,7 +614,7 @@ func (b *GVisor) create(budget *createBudget, instanceID string, lease protocol.
 		// The full engine configuration is read back before the start
 		// request (contract D23 precondition): a container the engine did
 		// not configure as asked is never started.
-		if err := b.verifyEngine(existing, s); err != nil {
+		if err := ev.engine(b.verifyEngine(existing, s)); err != nil {
 			return err
 		}
 		if err := b.engine.call(ctx, http.MethodPost, "/containers/"+url.PathEscape(instanceID)+"/start", nil, nil, nil); err != nil {
@@ -621,7 +623,7 @@ func (b *GVisor) create(budget *createBudget, instanceID string, lease protocol.
 				// The daemon gave no answer: the miner's fault.
 				return startErr
 			}
-			return b.startRefused(ctx, instanceID, existing.ID, s, startErr)
+			return b.startRefused(ctx, ev, instanceID, existing.ID, s, startErr)
 		}
 		if existing, found, err = b.inspect(ctx, instanceID); err != nil {
 			return err
@@ -629,12 +631,12 @@ func (b *GVisor) create(budget *createBudget, instanceID string, lease protocol.
 			return fmt.Errorf("sandbox %s vanished after start", instanceID)
 		}
 	}
-	if err := b.verifyEngine(existing, s); err != nil {
+	if err := ev.engine(b.verifyEngine(existing, s)); err != nil {
 		return err
 	}
-	cgroup, err := b.verifyProcess(existing, s)
+	cgroup, err := ev.process(b.verifyProcess(existing, s))
 	if err == nil {
-		if err = b.serveLive(instanceID, existing, cgroup); err == nil {
+		if err = b.serveLive(ev, instanceID, existing, cgroup); err == nil {
 			return nil
 		}
 	}
@@ -645,7 +647,7 @@ func (b *GVisor) create(budget *createBudget, instanceID string, lease protocol.
 	}
 	// The workload may have exited by itself before or during the kernel
 	// readback (contract D11-C2).
-	return b.settleExit(ctx, instanceID, existing.ID, s, err)
+	return b.settleExit(ctx, ev, instanceID, existing.ID, s, err)
 }
 
 func (b *GVisor) recordCgroup(instanceID, cgroup string) {
@@ -690,7 +692,7 @@ func (r ExitAttribution) log() {
 // kernel readback is repeated, and any value it reads that differs from
 // the lease is a miner fault (D11-C2). A state the engine reports as
 // failed, or no exit within the bound, is a miner fault.
-func (b *GVisor) settleExit(ctx context.Context, instanceID, containerID string, s spec, vanished error) error {
+func (b *GVisor) settleExit(ctx context.Context, ev *instanceEvidence, instanceID, containerID string, s spec, vanished error) error {
 	record := ExitAttribution{Instance: instanceID, ContainerID: containerID, SettleBound: startSettleBound}
 	// Logged as decided, not as first built.
 	defer func() { record.log() }()
@@ -713,14 +715,14 @@ func (b *GVisor) settleExit(ctx context.Context, instanceID, containerID string,
 		record.Pid, record.StartError = again.State.Pid, again.State.Error != ""
 		switch {
 		case workloadExited(again):
-			if err := b.verifyEngine(again, s); err != nil {
+			if err := ev.engine(b.verifyEngine(again, s)); err != nil {
 				return fault("engine configuration", err)
 			}
 			quiet := b.sliceQuiet(ctx, instanceID)
 			record.SliceQuiet = quiet == nil
 			if quiet == nil {
 				record.Decision, record.Settled = "exited", time.Since(begun)
-				return b.exited(again)
+				return b.exited(ev, again)
 			}
 			if !errors.Is(quiet, errProcessesRemain) {
 				return fault("slice unreadable", quiet)
@@ -729,9 +731,9 @@ func (b *GVisor) settleExit(ctx context.Context, instanceID, containerID string,
 		case again.State.Running || again.State.Pid > 0:
 			// The engine has not recorded the exit yet, or the process
 			// is in fact running: read it again.
-			cgroup, err := b.verifyProcess(again, s)
+			cgroup, err := ev.process(b.verifyProcess(again, s))
 			if err == nil {
-				if err = b.serveLive(instanceID, again, cgroup); err == nil {
+				if err = b.serveLive(ev, instanceID, again, cgroup); err == nil {
 					record.Decision, record.Settled = "running", time.Since(begun)
 					return nil
 				}
@@ -807,7 +809,7 @@ func (r StartAttribution) log() {
 // the slice or anywhere on the host referring to the container, and the
 // never-started container is removed. Anything else is the miner's fault
 // and returns startErr. The caller holds the start slot.
-func (b *GVisor) startRefused(ctx context.Context, instanceID, containerID string, s spec, startErr error) error {
+func (b *GVisor) startRefused(ctx context.Context, ev *instanceEvidence, instanceID, containerID string, s spec, startErr error) error {
 	record := StartAttribution{Instance: instanceID, ContainerID: containerID, StartStatus: engineStatus(startErr), SettleBound: startSettleBound}
 	// Logged as decided, not as first built.
 	defer func() { record.log() }()
@@ -830,7 +832,7 @@ func (b *GVisor) startRefused(ctx context.Context, instanceID, containerID strin
 	if !neverStarted(again) {
 		return fault("workload started", nil)
 	}
-	if err := b.verifyEngine(again, s); err != nil {
+	if err := ev.engine(b.verifyEngine(again, s)); err != nil {
 		return fault("engine configuration", err)
 	}
 	begun := time.Now()
@@ -871,7 +873,7 @@ func (b *GVisor) startRefused(ctx context.Context, instanceID, containerID strin
 	}
 	record.CleanedUp = true
 	record.Decision = "never_started"
-	b.logInstanceReport(instanceID, "never_started", nil, nil)
+	ev.decision = "never_started"
 	return &miner.SandboxRefusal{Code: "image_unavailable"}
 }
 
@@ -1203,11 +1205,10 @@ func (b *GVisor) liveSandboxCgroups(ctx context.Context, instanceID string) ([]s
 // be read back (contract D11): no customer code remains to contain, so the
 // lease is served and stays leased until release or expiry. Its engine
 // configuration was verified; the kernel readbacks did not run.
-func (b *GVisor) exited(c inspectedContainer) error {
-	instanceID := strings.TrimPrefix(c.Name, "/")
+func (b *GVisor) exited(ev *instanceEvidence, c inspectedContainer) error {
 	slog.Info("sandbox workload exited before the kernel readback; per-process checks not_run",
-		"sandbox", instanceID, "started_at", c.State.StartedAt)
-	b.logInstanceReport(instanceID, "exited", nil, nil)
+		"sandbox", strings.TrimPrefix(c.Name, "/"), "started_at", c.State.StartedAt)
+	ev.decision = "exited"
 	return nil
 }
 
@@ -1218,63 +1219,144 @@ func (b *GVisor) exited(c inspectedContainer) error {
 // process (contract D11-C2): a check carries no error kind, so the process
 // directory decides. One that fails while the process exists is a miner
 // fault.
-func (b *GVisor) serveLive(instanceID string, c inspectedContainer, cgroup string) error {
-	var observed []sandboxhost.Check
+func (b *GVisor) serveLive(ev *instanceEvidence, instanceID string, c inspectedContainer, cgroup string) error {
 	if b.observeInstance != nil {
-		observed = b.observeInstance(c.State.Pid)
+		observed := b.observeInstance(c.State.Pid)
+		ev.observe(observed)
 		for _, check := range observed {
 			if check.Status == sandboxhost.StatusPass {
 				continue
 			}
 			if _, err := os.Stat(filepath.Join(b.config.ProcRoot, strconv.Itoa(c.State.Pid))); gone(err) {
+				ev.annotate(check.ID, "process directory gone after this observation")
 				return fmt.Errorf("%w: sandbox %s process ended during host observation %s: %s", errProcessVanished, c.Name, check.ID, check.Evidence)
 			}
 			return fmt.Errorf("sandbox %s host observation %s %s: %s", c.Name, check.ID, check.Status, check.Evidence)
 		}
 	}
 	b.recordCgroup(instanceID, cgroup)
-	b.logInstanceReport(instanceID, "running", &liveReadback{pid: c.State.Pid, cgroup: cgroup}, observed)
+	ev.decision = "running"
 	return nil
 }
 
-// liveReadback is what a passing kernel readback of a sandbox's process saw.
-type liveReadback struct {
-	pid    int
-	cgroup string
+// laneOneInstanceIDs are this backend's per-instance checks in the order
+// the kernel readback runs them, after the engine configuration readback.
+var laneOneInstanceIDs = []string{"lease.sentry_pinned_exe", "lease.sentry_in_lease_child_cgroup", "lease.child_limits_match"}
+
+// instanceEvidence is what one Create observed of its instance, for the one
+// instance report it logs whatever it decides (SR-38-01). Each check keeps
+// its most informative result: a later pass or fail replaces an earlier
+// one, and a check that could not run never replaces one that did, so lane
+// 2's observation is kept when the process vanishes afterwards.
+type instanceEvidence struct {
+	checks map[string]sandboxhost.Check
+	// decision is "running", "exited" or "never_started" once Create served
+	// or refused on that basis; otherwise the error decides.
+	decision string
+}
+
+func (e *instanceEvidence) record(c sandboxhost.Check) {
+	if e.checks == nil {
+		e.checks = map[string]sandboxhost.Check{}
+	}
+	if previous, ok := e.checks[c.ID]; ok && c.Status == sandboxhost.StatusNotRun && previous.Status != sandboxhost.StatusNotRun {
+		return
+	}
+	c.Evidence = evidence(c.Evidence)
+	e.checks[c.ID] = c
+}
+
+func (e *instanceEvidence) set(id, status, text string) {
+	e.record(sandboxhost.Check{ID: id, Class: catalogClass(id), Status: status, Evidence: text})
+}
+
+// engine records an engine configuration readback and returns its error.
+func (e *instanceEvidence) engine(err error) error {
+	if err != nil {
+		e.set("lease.engine_config_matches", sandboxhost.StatusFail, err.Error())
+	} else {
+		e.set("lease.engine_config_matches", sandboxhost.StatusPass, "engine configuration read back and matched the sandbox spec")
+	}
+	return err
+}
+
+// process records a kernel readback (verifyProcess) and returns it: the
+// checks before the one it stopped at passed, that one failed, or did not
+// run when its process was gone, and the later ones were not reached.
+func (e *instanceEvidence) process(cgroup string, err error) (string, error) {
+	var stopped *readbackError
+	if err != nil && !errors.As(err, &stopped) {
+		for _, id := range laneOneInstanceIDs {
+			e.set(id, sandboxhost.StatusNotRun, err.Error())
+		}
+		return cgroup, err
+	}
+	reached := err == nil
+	for _, id := range laneOneInstanceIDs {
+		switch {
+		case err == nil:
+			e.set(id, sandboxhost.StatusPass, "kernel readback matched the lease; sentry cgroup "+cgroup)
+		case id == stopped.id && errors.Is(err, errProcessVanished):
+			e.set(id, sandboxhost.StatusNotRun, err.Error())
+			reached = true
+		case id == stopped.id:
+			e.set(id, sandboxhost.StatusFail, err.Error())
+			reached = true
+		case !reached:
+			e.set(id, sandboxhost.StatusPass, "kernel readback matched before "+stopped.id)
+		default:
+			e.set(id, sandboxhost.StatusNotRun, "not reached: "+stopped.id+" did not pass")
+		}
+	}
+	return cgroup, err
+}
+
+// observe records lane 2's instance observation of the live process.
+func (e *instanceEvidence) observe(checks []sandboxhost.Check) {
+	for _, c := range checks {
+		e.record(c)
+	}
+}
+
+// annotate appends note to the evidence of check id.
+func (e *instanceEvidence) annotate(id, note string) {
+	if c, ok := e.checks[id]; ok {
+		c.Evidence = evidence(c.Evidence + "; " + note)
+		e.checks[id] = c
+	}
 }
 
 // logInstanceReport logs the sandbox-host-preflight.v1 instance report of
-// one Create decision (INT-26-12): this backend's instance checks, from the
-// readback when it ran and not_run otherwise, and lane 2's observation of
-// the live process. It is built only for a backend opened from a host
-// profile.
-func (b *GVisor) logInstanceReport(instanceID, decision string, live *liveReadback, observed []sandboxhost.Check) {
+// one Create decision (INT-26-12, SR-38-01): served, refused or a miner
+// fault, with every check as last observed and the rest not_run. It is
+// built only for a backend opened from a host profile.
+func (b *GVisor) logInstanceReport(instanceID string, ev *instanceEvidence, err error) {
 	if b.profile == nil {
 		return
 	}
-	var r checkRecorder
-	r.add("lease.engine_config_matches", nil, "engine configuration read back and matched the sandbox spec")
-	if live != nil {
-		r.add("lease.sentry_pinned_exe", nil, fmt.Sprintf("PID %d executes the pinned %s", live.pid, b.sandboxExe))
-		r.add("lease.sentry_in_lease_child_cgroup", nil, fmt.Sprintf("PID %d in %s below %s", live.pid, live.cgroup, b.sliceCgroup))
-		r.add("lease.child_limits_match", nil, live.cgroup+": cpu.max, memory.max and pids.max equal the lease, memory.swap.max 0")
-	} else {
-		for _, id := range []string{"lease.sentry_pinned_exe", "lease.sentry_in_lease_child_cgroup", "lease.child_limits_match"} {
-			r.notRun(id, "no process to read: "+decision)
-		}
+	decision := ev.decision
+	var refusal *miner.SandboxRefusal
+	switch {
+	case err == nil || decision == "never_started":
+	case errors.As(err, &refusal):
+		decision = "refused: " + refusal.Code
+	default:
+		decision = "fault"
 	}
-	checks := append(r.checks, observed...)
-	if observed == nil {
-		for _, id := range []string{"lease.runtime_processes_in_finite_cgroups", "lease.host_netns_lo_only_no_routes"} {
-			checks = append(checks, sandboxhost.Check{ID: id, Class: catalogClass(id), Status: sandboxhost.StatusNotRun, Evidence: "no process to observe: " + decision})
-		}
+	checks := make([]sandboxhost.Check, 0, len(ev.checks))
+	for _, c := range ev.checks {
+		checks = append(checks, c)
 	}
-	report, err := sandboxhost.BuildReport(sandboxhost.ModeInstance, *b.profile, checks, sandboxhost.Environment{})
+	errText := ""
 	if err != nil {
-		slog.Warn("sandbox instance report", "sandbox", instanceID, "decision", decision, "error", err)
+		errText = err.Error()
+	}
+	report, buildErr := sandboxhost.BuildReport(sandboxhost.ModeInstance, *b.profile, checks, sandboxhost.Environment{})
+	if buildErr != nil {
+		slog.Warn("sandbox instance report", "sandbox", instanceID, "decision", decision, "error", errText, "report_error", buildErr)
 		return
 	}
-	slog.Info("sandbox instance report", "sandbox", instanceID, "decision", decision, "report", report)
+	slog.Info("sandbox instance report", "sandbox", instanceID, "decision", decision, "error", errText, "report", report)
 }
 
 // createContainer pulls and verifies the lease's image and creates, but
@@ -1661,44 +1743,64 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 	return nil
 }
 
+// readbackError is a kernel readback failure and the instance check it
+// stopped at.
+type readbackError struct {
+	id  string
+	err error
+}
+
+func (e *readbackError) Error() string { return e.err.Error() }
+func (e *readbackError) Unwrap() error { return e.err }
+
 // verifyProcess proves the kernel's view of the running sandbox process:
 // the pinned gVisor binary Open hashed, in a cgroup below the slice whose
 // cpu.max, memory.max and pids.max equal the lease's, with no swap
-// (lease.child_limits_match), and returns that cgroup. It reports
-// errProcessVanished only when there was no process left to read; a
-// mismatch it read is a plain error.
+// (lease.child_limits_match), and returns that cgroup. Its error is a
+// *readbackError; it wraps errProcessVanished only when there was no
+// process left to read, never for a mismatch it read.
 func (b *GVisor) verifyProcess(c inspectedContainer, s spec) (string, error) {
+	cgroup, id, err := b.readProcess(c, s)
+	if err != nil {
+		return "", &readbackError{id: id, err: err}
+	}
+	return cgroup, nil
+}
+
+// readProcess is verifyProcess; on failure it also names the check.
+func (b *GVisor) readProcess(c inspectedContainer, s spec) (string, string, error) {
+	const exe, child, limits = "lease.sentry_pinned_exe", "lease.sentry_in_lease_child_cgroup", "lease.child_limits_match"
 	if !c.State.Running || c.State.Pid <= 0 {
-		return "", fmt.Errorf("%w: sandbox %s is %s, not running: %q", errProcessVanished, c.Name, c.State.Status, c.State.Error)
+		return "", exe, fmt.Errorf("%w: sandbox %s is %s, not running: %q", errProcessVanished, c.Name, c.State.Status, c.State.Error)
 	}
 	proc := filepath.Join(b.config.ProcRoot, strconv.Itoa(c.State.Pid))
-	exe, err := os.Readlink(filepath.Join(proc, "exe"))
+	path, err := os.Readlink(filepath.Join(proc, "exe"))
 	if err != nil {
-		return "", fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
+		return "", exe, fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
 	}
-	if exe != b.sandboxExe {
-		return "", fmt.Errorf("sandbox %s process runs %s, not the pinned gVisor binary %s", c.Name, exe, b.sandboxExe)
+	if path != b.sandboxExe {
+		return "", exe, fmt.Errorf("sandbox %s process runs %s, not the pinned gVisor binary %s", c.Name, path, b.sandboxExe)
 	}
 	if file, err := os.Stat(filepath.Join(proc, "exe")); err != nil {
-		return "", fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
+		return "", exe, fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
 	} else if !os.SameFile(file, b.sandboxFile) || !file.ModTime().Equal(b.sandboxFile.ModTime()) || file.Size() != b.sandboxFile.Size() {
-		return "", fmt.Errorf("sandbox %s process runs a %s replaced or rewritten since the backend opened", c.Name, b.sandboxExe)
+		return "", exe, fmt.Errorf("sandbox %s process runs a %s replaced or rewritten since the backend opened", c.Name, b.sandboxExe)
 	}
 	cgroup, err := processCgroup(filepath.Join(proc, "cgroup"))
 	if err != nil {
-		return "", fmt.Errorf("sandbox %s: %w", c.Name, vanished(err))
+		return "", child, fmt.Errorf("sandbox %s: %w", c.Name, vanished(err))
 	}
 	if !strings.HasPrefix(cgroup, b.sliceCgroup+"/") {
-		return "", fmt.Errorf("sandbox %s process cgroup %s is outside slice %s", c.Name, cgroup, b.sliceCgroup)
+		return "", child, fmt.Errorf("sandbox %s process cgroup %s is outside slice %s", c.Name, cgroup, b.sliceCgroup)
 	}
 	dir := filepath.Join(b.config.CgroupRoot, cgroup)
-	limits := map[string]string{}
+	values := map[string]string{}
 	for _, name := range []string{"memory.max", "memory.swap.max", "pids.max", "cpu.max"} {
-		if limits[name], err = readSmall(filepath.Join(dir, name)); err != nil {
-			return "", fmt.Errorf("sandbox %s cgroup %s: %w", c.Name, cgroup, vanished(err))
+		if values[name], err = readSmall(filepath.Join(dir, name)); err != nil {
+			return "", limits, fmt.Errorf("sandbox %s cgroup %s: %w", c.Name, cgroup, vanished(err))
 		}
 	}
-	memory, swap, pids, cpu := limits["memory.max"], limits["memory.swap.max"], limits["pids.max"], limits["cpu.max"]
+	memory, swap, pids, cpu := values["memory.max"], values["memory.swap.max"], values["pids.max"], values["cpu.max"]
 	var quota, period int64
 	if fields := strings.Fields(cpu); len(fields) == 2 {
 		quota, _ = strconv.ParseInt(fields[0], 10, 64)
@@ -1707,10 +1809,10 @@ func (b *GVisor) verifyProcess(c inspectedContainer, s spec) (string, error) {
 	millis := s.host.NanoCpus / 1_000_000
 	if memory != strconv.FormatInt(s.host.Memory, 10) || swap != "0" || pids != strconv.FormatInt(*s.host.PidsLimit, 10) ||
 		quota <= 0 || period <= 0 || quota*1000 != millis*period {
-		return "", fmt.Errorf("sandbox %s kernel limits cpu.max=%q memory.max=%q memory.swap.max=%q pids.max=%q differ from the lease",
+		return "", limits, fmt.Errorf("sandbox %s kernel limits cpu.max=%q memory.max=%q memory.swap.max=%q pids.max=%q differ from the lease",
 			c.Name, cpu, memory, swap, pids)
 	}
-	return cgroup, nil
+	return cgroup, "", nil
 }
 
 // processCgroup returns the cgroup v2 path of a process.
