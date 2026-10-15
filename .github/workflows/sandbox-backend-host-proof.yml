@@ -1,0 +1,216 @@
+name: sandbox backend on disposable host
+
+# DEP-3: run the gVisor backend's own env-gated integration test, at a pinned
+# reviewed source SHA, on a host provisioned by scripts/sandbox-host from this
+# PR's exact head. GitHub-hosted only; the host is discarded with the VM.
+# The backend SHA is a reviewed pin: changing it is a reviewed change. It
+# names a main commit that contains the merged backend (INT-29-04).
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  BACKEND_SHA: f380ceb3a36e1ed5d775a76c4c3f4224d70a6fe9
+  # Repetitions of TestGVisorLaneOnDisposableHost only, in this one job, so
+  # the D11 exited-workload case meets both exit-before and exit-after
+  # readback timings. The oversized test still runs once.
+  LANE_TEST_COUNT: "10"
+
+jobs:
+  backend-on-host:
+    if: >-
+      github.event.label.name == 'run-sandbox-backend-gate' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: host
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.BACKEND_SHA }}
+          path: backend
+          persist-credentials: false
+      - name: Record exact source pins
+        run: |
+          host_sha=$(git -C host rev-parse HEAD)
+          backend_sha=$(git -C backend rev-parse HEAD)
+          # shellcheck disable=SC2153 # BACKEND_SHA is the workflow-level pin
+          [[ $backend_sha == "$BACKEND_SHA" ]] || { echo "backend checkout $backend_sha != pin $BACKEND_SHA"; exit 1; }
+          printf 'host scripts: %s\nbackend source: %s\n' "$host_sha" "$backend_sha" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.23.12"
+          cache: false
+      - name: Build the observer and the backend integration test as the runner user
+        run: |
+          (cd host && go build -trimpath -o "$RUNNER_TEMP/sandbox-host-observe" ./cmd/sandbox-host-observe)
+          (cd backend && go test -c -trimpath -o "$RUNNER_TEMP/sandboxbackend.test" ./pkg/sandboxbackend)
+      - name: Install pinned XFS and nftables tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xfsprogs=6.6.0-1ubuntu2.1 nftables
+      - name: Provision dedicated engine
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+          # The backend test holds one minimum lease (5120 MiB disk, 1 CPU,
+          # 1024 MiB), so the lab is sized up from the conformance default.
+          MC_SANDBOX_HOST_DATA_FS_MIB: "8192"
+          MC_SANDBOX_HOST_LEASE_MEMORY_MIB: "2048"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,MC_SANDBOX_HOST_DATA_FS_MIB,MC_SANDBOX_HOST_LEASE_MEMORY_MIB,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/provision-disposable.sh
+      - name: Live host preflight with pkg/sandboxhost
+        run: |
+          # The profile holds paths and hashes only; copy it out of the root-only
+          # work root into a runner-owned file.
+          # shellcheck disable=SC2024
+          sudo cat "$RUNNER_TEMP/mcsbx/profile.json" > "$RUNNER_TEMP/profile.json"
+          sudo "$RUNNER_TEMP/sandbox-host-observe" -profile "$RUNNER_TEMP/profile.json" preflight | tee "$RUNNER_TEMP/preflight-checks.json"
+          python3 - "$RUNNER_TEMP/preflight-checks.json" <<'PY'
+          import json, sys
+          bad = [c for c in json.load(open(sys.argv[1])) if c['status'] not in ('pass', 'gap')]
+          for c in bad:
+              print(f"FAIL {c['id']}: {c['evidence']}")
+          raise SystemExit(1 if bad else 0)
+          PY
+      - name: Backend integration test on the provisioned host
+        run: |
+          eval "$(python3 - "$RUNNER_TEMP/profile.json" <<'PY'
+          import json, shlex, sys
+          p = json.load(open(sys.argv[1]))
+          env = {
+              'MC_SANDBOX_DOCKER_HOST': p['docker_host'], 'MC_SANDBOX_RUNTIME': p['runtime']['name'],
+              'MC_SANDBOX_RUNSC_PATH': p['runtime']['path'], 'MC_SANDBOX_RUNSC_SHA256': p['runtime']['sha256'],
+              'MC_SANDBOX_SENTRY_PATH': p['runtime']['sentry_path'], 'MC_SANDBOX_SENTRY_SHA256': p['runtime']['sentry_sha256'],
+              'MC_SANDBOX_DATA_ROOT': p['docker_data_root'], 'MC_SANDBOX_SLICE': p['lease_slice'],
+          }
+          for key, value in env.items():
+              print(f'export {key}={shlex.quote(value)}')
+          PY
+          )"
+          # Independent lane-2 observation of every live sandbox the backend
+          # creates: engine settings, sentry exe and cgroup, limit files,
+          # pkg/sandboxhost ObserveInstance and XFS project quotas.
+          sudo python3 host/scripts/sandbox-host/observe-backend-instances.py watch \
+            "$RUNNER_TEMP/profile.json" "$RUNNER_TEMP/sandbox-host-observe" "$RUNNER_TEMP/backend-instances.jsonl" "$RUNNER_TEMP/observe.stop" &
+          watcher=$!
+          sleep 1
+          sudo env MC_SANDBOX_BACKEND_IT=1 MC_SANDBOX_DEPLOYMENT_CGROUP=/mcsbxdeployment.slice \
+            MC_SANDBOX_DOCKER_HOST="$MC_SANDBOX_DOCKER_HOST" MC_SANDBOX_RUNTIME="$MC_SANDBOX_RUNTIME" \
+            MC_SANDBOX_RUNSC_PATH="$MC_SANDBOX_RUNSC_PATH" MC_SANDBOX_RUNSC_SHA256="$MC_SANDBOX_RUNSC_SHA256" \
+            MC_SANDBOX_SENTRY_PATH="$MC_SANDBOX_SENTRY_PATH" MC_SANDBOX_SENTRY_SHA256="$MC_SANDBOX_SENTRY_SHA256" \
+            MC_SANDBOX_DATA_ROOT="$MC_SANDBOX_DATA_ROOT" MC_SANDBOX_SLICE="$MC_SANDBOX_SLICE" \
+            "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestGVisorLaneOnDisposableHost$' -test.v -test.count "$LANE_TEST_COUNT" -test.timeout 20m \
+            2>&1 | tee "$RUNNER_TEMP/backend-test.log"
+          touch "$RUNNER_TEMP/observe.stop"
+          wait "$watcher" || true
+          # Every exit-attribution decision the backend logged, verbatim.
+          grep -F 'sandbox exit attribution' "$RUNNER_TEMP/backend-test.log" > "$RUNNER_TEMP/exit-attribution.log" || true
+          passes=$(grep -cx -- '--- PASS: TestGVisorLaneOnDisposableHost.*' "$RUNNER_TEMP/backend-test.log" || true)
+          fails=$(grep -c -- '--- FAIL: TestGVisorLaneOnDisposableHost' "$RUNNER_TEMP/backend-test.log" || true)
+          records=$(wc -l < "$RUNNER_TEMP/exit-attribution.log")
+          {
+            echo "TestGVisorLaneOnDisposableHost: $passes passed, $fails failed of $LANE_TEST_COUNT; sandbox exit attribution records: $records"
+            sed 's/^/    /' "$RUNNER_TEMP/exit-attribution.log"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $passes == "$LANE_TEST_COUNT" && $fails == 0 ]] || { echo 'backend integration test did not pass every repetition (a skip is not a pass)'; exit 1; }
+      - name: Independent observations of the backend's live sandboxes
+        if: always()
+        run: python3 host/scripts/sandbox-host/observe-backend-instances.py summarize "$RUNNER_TEMP/profile.json" "$RUNNER_TEMP/backend-instances.jsonl" | tee -a "$GITHUB_STEP_SUMMARY"; exit "${PIPESTATUS[0]}"
+      - name: Host state after the backend test
+        if: always()
+        run: |
+          sock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json" 2>/dev/null || true)
+          [[ -n $sock ]] || exit 0
+          left=$(sudo docker -H "$sock" ps -aq | wc -l)
+          children=$(sudo find /sys/fs/cgroup/mcsbxlease.slice -mindepth 1 -maxdepth 1 -type d -name 'docker-*' | wc -l)
+          echo "after test: containers=$left lease sandbox cgroups=$children" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $left == 0 && $children == 0 ]]
+      - name: Oversized registry error through the real dockerd (scoped loopback exception)
+        if: always()
+        run: |
+          [[ -s $RUNNER_TEMP/profile.json ]] || { echo 'host was not provisioned'; exit 1; }
+          table=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["engine"]["egress_table"])' "$RUNNER_TEMP/profile.json")
+          strip() { sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/'; }
+          sudo nft list table inet "$table" | strip > "$RUNNER_TEMP/egress-before.nft"
+          # The engine slice may not reach loopback. Both oversized-error
+          # proofs serve their registry on 127.0.0.1, so open exactly
+          # 127.0.0.1 unprivileged TCP for the engine slice, for this step only.
+          # The exception carries a comment so the always() step below can find
+          # and remove it if this step is cut short (SR-29-01, INT-29-03); an
+          # EXIT/INT/TERM trap removes it on every other path out of this step.
+          handle=$(sudo nft -a -e insert rule inet "$table" output socket cgroupv2 level 1 '"mcsbxengine.slice"' ip daddr 127.0.0.1 tcp dport 1024-65535 accept comment '"mcsbx-lab-loopback-exception"' | sed -n 's/.*# handle \([0-9][0-9]*\)$/\1/p')
+          [[ $handle =~ ^[0-9]+$ ]] || { echo 'could not open the scoped loopback exception'; exit 1; }
+          close_exception() {
+            if [[ -n ${handle:-} ]]; then
+              sudo nft delete rule inet "$table" output handle "$handle" && handle=
+            fi
+          }
+          trap close_exception EXIT INT TERM
+          echo "scoped loopback exception: rule handle $handle" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=0
+          echo '### Independent: raw answer of the real dockerd' | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo python3 host/scripts/sandbox-host/probe-oversized-pull.py "$RUNNER_TEMP/profile.json" "$RUNNER_TEMP/oversized-pull.json" | tee -a "$GITHUB_STEP_SUMMARY" || rc=1
+          sudo chmod 0644 "$RUNNER_TEMP/oversized-pull.json" 2>/dev/null || true
+          echo '### Backend: TestEnginePullOversizedRegistryErrorOnDisposableHost' | tee -a "$GITHUB_STEP_SUMMARY"
+          docker_host=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json")
+          sudo env MC_SANDBOX_BACKEND_IT=1 MC_SANDBOX_DOCKER_HOST="$docker_host" \
+            timeout 600 "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestEnginePullOversizedRegistryErrorOnDisposableHost$' -test.v -test.count 1 -test.timeout 9m \
+            2>&1 | tee "$RUNNER_TEMP/oversized-test.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          test_rc=${PIPESTATUS[0]}
+          (( test_rc == 0 )) || { echo "backend oversized test exited $test_rc"; rc=1; }
+          grep -qx -- '--- PASS: TestEnginePullOversizedRegistryErrorOnDisposableHost.*' "$RUNNER_TEMP/oversized-test.log" || rc=1
+          close_exception
+          sudo nft list table inet "$table" | strip > "$RUNNER_TEMP/egress-after.nft"
+          diff -u "$RUNNER_TEMP/egress-before.nft" "$RUNNER_TEMP/egress-after.nft" || { echo 'egress table not restored'; rc=1; }
+          # shellcheck disable=SC2024 # the report file is runner-owned on purpose
+          sudo "$RUNNER_TEMP/sandbox-host-observe" -profile "$RUNNER_TEMP/profile.json" preflight > "$RUNNER_TEMP/preflight-after-exception.json"
+          python3 -c 'import json,sys; c=[c for c in json.load(open(sys.argv[1])) if c["id"]=="network.engine_egress_restricted"][0]; print("after exception:", c["status"], c["evidence"]); sys.exit(c["status"]!="pass")' "$RUNNER_TEMP/preflight-after-exception.json" | tee -a "$GITHUB_STEP_SUMMARY" || rc=1
+          exit "$rc"
+      - name: Verify the loopback exception is gone
+        if: always()
+        run: |
+          [[ -s $RUNNER_TEMP/profile.json ]] || exit 0
+          table=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["engine"]["egress_table"])' "$RUNNER_TEMP/profile.json")
+          sudo nft list table inet "$table" >/dev/null 2>&1 || exit 0
+          left=$(sudo nft -a list table inet "$table" | sed -n 's/.*mcsbx-lab-loopback-exception.*# handle \([0-9][0-9]*\)$/\1/p')
+          for handle in $left; do sudo nft delete rule inet "$table" output handle "$handle"; done
+          if [[ -n $left ]]; then echo "loopback exception was still present (handles: $left); removed" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          echo 'loopback exception absent before later steps' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Record command-failure behaviour of engine and runsc (no attribution)
+        if: always()
+        run: |
+          [[ -s $RUNNER_TEMP/profile.json ]] || { echo 'host was not provisioned'; exit 1; }
+          sock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json")
+          image=docker.io/library/busybox@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          sudo docker -H "$sock" pull --quiet --platform linux/amd64 "$image"
+          sudo python3 host/scripts/sandbox-host/probe-command-failures.py "$RUNNER_TEMP/profile.json" "$image" "$RUNNER_TEMP/command-failures.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo chmod 0644 "$RUNNER_TEMP/command-failures.json"
+          sudo docker -H "$sock" image rm "$image" >/dev/null
+      - name: Teardown and verify cleanup
+        if: always()
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/teardown-disposable.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sandbox-backend-host-proof-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/backend-test.log
+            ${{ runner.temp }}/exit-attribution.log
+            ${{ runner.temp }}/preflight-checks.json
+            ${{ runner.temp }}/profile.json
+            ${{ runner.temp }}/backend-instances.jsonl
+            ${{ runner.temp }}/command-failures.json
+            ${{ runner.temp }}/oversized-pull.json
+            ${{ runner.temp }}/oversized-test.log
+            ${{ runner.temp }}/egress-before.nft
+            ${{ runner.temp }}/egress-after.nft
+          if-no-files-found: warn
+          retention-days: 30
