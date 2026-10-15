@@ -128,7 +128,10 @@ if the process exits afterwards. `Create` then succeeds only when the engine
 configuration above matches, a fresh inspection shows the container exited
 with no start error, no PID and an exit time after its start time, and no
 process remains anywhere below the slice except in the cgroups of other
-running sandboxes. The per-process checks are logged as `not_run`, the
+sandboxes: those the engine reports running, and those an earlier readback
+found a sandbox's process in, until that sandbox's container is removed.
+Sandboxes start and are verified one at a time, so no other sandbox is
+starting while this check runs. The per-process checks are logged as `not_run`, the
 exited container is never restarted, and it keeps its lease, writable layer
 and logs until release or expiry.
 

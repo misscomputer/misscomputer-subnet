@@ -133,6 +133,15 @@ type GVisor struct {
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 	mu     sync.Mutex
 	images map[string]*imageLock
+	// startSlot admits one sandbox at a time from its start through its
+	// verification, so a sandbox whose workload exited is never checked
+	// while another is starting and has processes the engine does not yet
+	// report (contract D11-C1 under concurrency, SR-26-16/INT-26-13).
+	startSlot chan struct{}
+	// cgroups records, per instance, the cgroup the kernel readback found
+	// its process in. It keeps an instance's cgroup attributed to it while
+	// its workload winds down or its container is removed.
+	cgroups map[string]string
 }
 
 type imageLock struct {
@@ -630,6 +639,11 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	if existing.Config.Labels[LabelLeaseID] != protocol.SandboxLeaseIDV1(lease) || existing.Config.Labels[LabelLeaseDigest] != leaseDigest {
 		return fmt.Errorf("container %s exists for another lease", instanceID)
 	}
+	release, err := b.acquireStart(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if !existing.State.Running && !workloadExited(existing) {
 		if existing.State.Status != "created" {
 			return fmt.Errorf("sandbox %s is %s, not running", instanceID, existing.State.Status)
@@ -647,10 +661,19 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	if err := b.verifyEngine(existing, s); err != nil {
 		return err
 	}
-	err = b.verifyProcess(existing, s)
+	cgroup, err := b.verifyProcess(existing, s)
+	if err == nil {
+		b.mu.Lock()
+		if b.cgroups == nil {
+			b.cgroups = map[string]string{}
+		}
+		b.cgroups[instanceID] = cgroup
+		b.mu.Unlock()
+		return nil
+	}
 	if !errors.Is(err, errProcessVanished) {
-		// nil, or a value read from the live process that differs from the
-		// lease: a miner fault even if the process exits afterwards.
+		// A value read from the live process that differs from the lease:
+		// a miner fault even if the process exits afterwards.
 		return err
 	}
 	// The workload may have exited by itself before or during the kernel
@@ -692,15 +715,40 @@ func workloadExited(c inspectedContainer) bool {
 		startErr == nil && finishErr == nil && started.Year() > 1 && finished.After(started)
 }
 
+// acquireStart waits for the start slot; the returned func frees it.
+func (b *GVisor) acquireStart(ctx context.Context) (func(), error) {
+	b.mu.Lock()
+	if b.startSlot == nil {
+		b.startSlot = make(chan struct{}, 1)
+	}
+	slot := b.startSlot
+	b.mu.Unlock()
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("wait to start a sandbox: %w", ctx.Err())
+	}
+}
+
 // sliceQuiet requires that no process remains anywhere below the slice
-// once a sandbox's workload exited, except in the cgroups of other running
-// sandboxes (contract D11-C1). Cgroup names are not trusted to tell which
-// instance a process belongs to.
+// once a sandbox's workload exited, except in the cgroups of other
+// sandboxes: those the engine reports running, and those whose process the
+// kernel readback found while their container exists (contract D11-C1).
+// Cgroup names are not trusted to tell which instance a process belongs
+// to. The caller holds the start slot, so no other sandbox is starting.
 func (b *GVisor) sliceQuiet(ctx context.Context, instanceID string) error {
 	owned, err := b.liveSandboxCgroups(ctx, instanceID)
 	if err != nil {
 		return err
 	}
+	b.mu.Lock()
+	for instance, cgroup := range b.cgroups {
+		if instance != instanceID {
+			owned = append(owned, cgroup)
+		}
+	}
+	b.mu.Unlock()
 	root := filepath.Join(b.config.CgroupRoot, b.sliceCgroup)
 	return filepath.WalkDir(root, func(dir string, entry fs.DirEntry, err error) error {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1087,37 +1135,38 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 // verifyProcess proves the kernel's view of the running sandbox process:
 // the pinned gVisor binary Open hashed, in a cgroup below the slice whose
 // cpu.max, memory.max and pids.max equal the lease's, with no swap
-// (lease.child_limits_match). It reports errProcessVanished only when
-// there was no process left to read; a mismatch it read is a plain error.
-func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
+// (lease.child_limits_match), and returns that cgroup. It reports
+// errProcessVanished only when there was no process left to read; a
+// mismatch it read is a plain error.
+func (b *GVisor) verifyProcess(c inspectedContainer, s spec) (string, error) {
 	if !c.State.Running || c.State.Pid <= 0 {
-		return fmt.Errorf("%w: sandbox %s is %s, not running: %q", errProcessVanished, c.Name, c.State.Status, c.State.Error)
+		return "", fmt.Errorf("%w: sandbox %s is %s, not running: %q", errProcessVanished, c.Name, c.State.Status, c.State.Error)
 	}
 	proc := filepath.Join(b.config.ProcRoot, strconv.Itoa(c.State.Pid))
 	exe, err := os.Readlink(filepath.Join(proc, "exe"))
 	if err != nil {
-		return fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
+		return "", fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
 	}
 	if exe != b.sandboxExe {
-		return fmt.Errorf("sandbox %s process runs %s, not the pinned gVisor binary %s", c.Name, exe, b.sandboxExe)
+		return "", fmt.Errorf("sandbox %s process runs %s, not the pinned gVisor binary %s", c.Name, exe, b.sandboxExe)
 	}
 	if file, err := os.Stat(filepath.Join(proc, "exe")); err != nil {
-		return fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
+		return "", fmt.Errorf("sandbox %s process executable: %w", c.Name, vanished(err))
 	} else if !os.SameFile(file, b.sandboxFile) || !file.ModTime().Equal(b.sandboxFile.ModTime()) || file.Size() != b.sandboxFile.Size() {
-		return fmt.Errorf("sandbox %s process runs a %s replaced or rewritten since the backend opened", c.Name, b.sandboxExe)
+		return "", fmt.Errorf("sandbox %s process runs a %s replaced or rewritten since the backend opened", c.Name, b.sandboxExe)
 	}
 	cgroup, err := processCgroup(filepath.Join(proc, "cgroup"))
 	if err != nil {
-		return fmt.Errorf("sandbox %s: %w", c.Name, vanished(err))
+		return "", fmt.Errorf("sandbox %s: %w", c.Name, vanished(err))
 	}
 	if !strings.HasPrefix(cgroup, b.sliceCgroup+"/") {
-		return fmt.Errorf("sandbox %s process cgroup %s is outside slice %s", c.Name, cgroup, b.sliceCgroup)
+		return "", fmt.Errorf("sandbox %s process cgroup %s is outside slice %s", c.Name, cgroup, b.sliceCgroup)
 	}
 	dir := filepath.Join(b.config.CgroupRoot, cgroup)
 	limits := map[string]string{}
 	for _, name := range []string{"memory.max", "memory.swap.max", "pids.max", "cpu.max"} {
 		if limits[name], err = readSmall(filepath.Join(dir, name)); err != nil {
-			return fmt.Errorf("sandbox %s cgroup %s: %w", c.Name, cgroup, vanished(err))
+			return "", fmt.Errorf("sandbox %s cgroup %s: %w", c.Name, cgroup, vanished(err))
 		}
 	}
 	memory, swap, pids, cpu := limits["memory.max"], limits["memory.swap.max"], limits["pids.max"], limits["cpu.max"]
@@ -1129,10 +1178,10 @@ func (b *GVisor) verifyProcess(c inspectedContainer, s spec) error {
 	millis := s.host.NanoCpus / 1_000_000
 	if memory != strconv.FormatInt(s.host.Memory, 10) || swap != "0" || pids != strconv.FormatInt(*s.host.PidsLimit, 10) ||
 		quota <= 0 || period <= 0 || quota*1000 != millis*period {
-		return fmt.Errorf("sandbox %s kernel limits cpu.max=%q memory.max=%q memory.swap.max=%q pids.max=%q differ from the lease",
+		return "", fmt.Errorf("sandbox %s kernel limits cpu.max=%q memory.max=%q memory.swap.max=%q pids.max=%q differ from the lease",
 			c.Name, cpu, memory, swap, pids)
 	}
-	return nil
+	return cgroup, nil
 }
 
 // processCgroup returns the cgroup v2 path of a process.
@@ -1186,8 +1235,12 @@ func sameSet(left, right []string) bool {
 // image unless another container still uses it. It is idempotent.
 func (b *GVisor) Destroy(ctx context.Context, instanceID string) error {
 	existing, found, err := b.inspect(ctx, instanceID)
-	if err != nil || !found {
+	if err != nil {
 		return err
+	}
+	if !found {
+		b.forgetCgroup(instanceID)
+		return nil
 	}
 	if existing.Config.Labels[LabelSandbox] != sandboxLabelV1 {
 		return fmt.Errorf("container %s is not a sandbox", instanceID)
@@ -1195,10 +1248,19 @@ func (b *GVisor) Destroy(ctx context.Context, instanceID string) error {
 	if err := b.removeContainer(ctx, instanceID); err != nil {
 		return err
 	}
+	b.forgetCgroup(instanceID)
 	if imageID := existing.Image; strings.HasPrefix(imageID, "sha256:") {
 		return b.releaseImage(ctx, imageID)
 	}
 	return nil
+}
+
+// forgetCgroup drops the recorded cgroup of an instance whose container is
+// gone.
+func (b *GVisor) forgetCgroup(instanceID string) {
+	b.mu.Lock()
+	delete(b.cgroups, instanceID)
+	b.mu.Unlock()
 }
 
 func (b *GVisor) removeContainer(ctx context.Context, instanceID string) error {

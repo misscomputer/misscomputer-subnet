@@ -14,10 +14,12 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
@@ -79,6 +81,11 @@ type fakeEngine struct {
 	// started rewrites a container after start and inspected after each
 	// inspection, standing in for a workload that exits.
 	started, inspected func(*engineContainer)
+	// holdStart, when it returns a channel, holds a start in progress
+	// (without blocking other requests) until that channel closes, standing
+	// in for a runtime whose processes exist before the engine reports the
+	// container running.
+	holdStart func(*engineContainer) <-chan struct{}
 }
 
 func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
@@ -251,6 +258,13 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			reply(w, 404, map[string]string{"message": "No such container"})
 			return
+		}
+		if e.holdStart != nil {
+			if hold := e.holdStart(c); hold != nil {
+				e.mu.Unlock()
+				<-hold
+				e.mu.Lock()
+			}
 		}
 		c.Status, c.StartedAt = "running", "2026-10-14T12:00:01Z"
 		if e.started != nil {
@@ -622,6 +636,88 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 			}
 		})
 	}
+}
+
+// With more than one sandbox, another sandbox's processes are not this
+// one's leftovers (SR-26-16/INT-26-13): neither while the other sandbox's
+// workload winds down or its container is removed, nor while it is starting
+// and the engine does not yet report it running. Once the other container
+// is gone, processes left in its cgroup count again.
+func TestCreateServesAnExitBesideOtherSandboxes(t *testing.T) {
+	exit := func(c *engineContainer) { c.Status, c.FinishedAt = "exited", "2026-10-14T12:00:02.5Z" }
+	leaseOf := func(n int) protocol.SandboxLeaseV1 {
+		return testLease(func(l *protocol.SandboxLeaseV1) { l.SandboxID = "sbx-" + strings.Repeat("0", 31) + strconv.Itoa(n) })
+	}
+	otherProcs := func(h *host) string {
+		return filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "docker-1.scope", "cgroup.procs")
+	}
+	exitsAtOnce := func(h *host, names ...string) {
+		h.engine.started = func(c *engineContainer) {
+			if slices.Contains(names, c.Name) {
+				exit(c)
+			}
+		}
+	}
+
+	t.Run("while another winds down or is removed", func(t *testing.T) {
+		h := newHost(t)
+		b := h.backend()
+		ctx := context.Background()
+		first, second, third := leaseOf(1), leaseOf(2), leaseOf(3)
+		if err := b.Create(ctx, instanceOf(first), first); err != nil {
+			t.Fatal(err)
+		}
+		// The first sandbox's workload exits; its processes linger.
+		exit(h.engine.containers[instanceOf(first)])
+		writeFile(t, otherProcs(h), "4243\n")
+		exitsAtOnce(h, instanceOf(second), instanceOf(third))
+		if err := b.Create(ctx, instanceOf(second), second); err != nil {
+			t.Fatalf("create = %v, want the exit served beside a winding-down sandbox", err)
+		}
+		if err := b.Destroy(ctx, instanceOf(first)); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Create(ctx, instanceOf(third), third); err == nil || !strings.Contains(err.Error(), "processes remain") {
+			t.Fatalf("create = %v, want processes left by a removed sandbox to count", err)
+		}
+	})
+
+	t.Run("while another is starting", func(t *testing.T) {
+		h := newHost(t)
+		b := h.backend()
+		ctx := context.Background()
+		first, second := leaseOf(1), leaseOf(2)
+		entered, release := make(chan struct{}), make(chan struct{})
+		h.engine.holdStart = func(c *engineContainer) <-chan struct{} {
+			if c.Name != instanceOf(first) {
+				return nil
+			}
+			// The runtime's processes exist before the engine reports
+			// the container running.
+			writeFile(t, otherProcs(h), "4243\n")
+			close(entered)
+			return release
+		}
+		exitsAtOnce(h, instanceOf(second))
+		firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+		go func() { firstDone <- b.Create(ctx, instanceOf(first), first) }()
+		<-entered
+		go func() { secondDone <- b.Create(ctx, instanceOf(second), second) }()
+		select {
+		case err := <-secondDone:
+			close(release)
+			<-firstDone
+			t.Fatalf("second sandbox was checked while the first was starting: %v", err)
+		case <-time.After(300 * time.Millisecond):
+		}
+		close(release)
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-secondDone; err != nil {
+			t.Fatalf("create = %v, want the exit served once the other sandbox started", err)
+		}
+	})
 }
 
 func mustDigest(t *testing.T, lease protocol.SandboxLeaseV1) string {
