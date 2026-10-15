@@ -14,6 +14,10 @@ permissions:
 
 env:
   BACKEND_SHA: c96d46566be8b75b496c80981e2c9dcf87f22230
+  # Repetitions of TestGVisorLaneOnDisposableHost only, in this one job, so
+  # the D11 exited-workload case meets both exit-before and exit-after
+  # readback timings. The oversized test still runs once.
+  LANE_TEST_COUNT: "10"
 
 jobs:
   backend-on-host:
@@ -101,11 +105,20 @@ jobs:
             MC_SANDBOX_RUNSC_PATH="$MC_SANDBOX_RUNSC_PATH" MC_SANDBOX_RUNSC_SHA256="$MC_SANDBOX_RUNSC_SHA256" \
             MC_SANDBOX_SENTRY_PATH="$MC_SANDBOX_SENTRY_PATH" MC_SANDBOX_SENTRY_SHA256="$MC_SANDBOX_SENTRY_SHA256" \
             MC_SANDBOX_DATA_ROOT="$MC_SANDBOX_DATA_ROOT" MC_SANDBOX_SLICE="$MC_SANDBOX_SLICE" \
-            "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestGVisorLaneOnDisposableHost$' -test.v -test.count 1 -test.timeout 15m \
+            "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestGVisorLaneOnDisposableHost$' -test.v -test.count "$LANE_TEST_COUNT" -test.timeout 20m \
             2>&1 | tee "$RUNNER_TEMP/backend-test.log"
           touch "$RUNNER_TEMP/observe.stop"
           wait "$watcher" || true
-          grep -qx -- '--- PASS: TestGVisorLaneOnDisposableHost.*' "$RUNNER_TEMP/backend-test.log" || { echo 'backend integration test did not pass (a skip is not a pass)'; exit 1; }
+          # Every exit-attribution decision the backend logged, verbatim.
+          grep -F 'sandbox exit attribution' "$RUNNER_TEMP/backend-test.log" > "$RUNNER_TEMP/exit-attribution.log" || true
+          passes=$(grep -cx -- '--- PASS: TestGVisorLaneOnDisposableHost.*' "$RUNNER_TEMP/backend-test.log" || true)
+          fails=$(grep -c -- '--- FAIL: TestGVisorLaneOnDisposableHost' "$RUNNER_TEMP/backend-test.log" || true)
+          records=$(wc -l < "$RUNNER_TEMP/exit-attribution.log")
+          {
+            echo "TestGVisorLaneOnDisposableHost: $passes passed, $fails failed of $LANE_TEST_COUNT; sandbox exit attribution records: $records"
+            sed 's/^/    /' "$RUNNER_TEMP/exit-attribution.log"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $passes == "$LANE_TEST_COUNT" && $fails == 0 ]] || { echo 'backend integration test did not pass every repetition (a skip is not a pass)'; exit 1; }
       - name: Independent observations of the backend's live sandboxes
         if: always()
         run: python3 host/scripts/sandbox-host/observe-backend-instances.py summarize "$RUNNER_TEMP/profile.json" "$RUNNER_TEMP/backend-instances.jsonl" | tee -a "$GITHUB_STEP_SUMMARY"; exit "${PIPESTATUS[0]}"
@@ -190,6 +203,7 @@ jobs:
           name: sandbox-backend-host-proof-${{ github.event.pull_request.head.sha }}
           path: |
             ${{ runner.temp }}/backend-test.log
+            ${{ runner.temp }}/exit-attribution.log
             ${{ runner.temp }}/preflight-checks.json
             ${{ runner.temp }}/profile.json
             ${{ runner.temp }}/backend-instances.jsonl
