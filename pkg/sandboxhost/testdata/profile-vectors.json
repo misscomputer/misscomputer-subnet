@@ -1,0 +1,163 @@
+{
+  "comment": "Shared by pkg/sandboxhost (Go) and scripts/sandbox-host/report.py (Python) tests: both must accept valid with this digest and reject every mutation.",
+  "valid": {
+    "schema": "miss.computer/misscomputer-subnet/sandbox-host-profile",
+    "schema_version": 1,
+    "docker_host": "unix:///run/mcsbx/run/docker/docker.sock",
+    "containerd": {
+      "address": "/run/mcsbx/run/containerd/containerd.sock",
+      "namespace": "mc-sandbox",
+      "plugins_namespace": "mc-sandbox-plugins"
+    },
+    "data_root": "/run/mcsbx/data",
+    "docker_data_root": "/run/mcsbx/data/docker",
+    "run_root": "/run/mcsbx/run",
+    "runtime": {
+      "name": "runsc",
+      "path": "/run/mcsbx/bin/runsc",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sentry_path": "/run/mcsbx/bin/gvisor-bin/gvisor_sentry",
+      "sentry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "args": [
+        "--systemd-cgroup",
+        "--overlay2=none"
+      ],
+      "release": "release-20261005.0"
+    },
+    "engine": {
+      "docker_version": "28.0.4",
+      "egress_table": "mcsbx_engine_egress"
+    },
+    "cgroup_root": "/sys/fs/cgroup",
+    "lease_slice": "mcsbxlease.slice",
+    "engine_slice": "mcsbxengine.slice",
+    "aggregate": {
+      "cpu_millis": 2000,
+      "memory_mib": 1024,
+      "pids": 1024,
+      "data_fs_mib": 4096,
+      "run_tmpfs_mib": 64,
+      "image_reserve_mib": 512,
+      "engine_overhead_mib": 512,
+      "image_max_mib": 256,
+      "log_mib": 16,
+      "disk_mib": 1984,
+      "sandboxes": 4
+    },
+    "per_lease": {
+      "default_writable_mib": 64,
+      "log_max_size_mib": 8,
+      "log_max_file": 2,
+      "pids_max": 64,
+      "mounts": "none",
+      "image_volumes": "refuse",
+      "network_modes": [
+        "none"
+      ],
+      "isolation": [
+        "gvisor"
+      ]
+    }
+  },
+  "valid_digest": "sha256:48a3cea900f8000842f68e7d906179a3bd94e9eab46084de98e04da666f0cb3c",
+  "invalid": [
+    {
+      "name": "default docker socket",
+      "path": [
+        "docker_host"
+      ],
+      "value": "unix:///var/run/docker.sock"
+    },
+    {
+      "name": "shared containerd namespace",
+      "path": [
+        "containerd",
+        "namespace"
+      ],
+      "value": "moby"
+    },
+    {
+      "name": "runsc without overlay2=none",
+      "path": [
+        "runtime",
+        "args"
+      ],
+      "value": [
+        "--systemd-cgroup"
+      ]
+    },
+    {
+      "name": "D7 disk overcommit",
+      "path": [
+        "aggregate",
+        "disk_mib"
+      ],
+      "value": 1985
+    },
+    {
+      "name": "log_mib not max-size x max-file",
+      "path": [
+        "aggregate",
+        "log_mib"
+      ],
+      "value": 8
+    },
+    {
+      "name": "pids do not cover sandboxes x pids_max",
+      "path": [
+        "per_lease",
+        "pids_max"
+      ],
+      "value": 512
+    },
+    {
+      "name": "public egress",
+      "path": [
+        "per_lease",
+        "network_modes"
+      ],
+      "value": [
+        "none",
+        "public"
+      ]
+    },
+    {
+      "name": "hyphenated slice",
+      "path": [
+        "lease_slice"
+      ],
+      "value": "mc-sandbox.slice"
+    },
+    {
+      "name": "unclean data root",
+      "path": [
+        "data_root"
+      ],
+      "value": "/run/mcsbx/data/"
+    },
+    {
+      "name": "non-integer size",
+      "path": [
+        "aggregate",
+        "sandboxes"
+      ],
+      "value": 4.5
+    },
+    {
+      "name": "unknown member",
+      "path": [
+        "engine",
+        "extra"
+      ],
+      "value": 1
+    },
+    {
+      "name": "no egress table",
+      "path": [
+        "engine",
+        "egress_table"
+      ],
+      "value": ""
+    }
+  ]
+}

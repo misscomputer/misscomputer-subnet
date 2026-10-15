@@ -1,0 +1,666 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package sandboxhost
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"net/netip"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"golang.org/x/sys/unix"
+)
+
+// Host reads the kernel's view of this machine. Proc is the procfs mount of
+// the host PID namespace ("/proc" when empty; an agent in a container with
+// the host's procfs mounted elsewhere names that mount). Every read is
+// read-only; nothing is created, written or signalled.
+type Host struct {
+	Proc string
+	// ListNFTable returns `nft list table inet <name>`; nil runs the nft
+	// binary read-only. An agent that reads the ruleset another way (for
+	// example through a privileged helper) supplies it here.
+	ListNFTable func(name string) (string, error)
+}
+
+func (h Host) listEgressTable(name string) (string, error) {
+	if h.ListNFTable != nil {
+		return h.ListNFTable(name)
+	}
+	out, err := exec.Command("nft", "list", "table", "inet", name).Output()
+	if err != nil {
+		return "", fmt.Errorf("nft list table inet %s: %w", name, err)
+	}
+	return string(out), nil
+}
+
+// Destinations the engine slice must never reach.
+var egressDenied = []string{
+	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+	"192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
+	"::/127", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "ff00::/8",
+}
+
+// localReject is the rule body that rejects every address of this host,
+// whichever interface carries it (a public address on an interface is not
+// covered by any fixed prefix). It must apply to both families.
+const localReject = "fib daddr type local"
+
+// egressRestricted checks the listed table: an output hook; reject rules
+// matching the engine slice by name (a stale cgroup ID prints as a number)
+// that together cover every denied prefix; a reject rule for every local
+// address of the host in both families; and accept rules that only admit
+// the local resolver on port 53.
+func egressRestricted(listing, engineSlice string) error {
+	match := `socket cgroupv2 level 1 "` + engineSlice + `"`
+	if !strings.Contains(listing, "hook output") {
+		return errors.New("egress table has no output hook")
+	}
+	covered := map[netip.Prefix]bool{}
+	local := false
+	for _, line := range strings.Split(listing, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "socket cgroupv2") {
+			continue
+		}
+		if !strings.HasPrefix(line, match+" ") {
+			return fmt.Errorf("rule does not match %s by name (stale cgroup?): %s", engineSlice, line)
+		}
+		switch {
+		case strings.Contains(line, " reject") && strings.Contains(line, localReject):
+			// Family-limited forms (ip/ip6/nfproto) would leave the other family open.
+			body := strings.TrimPrefix(line, match+" ")
+			if strings.HasPrefix(body, localReject+" ") {
+				local = true
+			}
+		case strings.Contains(line, " reject"):
+			// nft may print a prefix in another textual form (for example
+			// ::ffff:0.0.0.0/96), so compare parsed, masked prefixes.
+			for _, token := range strings.FieldsFunc(line, func(r rune) bool { return r == ' ' || r == ',' || r == '{' || r == '}' }) {
+				if prefix, err := netip.ParsePrefix(token); err == nil {
+					covered[prefix.Masked()] = true
+				}
+			}
+		case strings.HasSuffix(line, " accept") && strings.Contains(line, "ip daddr 127.0.0.53 ") && strings.Contains(line, "th dport 53 "):
+		default:
+			return fmt.Errorf("unexpected engine egress rule: %s", line)
+		}
+	}
+	for _, text := range egressDenied {
+		if !covered[netip.MustParsePrefix(text).Masked()] {
+			return fmt.Errorf("engine egress does not reject %s", text)
+		}
+	}
+	if !local {
+		return errors.New("engine egress does not reject the host's own addresses (fib daddr type local) for both families")
+	}
+	return nil
+}
+
+func (h Host) proc(parts ...string) string {
+	root := h.Proc
+	if root == "" {
+		root = "/proc"
+	}
+	return filepath.Join(append([]string{root}, parts...)...)
+}
+
+type recorder struct{ checks []Check }
+
+func (r *recorder) add(id string, err error, evidence string) {
+	entry, _ := catalogEntry(id)
+	status := StatusPass
+	if err != nil {
+		status, evidence = StatusFail, err.Error()
+	}
+	r.checks = append(r.checks, Check{ID: id, Class: entry.Class, Status: status, Evidence: clean(evidence)})
+}
+
+func (r *recorder) gap(id, evidence string) {
+	r.checks = append(r.checks, Check{ID: id, Class: Unenforced, Status: StatusGap, Evidence: clean(evidence)})
+}
+
+func clean(text string) string {
+	out := make([]byte, 0, len(text))
+	for i := 0; i < len(text) && len(out) < 500; i++ {
+		switch c := text[i]; {
+		case c >= 0x20 && c <= 0x7e:
+			out = append(out, c)
+		case c == '\n' || c == '\t':
+			out = append(out, ' ')
+		}
+	}
+	return string(out)
+}
+
+// slicePath is the cgroup v2 path of a top-level slice. Profiles allow only
+// top-level names without '-', which systemd maps to /<name>.
+func slicePath(name string) string { return "/" + name }
+
+func within(child, parent string) bool {
+	return child == parent || strings.HasPrefix(child, parent+"/")
+}
+
+// Preflight observes every preflight check this package owns, plus every
+// declared gap, for the host profile describes. exclusive names cgroups
+// sandboxes must never share (the agent's own and the deployment.v4
+// replicas'); the caller's own cgroup is always included. Engine checks
+// come from the backend's engine client and are merged with BuildReport.
+func (h Host) Preflight(profile Profile, exclusive []string) []Check {
+	var r recorder
+	lease, engine := slicePath(profile.LeaseSlice), slicePath(profile.EngineSlice)
+	cg := cgroupReader{root: profile.CgroupRoot}
+
+	r.add("host.cgroup2_mount_authentic", h.cgroup2Authentic(profile.CgroupRoot), profile.CgroupRoot+": cgroup2 superblock magic, single mount of the hierarchy root")
+
+	leaseLimits, leaseErr := cg.limits(lease)
+	if leaseErr == nil && (leaseLimits.cpuQuota <= 0 || leaseLimits.memory <= 0 || leaseLimits.pids <= 0) {
+		leaseErr = fmt.Errorf("%s limits are not all finite: %s", lease, leaseLimits)
+	}
+	r.add("cgroup.lease_slice_finite", leaseErr, lease+" "+leaseLimits.String())
+	swapErr := leaseErr
+	if swapErr == nil && leaseLimits.swap != 0 {
+		swapErr = fmt.Errorf("%s memory.swap.max=%d", lease, leaseLimits.swap)
+	}
+	r.add("cgroup.lease_slice_swap_zero", swapErr, lease+" memory.swap.max=0")
+
+	engineLimits, engineErr := cg.limits(engine)
+	if engineErr == nil && (engineLimits.memory <= 0 || engineLimits.pids <= 0 || engineLimits.swap != 0) {
+		engineErr = fmt.Errorf("%s limits are not finite with swap 0: %s", engine, engineLimits)
+	}
+	r.add("cgroup.engine_slice_finite", engineErr, engine+" "+engineLimits.String())
+
+	need := int64(profile.Aggregate.Sandboxes) * int64(profile.PerLease.PIDsMax)
+	pidsErr := leaseErr
+	if pidsErr == nil && leaseLimits.pids < need {
+		pidsErr = fmt.Errorf("%s pids.max=%d < sandboxes x pids_max = %d", lease, leaseLimits.pids, need)
+	}
+	r.add("cgroup.pids_finite_covers_sum", pidsErr, fmt.Sprintf("%s pids.max=%d >= %d", lease, leaseLimits.pids, need))
+
+	members, memberErr := h.socketOwnersIn(engine, profile.DockerSocket(), profile.Containerd.Address)
+	r.add("cgroup.engine_processes_member", memberErr, members)
+
+	self, disjointErr := h.processCgroup("self")
+	if disjointErr == nil {
+		disjointErr = disjoint(lease, engine, append([]string{self}, exclusive...))
+	}
+	r.add("cgroup.disjoint_from_caller", disjointErr, fmt.Sprintf("%s and %s disjoint from caller %s and %v", lease, engine, self, exclusive))
+
+	mounts, mountErr := h.mounts()
+	quotaErr := mountErr
+	if quotaErr == nil {
+		quotaErr = xfsProjectQuota(mounts, profile.DataRoot)
+	}
+	r.add("storage.data_fs_xfs_prjquota", quotaErr, profile.DataRoot+": xfs, prjquota accounting and enforcement")
+	var dataBytes int64
+	sizeErr := mountErr
+	if sizeErr == nil {
+		dataBytes, sizeErr = dedicatedSize(mounts, profile.DataRoot, int64(profile.Aggregate.DataFSMiB)<<20)
+	}
+	r.add("storage.data_fs_dedicated_finite", sizeErr, fmt.Sprintf("%s: one whole xfs mount of %d bytes", profile.DataRoot, dataBytes))
+	runErr := mountErr
+	if runErr == nil {
+		runErr = sizedTmpfs(mounts, profile.RunRoot, profile.DockerSocket(), profile.Containerd.Address)
+	}
+	r.add("storage.run_root_tmpfs_finite", runErr, profile.RunRoot+": sized tmpfs holding both engine sockets")
+
+	a := profile.Aggregate
+	budgetErr := errors.Join(leaseErr, sizeErr)
+	if budgetErr == nil {
+		switch {
+		case int64(a.CPUMillis) > leaseLimits.cpuMillis():
+			budgetErr = fmt.Errorf("profile cpu %d millis > slice %d", a.CPUMillis, leaseLimits.cpuMillis())
+		case int64(a.MemoryMiB) > leaseLimits.memory>>20:
+			budgetErr = fmt.Errorf("profile memory %d MiB > slice %d MiB", a.MemoryMiB, leaseLimits.memory>>20)
+		case int64(a.PIDs) > leaseLimits.pids:
+			budgetErr = fmt.Errorf("profile pids %d > slice %d", a.PIDs, leaseLimits.pids)
+		case int64(a.DiskRequiredMiB()) > dataBytes>>20:
+			budgetErr = fmt.Errorf("disk with overhead %d MiB > data filesystem %d MiB", a.DiskRequiredMiB(), dataBytes>>20)
+		}
+	}
+	r.add("budget.within_observed", budgetErr, fmt.Sprintf("profile within observed slice; disk %d MiB + overhead = %d MiB <= %d MiB", a.DiskMiB, a.DiskRequiredMiB(), dataBytes>>20))
+
+	listing, egressErr := h.listEgressTable(profile.Engine.EgressTable)
+	if egressErr == nil {
+		egressErr = egressRestricted(listing, profile.EngineSlice)
+	}
+	r.add("network.engine_egress_restricted", egressErr, fmt.Sprintf("nft table inet %s rejects non-public destinations for %s", profile.Engine.EgressTable, profile.EngineSlice))
+
+	r.gap("storage.images_cache_unreserved", "image and pull bytes share the data filesystem; the image reserve is arithmetic, not a quota")
+	r.gap("storage.shim_socket_dir_shared", "containerd shim sockets live in the host-wide /run/containerd/s directory")
+	r.gap("network.engine_pull_egress_public_unrestricted", "the engine may reach any public unicast address; no registry hostname allowlist")
+	r.gap("network.public_allowlist_unsupported", "only network=none is provisioned; public and allowlist must be refused")
+	r.gap("lease.guest_pids_host_task_semantics", "the lease pids limit bounds sentry host tasks, not guest processes; exceeding it may terminate the sandbox")
+	r.gap("lease.image_volumes_refused", "the engine gives image VOLUMEs no per-lease quota; the backend must refuse such images")
+	return r.checks
+}
+
+// ObserveInstance observes the instance checks this package owns for the
+// sandbox whose sentry (the engine's container PID) is pid. The sentry's
+// executable, cgroup and limits are observed by the backend (catalog owner).
+func (h Host) ObserveInstance(profile Profile, pid int) []Check {
+	var r recorder
+	procs, err := h.runtimeProcesses(profile, slicePath(profile.LeaseSlice), slicePath(profile.EngineSlice))
+	r.add("lease.runtime_processes_in_finite_cgroups", err, procs)
+	netErr := fmt.Errorf("PID %d is not a process", pid)
+	if pid > 0 {
+		netErr = h.loOnlyNoRoutes(strconv.Itoa(pid))
+	}
+	r.add("lease.host_netns_lo_only_no_routes", netErr, fmt.Sprintf("network namespace of PID %d: only lo, no route off lo", pid))
+	return r.checks
+}
+
+// ---- cgroups ---------------------------------------------------------------
+
+// sliceLimits holds cgroup v2 limits; -1 is "max".
+type sliceLimits struct {
+	cpuQuota, cpuPeriod, memory, swap, pids int64
+}
+
+func (l sliceLimits) cpuMillis() int64 {
+	if l.cpuQuota <= 0 || l.cpuPeriod <= 0 {
+		return -1
+	}
+	return l.cpuQuota * 1000 / l.cpuPeriod
+}
+
+func (l sliceLimits) String() string {
+	return fmt.Sprintf("cpu.max=%d/%d memory.max=%d memory.swap.max=%d pids.max=%d", l.cpuQuota, l.cpuPeriod, l.memory, l.swap, l.pids)
+}
+
+type cgroupReader struct{ root string }
+
+func parseLimit(value string) (int64, error) {
+	if value == "max" {
+		return -1, nil
+	}
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("malformed cgroup limit %q", value)
+	}
+	return n, nil
+}
+
+func (c cgroupReader) limits(cgroup string) (sliceLimits, error) {
+	dir, err := openNoFollow(c.root, cgroup)
+	if err != nil {
+		return sliceLimits{}, err
+	}
+	defer unix.Close(dir)
+	var l sliceLimits
+	cpu, err := readAt(dir, "cpu.max")
+	if err != nil {
+		return l, fmt.Errorf("%s: %w", cgroup, err)
+	}
+	fields := strings.Fields(cpu)
+	if len(fields) != 2 {
+		return l, fmt.Errorf("%s cpu.max %q is malformed", cgroup, cpu)
+	}
+	if l.cpuQuota, err = parseLimit(fields[0]); err != nil {
+		return l, err
+	}
+	if l.cpuPeriod, err = strconv.ParseInt(fields[1], 10, 64); err != nil || l.cpuPeriod <= 0 {
+		return l, fmt.Errorf("%s cpu.max period %q is malformed", cgroup, fields[1])
+	}
+	for _, item := range []struct {
+		name   string
+		target *int64
+	}{{"memory.max", &l.memory}, {"memory.swap.max", &l.swap}, {"pids.max", &l.pids}} {
+		value, err := readAt(dir, item.name)
+		if err != nil {
+			return l, fmt.Errorf("%s: %w", cgroup, err)
+		}
+		if *item.target, err = parseLimit(value); err != nil {
+			return l, err
+		}
+	}
+	return l, nil
+}
+
+// openNoFollow opens root/cgroup one component at a time without following
+// symlinks, so a link cannot substitute another subtree's limits.
+func openNoFollow(root, cgroup string) (int, error) {
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, fmt.Errorf("open cgroup root %s: %w", root, err)
+	}
+	for _, part := range strings.Split(strings.Trim(cgroup, "/"), "/") {
+		if part == "" || part == "." || part == ".." {
+			unix.Close(fd)
+			return -1, fmt.Errorf("cgroup path %q is not clean", cgroup)
+		}
+		next, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		unix.Close(fd)
+		if err != nil {
+			return -1, fmt.Errorf("open cgroup %s: %w", cgroup, err)
+		}
+		fd = next
+	}
+	return fd, nil
+}
+
+func readAt(dir int, name string) (string, error) {
+	fd, err := unix.Openat(dir, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", name, err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, 257))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > 256 {
+		return "", fmt.Errorf("%s is too large", name)
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+func (h Host) processCgroup(pid string) (string, error) {
+	raw, err := os.ReadFile(h.proc(pid, "cgroup"))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if rest, ok := strings.CutPrefix(line, "0::"); ok && strings.HasPrefix(rest, "/") {
+			return rest, nil
+		}
+	}
+	return "", fmt.Errorf("PID %s has no cgroup v2 membership", pid)
+}
+
+func disjoint(lease, engine string, others []string) error {
+	if within(lease, engine) || within(engine, lease) {
+		return fmt.Errorf("%s overlaps %s", lease, engine)
+	}
+	for _, other := range others {
+		if other == "" || !path.IsAbs(other) || path.Clean(other) != other || other == "/" {
+			return fmt.Errorf("exclusive cgroup %q must be a clean absolute path below the root", other)
+		}
+		for _, mine := range []string{lease, engine} {
+			if within(mine, other) || within(other, mine) {
+				return fmt.Errorf("%s overlaps %s", mine, other)
+			}
+		}
+	}
+	return nil
+}
+
+// ---- mounts ----------------------------------------------------------------
+
+type mount struct{ root, target, fstype, superOptions string }
+
+func unescapeMount(field string) string {
+	var b strings.Builder
+	for i := 0; i < len(field); i++ {
+		if field[i] == '\\' && i+3 < len(field) {
+			if n, err := strconv.ParseUint(field[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(field[i])
+	}
+	return b.String()
+}
+
+func (h Host) mounts() ([]mount, error) {
+	file, err := os.Open(h.proc("self", "mountinfo"))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var out []mount
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		left, right, ok := strings.Cut(scanner.Text(), " - ")
+		fields, tail := strings.Fields(left), strings.Fields(right)
+		if !ok || len(fields) < 5 || len(tail) < 3 {
+			return nil, errors.New("malformed mountinfo line")
+		}
+		out = append(out, mount{root: unescapeMount(fields[3]), target: unescapeMount(fields[4]), fstype: tail[0], superOptions: tail[2]})
+	}
+	return out, scanner.Err()
+}
+
+func mountsAt(mounts []mount, target string) []mount {
+	var out []mount
+	for _, m := range mounts {
+		if m.target == target {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func hasOption(options, want string) bool {
+	for _, option := range strings.Split(options, ",") {
+		if option == want {
+			return true
+		}
+	}
+	return false
+}
+
+func statfsType(name string, magic int64) error {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(name, &stat); err != nil {
+		return fmt.Errorf("statfs %s: %w", name, err)
+	}
+	if stat.Type != magic {
+		return fmt.Errorf("%s superblock magic %#x, want %#x", name, stat.Type, magic)
+	}
+	return nil
+}
+
+func (h Host) cgroup2Authentic(root string) error {
+	if err := statfsType(root, unix.CGROUP2_SUPER_MAGIC); err != nil {
+		return err
+	}
+	mounts, err := h.mounts()
+	if err != nil {
+		return err
+	}
+	at := mountsAt(mounts, root)
+	if len(at) != 1 || at[0].fstype != "cgroup2" || at[0].root != "/" {
+		return fmt.Errorf("%s must be exactly one cgroup2 mount of the hierarchy root, found %v", root, at)
+	}
+	return nil
+}
+
+// xfsProjectQuota relies on XFS reporting its live quota state as mount
+// options: prjquota is accounting and enforcement, pqnoenforce accounting
+// only.
+func xfsProjectQuota(mounts []mount, dataRoot string) error {
+	if err := statfsType(dataRoot, unix.XFS_SUPER_MAGIC); err != nil {
+		return err
+	}
+	at := mountsAt(mounts, dataRoot)
+	if len(at) != 1 || !hasOption(at[0].superOptions, "prjquota") || hasOption(at[0].superOptions, "pqnoenforce") {
+		return fmt.Errorf("%s project quota is not enforced: %v", dataRoot, at)
+	}
+	return nil
+}
+
+func dedicatedSize(mounts []mount, dataRoot string, want int64) (int64, error) {
+	at := mountsAt(mounts, dataRoot)
+	if len(at) != 1 || at[0].fstype != "xfs" || at[0].root != "/" {
+		return 0, fmt.Errorf("%s must be exactly one whole xfs filesystem, found %v", dataRoot, at)
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(dataRoot, &stat); err != nil {
+		return 0, err
+	}
+	size := int64(stat.Blocks) * stat.Bsize
+	if size > want || size < want*9/10 {
+		return size, fmt.Errorf("%s holds %d bytes, profile says %d", dataRoot, size, want)
+	}
+	return size, nil
+}
+
+func sizedTmpfs(mounts []mount, runRoot string, sockets ...string) error {
+	at := mountsAt(mounts, runRoot)
+	if len(at) != 1 || at[0].fstype != "tmpfs" {
+		return fmt.Errorf("%s must be exactly one tmpfs, found %v", runRoot, at)
+	}
+	sized := false
+	for _, option := range strings.Split(at[0].superOptions, ",") {
+		if size, ok := strings.CutPrefix(option, "size="); ok && strings.TrimLeft(size, "0") != "" && !strings.HasPrefix(size, "0") {
+			sized = true
+		}
+	}
+	if !sized {
+		return fmt.Errorf("%s tmpfs has no size limit", runRoot)
+	}
+	for _, socket := range sockets {
+		if !strings.HasPrefix(socket, runRoot+"/") {
+			return fmt.Errorf("socket %s is not on %s", socket, runRoot)
+		}
+	}
+	return nil
+}
+
+// ---- processes -------------------------------------------------------------
+
+// socketOwnersIn finds the processes holding each listening unix socket
+// path and requires every one of them to be in cgroup.
+func (h Host) socketOwnersIn(cgroup string, sockets ...string) (string, error) {
+	raw, err := os.ReadFile(h.proc("net", "unix"))
+	if err != nil {
+		return "", err
+	}
+	inodes := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 8 {
+			continue
+		}
+		for _, socket := range sockets {
+			if fields[7] == socket {
+				inodes["socket:["+fields[6]+"]"] = socket
+			}
+		}
+	}
+	owners := map[string][]string{}
+	if err := h.eachPID(func(pid string) error {
+		fds, err := os.ReadDir(h.proc(pid, "fd"))
+		if err != nil {
+			return nil // exited, or not readable without privilege
+		}
+		for _, fd := range fds {
+			if link, err := os.Readlink(h.proc(pid, "fd", fd.Name())); err == nil {
+				if socket, ok := inodes[link]; ok {
+					owners[socket] = append(owners[socket], pid)
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	var evidence strings.Builder
+	for _, socket := range sockets {
+		if len(owners[socket]) == 0 {
+			return evidence.String(), fmt.Errorf("no visible process holds listening socket %s", socket)
+		}
+		for _, pid := range owners[socket] {
+			member, err := h.processCgroup(pid)
+			if err != nil {
+				return evidence.String(), err
+			}
+			if !within(member, cgroup) {
+				return evidence.String(), fmt.Errorf("PID %s holding %s is in %s, not %s", pid, socket, member, cgroup)
+			}
+			fmt.Fprintf(&evidence, "%s pid=%s cgroup=%s; ", path.Base(socket), pid, member)
+		}
+	}
+	return evidence.String(), nil
+}
+
+func (h Host) eachPID(visit func(pid string) error) error {
+	entries, err := os.ReadDir(h.proc())
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if _, err := strconv.Atoi(entry.Name()); err == nil {
+			if err := visit(entry.Name()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// runtimeProcesses requires every process executing from the runtime's
+// directory (runsc, the sentry, gofers, the pinned containerd and shim) to
+// be in the lease or engine slice.
+func (h Host) runtimeProcesses(profile Profile, lease, engine string) (string, error) {
+	binDir := path.Dir(profile.Runtime.Path) + "/"
+	var evidence strings.Builder
+	found := 0
+	err := h.eachPID(func(pid string) error {
+		exe, err := os.Readlink(h.proc(pid, "exe"))
+		if err != nil || !strings.HasPrefix(exe, binDir) {
+			return nil
+		}
+		member, err := h.processCgroup(pid)
+		if err != nil {
+			return nil // exited
+		}
+		if !within(member, lease) && !within(member, engine) {
+			return fmt.Errorf("PID %s (%s) is in unbounded cgroup %s", pid, exe, member)
+		}
+		found++
+		fmt.Fprintf(&evidence, "%s@%s ", path.Base(exe), member)
+		return nil
+	})
+	if err == nil && found == 0 {
+		err = fmt.Errorf("no process executes from %s", binDir)
+	}
+	return evidence.String(), err
+}
+
+// loOnlyNoRoutes reads pid's network namespace through procfs, which shows
+// the namespace of the named process, not the reader's.
+func (h Host) loOnlyNoRoutes(pid string) error {
+	dev, err := os.ReadFile(h.proc(pid, "net", "dev"))
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.TrimSpace(string(dev)), "\n")
+	var names []string
+	for _, line := range lines[min(2, len(lines)):] {
+		name, _, _ := strings.Cut(strings.TrimSpace(line), ":")
+		names = append(names, name)
+	}
+	if len(names) != 1 || names[0] != "lo" {
+		return fmt.Errorf("interfaces %v, want only lo", names)
+	}
+	route, err := os.ReadFile(h.proc(pid, "net", "route"))
+	if err != nil {
+		return err
+	}
+	if lines := strings.Split(strings.TrimSpace(string(route)), "\n"); len(lines) > 1 {
+		return fmt.Errorf("%d IPv4 routes present", len(lines)-1)
+	}
+	v6, err := os.ReadFile(h.proc(pid, "net", "ipv6_route"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(v6)), "\n") {
+		if fields := strings.Fields(line); len(fields) == 10 && fields[9] != "lo" {
+			return fmt.Errorf("IPv6 route via %s", fields[9])
+		}
+	}
+	return nil
+}

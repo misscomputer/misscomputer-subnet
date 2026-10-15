@@ -1,0 +1,71 @@
+name: sandbox-host disposable conformance
+
+# Privileged proof of the dedicated sandbox engine on a disposable
+# GitHub-hosted VM. A maintainer applies the label to a same-repository PR;
+# the job checks out that PR's exact head SHA. Never route this to a
+# self-hosted runner: the scripts change mounts, loop devices and cgroups.
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    if: >-
+      github.event.label.name == 'run-sandbox-host-gate' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.23.12"
+          cache: false
+      - name: Build the pkg/sandboxhost observer from this checkout
+        run: go build -trimpath -o "$RUNNER_TEMP/sandbox-host-observe" ./cmd/sandbox-host-observe
+      - name: Install pinned XFS and nftables tooling and record runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xfsprogs=6.6.0-1ubuntu2.1 nftables
+          nft --version
+          printf 'Checkout: %s\n' "$(git rev-parse HEAD)"
+          printf 'Runner image: %s %s\n' "$ImageOS" "$ImageVersion"
+          printf 'Kernel: %s\n' "$(uname -r)"
+          systemctl --version | head -1
+          docker version
+          printf 'Runner containerd (not used by the dedicated engine): %s\n' "$(containerd --version)"
+          mkfs.xfs -V
+      - name: Provision dedicated engine
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash scripts/sandbox-host/provision-disposable.sh
+      - name: Conformance
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+          MC_SANDBOX_HOST_OBSERVER: ${{ runner.temp }}/sandbox-host-observe
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,MC_SANDBOX_HOST_OBSERVER,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,GITHUB_RUN_ID,ImageOS,ImageVersion bash scripts/sandbox-host/conformance.sh
+      - name: Teardown and verify cleanup
+        if: always()
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash scripts/sandbox-host/teardown-disposable.sh
+      - name: Validate report
+        if: always()
+        run: |
+          sudo chown -R "$(id -u)" "$RUNNER_TEMP/mcsbx-report" 2>/dev/null || true
+          report=$RUNNER_TEMP/mcsbx-report/sandbox-host-preflight.conformance.json
+          [[ -f $report ]] || { echo 'no report: conformance did not run (provisioning failed)'; exit 1; }
+          python3 scripts/sandbox-host/report.py validate "$report"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sandbox-host-preflight-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/mcsbx-report/
+          if-no-files-found: warn
+          retention-days: 30
