@@ -17,8 +17,9 @@
 #       require their SHA-256 digests.
 #   publish-probes.sh check-environment OWNER/REPO ENVIRONMENT
 #       With GITHUB_TOKEN (actions: read), require that the environment
-#       exists with at least one required reviewer, no administrator bypass,
-#       and a deployment-branch policy of exactly the branch main. GitHub
+#       exists with at least one required reviewer, self-review prevented,
+#       no administrator bypass, and a deployment-branch policy of exactly
+#       the branch main. GitHub
 #       creates a missing environment without protection on first use, so
 #       the publish job runs this before it touches the registry.
 set -euo pipefail
@@ -72,18 +73,25 @@ cmd_push() {
 		target_flag=(--oci-layout)
 		;;
 	esac
-	local name digest tag existing got errors
+	local name digest tag existing got errors absent
 	errors=$(mktemp)
 	trap 'rm -f "$errors"' RETURN
 	while read -r name digest; do
 		tag="$name-v1"
+		# The only answers that mean the tag does not exist: oras's
+		# not-found for this exact reference, from the registry or the
+		# layout. Any other failure, such as a credential helper that is
+		# itself "not found", could hide a tag that would be re-pointed.
+		if [ ${#target_flag[@]} -gt 0 ]; then
+			absent="Error: failed to resolve digest: not found"
+		else
+			absent="Error response from registry: failed to resolve digest: $target:$tag: not found"
+		fi
 		if [ ${#target_flag[@]} -gt 0 ] && [ ! -d "$target" ]; then
 			: # a dry run into a layout that does not exist yet: no tag exists
 		elif existing=$(oras resolve "${target_flag[@]}" "$target:$tag" 2>"$errors"); then
 			[ "$existing" = "$digest" ] || die "$target:$tag already names $existing, not $digest; refusing to overwrite"
-		elif ! grep -qiE 'not found|name unknown' "$errors"; then
-			# Only a definite "not found" means the tag is absent; any other
-			# failure could hide an existing tag that would be re-pointed.
+		elif [ "$(cat "$errors")" != "$absent" ]; then
 			die "cannot tell whether $target:$tag exists: $(tr '\n' ' ' <"$errors")"
 		fi
 		if [ ${#target_flag[@]} -gt 0 ]; then
@@ -141,6 +149,8 @@ cmd_check_environment() {
 		die "environment $environment of $repo is not readable"
 	jq -e '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length > 0' "$tmp/environment" >/dev/null ||
 		die "environment $environment has no required reviewer"
+	jq -e '[.protection_rules[]? | select(.type == "required_reviewers" and .prevent_self_review == true)] | length > 0' "$tmp/environment" >/dev/null ||
+		die "environment $environment lets the person who dispatches a run approve it (prevent self-review is off)"
 	jq -e '.can_admins_bypass == false' "$tmp/environment" >/dev/null ||
 		die "environment $environment lets administrators bypass its protection rules"
 	jq -e '.deployment_branch_policy.custom_branch_policies == true and .deployment_branch_policy.protected_branches == false' "$tmp/environment" >/dev/null ||
@@ -149,7 +159,7 @@ cmd_check_environment() {
 		die "deployment branch policies of $environment are not readable"
 	jq -e '.total_count == 1 and (.branch_policies | length) == 1 and .branch_policies[0].name == "main" and (.branch_policies[0].type // "branch") == "branch"' "$tmp/policies" >/dev/null ||
 		die "environment $environment must allow deployments from exactly the branch main"
-	echo "environment $environment: required reviewers, no administrator bypass, deployments from main only"
+	echo "environment $environment: required reviewers, no self-review, no administrator bypass, deployments from main only"
 }
 
 case "${1:-}" in

@@ -6,10 +6,12 @@ name: publish-sandbox-probes
 # each manifest with a checksum-pinned oras using this job's GITHUB_TOKEN.
 # "check-public" needs no credentials: it reads every pinned manifest, blob
 # and tag anonymously. The publish job runs in the "probe-publication"
-# environment, which an org owner configures (required reviewer, no
-# administrator bypass, deployments from main only) and which the job
-# checks before it touches the registry. Making the package public is an
-# org owner's step in the package settings; nothing here can do it. The
+# environment, which the repository owner (the user misscomputer)
+# configures (a required reviewer other than the dispatcher, self-review
+# prevented, no administrator bypass, deployments from main only) and
+# which the job checks before it touches the registry. Making the package
+# public is the owner's step in the package settings; nothing here can do
+# it. The
 # guards in this file bind only this file: see "What the environment does
 # not cover" in docs/sandbox-probe-images.md.
 on:
