@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Lab harness, not part of this repository's build: the disposable-host lab
+// workflow copies it into a checkout of the backend under test as
+// cmd/mcsbx-lab-preflight/main.go and builds it there. It calls
+// sandboxbackend.OpenFromProfile exactly as the miner agent does and prints
+// whether the backend opened, the error, and the combined preflight report.
+//
+//	mcsbx-lab-preflight PROFILE DAEMON_CONFIG DEPLOYMENT_CGROUP
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandboxbackend"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandboxhost"
+)
+
+func main() {
+	if len(os.Args) != 4 {
+		fmt.Fprintln(os.Stderr, "usage: mcsbx-lab-preflight PROFILE DAEMON_CONFIG DEPLOYMENT_CGROUP")
+		os.Exit(2)
+	}
+	profile, err := sandboxhost.LoadProfile(os.Args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "profile:", err)
+		os.Exit(2)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	backend, report, openErr := sandboxbackend.OpenFromProfile(ctx, profile, os.Args[2], sandboxhost.Host{}, []string{os.Args[3]})
+	out := map[string]any{"opened": backend != nil, "error": nil, "report": report}
+	if openErr != nil {
+		out["error"] = openErr.Error()
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(out); err != nil {
+		os.Exit(2)
+	}
+}
