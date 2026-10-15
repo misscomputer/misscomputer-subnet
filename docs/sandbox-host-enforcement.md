@@ -226,3 +226,14 @@ endpoint (SR-27-12).
 
 These are lab proofs of the readback. They do not activate anything; a live
 host must still pass its own preflight.
+
+## Backend on this host (DEP-3)
+
+`.github/workflows/sandbox-backend-host-proof.yml` (label
+`run-sandbox-backend-gate`) provisions this host from the PR head, checks the
+host with `pkg/sandboxhost`, and runs the backend's own env-gated
+`TestGVisorLaneOnDisposableHost` from a pinned, reviewed source SHA
+(`BACKEND_SHA`) with every `MC_SANDBOX_*` value derived from the emitted
+profile. A skipped test fails the job. It proves the backend's preflight,
+create, idempotent replay, release-after-destroy and restart recovery on this
+host for those two SHAs only; it does not wire `--sandbox-leases on`.

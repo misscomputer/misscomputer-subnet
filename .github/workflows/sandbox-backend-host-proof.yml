@@ -1,0 +1,122 @@
+name: sandbox backend on disposable host
+
+# DEP-3: run the gVisor backend's own env-gated integration test, at a pinned
+# reviewed source SHA, on a host provisioned by scripts/sandbox-host from this
+# PR's exact head. GitHub-hosted only; the host is discarded with the VM.
+# The backend SHA is a reviewed pin: changing it is a reviewed change.
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  BACKEND_SHA: 2c574a2fd789ad9c0c025939b71a5fe8398bbbdc
+
+jobs:
+  backend-on-host:
+    if: >-
+      github.event.label.name == 'run-sandbox-backend-gate' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: host
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.BACKEND_SHA }}
+          path: backend
+          persist-credentials: false
+      - name: Record exact source pins
+        run: |
+          host_sha=$(git -C host rev-parse HEAD)
+          backend_sha=$(git -C backend rev-parse HEAD)
+          # shellcheck disable=SC2153 # BACKEND_SHA is the workflow-level pin
+          [[ $backend_sha == "$BACKEND_SHA" ]] || { echo "backend checkout $backend_sha != pin $BACKEND_SHA"; exit 1; }
+          printf 'host scripts: %s\nbackend source: %s\n' "$host_sha" "$backend_sha" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.23.12"
+          cache: false
+      - name: Build the observer and the backend integration test as the runner user
+        run: |
+          (cd host && go build -trimpath -o "$RUNNER_TEMP/sandbox-host-observe" ./cmd/sandbox-host-observe)
+          (cd backend && go test -c -trimpath -o "$RUNNER_TEMP/sandboxbackend.test" ./pkg/sandboxbackend)
+      - name: Install pinned XFS and nftables tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xfsprogs=6.6.0-1ubuntu2.1 nftables
+      - name: Provision dedicated engine
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+          # The backend test holds one minimum lease (5120 MiB disk, 1 CPU,
+          # 1024 MiB), so the lab is sized up from the conformance default.
+          MC_SANDBOX_HOST_DATA_FS_MIB: "8192"
+          MC_SANDBOX_HOST_LEASE_MEMORY_MIB: "2048"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,MC_SANDBOX_HOST_DATA_FS_MIB,MC_SANDBOX_HOST_LEASE_MEMORY_MIB,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/provision-disposable.sh
+      - name: Live host preflight with pkg/sandboxhost
+        run: |
+          # The profile holds paths and hashes only; copy it out of the root-only
+          # work root into a runner-owned file.
+          # shellcheck disable=SC2024
+          sudo cat "$RUNNER_TEMP/mcsbx/profile.json" > "$RUNNER_TEMP/profile.json"
+          sudo "$RUNNER_TEMP/sandbox-host-observe" -profile "$RUNNER_TEMP/profile.json" preflight | tee "$RUNNER_TEMP/preflight-checks.json"
+          python3 - "$RUNNER_TEMP/preflight-checks.json" <<'PY'
+          import json, sys
+          bad = [c for c in json.load(open(sys.argv[1])) if c['status'] not in ('pass', 'gap')]
+          for c in bad:
+              print(f"FAIL {c['id']}: {c['evidence']}")
+          raise SystemExit(1 if bad else 0)
+          PY
+      - name: Backend integration test on the provisioned host
+        run: |
+          eval "$(python3 - "$RUNNER_TEMP/profile.json" <<'PY'
+          import json, shlex, sys
+          p = json.load(open(sys.argv[1]))
+          env = {
+              'MC_SANDBOX_DOCKER_HOST': p['docker_host'], 'MC_SANDBOX_RUNTIME': p['runtime']['name'],
+              'MC_SANDBOX_RUNSC_PATH': p['runtime']['path'], 'MC_SANDBOX_RUNSC_SHA256': p['runtime']['sha256'],
+              'MC_SANDBOX_SENTRY_PATH': p['runtime']['sentry_path'], 'MC_SANDBOX_SENTRY_SHA256': p['runtime']['sentry_sha256'],
+              'MC_SANDBOX_DATA_ROOT': p['docker_data_root'], 'MC_SANDBOX_SLICE': p['lease_slice'],
+          }
+          for key, value in env.items():
+              print(f'export {key}={shlex.quote(value)}')
+          PY
+          )"
+          sudo env MC_SANDBOX_BACKEND_IT=1 MC_SANDBOX_DEPLOYMENT_CGROUP=/mcsbxdeployment.slice \
+            MC_SANDBOX_DOCKER_HOST="$MC_SANDBOX_DOCKER_HOST" MC_SANDBOX_RUNTIME="$MC_SANDBOX_RUNTIME" \
+            MC_SANDBOX_RUNSC_PATH="$MC_SANDBOX_RUNSC_PATH" MC_SANDBOX_RUNSC_SHA256="$MC_SANDBOX_RUNSC_SHA256" \
+            MC_SANDBOX_SENTRY_PATH="$MC_SANDBOX_SENTRY_PATH" MC_SANDBOX_SENTRY_SHA256="$MC_SANDBOX_SENTRY_SHA256" \
+            MC_SANDBOX_DATA_ROOT="$MC_SANDBOX_DATA_ROOT" MC_SANDBOX_SLICE="$MC_SANDBOX_SLICE" \
+            "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestGVisorLaneOnDisposableHost$' -test.v -test.count 1 -test.timeout 15m \
+            2>&1 | tee "$RUNNER_TEMP/backend-test.log"
+          grep -qx -- '--- PASS: TestGVisorLaneOnDisposableHost.*' "$RUNNER_TEMP/backend-test.log" || { echo 'backend integration test did not pass (a skip is not a pass)'; exit 1; }
+      - name: Host state after the backend test
+        if: always()
+        run: |
+          sock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json" 2>/dev/null || true)
+          [[ -n $sock ]] || exit 0
+          left=$(sudo docker -H "$sock" ps -aq | wc -l)
+          children=$(sudo find /sys/fs/cgroup/mcsbxlease.slice -mindepth 1 -maxdepth 1 -type d -name 'docker-*' | wc -l)
+          echo "after test: containers=$left lease sandbox cgroups=$children" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $left == 0 && $children == 0 ]]
+      - name: Teardown and verify cleanup
+        if: always()
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/teardown-disposable.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sandbox-backend-host-proof-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/backend-test.log
+            ${{ runner.temp }}/preflight-checks.json
+            ${{ runner.temp }}/profile.json
+          if-no-files-found: warn
+          retention-days: 30
