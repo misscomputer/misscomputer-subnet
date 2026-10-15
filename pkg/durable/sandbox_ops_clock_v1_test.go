@@ -106,3 +106,55 @@ func TestSandboxOpWindowRefusalHoldsAfterBackwardStep(t *testing.T) {
 		t.Fatalf("refused request admitted after a backward step: %+v %v", decision, err)
 	}
 }
+
+// SR-49-01: lease liveness is decided at the high-water time, not the wall
+// clock. Once a decision has passed the lease's expiry, a wall clock stepped
+// back before that expiry must not make the lease live again. A new op, an
+// exec lookup and an exact replay are each answered by the lease state
+// (lease_expired), never as admitted, found or replayed live.
+func TestSandboxOpLeaseExpiryHoldsAfterBackwardStep(t *testing.T) {
+	f := newOpsFixture(t)
+	ctx := context.Background()
+	expiry := sandboxT0.Add(10 * time.Minute)
+	beforeExpiry := expiry.Add(-20 * time.Second)
+	f.clock.set(beforeExpiry)
+	start := f.op(t, sandbox.OpExecStart, 1, beforeExpiry, nil)
+	if decision, err := f.ops.AdmitOp(ctx, start); err != nil || !decision.Start {
+		t.Fatalf("admission before expiry %+v %v", decision, err)
+	}
+	// One decision after the expiry raises the high-water time past it.
+	pastExpiry := expiry.Add(5 * time.Second)
+	f.clock.set(pastExpiry)
+	if decision, err := f.ops.AdmitOp(ctx, f.op(t, sandbox.OpFileStat, 2, pastExpiry, nil)); err != nil || decision.Unavailable == nil {
+		t.Fatalf("decision past expiry %+v %v", decision, err)
+	}
+	// The wall clock steps back to before the expiry. Every request below
+	// is inside its own window at both times, so only lease liveness
+	// decides.
+	stepped := expiry.Add(-10 * time.Second)
+	f.clock.set(stepped)
+	expired := func(name string, decidedAt time.Time, state *SandboxOpLeaseState) {
+		t.Helper()
+		if state == nil || state.RefusalCode(decidedAt) != "lease_expired" || decidedAt.Before(pastExpiry) {
+			t.Fatalf("%s answered live after a backward step: decided %v, state %+v", name, decidedAt, state)
+		}
+	}
+	fresh, err := f.ops.AdmitOp(ctx, f.op(t, sandbox.OpExecStart, 3, stepped, nil))
+	if err != nil || fresh.Start {
+		t.Fatalf("new exec_start %+v %v", fresh, err)
+	}
+	expired("new admission", fresh.DecidedAt, fresh.Unavailable)
+	lookup, err := f.ops.LookupExec(ctx, f.op(t, sandbox.OpExecRead, 2, stepped, nil))
+	if err != nil || lookup.Found {
+		t.Fatalf("lookup %+v %v", lookup, err)
+	}
+	expired("exec lookup", lookup.DecidedAt, lookup.Unavailable)
+	replay, err := f.ops.AdmitOp(ctx, start)
+	if err != nil || replay.Start || !replay.Replay {
+		t.Fatalf("exact replay %+v %v", replay, err)
+	}
+	expired("exact replay", replay.DecidedAt, replay.Unavailable)
+	if _, execs := opRows(t, f.store); execs != 1 {
+		t.Fatalf("%d exec rows; only the exec admitted before expiry may exist", execs)
+	}
+}
