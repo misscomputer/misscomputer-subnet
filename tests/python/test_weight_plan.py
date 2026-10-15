@@ -250,17 +250,28 @@ def test_unfinalized_or_duplicate_snapshot_identity_fails_closed() -> None:
         )
 
 
+@pytest.mark.parametrize("force_visible_fallback", [False, True])
 def test_atomic_plan_write_is_private_idempotent_and_replaces_new_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    force_visible_fallback: bool,
 ) -> None:
     target = tmp_path / "plans" / "weight-plan.json"
     target.parent.mkdir(mode=0o700)
-    fsync_kinds: list[str] = []
+    if force_visible_fallback:
+
+        def link_unavailable(_descriptor: int, _directory_fd: int, name: str) -> None:
+            raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), name)
+
+        monkeypatch.setattr(weight_plan_module, "_link_unnamed_temporary", link_unavailable)
+
+    fsync_events: list[tuple[str, int, int]] = []
     real_fsync = os.fsync
 
     def recording_fsync(descriptor: int) -> None:
-        fsync_kinds.append("directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file")
+        value = os.fstat(descriptor)
+        kind = "directory" if stat.S_ISDIR(value.st_mode) else "file"
+        fsync_events.append((kind, value.st_ino, value.st_nlink))
         real_fsync(descriptor)
 
     monkeypatch.setattr(os, "fsync", recording_fsync)
@@ -268,25 +279,41 @@ def test_atomic_plan_write_is_private_idempotent_and_replaces_new_snapshot(
     assert write_weight_plan_atomic(first, target) is True
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert target.read_bytes() == first.canonical_bytes()
-    assert fsync_kinds == ["file", "directory"]
     first_inode = target.stat().st_ino
+    first_file_syncs = sum(kind == "file" for kind, _, _ in fsync_events)
+    assert any(
+        kind == "file" and inode == first_inode and (not force_visible_fallback or links == 1)
+        for kind, inode, links in fsync_events
+    )
+    assert [kind for kind, _, _ in fsync_events if kind == "directory"] == ["directory"]
+    assert fsync_events[-1][0] == "directory"
     first_mtime = target.stat().st_mtime_ns
 
-    fsync_kinds.clear()
+    fsync_events.clear()
     assert write_weight_plan_atomic(first, target) is False
     assert target.stat().st_ino == first_inode
     assert target.stat().st_mtime_ns == first_mtime
-    assert fsync_kinds == []
+    assert fsync_events == []
 
-    fsync_kinds.clear()
+    fsync_events.clear()
     replacement = plan(block=102)
     assert write_weight_plan_atomic(replacement, target) is True
     assert target.read_bytes() == replacement.canonical_bytes()
     assert target.stat().st_ino != first_inode
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
-    # Replacement retains a separately fsynced rollback copy until the
-    # exchanged destination has been byte- and identity-verified.
-    assert fsync_kinds == ["file", "file", "directory"]
+    # The published inode and a rollback copy are fsynced before the directory.
+    # A kernel that cannot link O_TMPFILE may also fsync a discarded unnamed
+    # inode before taking the visible temporary fallback. In the forced
+    # fallback, require a linked inode's fsync to avoid inode-reuse false positives.
+    assert any(
+        kind == "file"
+        and inode == target.stat().st_ino
+        and (not force_visible_fallback or links == 1)
+        for kind, inode, links in fsync_events
+    )
+    assert sum(kind == "file" for kind, _, _ in fsync_events) >= 2 * first_file_syncs
+    assert [kind for kind, _, _ in fsync_events if kind == "directory"] == ["directory"]
+    assert fsync_events[-1][0] == "directory"
 
 
 def test_unnamed_temporary_materialization_enoent_uses_visible_fallback(
