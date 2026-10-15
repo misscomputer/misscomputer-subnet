@@ -127,7 +127,7 @@ func opRows(t *testing.T, store *Store) (ops, execs int) {
 
 func schemaWithoutOps(t *testing.T, store *Store) string {
 	t.Helper()
-	rows, err := store.db.Query(`SELECT type,name,COALESCE(sql,'') FROM sqlite_master WHERE tbl_name NOT IN ('sandbox_ops','sandbox_execs') ORDER BY type,name`)
+	rows, err := store.db.Query(`SELECT type,name,COALESCE(sql,'') FROM sqlite_master WHERE tbl_name NOT IN ('sandbox_ops','sandbox_execs','sandbox_ops_clock') ORDER BY type,name`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func schemaWithoutOps(t *testing.T, store *Store) string {
 func opsTables(t *testing.T, store *Store) int {
 	t.Helper()
 	var count int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE tbl_name IN ('sandbox_ops','sandbox_execs')`).Scan(&count); err != nil {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE tbl_name IN ('sandbox_ops','sandbox_execs','sandbox_ops_clock')`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count
@@ -296,10 +296,13 @@ func TestSandboxOpOnPendingLeaseRecordsNothing(t *testing.T) {
 	if _, err := f.leases.CommitLease(ctx, pending, sandboxT0); err != nil {
 		t.Fatal(err)
 	}
-	decision, err := f.ops.AdmitOp(ctx, f.opOn(t, f.parties, pending, sandbox.OpExecStart, 1, f.clock.read(), nil))
-	if err != nil || decision.Unavailable == nil || decision.Unavailable.Status != "pending" || decision.Start {
+	request := f.opOn(t, f.parties, pending, sandbox.OpExecStart, 1, f.clock.read(), nil)
+	decision, err := f.ops.AdmitOp(ctx, request)
+	if err != nil || decision.Unavailable == nil || decision.Unavailable.Status != "pending" || decision.Start ||
+		decision.Unavailable.RefusalCode(decision.DecidedAt) != "lease_not_running" {
 		t.Fatalf("op on a pending lease %+v %v", decision, err)
 	}
+	assertRefusedReceipt(t, f, request, "lease_not_running")
 	if ops, _ := opRows(t, f.store); ops != 0 {
 		t.Fatal("refused op was recorded")
 	}
