@@ -1,0 +1,66 @@
+name: sandbox-host no-start probes
+
+# Lab observation only (lane 6 addendum A1, provisional D23): record raw
+# engine and runsc state for sandboxes whose workload never starts, three
+# times each, on a host provisioned by scripts/sandbox-host from this PR's
+# exact head. No backend code runs; nothing is attributed from text.
+# GitHub-hosted only; the host is discarded with the VM.
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  no-start-probes:
+    if: >-
+      github.event.label.name == 'run-sandbox-nostart-probes' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Record exact source pin
+        run: |
+          printf 'host scripts: %s\n' "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install pinned XFS and nftables tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xfsprogs=6.6.0-1ubuntu2.1 nftables
+      - name: Provision dedicated engine
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+          MC_SANDBOX_HOST_DATA_FS_MIB: "8192"
+          MC_SANDBOX_HOST_LEASE_MEMORY_MIB: "2048"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,MC_SANDBOX_HOST_DATA_FS_MIB,MC_SANDBOX_HOST_LEASE_MEMORY_MIB,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash scripts/sandbox-host/provision-disposable.sh
+      - name: Record no-start behaviour of engine and runsc (raw, no attribution)
+        run: |
+          # shellcheck disable=SC2024 # runner-owned copy of the paths-only profile
+          sudo cat "$RUNNER_TEMP/mcsbx/profile.json" > "$RUNNER_TEMP/profile.json"
+          sock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json")
+          image=docker.io/library/busybox@sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f
+          sudo docker -H "$sock" pull --quiet --platform linux/amd64 "$image"
+          sudo python3 scripts/sandbox-host/probe-command-failures.py "$RUNNER_TEMP/profile.json" "$image" "$RUNNER_TEMP/no-start-probes.json" \
+            missing_command,non_executable_command,wrong_architecture_elf,missing_interpreter,unresolvable_config_user,unresolvable_config_group,control_runs_and_exits \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo chmod 0644 "$RUNNER_TEMP/no-start-probes.json"
+          sudo docker -H "$sock" image rm "$image" >/dev/null
+          left=$(sudo docker -H "$sock" ps -aq | wc -l)
+          echo "after probes: containers=$left" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $left == 0 ]]
+      - name: Teardown and verify cleanup
+        if: always()
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash scripts/sandbox-host/teardown-disposable.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sandbox-no-start-probes-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/no-start-probes.json
+          if-no-files-found: warn
+          retention-days: 30

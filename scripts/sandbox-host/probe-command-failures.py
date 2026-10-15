@@ -22,7 +22,7 @@ command that runs and exits, a fork storm at start and a memory exhaustion at
 start; the last two run three times each. Runs as root on the disposable host
 only.
 
-  probe-command-failures.py PROFILE IMAGE OUT
+  probe-command-failures.py PROFILE IMAGE OUT [CASE,CASE...]
 """
 
 from __future__ import annotations
@@ -200,8 +200,35 @@ def slice_quiet(lease_dir: str) -> dict[str, Any]:
     return {"quiet": not busy, "busy_cgroups": busy}
 
 
+def stability(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Which recorded fields were identical across attempts (no interpretation)."""
+
+    def zero_time(value: Any) -> bool:
+        return isinstance(value, str) and value.startswith("0001-01-01")
+
+    columns = {
+        "Status": [a["state"].get("Status") for a in attempts],
+        "Pid": [a["state"].get("Pid") for a in attempts],
+        "StartedAt_zero": [zero_time(a["state"].get("StartedAt")) for a in attempts],
+        "FinishedAt_zero": [zero_time(a["state"].get("FinishedAt")) for a in attempts],
+        "ExitCode": [a["state"].get("ExitCode") for a in attempts],
+        "Error": [a["state"].get("Error") for a in attempts],
+        "run_rc": [a["run_rc"] for a in attempts],
+        "no_process_before_removal": [
+            not a["before_removal"]["runtime_processes_naming_container"] for a in attempts
+        ],
+        "no_cgroup_before_removal": [
+            not a["before_removal"]["lease_cgroups_naming_container"] for a in attempts
+        ],
+    }
+    return {
+        name: {"values": values, "stable": len({json.dumps(v) for v in values}) <= 1}
+        for name, values in columns.items()
+    }
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    if len(argv) not in (3, 4):
         print(__doc__, file=sys.stderr)
         return 2
     with open(argv[0], encoding="utf-8") as handle:
@@ -213,18 +240,38 @@ def main(argv: list[str]) -> int:
     lease_prefix = "/" + profile["lease_slice"] + "/"
     # case: (extra file, ENTRYPOINT json, repeats, seconds to wait for an exit)
     cases: dict[str, tuple[tuple[str, bytes, int] | None, str, int, int]] = {
-        "missing_command": (None, '["/no/such/command"]', 1, 3),
+        "missing_command": (None, '["/no/such/command"]', 3, 3),
         "non_executable_command": (
             ("probe-noexec", b"#!/bin/sh\necho never\n", 0o644),
             '["/probe-noexec"]',
-            1,
+            3,
             3,
         ),
-        "wrong_architecture_elf": (("probe-arm64", aarch64_elf(), 0o755), '["/probe-arm64"]', 1, 3),
+        "wrong_architecture_elf": (("probe-arm64", aarch64_elf(), 0o755), '["/probe-arm64"]', 3, 3),
+        "missing_interpreter": (
+            ("probe-interp", b"#!/no/such/interpreter\necho never\n", 0o755),
+            '["/probe-interp"]',
+            3,
+            3,
+        ),
+        "unresolvable_config_user": (None, '["/bin/true"]', 3, 3),
+        "unresolvable_config_group": (None, '["/bin/true"]', 3, 3),
         "control_runs_and_exits": (None, '["/bin/true"]', 1, 5),
         "fork_storm_at_start": (None, json.dumps(["sh", "-c", STORM]), 3, 40),
         "memory_exhaustion_at_start": (None, json.dumps(["sh", "-c", MEMORY_HOG]), 3, 40),
     }
+    # Config.User set on the committed image; the backend runs the image's own user.
+    users = {
+        "unresolvable_config_user": "nosuchuser",
+        "unresolvable_config_group": "65534:nosuchgroup",
+    }
+    if len(argv) == 4:
+        wanted = set(argv[3].split(","))
+        unknown = wanted - set(cases)
+        if unknown:
+            print(f"unknown cases {sorted(unknown)}", file=sys.stderr)
+            return 2
+        cases = {name: spec for name, spec in cases.items() if name in wanted}
     results: dict[str, Any] = {
         "image": image,
         "flags": "backend create flags at the lease minimum: runsc, network none, lease slice, "
@@ -244,16 +291,10 @@ def main(argv: list[str]) -> int:
         if extra:
             name, data, mode = extra
             run(*docker, "cp", "-", base + "-base:/", stdin=layer(name, data, mode))
-        commit = run(
-            *docker,
-            "commit",
-            "--change",
-            f"ENTRYPOINT {entrypoint}",
-            "--change",
-            "CMD []",
-            base + "-base",
-            tag,
-        )
+        changes = ["--change", f"ENTRYPOINT {entrypoint}", "--change", "CMD []"]
+        if case in users:
+            changes += ["--change", f"USER {users[case]}"]
+        commit = run(*docker, "commit", *changes, base + "-base", tag)
         run(*docker, "rm", base + "-base")
         attempts = []
         for attempt in range(repeats):
@@ -347,8 +388,10 @@ def main(argv: list[str]) -> int:
             )
         results["cases"][case] = {
             "entrypoint": entrypoint,
+            "config_user": users.get(case),
             "image_commit_rc": commit.returncode,
             "attempts": attempts,
+            "stability": stability(attempts),
         }
         run(*docker, "image", "rm", tag)
     with open(out, "w", encoding="utf-8") as handle:
@@ -372,6 +415,9 @@ def main(argv: list[str]) -> int:
                 f"memory.events.local={events.get('memory.events.local')}",
             ]
             print(" ".join(line))
+        if "stability" in result:
+            stable = {name: column["stable"] for name, column in result["stability"].items()}
+            print(f"{case} stability across {len(result['attempts'])} attempts: {stable}")
     return 0
 
 
