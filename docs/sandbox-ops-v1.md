@@ -290,7 +290,14 @@ security design review, and the helper slice must meet them:
   regular file, or a directory holding a fake helper. The backend must not
   assume the target is benign. The mount must resolve inside the sandbox
   root filesystem (gVisor resolves mounts in the sentry). A conflict that
-  makes create fail is a non-fault refusal, not `runtime_start_failed`.
+  makes create fail is a non-fault refusal, never `runtime_start_failed`:
+  that code would let one customer-chosen image exclude honest miners.
+  The sandbox-lease-v1 receipt codes are frozen and none names this case,
+  so the helper slice must do two things. First, detect the conflict from
+  the verified image config before any engine create, where it can.
+  Second, answer with an existing non-fault lease code named explicitly in
+  that slice and agreed with the contract owner. It must not reuse a code
+  whose meaning misleads customers.
   The helper path must still run the pinned binary, which is checked by
   hashing it inside the guest. Probe D5-P9 covers each of these cases, and
   the pass condition is that the host filesystem is untouched.
