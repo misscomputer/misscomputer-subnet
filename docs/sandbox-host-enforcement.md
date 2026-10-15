@@ -269,3 +269,12 @@ The independent probe records the real dockerd's raw `/images/create`
 answer (status, longest progress line, whether a line carries the registry
 body); the backend test's own assertion is its classification of that
 answer.
+
+`.github/workflows/sandbox-host-no-start-probes.yml` (label
+`run-sandbox-nostart-probes`) runs only `probe-command-failures.py` for
+workloads that never start (missing command, non-executable command,
+wrong-architecture ELF, missing script interpreter, unresolvable
+`Config.User` name or group), three times each, plus a control that runs and
+exits. It records raw engine and runsc state and which fields stayed
+identical across attempts; it runs no backend code and infers nothing from
+error text or from `ExitCode`/`FinishedAt`.
