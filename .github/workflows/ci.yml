@@ -12,6 +12,8 @@ jobs:
       - run: ./scripts/check-commit-attribution.sh
       - run: ./scripts/check-public-boundary.sh
       - run: python scripts/check-release-metadata.py
+      - run: shellcheck -x scripts/sandbox-probes/publish-probes.sh
+      - run: scripts/sandbox-probes/publish-probes.sh layout "$RUNNER_TEMP/probe-layout"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

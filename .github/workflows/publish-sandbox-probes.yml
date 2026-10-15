@@ -4,9 +4,14 @@ name: publish-sandbox-probes
 # byte (docs/sandbox-probe-images.md). "publish" rebuilds the layout,
 # requires build_probe_images.py --verify and the committed pins, and copies
 # each manifest with a checksum-pinned oras using this job's GITHUB_TOKEN.
-# "check-public" needs no credentials: it reads every pinned manifest and
-# blob anonymously. Making the package public is an org owner's step in the
-# package settings; nothing here can do it.
+# "check-public" needs no credentials: it reads every pinned manifest, blob
+# and tag anonymously. The publish job runs in the "probe-publication"
+# environment, which an org owner configures (required reviewer, no
+# administrator bypass, deployments from main only) and which the job
+# checks before it touches the registry. Making the package public is an
+# org owner's step in the package settings; nothing here can do it. The
+# guards in this file bind only this file: see "What the environment does
+# not cover" in docs/sandbox-probe-images.md.
 on:
   workflow_dispatch:
     inputs:
@@ -38,7 +43,9 @@ jobs:
     if: inputs.mode == 'publish'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment: probe-publication
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
@@ -51,6 +58,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Require the owner-configured environment protection
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/sandbox-probes/publish-probes.sh check-environment "$GITHUB_REPOSITORY" probe-publication
       - name: Rebuild and verify the layout
         run: scripts/sandbox-probes/publish-probes.sh layout "$RUNNER_TEMP/probe-layout"
       - name: Install the pinned oras
