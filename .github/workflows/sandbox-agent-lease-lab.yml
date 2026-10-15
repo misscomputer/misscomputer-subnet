@@ -98,26 +98,38 @@ jobs:
           mkdir -p "$RUNNER_TEMP/agent/artifacts" "$RUNNER_TEMP/agent/docker-state"
           # Per-run random bridge secret; nothing durable is stored.
           (umask 077; openssl rand -hex 32 > "$RUNNER_TEMP/agent/bridge.secret")
-          # The runner user writes the log under RUNNER_TEMP; only the agent needs root.
-          # shellcheck disable=SC2024
-          sudo nohup "$RUNNER_TEMP/miner-agent" --bridge-secret-file "$RUNNER_TEMP/agent/bridge.secret" \
+          # A transient unit of its own: it outlives this step, has its own
+          # cgroup (disjoint from the lease and engine slices) and its exit
+          # status stays readable (RemainAfterExit).
+          log=$RUNNER_TEMP/lab-out/agent.log
+          : > "$log"
+          sudo systemd-run --quiet --unit mcsbxlabagent.service --property=Type=exec --property=RemainAfterExit=yes \
+            --property="StandardOutput=append:$log" --property="StandardError=append:$log" \
+            "$RUNNER_TEMP/miner-agent" --bridge-secret-file "$RUNNER_TEMP/agent/bridge.secret" \
             --network mock --netuid 1 --hotkey "$MINER_HOTKEY" --uid -1 \
             --service-key-file "$RUNNER_TEMP/agent/service.key" --state-db "$RUNNER_TEMP/agent/state.db" \
             --artifact-dir "$RUNNER_TEMP/agent/artifacts" --docker-state-dir "$RUNNER_TEMP/agent/docker-state" \
             --miner-transport http --allow-insecure-mock-http --bind 127.0.0.1:19101 \
             --sandbox-leases on --sandbox-host-profile "$RUNNER_TEMP/mcsbx/profile.json" \
-            --sandbox-deployment-cgroup /mcsbxdeploy.slice --sandbox-daemon-config "$RUNNER_TEMP/mcsbx/daemon.json" \
-            > "$RUNNER_TEMP/lab-out/agent.log" 2>&1 &
+            --sandbox-deployment-cgroup /mcsbxdeploy.slice --sandbox-daemon-config "$RUNNER_TEMP/mcsbx/daemon.json"
           for _ in $(seq 1 240); do
-            grep -q 'miner agent ready' "$RUNNER_TEMP/lab-out/agent.log" && break
-            pgrep -x miner-agent >/dev/null || break
+            grep -q 'miner agent ready' "$log" && break
+            [[ $(systemctl show --property=MainPID --value mcsbxlabagent.service) != 0 ]] || break
             sleep 0.5
           done
-          agent_pid=$(pgrep -x miner-agent | head -1 || true)
-          echo "agent pid=${agent_pid:-none} ready=$(grep -c 'miner agent ready' "$RUNNER_TEMP/lab-out/agent.log")" | tee -a "$GITHUB_STEP_SUMMARY"
+          agent_pid=$(systemctl show --property=MainPID --value mcsbxlabagent.service)
+          dockerd_pid=$(systemctl show --property=MainPID --value mcsbxdockerd.service)
+          {
+            echo "agent unit mcsbxlabagent.service pid=$agent_pid ready=$(grep -c 'miner agent ready' "$log")"
+            if [[ $agent_pid != 0 ]]; then
+              echo "agent cgroup=$(sudo cat /proc/"$agent_pid"/cgroup)"
+              echo "netns agent=$(sudo readlink /proc/"$agent_pid"/ns/net) dockerd=$(sudo readlink /proc/"$dockerd_pid"/ns/net)"
+              echo "pidns agent=$(sudo readlink /proc/"$agent_pid"/ns/pid) dockerd=$(sudo readlink /proc/"$dockerd_pid"/ns/pid)"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           echo "healthz=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:19101/healthz || true)" | tee -a "$GITHUB_STEP_SUMMARY"
           python3 host/scripts/sandbox-host/lab/parse_agent_log.py "$RUNNER_TEMP/lab-out/agent.log" "$RUNNER_TEMP/lab-out" | tee "$RUNNER_TEMP/lab-out/startup-report.txt" | head -1 | tee -a "$GITHUB_STEP_SUMMARY"
-          [[ -n $agent_pid ]] && grep -q 'miner agent ready' "$RUNNER_TEMP/lab-out/agent.log"
+          [[ $agent_pid != 0 ]] && grep -q 'miner agent ready' "$log"
           python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r and r["verdict"]=="pass" else 1)' "$RUNNER_TEMP/lab-out/startup-report.json"
       - name: One real lease through the agent bridge (reserve, commit, readback)
         run: |
@@ -173,14 +185,24 @@ jobs:
       - name: Stop the agent (SIGTERM) and record the exit
         if: always()
         run: |
-          agent_pid=$(pgrep -x miner-agent | head -1 || true)
-          if [[ -n $agent_pid ]]; then
-            sudo kill -TERM "$agent_pid"
-            for _ in $(seq 1 120); do sudo kill -0 "$agent_pid" 2>/dev/null || break; sleep 0.5; done
-            if sudo kill -0 "$agent_pid" 2>/dev/null; then echo 'agent still running 60s after SIGTERM; killing'; sudo kill -KILL "$agent_pid"; fi
+          unit=mcsbxlabagent.service
+          if systemctl list-units --all --plain --no-legend "$unit" | grep -q .; then
+            if [[ $(systemctl show --property=MainPID --value "$unit") != 0 ]]; then
+              sudo systemctl kill --signal=SIGTERM --kill-whom=main "$unit"
+              for _ in $(seq 1 120); do [[ $(systemctl show --property=MainPID --value "$unit") == 0 ]] && break; sleep 0.5; done
+              if [[ $(systemctl show --property=MainPID --value "$unit") != 0 ]]; then
+                echo 'agent still running 60s after SIGTERM; killing'
+                sudo systemctl kill --signal=SIGKILL "$unit"
+              fi
+            fi
+            echo "agent exit after SIGTERM: $(systemctl show --property=ExecMainCode --property=ExecMainStatus --property=Result "$unit" | tr '\n' ' ')" | tee -a "$GITHUB_STEP_SUMMARY"
+            sudo systemctl stop "$unit" >/dev/null 2>&1 || true
+            sudo systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+          else
+            echo 'agent unit never started' | tee -a "$GITHUB_STEP_SUMMARY"
           fi
-          grep -E 'miner agent stopped|level=ERROR| ERROR ' "$RUNNER_TEMP/lab-out/agent.log" | cut -c1-300 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo "agent stopped: pid=${agent_pid:-none}; engine containers=$(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq 2>/dev/null | wc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E 'miner agent stopped| ERROR ' "$RUNNER_TEMP/lab-out/agent.log" | cut -c1-300 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo "engine containers after agent stop: $(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq 2>/dev/null | wc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Default off - a sandbox setting without --sandbox-leases on is refused
         run: |
           rc=0
