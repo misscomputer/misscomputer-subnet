@@ -81,8 +81,11 @@ per-image limit (`image_unavailable`). The engine must record the image under th
 repository (after Docker normalization) and digest. A wrong record is a
 miner fault. The image must be `linux/amd64` and within the stored-size
 limit (otherwise `image_unavailable`). It must declare no `VOLUME`, whose
-bytes no quota counts (otherwise `resources_unsupported`). A refused image
-is removed. Every pull failure the engine reports is `image_unavailable`:
+bytes no quota counts (otherwise `resources_unsupported`). It must name a
+command: an entrypoint or a command whose first argument is not empty, after
+an entrypoint of `[""]` is cleared as the engine clears it (otherwise
+`image_unavailable`, decided before the container is created, contract
+D19). A refused image is removed. Every pull failure the engine reports is `image_unavailable`:
 registry answers of any status, transport failures to the registry, a pull
 that outlasts the create budget, and running out of space after the
 headroom check passed, because the engine relays registry-chosen text and

@@ -43,6 +43,8 @@ type engineImage struct {
 	Os, Arch     string
 	Size         int64
 	Volumes      map[string]any
+	Entrypoint   []string
+	Cmd          []string
 	PullStatus   int
 	PullMessages []string
 }
@@ -99,6 +101,7 @@ func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
 		catalog: map[string]engineImage{
 			"docker.io/library/busybox@" + testImageDigest: {
 				ID: testImageID, RepoDigests: []string{"busybox@" + testImageDigest}, Os: "linux", Arch: "amd64", Size: 4 << 20,
+				Cmd:          []string{"sh"},
 				PullMessages: []string{`{"id":"layer1","status":"Downloading","progressDetail":{"current":1,"total":2097152}}`, `{"status":"Status: Downloaded"}`},
 			},
 		},
@@ -178,7 +181,7 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reply(w, 200, map[string]any{"Id": image.ID, "RepoDigests": image.RepoDigests, "Os": image.Os, "Architecture": image.Arch,
-			"Size": image.Size, "Config": map[string]any{"Volumes": image.Volumes}})
+			"Size": image.Size, "Config": map[string]any{"Volumes": image.Volumes, "Entrypoint": image.Entrypoint, "Cmd": image.Cmd}})
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/images/"):
 		id := strings.TrimPrefix(p, "/images/")
 		if _, ok := e.images[id]; !ok {
@@ -221,8 +224,15 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		image, _ := body["Image"].(string)
-		if _, ok := e.images[image]; !ok {
+		stored, ok := e.images[image]
+		if !ok {
 			reply(w, 404, map[string]string{"message": "No such image: " + image})
+			return
+		}
+		if len(stored.Entrypoint) == 0 && len(stored.Cmd) == 0 {
+			// dockerd's answer when neither the image nor the request
+			// names a command.
+			reply(w, 400, map[string]string{"message": "no command specified"})
 			return
 		}
 		e.created = append(e.created, body)
@@ -476,6 +486,28 @@ func TestCreateRunsTheLeaseUnderGVisorAndDestroyRemovesEverything(t *testing.T) 
 	}
 }
 
+// The command check (contract D19) refuses only images with nothing to run:
+// an entrypoint alone, as the pause image has, or a command after a cleared
+// entrypoint still runs.
+func TestCreateRunsImagesThatNameACommandEitherWay(t *testing.T) {
+	key := "docker.io/library/busybox@" + testImageDigest
+	for name, set := range map[string]func(*engineImage){
+		"entrypoint only":                    func(i *engineImage) { i.Entrypoint, i.Cmd = []string{"/pause"}, nil },
+		"command after a cleared entrypoint": func(i *engineImage) { i.Entrypoint = []string{""} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHost(t)
+			image := h.engine.catalog[key]
+			set(&image)
+			h.engine.catalog[key] = image
+			lease := testLease(nil)
+			if err := h.backend().Create(context.Background(), instanceOf(lease), lease); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 // A container that exists but was never started (a crash between create and
 // start) is started and verified by a replayed Create; a container of the
 // same name made for another lease is never adopted.
@@ -648,6 +680,11 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 		{name: "unpacked image exceeds the limit", image: func(i *engineImage) { i.Size = 65<<20 + 1 }, code: "image_unavailable"},
 		{name: "image declares a volume", image: func(i *engineImage) { i.Volumes = map[string]any{"/data": map[string]any{}} }, code: "resources_unsupported"},
 		{name: "image is not linux/amd64", image: func(i *engineImage) { i.Arch = "arm64" }, code: "image_unavailable"},
+		{name: "image has no command", image: func(i *engineImage) { i.Cmd = nil }, code: "image_unavailable"},
+		{name: "image clears its entrypoint and has no command", image: func(i *engineImage) {
+			i.Entrypoint, i.Cmd = []string{""}, nil
+		}, code: "image_unavailable"},
+		{name: "image command is the empty string", image: func(i *engineImage) { i.Cmd = []string{""} }, code: "image_unavailable"},
 		{name: "localhost registry", lease: func(l *protocol.SandboxLeaseV1) {
 			l.ImageReference = "localhost:5000/busybox@" + testImageDigest
 		}, code: "image_unavailable", policy: true},

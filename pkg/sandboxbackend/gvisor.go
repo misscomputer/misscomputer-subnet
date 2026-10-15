@@ -899,14 +899,28 @@ type inspectedImage struct {
 	Architecture string   `json:"Architecture"`
 	Size         int64    `json:"Size"`
 	Config       struct {
-		Volumes map[string]any `json:"Volumes"`
+		Volumes    map[string]any `json:"Volumes"`
+		Entrypoint []string       `json:"Entrypoint"`
+		Cmd        []string       `json:"Cmd"`
 	} `json:"Config"`
+}
+
+// imageCommand is the argv a container of image runs: the image's
+// entrypoint followed by its command. The leases set neither, and an
+// entrypoint of the single empty string clears the entrypoint, as the
+// engine's --entrypoint "" does.
+func imageCommand(image inspectedImage) []string {
+	entrypoint := image.Config.Entrypoint
+	if len(entrypoint) == 1 && entrypoint[0] == "" {
+		entrypoint = nil
+	}
+	return append(append([]string{}, entrypoint...), image.Config.Cmd...)
 }
 
 // verifiedImage inspects image (a reference or an ID) and requires that the
 // engine recorded it under the lease's exact repository and digest, for
 // linux/amd64, without image-defined volumes, whose bytes no quota would
-// count.
+// count, and with a command to run.
 func (b *GVisor) verifiedImage(ctx context.Context, image string, lease protocol.SandboxLeaseV1) (string, int64, error) {
 	var inspected inspectedImage
 	if err := b.engine.call(ctx, http.MethodGet, "/images/"+image+"/json", nil, nil, &inspected); err != nil {
@@ -937,6 +951,12 @@ func (b *GVisor) verifiedImage(ctx context.Context, image string, lease protocol
 	}
 	if len(inspected.Config.Volumes) != 0 {
 		return inspected.ID, 0, &miner.SandboxRefusal{Code: "resources_unsupported"}
+	}
+	if command := imageCommand(inspected); len(command) == 0 || command[0] == "" {
+		// The engine would refuse to create the container, an answer that
+		// must not count against the miner: the image cannot run as a lease
+		// (contract D19).
+		return inspected.ID, 0, &miner.SandboxRefusal{Code: "image_unavailable"}
 	}
 	return inspected.ID, inspected.Size, nil
 }
