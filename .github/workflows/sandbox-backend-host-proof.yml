@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: 1f396ff9e85f0ebbfa4880bc1c1bf473fbe60c9b
+  BACKEND_SHA: f434bb4c172f07882a6f0889145e7891565b1a33
 
 jobs:
   backend-on-host:
@@ -117,6 +117,36 @@ jobs:
           children=$(sudo find /sys/fs/cgroup/mcsbxlease.slice -mindepth 1 -maxdepth 1 -type d -name 'docker-*' | wc -l)
           echo "after test: containers=$left lease sandbox cgroups=$children" | tee -a "$GITHUB_STEP_SUMMARY"
           [[ $left == 0 && $children == 0 ]]
+      - name: Oversized registry error through the real dockerd (scoped loopback exception)
+        if: always()
+        run: |
+          [[ -s $RUNNER_TEMP/profile.json ]] || { echo 'host was not provisioned'; exit 1; }
+          table=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["engine"]["egress_table"])' "$RUNNER_TEMP/profile.json")
+          strip() { sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/'; }
+          sudo nft list table inet "$table" | strip > "$RUNNER_TEMP/egress-before.nft"
+          # The engine slice may not reach loopback. Both oversized-error
+          # proofs serve their registry on 127.0.0.1, so open exactly
+          # 127.0.0.1 unprivileged TCP for the engine slice, for this step only.
+          handle=$(sudo nft -a -e insert rule inet "$table" output socket cgroupv2 level 1 '"mcsbxengine.slice"' ip daddr 127.0.0.1 tcp dport 1024-65535 accept | sed -n 's/.*# handle \([0-9][0-9]*\)$/\1/p')
+          [[ $handle =~ ^[0-9]+$ ]] || { echo 'could not open the scoped loopback exception'; exit 1; }
+          echo "scoped loopback exception: rule handle $handle" | tee -a "$GITHUB_STEP_SUMMARY"
+          rc=0
+          echo '### Independent: raw answer of the real dockerd' | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo python3 host/scripts/sandbox-host/probe-oversized-pull.py "$RUNNER_TEMP/profile.json" "$RUNNER_TEMP/oversized-pull.json" | tee -a "$GITHUB_STEP_SUMMARY" || rc=1
+          sudo chmod 0644 "$RUNNER_TEMP/oversized-pull.json" 2>/dev/null || true
+          echo '### Backend: TestEnginePullOversizedRegistryErrorOnDisposableHost' | tee -a "$GITHUB_STEP_SUMMARY"
+          docker_host=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_host"])' "$RUNNER_TEMP/profile.json")
+          sudo env MC_SANDBOX_BACKEND_IT=1 MC_SANDBOX_DOCKER_HOST="$docker_host" \
+            "$RUNNER_TEMP/sandboxbackend.test" -test.run '^TestEnginePullOversizedRegistryErrorOnDisposableHost$' -test.v -test.count 1 -test.timeout 10m \
+            2>&1 | tee "$RUNNER_TEMP/oversized-test.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -qx -- '--- PASS: TestEnginePullOversizedRegistryErrorOnDisposableHost.*' "$RUNNER_TEMP/oversized-test.log" || rc=1
+          sudo nft delete rule inet "$table" output handle "$handle"
+          sudo nft list table inet "$table" | strip > "$RUNNER_TEMP/egress-after.nft"
+          diff -u "$RUNNER_TEMP/egress-before.nft" "$RUNNER_TEMP/egress-after.nft" || { echo 'egress table not restored'; rc=1; }
+          # shellcheck disable=SC2024 # the report file is runner-owned on purpose
+          sudo "$RUNNER_TEMP/sandbox-host-observe" -profile "$RUNNER_TEMP/profile.json" preflight > "$RUNNER_TEMP/preflight-after-exception.json"
+          python3 -c 'import json,sys; c=[c for c in json.load(open(sys.argv[1])) if c["id"]=="network.engine_egress_restricted"][0]; print("after exception:", c["status"], c["evidence"]); sys.exit(c["status"]!="pass")' "$RUNNER_TEMP/preflight-after-exception.json" | tee -a "$GITHUB_STEP_SUMMARY" || rc=1
+          exit "$rc"
       - name: Record command-failure behaviour of engine and runsc (no attribution)
         if: always()
         run: |
@@ -142,5 +172,9 @@ jobs:
             ${{ runner.temp }}/profile.json
             ${{ runner.temp }}/backend-instances.jsonl
             ${{ runner.temp }}/command-failures.json
+            ${{ runner.temp }}/oversized-pull.json
+            ${{ runner.temp }}/oversized-test.log
+            ${{ runner.temp }}/egress-before.nft
+            ${{ runner.temp }}/egress-after.nft
           if-no-files-found: warn
           retention-days: 30

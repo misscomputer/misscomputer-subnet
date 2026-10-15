@@ -255,3 +255,14 @@ evaluation is lane 2's reading of the predicate, not the backend's own
 classification, and no cause is inferred. It proves the backend's preflight,
 create, idempotent replay, release-after-destroy and restart recovery on this
 host for those two SHAs only; it does not wire `--sandbox-leases on`.
+
+The oversized registry error proof (`TestEnginePullOversizedRegistryErrorOnDisposableHost`
+and the independent `scripts/sandbox-host/probe-oversized-pull.py`) serves
+its registry on `127.0.0.1`, which the engine egress table rejects. The job
+opens exactly `127.0.0.1` unprivileged TCP for the engine slice for that
+step only, records the rule handle, removes it, diffs the table against its
+state before the exception and re-runs `network.engine_egress_restricted`.
+The independent probe records the real dockerd's raw `/images/create`
+answer (status, longest progress line, whether a line carries the registry
+body); the backend test's own assertion is its classification of that
+answer.
