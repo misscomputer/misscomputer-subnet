@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  AGENT_SHA: 1c0c26d47ed68824a35e0e36fbcdc408f8ca1208
+  AGENT_SHA: 537ba3494016fe0b96af96bab23c604ce257c69f
   # rancher/mirrored-pause:3.10 manifest list, resolved 2026-10-15: entrypoint
   # /pause waits for a signal and does nothing else (no network use), user
   # 65535:65535, no image VOLUMEs, about 0.3 MB (linux/amd64). Run 38702841136
@@ -34,6 +34,11 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    defaults:
+      run:
+        # -eo pipefail: a failing harness or agent command fails its step
+        # even when its output is piped to tee.
+        shell: bash
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -131,9 +136,19 @@ jobs:
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
           echo "healthz=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:19101/healthz || true)" | tee -a "$GITHUB_STEP_SUMMARY"
-          python3 host/scripts/sandbox-host/lab/parse_agent_log.py "$RUNNER_TEMP/lab-out/agent.log" "$RUNNER_TEMP/lab-out" | tee "$RUNNER_TEMP/lab-out/startup-report.txt" | head -1 | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 host/scripts/sandbox-host/lab/parse_agent_log.py "$RUNNER_TEMP/lab-out/agent.log" "$RUNNER_TEMP/lab-out" | tee "$RUNNER_TEMP/lab-out/startup-report.txt" | sed -n 1p | tee -a "$GITHUB_STEP_SUMMARY"
           [[ $agent_pid != 0 ]] && grep -q 'miner agent ready' "$log"
-          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r and r["verdict"]=="pass" else 1)' "$RUNNER_TEMP/lab-out/startup-report.json"
+          python3 - "$RUNNER_TEMP/lab-out/startup-report.json" "$RUNNER_TEMP/lab-out/openfromprofile.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          agent = json.load(open(sys.argv[1]))
+          direct = json.load(open(sys.argv[2]))['report']
+          pairs = [(c['id'], c['status']) for c in agent['checks']]
+          passed = sum(1 for _, st in pairs if st == 'pass')
+          gaps = sum(1 for _, st in pairs if st == 'gap')
+          same = pairs == [(c['id'], c['status']) for c in direct['checks']]
+          print(f"agent startup report: verdict={agent['verdict']} checks={len(pairs)} pass={passed} gap={gaps} matches OpenFromProfile={same}")
+          sys.exit(0 if agent['verdict'] == 'pass' and len(pairs) == 31 and passed == 25 and gaps == 6 and same else 1)
+          PY
       - name: One real lease through the agent bridge (reserve, commit, readback)
         run: |
           engine=(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock")
@@ -185,26 +200,34 @@ jobs:
           state = json.load(open(sys.argv[1]))
           stages = [r['stage'] for r in state['receipts']]
           instances = json.load(open(sys.argv[2]))
-          running = [r for r in instances if r.get('decision') == 'running' and r['verdict'] == 'pass']
+          running = [r for r in instances if r.get('decision') == 'running' and r['verdict'] == 'pass'
+                     and len(r['checks']) == 6 and all(c['status'] == 'pass' for c in r['checks'])]
           try:
               live = [c for c in json.load(open(sys.argv[3])) if c['State']['Running'] and c['State']['Pid'] > 0]
           except (OSError, ValueError):
               live = []
           print(f"receipt stages={stages} instance reports={[(r.get('decision'), r['verdict']) for r in instances]} running containers 10 s after ready={len(live)}")
-          sys.exit(0 if stages[:1] == ['held'] and stages[-1] == 'ready' and running and len(live) == 1 else 1)
+          sys.exit(0 if stages[:1] == ['held'] and stages[-1] == 'ready' and len(instances) == 1 and len(running) == 1 and len(live) == 1 else 1)
           PY
       - name: Release the lease and verify the sandbox is gone
         run: |
           sudo "$RUNNER_TEMP/mcsbx-lab-lease" release "$RUNNER_TEMP/lease-state.json" | tee -a "$GITHUB_STEP_SUMMARY"
-          left=$(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq | wc -l)
-          children=$(find /sys/fs/cgroup/mcsbxlease.slice -mindepth 1 -type d | wc -l)
-          echo "after release: engine containers=$left lease slice child cgroups=$children" | tee -a "$GITHUB_STEP_SUMMARY"
-          [[ $left == 0 ]]
+          sudo python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("receipt stages:", [r["stage"] for r in s["receipts"]])' "$RUNNER_TEMP/lease-state.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          for _ in $(seq 1 30); do
+            left=$(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq | wc -l)
+            children=$(sudo find /sys/fs/cgroup/mcsbxlease.slice -mindepth 1 -maxdepth 1 -type d -name 'docker-*' | wc -l)
+            [[ $left == 0 && $children == 0 ]] && break
+            sleep 0.5
+          done
+          images=$(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" images -q | wc -l)
+          echo "after release: engine containers=$left lease sandbox cgroups=$children engine images=$images (informational)" | tee -a "$GITHUB_STEP_SUMMARY"
+          last=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["receipts"][-1]["stage"])' "$RUNNER_TEMP/lease-state.json")
+          [[ $last == released && $left == 0 && $children == 0 ]]
       - name: Stop the agent (SIGTERM) and record the exit
         if: always()
         run: |
           unit=mcsbxlabagent.service
-          if systemctl list-units --all --plain --no-legend "$unit" | grep -q .; then
+          if [[ -n $(systemctl list-units --all --plain --no-legend "$unit") ]]; then
             if [[ $(systemctl show --property=MainPID --value "$unit") != 0 ]]; then
               sudo systemctl kill --signal=SIGTERM --kill-whom=main "$unit"
               for _ in $(seq 1 120); do [[ $(systemctl show --property=MainPID --value "$unit") == 0 ]] && break; sleep 0.5; done
@@ -213,6 +236,7 @@ jobs:
                 sudo systemctl kill --signal=SIGKILL "$unit"
               fi
             fi
+            status=$(systemctl show --property=ExecMainStatus --value "$unit")
             echo "agent exit after SIGTERM: $(systemctl show --property=ExecMainCode --property=ExecMainStatus --property=Result "$unit" | tr '\n' ' ')" | tee -a "$GITHUB_STEP_SUMMARY"
             sudo systemctl stop "$unit" >/dev/null 2>&1 || true
             sudo systemctl reset-failed "$unit" >/dev/null 2>&1 || true
@@ -220,7 +244,9 @@ jobs:
             echo 'agent unit never started' | tee -a "$GITHUB_STEP_SUMMARY"
           fi
           grep -E 'miner agent stopped| ERROR ' "$RUNNER_TEMP/lab-out/agent.log" | cut -c1-300 | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo "engine containers after agent stop: $(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq 2>/dev/null | wc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
+          left=$(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq 2>/dev/null | wc -l)
+          echo "engine containers after agent stop: $left" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ ${status:-unset} == 0 && $left == 0 ]]
       - name: Default off - a sandbox setting without --sandbox-leases on is refused
         run: |
           rc=0
