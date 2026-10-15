@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: c96d46566be8b75b496c80981e2c9dcf87f22230
+  BACKEND_SHA: fe8dcc7615b8ddceb24e2cc0b49af7f0341c6e34
   # Repetitions of TestGVisorLaneOnDisposableHost only, in this one job, so
   # the D11 exited-workload case meets both exit-before and exit-after
   # readback timings. The oversized test still runs once.
