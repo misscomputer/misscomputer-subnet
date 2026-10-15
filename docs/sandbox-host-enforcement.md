@@ -244,9 +244,14 @@ observation is reported as disappeared with its engine state, never as a
 mismatch. `scripts/sandbox-host/probe-command-failures.py` then records,
 without interpreting any text, what the engine and runsc report for a
 missing command, a non-executable command, a wrong-architecture ELF and a
-command that runs and exits: the create/start response, `State` (`Error`,
-`Pid`, `ExitCode`, `StartedAt`, `FinishedAt`), the gVisor processes and
-their cgroups seen during creation, and what remains before and after
-removal. It proves the backend's preflight,
+command that runs and exits, plus a fork storm and a memory exhaustion in
+the image's own entrypoint (three runs each), at the lease minimum: the
+create/start response, `State` (`Error`, `Pid`, `ExitCode`, `OOMKilled`,
+`StartedAt`, `FinishedAt`), the sandbox cgroup's `pids.events` and
+`memory.events.local`, the gVisor processes and their cgroups, whether the
+lease slice is quiet after the exit, and the conditions of the merged
+backend's `workloadExited` predicate evaluated on that recorded state. The
+evaluation is lane 2's reading of the predicate, not the backend's own
+classification, and no cause is inferred. It proves the backend's preflight,
 create, idempotent replay, release-after-destroy and restart recovery on this
 host for those two SHAs only; it does not wire `--sandbox-leases on`.
