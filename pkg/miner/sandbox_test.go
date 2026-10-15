@@ -49,6 +49,8 @@ type sbBackend struct {
 	// createGate holds Create until it closes or the create is cancelled,
 	// like a pull in progress; stuckCreate holds it whatever its context.
 	createGate, stuckCreate chan struct{}
+	// createEntered, when set, receives once Create is entered.
+	createEntered chan struct{}
 	// destroyGate holds Destroy until it closes or the destroy is
 	// cancelled; destroying receives the instance as Destroy begins.
 	destroyGate chan struct{}
@@ -66,6 +68,12 @@ func (b *sbBackend) Budget(context.Context) (SandboxBudget, error) {
 func (b *sbBackend) Unsupported(protocol.SandboxLeaseV1) string { return b.unsupported }
 
 func (b *sbBackend) Create(ctx context.Context, instance string, lease protocol.SandboxLeaseV1) error {
+	if b.createEntered != nil {
+		select {
+		case b.createEntered <- struct{}{}:
+		default:
+		}
+	}
 	if b.stuckCreate != nil {
 		<-b.stuckCreate
 	}
@@ -973,7 +981,7 @@ func TestSandboxCloseCancelsStartsInProgress(t *testing.T) {
 func TestSandboxCloseIsBounded(t *testing.T) {
 	f := newSBFixture(t)
 	ctx := context.Background()
-	f.backend.stuckCreate = make(chan struct{})
+	f.backend.stuckCreate, f.backend.createEntered = make(chan struct{}), make(chan struct{}, 1)
 	defer close(f.backend.stuckCreate)
 	r := f.reservation(1)
 	receipt, err := f.lane.Reserve(ctx, r, f.request())
@@ -988,7 +996,13 @@ func TestSandboxCloseIsBounded(t *testing.T) {
 		receipt, err := f.lane.Commit(ctx, l, f.request())
 		committed <- result{receipt, err}
 	}()
-	waitLease(t, f, protocol.SandboxLeaseIDV1(l), "pending")
+	// The lease is pending before its start is tracked; only once Create
+	// is entered is the start one that Close must wait for.
+	select {
+	case <-f.backend.createEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the start never reached Create")
+	}
 
 	closeCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
