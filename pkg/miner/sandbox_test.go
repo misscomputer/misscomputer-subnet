@@ -160,6 +160,8 @@ type sbFixture struct {
 	lane      *SandboxLane
 	root      string
 	now       time.Time
+	// dbPath is the durable store's database file.
+	dbPath string
 }
 
 func writeCgroup(t *testing.T, root, cpu, memory string) {
@@ -189,7 +191,8 @@ func newSBFixture(t *testing.T) *sbFixture {
 		now:       sbT0,
 	}
 	writeCgroup(t, f.root, "400000 100000", fmt.Sprint(8192<<20))
-	store, err := durable.Open(filepath.Join(t.TempDir(), "state.db"))
+	f.dbPath = filepath.Join(t.TempDir(), "state.db")
+	store, err := durable.Open(f.dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1008,4 +1011,103 @@ func TestSandboxCloseIsBounded(t *testing.T) {
 	if err := f.lane.Recover(ctx); err == nil || !strings.Contains(err.Error(), "busy") {
 		t.Fatalf("shutdown recover = %v, want the still-running start's lease reported busy", err)
 	}
+}
+
+// A release admitted before the lane closes is answered for what is
+// durable, never with a bare cancellation (which the bridge would report as
+// a non-retryable 422): fenced with its destroy unfinished, it answers
+// cleanup_pending, and once the shutdown Recover destroyed the sandbox an
+// exact replay answers released. Close stops only the destroy.
+func TestSandboxReleaseInFlightAtClose(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// block holds the release where Close must find it, so that only
+		// Close's cancellation can end it, and returns a func that lets the
+		// later shutdown Recover continue.
+		block func(t *testing.T, f *sbFixture) func()
+	}{
+		{name: "destroy in progress", block: func(t *testing.T, f *sbFixture) func() {
+			f.backend.destroyGate, f.backend.destroying = make(chan struct{}), make(chan string, 1)
+			return func() { close(f.backend.destroyGate) }
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newSBFixture(t)
+			ctx := context.Background()
+			r, l, receipt, err := f.commitHeld(1, nil)
+			f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+			unblock := test.block(t, f)
+			release := f.release(r)
+			released := make(chan error, 1)
+			go func() {
+				_, err := f.lane.Release(ctx, release, f.request())
+				released <- err
+			}()
+			<-f.backend.destroying
+			closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			closed := make(chan error, 1)
+			go func() { closed <- f.lane.Close(closeCtx) }()
+			select {
+			case err := <-released:
+				if !errors.Is(err, ErrSandboxCleanupPending) {
+					t.Fatalf("release in flight at Close = %v, want ErrSandboxCleanupPending", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the release did not end after Close")
+			}
+			if err := <-closed; err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			unblock()
+			if record, _, _ := f.store.Lease(ctx, protocol.SandboxLeaseIDV1(l)); record.Status != "cleanup" {
+				t.Fatalf("lease status %q, want the release fenced in cleanup", record.Status)
+			}
+			if err := f.lane.Recover(ctx); err != nil {
+				t.Fatalf("shutdown recover: %v", err)
+			}
+			if live, _, _ := f.backend.state(); live != 0 {
+				t.Fatalf("%d sandboxes survive the shutdown recover", live)
+			}
+			receipt, err = f.newLane(f.agent()).Release(ctx, release, f.request())
+			f.check(receipt, err, protocol.SandboxReleaseSchema, release, sandbox.StageReleased, "")
+		})
+	}
+}
+
+// Whenever Close lands during a release, before, inside or after its
+// fence, destroy and occupancy read, the release answers a receipt,
+// cleanup_pending or sandbox_lane_closed: never a bare cancellation.
+func TestSandboxReleaseRacingCloseNeverEndsInABareCancellation(t *testing.T) {
+	outcomes := map[string]int{}
+	for i := range 60 {
+		f := newSBFixture(t)
+		ctx := context.Background()
+		r, l, receipt, err := f.commitHeld(1, nil)
+		f.check(receipt, err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+		released := make(chan error, 1)
+		go func() {
+			_, err := f.lane.Release(ctx, f.release(r), f.request())
+			released <- err
+		}()
+		// Spread Close over the release's few milliseconds.
+		time.Sleep(time.Duration(i%30) * 50 * time.Microsecond)
+		closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := f.lane.Close(closeCtx); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		cancel()
+		err = <-released
+		switch {
+		case err == nil:
+			outcomes["released"]++
+		case errors.Is(err, ErrSandboxCleanupPending):
+			outcomes["cleanup_pending"]++
+		case errors.Is(err, ErrSandboxLaneClosed):
+			outcomes["lane_closed"]++
+		default:
+			t.Fatalf("release racing Close (iteration %d) = %v, want a receipt, ErrSandboxCleanupPending or ErrSandboxLaneClosed", i, err)
+		}
+	}
+	t.Logf("outcomes %v", outcomes)
 }
