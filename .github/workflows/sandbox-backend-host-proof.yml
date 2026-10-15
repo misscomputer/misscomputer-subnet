@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  BACKEND_SHA: 2c574a2fd789ad9c0c025939b71a5fe8398bbbdc
+  BACKEND_SHA: 95bac39df35235cd2a7b585540db473eddfc1b0c
 
 jobs:
   backend-on-host:
