@@ -10,7 +10,8 @@ ops lane wires it.
 ## What it guarantees
 
 - **Opt-in schema.** `(*SandboxLeases).EnableSandboxOps(ctx, clock)` creates
-  `sandbox_ops` and `sandbox_execs` in a store whose lease lane is enabled.
+  `sandbox_ops`, `sandbox_execs` and `sandbox_ops_clock` in a store whose
+  lease lane is enabled.
   It is the only path that creates them. Every other table definition,
   including the lease tables, is unchanged, and the ops store only reads the
   lease tables.
@@ -19,9 +20,23 @@ ops lane wires it.
   row in state `admitted`. Both rows go in one transaction, before the
   caller may cause any effect. `Start` is true only on the first admission
   of an `exec_start`.
-- **One atomic admission (SR-28-05).** The store reads its clock inside the
-  transaction, after taking the store's single database connection. With
-  that one reading it re-decides all of these, then inserts:
+- **Decision time never goes back (DP-8).** Each transaction decides at
+  the later of the wall clock and the durable high-water time in
+  `sandbox_ops_clock`, and raises the high-water time to it in the same
+  transaction. A refusal with no receipt (window closed, foreign lease,
+  equivocation) still commits that time.
+
+  A wall clock stepped backward, before or across a restart, therefore
+  cannot:
+  - re-open a request window an earlier decision closed;
+  - admit an `exec_start` after a definitive `exec_not_found`;
+  - move `DecidedAt` backwards.
+
+  This is the prerequisite for `N_ops` counting and INT-OPS-01 pruning,
+  neither of which is in this slice.
+- **One atomic admission (SR-28-05).** The store takes its decision time
+  inside the transaction, after taking the store's single database
+  connection. With that one time it re-decides all of these, then inserts:
   - the request window (`now < expires_at`);
   - the lease fence (`SandboxOpTargetsLeaseV1` against the stored signed
     lease);
@@ -59,6 +74,23 @@ ops lane wires it.
   obligation:** a receipt answering `exec_not_found` from a lookup must
   carry `observed_at = DecidedAt`, never a later time. Only then is it
   definitive under `SandboxExecNeverStartedV1`.
+- **Lease-state answers (U1).** The store reports the raw lease state
+  (`Unavailable`), and `SandboxOpLeaseState.RefusalCode(at)` maps it to the
+  non-fault op code:
+
+  | Lease state at the decision time | Code |
+  | --- | --- |
+  | `running`, before expiry | none: the op proceeds |
+  | `running`, at or after expiry | `lease_expired` |
+  | `pending` | `lease_not_running` |
+  | `released`, or `cleanup` towards released | `released` |
+  | `expired`, or `cleanup` towards expired | `lease_expired` |
+  | `failed` (including `miner_restart`), or `cleanup` towards failed | `lease_not_running` |
+
+  The codes mean "no further ops on this lease"; during cleanup the sandbox
+  may still be torn down. None is proof that an exec never started.
+  `miner_restart` is not emitted for ops. An op naming no lease row of this
+  miner, fenced or not, is `ErrSandboxOpForeign` and gets no receipt.
 - **No content.** Rows hold identities, digests, states and times. No path,
   argv, payload, result or signed request JSON is stored.
 - **Exec transitions are supplied by the caller.** `RecordExecState` stores
@@ -73,15 +105,13 @@ the swarm readiness record.
 
 | Id | Not decided here |
 | --- | --- |
-| U1 | Which wire refusal code a lease state maps to. The store returns the raw state (`Unavailable`): status, cleanup status and expiry. |
 | U2 | Recording side-effect-free ops. They are recorded, for uniform equivocation detection. This choice is the draft's and can be reversed. |
 | U3 | How an exact replay of an `exec_start` still in flight is answered. The store only reports `Replay`. |
 | U4 | Who writes exec transitions and when, how races between them resolve, and re-capping of reported output. |
 | U5 | `file_write` completion, partial writes after a crash, and the source of `offset_mismatch`. |
 | U6 | Restart recovery of op and exec rows. No recovery method exists. Lease `Recover` already makes every lease non-running. |
-| U7 | Retention. The documented bounds conflict for leases that end inside an op window, so this slice has **no pruning**. Records grow until this is decided, which is acceptable only while nothing calls the store. |
+| U7, INT-OPS-01, `N_ops` | Retention and the non-exec op cap. The design is accepted (terminal-lease and closed-window pruning in tracked batches, and an `N_ops` cap with `exec_cancel` headroom), but its parameters are not reviewed yet. This slice therefore has **no pruning and no `N_ops` cap**. Records grow until then, which is acceptable only while nothing calls the store. |
 | U8–U10 | Per-agent output budget, guest spawn-storm mapping, capability advertisement. These are outside the durable store. |
-| C1 | A backward wall-clock step can re-open a window. A durable high-water clock is a possible later hardening, not part of this draft. |
 
 ## Merge and activation
 

@@ -30,14 +30,23 @@ import (
 //     insert, all decided with one clock reading taken inside that
 //     transaction;
 //   - an exec lookup reports the in-transaction time it decided at, so a
-//     receipt can carry that time as observed_at.
+//     receipt can carry that time as observed_at;
+//   - decision times never go back (DP-8): each transaction decides at the
+//     later of the wall clock and the durable high-water time, and raises
+//     the high-water time to it. A wall clock stepped backward, before or
+//     across a restart, can therefore never re-open a request window that
+//     an earlier decision closed, nor admit an exec_start after a
+//     definitive exec_not_found.
 //
-// What it does not decide: which wire refusal code a lease state maps to,
-// how an in-flight exec_start replay is answered, who writes exec
-// transitions or when, restart recovery, and file_write completion. Nor
-// does it prune: the retention bounds conflict. The durability doc lists
-// these as U1, U3, U4, U5, U6 and U7. Records therefore grow until that is
-// decided, which is acceptable only while nothing calls this code.
+// The U1 refusal code of a lease state is SandboxOpLeaseState.RefusalCode;
+// the store itself reports the raw state.
+//
+// What it does not decide: how an in-flight exec_start replay is answered,
+// who writes exec transitions or when, restart recovery, and file_write
+// completion (U3, U4, U5, U6). Nor does it cap non-exec ops (N_ops) or
+// prune records (U7, INT-OPS-01). Both build on the high-water time, but
+// their parameters are not reviewed yet. Records therefore grow until then,
+// which is acceptable only while nothing calls this code.
 //
 // Rows hold identities, digests, states and times only, never a path,
 // argv, payload or result.
@@ -60,7 +69,12 @@ CREATE TABLE IF NOT EXISTS sandbox_execs (
   updated_at_ns INTEGER NOT NULL
 );
 -- The per-lease caps count every exec row of the lease.
-CREATE INDEX IF NOT EXISTS sandbox_execs_by_lease ON sandbox_execs(lease_id, state);`
+CREATE INDEX IF NOT EXISTS sandbox_execs_by_lease ON sandbox_execs(lease_id, state);
+-- The high-water decision time (DP-8): one row, never decreasing.
+CREATE TABLE IF NOT EXISTS sandbox_ops_clock (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  high_water_ns INTEGER NOT NULL
+);`
 
 // ErrSandboxOpForeign reports an op request that does not target the
 // stored lease it names: another validator, another generation, a sibling
@@ -84,8 +98,9 @@ type SandboxOps struct {
 
 // EnableSandboxOps creates the ops tables, if absent, in a store whose
 // sandbox lease lane is enabled. It is the only path that creates them; it
-// reads the lease tables and never writes them. clock is read inside each
-// transaction, after the store's single connection is held.
+// reads the lease tables and never writes them. clock is the wall clock. It
+// is read inside each transaction, after the store's single connection is
+// held, and never used below the durable high-water time.
 func (l *SandboxLeases) EnableSandboxOps(ctx context.Context, clock func() time.Time) (*SandboxOps, error) {
 	if clock == nil {
 		return nil, errors.New("sandbox ops admission requires a clock")
@@ -103,6 +118,37 @@ type SandboxOpLeaseState struct {
 	Status        string
 	CleanupStatus *string
 	ExpiresAt     time.Time
+}
+
+// RefusalCode is the U1 mapping from the raw lease state at a decision time
+// to the non-fault op refusal code, or "" when the lease runs ops then:
+//
+//   - running and before its expiry: "" (ops proceed);
+//   - running at or after its expiry: lease_expired;
+//   - pending: lease_not_running;
+//   - released, or cleanup towards released: released;
+//   - expired, or cleanup towards expired: lease_expired;
+//   - failed (including miner_restart), cleanup towards failed, or anything
+//     else: lease_not_running.
+//
+// The codes mean "no further ops on this lease"; in cleanup the sandbox
+// may still be torn down. None is proof that an exec never started, and
+// miner_restart is never emitted for ops. An op that names no lease row of
+// this miner, fenced or not, gets no receipt at all (ErrSandboxOpForeign).
+func (s SandboxOpLeaseState) RefusalCode(at time.Time) string {
+	status := s.Status
+	if status == "cleanup" && s.CleanupStatus != nil {
+		status = *s.CleanupStatus
+	}
+	switch {
+	case s.Status == "running" && at.Before(s.ExpiresAt):
+		return ""
+	case s.Status == "running", status == "expired":
+		return "lease_expired"
+	case status == "released":
+		return "released"
+	}
+	return "lease_not_running"
 }
 
 // SandboxOpAdmission is the durable decision on one op request. When
@@ -166,10 +212,16 @@ func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV
 	// The store has one connection, so this transaction excludes every
 	// other durable read and write. This reading therefore orders the
 	// decision against every exec lookup.
-	now := o.clock()
+	now, err := o.nowTx(ctx, tx)
+	if err != nil {
+		return SandboxOpAdmission{}, err
+	}
 	decision := SandboxOpAdmission{DecidedAt: now}
 
 	state, err := sandboxOpLeaseTx(ctx, tx, req)
+	if errors.Is(err, ErrSandboxOpForeign) {
+		return decided(tx, SandboxOpAdmission{}, err)
+	}
 	if err != nil {
 		return SandboxOpAdmission{}, err
 	}
@@ -178,7 +230,7 @@ func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV
 	err = tx.QueryRowContext(ctx, `SELECT document_digest,admitted_at_ns FROM sandbox_ops WHERE op_id=?`, opID).Scan(&existingDigest, &admitted)
 	switch {
 	case err == nil && existingDigest != digest:
-		return SandboxOpAdmission{}, ErrSandboxConflict
+		return decided(tx, SandboxOpAdmission{}, ErrSandboxConflict)
 	case err == nil:
 		// An exact replay never permits a second effect, but it is
 		// answered from the lease as it is now: once the lease stopped
@@ -194,7 +246,7 @@ func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV
 	}
 	// The request window decides only ops not recorded yet.
 	if !now.Before(expires) {
-		return SandboxOpAdmission{}, ErrSandboxOpExpired
+		return decided(tx, SandboxOpAdmission{}, ErrSandboxOpExpired)
 	}
 	if !sandboxOpLeaseLive(state, now) {
 		decision.Unavailable = &state
@@ -227,6 +279,38 @@ func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV
 	}
 	decision.AdmittedAt, decision.Start = now, start
 	return decision, nil
+}
+
+// nowTx is the decision time of one transaction: the later of the wall
+// clock and the durable high-water time, which it raises to that time. The
+// write is part of tx, so a transaction that commits also persists its
+// decision time; one that rolls back decided nothing.
+func (o *SandboxOps) nowTx(ctx context.Context, tx *sql.Tx) (time.Time, error) {
+	wall := o.clock().UTC()
+	var highWater int64
+	err := tx.QueryRowContext(ctx, `SELECT high_water_ns FROM sandbox_ops_clock WHERE singleton=1`).Scan(&highWater)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return time.Time{}, err
+	case wall.UnixNano() <= highWater:
+		return time.Unix(0, highWater).UTC(), nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO sandbox_ops_clock(singleton,high_water_ns) VALUES(1,?)
+ON CONFLICT(singleton) DO UPDATE SET high_water_ns=excluded.high_water_ns`, wall.UnixNano()); err != nil {
+		return time.Time{}, err
+	}
+	return wall, nil
+}
+
+// decided commits tx, which holds only the decision time when nothing else
+// was written, and returns err: a refusal still moves the high-water time.
+func decided[T any](tx *sql.Tx, value T, err error) (T, error) {
+	if commitErr := tx.Commit(); commitErr != nil {
+		var zero T
+		return zero, commitErr
+	}
+	return value, err
 }
 
 // sandboxOpLeaseLive reports whether the lease runs ops at now.
@@ -293,8 +377,14 @@ func (o *SandboxOps) LookupExec(ctx context.Context, req protocol.SandboxOpReque
 		return SandboxExecLookup{}, err
 	}
 	defer tx.Rollback()
-	now := o.clock()
+	now, err := o.nowTx(ctx, tx)
+	if err != nil {
+		return SandboxExecLookup{}, err
+	}
 	state, err := sandboxOpLeaseTx(ctx, tx, req)
+	if errors.Is(err, ErrSandboxOpForeign) {
+		return decided(tx, SandboxExecLookup{}, err)
+	}
 	if err != nil {
 		return SandboxExecLookup{}, err
 	}
@@ -345,7 +435,10 @@ func (o *SandboxOps) RecordExecState(ctx context.Context, execID, state string, 
 		return err
 	}
 	defer tx.Rollback()
-	now := o.clock()
+	now, err := o.nowTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 	var current string
 	var currentCode *string
 	err = tx.QueryRowContext(ctx, `SELECT state,error_code FROM sandbox_execs WHERE exec_id=?`, execID).Scan(&current, &currentCode)
