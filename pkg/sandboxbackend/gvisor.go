@@ -134,6 +134,9 @@ type GVisor struct {
 	runscFile fs.FileInfo
 	// lookup resolves a registry host before any pull.
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
+	// hostAddresses lists the addresses assigned to this host's
+	// interfaces; Open sets interfaceAddresses.
+	hostAddresses func() ([]netip.Addr, error)
 	// localReserve is the part of the create budget the steps after a pull
 	// run under; zero means localStepReserve (contract D15(d)).
 	localReserve time.Duration
@@ -195,7 +198,7 @@ func Open(ctx context.Context, config Config) (*GVisor, error) {
 	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		return nil, err
 	}
-	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, sandboxFile: file, runscFile: runscFile, lookup: lookupHost}
+	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, sandboxFile: file, runscFile: runscFile, lookup: lookupHost, hostAddresses: interfaceAddresses}
 	if err := b.verifyDaemon(ctx); err != nil {
 		return nil, err
 	}
@@ -1400,7 +1403,44 @@ func (b *GVisor) publicRegistry(ctx context.Context, repository string) error {
 			return &miner.SandboxRefusal{Code: "image_unavailable"}
 		}
 	}
+	// A public address assigned to this host would make the daemon pull
+	// from a service on the miner's own host (contract D8 item 2b). Read
+	// fresh for every pull, since addresses change; not knowing them
+	// refuses the pull as the miner's fault.
+	own, err := b.hostAddresses()
+	if err != nil {
+		return fmt.Errorf("list this host's addresses before a pull: %w", err)
+	}
+	for _, address := range addresses {
+		for _, assigned := range own {
+			if address.Unmap() == assigned.Unmap() {
+				return &miner.SandboxRefusal{Code: "image_unavailable"}
+			}
+		}
+	}
 	return nil
+}
+
+// interfaceAddresses lists the addresses assigned to the interfaces of
+// this process's network namespace, unmapped and without zones.
+func interfaceAddresses() ([]netip.Addr, error) {
+	assigned, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	addresses := make([]netip.Addr, 0, len(assigned))
+	for _, entry := range assigned {
+		network, ok := entry.(*net.IPNet)
+		if !ok {
+			return nil, fmt.Errorf("interface address %v is not an IP network", entry)
+		}
+		address, ok := netip.AddrFromSlice(network.IP)
+		if !ok {
+			return nil, fmt.Errorf("interface address %v is not an IP", network.IP)
+		}
+		addresses = append(addresses, address.Unmap())
+	}
+	return addresses, nil
 }
 
 // publicHostName refuses registry names that only resolve on the miner's

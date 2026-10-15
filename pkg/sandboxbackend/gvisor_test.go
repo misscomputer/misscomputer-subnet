@@ -37,6 +37,10 @@ const (
 	testImageID     = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	testSlice       = "mc-sandbox.slice"
 	testPID         = 4242
+	// hostPublicIPv4 and hostPublicIPv6 are public addresses assigned to
+	// the scripted host's interfaces.
+	hostPublicIPv4 = "151.101.200.9"
+	hostPublicIPv6 = "2a04:4e42:200::9"
 )
 
 type engineImage struct {
@@ -401,6 +405,10 @@ type host struct {
 	sentryFile, runscFile os.FileInfo
 	// dns answers registry host lookups; a host it lacks does not resolve.
 	dns map[string][]netip.Addr
+	// assigned are this host's interface addresses (assignedErr: they
+	// cannot be read).
+	assigned    []netip.Addr
+	assignedErr error
 }
 
 func writeFile(t *testing.T, file, content string) {
@@ -430,7 +438,10 @@ func newHost(t *testing.T) *host {
 	}
 	engine, socket := newFakeEngine(t, dataRoot, runsc)
 	public := []netip.Addr{netip.MustParseAddr("151.101.0.1")}
-	h := &host{t: t, engine: engine, socket: socket, sentry: sentry, dns: map[string][]netip.Addr{
+	h := &host{t: t, engine: engine, socket: socket, sentry: sentry, assigned: []netip.Addr{
+		netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1"),
+		netip.MustParseAddr(hostPublicIPv4), netip.MustParseAddr(hostPublicIPv6),
+	}, dns: map[string][]netip.Addr{
 		"registry-1.docker.io": public, "ghcr.io": public,
 	}, config: Config{
 		DockerHost: "unix://" + socket, Runtime: "runsc", RunscPath: runsc, RunscSHA256: digestOf("runsc binary"),
@@ -482,6 +493,7 @@ func (h *host) backend() *GVisor {
 			}
 			return nil, fmt.Errorf("lookup %s: no such host", name)
 		},
+		hostAddresses: func() ([]netip.Addr, error) { return h.assigned, h.assignedErr },
 	}
 }
 
@@ -834,8 +846,10 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 		// config changes the backend's configuration; such a case must
 		// not reach the engine either.
 		config func(*Config)
-		dns    map[string][]netip.Addr
-		code   string
+		// host changes the scripted host, before the backend is built.
+		host func(*host)
+		dns  map[string][]netip.Addr
+		code string
 		// policy marks a refusal the backend must reach before any pull.
 		policy bool
 		fault  string // the miner fault a case without a refusal code must report
@@ -898,6 +912,18 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 		{name: "mDNS registry name", lease: func(l *protocol.SandboxLeaseV1) {
 			l.ImageReference = "nas.local/busybox@" + testImageDigest
 		}, dns: map[string][]netip.Addr{"nas.local": {netip.MustParseAddr("151.101.0.1")}}, code: "image_unavailable", policy: true},
+		// A public registry address assigned to this host (D8 item 2b).
+		{name: "registry resolving to this host's public address", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "registry.example.net/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"registry.example.net": {netip.MustParseAddr(hostPublicIPv4)}}, code: "image_unavailable", policy: true},
+		{name: "registry with one address of this host among public ones", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "registry.example.net/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"registry.example.net": {netip.MustParseAddr("151.101.0.1"), netip.MustParseAddr(hostPublicIPv4)}}, code: "image_unavailable", policy: true},
+		{name: "registry resolving to this host's IPv6 address", lease: func(l *protocol.SandboxLeaseV1) {
+			l.ImageReference = "registry.example.net/busybox@" + testImageDigest
+		}, dns: map[string][]netip.Addr{"registry.example.net": {netip.MustParseAddr(hostPublicIPv6)}}, code: "image_unavailable", policy: true},
+		{name: "this host's addresses cannot be read", host: func(h *host) { h.assignedErr = errors.New("netlink: operation not permitted") },
+			fault: "this host's addresses", policy: true},
 		{name: "engine records another digest", image: func(i *engineImage) {
 			i.RepoDigests = []string{"busybox@sha256:" + strings.Repeat("9", 64)}
 		}, fault: "is not recorded as"},
@@ -927,6 +953,9 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 			}
 			for name, addresses := range test.dns {
 				h.dns[name] = addresses
+			}
+			if test.host != nil {
+				test.host(h)
 			}
 			b := h.backend()
 			if test.config != nil {
@@ -1140,5 +1169,18 @@ func TestNormalizedRepositoryMatchesDockerNormalization(t *testing.T) {
 	}
 	if _, err := normalizedRepository("busybox:latest"); err == nil {
 		t.Error("a tag reference was normalized")
+	}
+}
+
+// The production source of this host's addresses reads the real
+// interfaces, unmapped: every Linux host has 127.0.0.1 assigned.
+func TestInterfaceAddressesListThisHost(t *testing.T) {
+	addresses, err := interfaceAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// net.InterfaceAddrs reports IPv4 addresses in IPv4-mapped form.
+	if !slices.Contains(addresses, netip.MustParseAddr("127.0.0.1")) {
+		t.Fatalf("interface addresses %v lack 127.0.0.1 in unmapped form", addresses)
 	}
 }
