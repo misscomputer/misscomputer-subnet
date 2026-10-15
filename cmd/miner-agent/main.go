@@ -203,22 +203,76 @@ func run() error {
 		}
 	case <-shutdownCtx.Done():
 	}
-	shutdown, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
-	if err := server.Shutdown(shutdown); serveErr == nil && err != nil {
+	var lane sandboxStopper
+	if sandboxLane != nil {
+		lane = sandboxLane
+	}
+	if err := stopAgent(server, agent.RecoverCleanup, lane, agentStopBudgets); serveErr == nil {
 		serveErr = err
 	}
-	cancelShutdown()
-	cleanup, cancelCleanup := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := agent.RecoverCleanup(cleanup); serveErr == nil && err != nil {
-		serveErr = fmt.Errorf("shutdown cleanup: %w", err)
+	return serveErr
+}
+
+// stopBudgets bound the phases of the agent's shutdown. Their sum is the
+// longest the agent takes to stop; a service manager's stop timeout must
+// exceed it (docs/miner-quickstart.md).
+type stopBudgets struct {
+	// serve bounds server.Shutdown and the sandbox lane's Close together:
+	// both start at the signal and share one deadline.
+	serve time.Duration
+	// cleanup bounds the agent's own replica cleanup.
+	cleanup time.Duration
+	// sandbox bounds the sandbox lane's shutdown Recover, which runs after
+	// the cleanup on a budget of its own.
+	sandbox time.Duration
+}
+
+var agentStopBudgets = stopBudgets{serve: 15 * time.Second, cleanup: 30 * time.Second, sandbox: 60 * time.Second}
+
+type shutdowner interface {
+	Shutdown(ctx context.Context) error
+}
+
+// sandboxStopper is the part of the sandbox lane the shutdown drives.
+type sandboxStopper interface {
+	Close(ctx context.Context) error
+	Recover(ctx context.Context) error
+}
+
+// stopAgent runs the shutdown after the signal. The sandbox lane closes
+// while the server drains, on the same deadline, so neither adds to the
+// other's time; then the agent cleans up its replicas, and then the lane's
+// Recover destroys every sandbox once nothing else holds a lease lock. A
+// phase that fails or runs out of time does not stop the later ones.
+func stopAgent(server shutdowner, cleanup func(context.Context) error, lane sandboxStopper, budgets stopBudgets) error {
+	var errs []error
+	serveCtx, cancelServe := context.WithTimeout(context.Background(), budgets.serve)
+	closed := make(chan error, 1)
+	if lane != nil {
+		go func() { closed <- lane.Close(serveCtx) }()
+	} else {
+		closed <- nil
 	}
-	if sandboxLane != nil {
-		if err := sandboxLane.Recover(cleanup); serveErr == nil && err != nil {
-			serveErr = fmt.Errorf("sandbox shutdown cleanup: %w", err)
-		}
+	if err := server.Shutdown(serveCtx); err != nil {
+		errs = append(errs, err)
+	}
+	if err := <-closed; err != nil {
+		errs = append(errs, err)
+	}
+	cancelServe()
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), budgets.cleanup)
+	if err := cleanup(cleanupCtx); err != nil {
+		errs = append(errs, fmt.Errorf("shutdown cleanup: %w", err))
 	}
 	cancelCleanup()
-	return serveErr
+	if lane != nil {
+		recoverCtx, cancelRecover := context.WithTimeout(context.Background(), budgets.sandbox)
+		if err := lane.Recover(recoverCtx); err != nil {
+			errs = append(errs, fmt.Errorf("sandbox shutdown cleanup: %w", err))
+		}
+		cancelRecover()
+	}
+	return errors.Join(errs...)
 }
 
 // routes is the authenticated bridge API. Sandbox routes exist only with an

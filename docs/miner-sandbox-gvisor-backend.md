@@ -39,7 +39,9 @@ following hold:
   pass: every check `pass`, every `unenforced` entry `gap`.
 - **The lane accepts its budget.** The lane is then built with the
   profile's aggregate as its budget and verifies it against the slice.
-- **Restart recovery** gets its own 5-minute budget.
+- **Restart recovery** gets its own 5-minute budget; the shutdown
+  recovery, after the lane closes and the replicas are cleaned up, gets 60
+  seconds (docs/sandbox-lease-v1.md, Shutdown).
 
 The lane's restart recovery uses the backend contract. Every lease whose
 sandbox may exist answers `failed/miner_restart` and is destroyed. Every

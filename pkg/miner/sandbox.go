@@ -88,6 +88,10 @@ type SandboxLaneConfig struct {
 // release; the sweep keeps destroying in the meantime.
 var ErrSandboxCleanupPending = errors.New("sandbox release is fenced but its sandbox is not destroyed yet; retry the release")
 
+// ErrSandboxLaneClosed answers a document that arrives after the lane was
+// closed for shutdown. Nothing was written; the validator retries later.
+var ErrSandboxLaneClosed = errors.New("sandbox lane is shutting down; retry later")
+
 const (
 	sandboxCreateTimeout  = 5 * time.Minute
 	sandboxStateTimeout   = 30 * time.Second
@@ -119,6 +123,15 @@ type SandboxLane struct {
 	starts  sandboxStarts
 	// answerWithin is sandboxCommitAnswer.
 	answerWithin time.Duration
+	// base is cancelled by Close. Background starts run under it, and
+	// every tracked operation's context ends with it.
+	base   context.Context
+	cancel context.CancelFunc
+	// closed is closed by Close; gate orders tracking against it, so no
+	// operation is added to work after Close began waiting.
+	closed chan struct{}
+	gate   sync.Mutex
+	work   sync.WaitGroup
 }
 
 // NewSandboxLane enables the lane only with a backend that runs sandboxes
@@ -151,7 +164,60 @@ func NewSandboxLane(ctx context.Context, agent *Agent, store *durable.SandboxLea
 	if !budget.Within(limits) {
 		return nil, fmt.Errorf("sandbox budget %+v exceeds what the backend enforces %+v", budget, limits)
 	}
-	return &SandboxLane{agent: agent, store: store, backend: backend, budget: budget, now: time.Now, answerWithin: sandboxCommitAnswer}, nil
+	base, cancel := context.WithCancel(context.Background())
+	return &SandboxLane{agent: agent, store: store, backend: backend, budget: budget, now: time.Now, answerWithin: sandboxCommitAnswer,
+		base: base, cancel: cancel, closed: make(chan struct{})}, nil
+}
+
+// track registers one operation that holds lease locks or drives the
+// backend, so that Close waits for it before the shutdown Recover. It
+// refuses once the lane is closed. The returned context ends with ctx or
+// when Close cancels the lane; done must be called when the operation ends.
+func (l *SandboxLane) track(ctx context.Context) (context.Context, func(), error) {
+	l.gate.Lock()
+	defer l.gate.Unlock()
+	select {
+	case <-l.closed:
+		return nil, nil, ErrSandboxLaneClosed
+	default:
+	}
+	l.work.Add(1)
+	tracked, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(l.base, cancel)
+	return tracked, func() {
+		stop()
+		cancel()
+		l.work.Done()
+	}, nil
+}
+
+// Close stops the lane for shutdown, before Recover runs: documents that
+// would start, sweep or release are refused, a Commit waiting for its start
+// answers the lease's durable stage at once, and every tracked operation's
+// context is cancelled. Close then waits for those operations until ctx
+// ends; an operation still running then keeps its lease lock, so the
+// shutdown Recover reports that lease busy and the next start's Recover
+// destroys it. Close is idempotent.
+func (l *SandboxLane) Close(ctx context.Context) error {
+	l.gate.Lock()
+	select {
+	case <-l.closed:
+	default:
+		close(l.closed)
+		l.cancel()
+	}
+	l.gate.Unlock()
+	drained := make(chan struct{})
+	go func() {
+		l.work.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("sandbox lane operations still running at shutdown: %w", ctx.Err())
+	}
 }
 
 // SandboxInstanceName is the deterministic backend name of a lease.
@@ -235,6 +301,11 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 		return protocol.SandboxReceiptV1{}, err
 	}
 	leaseID := protocol.SandboxLeaseIDV1(lease)
+	select {
+	case <-l.closed:
+		return protocol.SandboxReceiptV1{}, ErrSandboxLaneClosed
+	default:
+	}
 	deadline := time.Now().Add(l.answerWithin)
 	var unlock func()
 	for {
@@ -260,6 +331,14 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 		case <-ctx.Done():
 			timer.Stop()
 			return protocol.SandboxReceiptV1{}, ctx.Err()
+		case <-l.closed:
+			timer.Stop()
+			if _, found, err := l.store.Lease(ctx, leaseID); err != nil {
+				return protocol.SandboxReceiptV1{}, err
+			} else if found {
+				return l.answerCommit(ctx, lease)
+			}
+			return protocol.SandboxReceiptV1{}, ErrSandboxLaneClosed
 		case <-timer.C:
 		}
 	}
@@ -271,9 +350,18 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 		}
 		return l.receipt(protocol.SandboxLeaseSchema, lease, lease.SandboxID, lease.Generation, lease.Subnet, outcome, l.now().UTC())
 	}
+	// The start does not inherit the request's cancellation, only the
+	// lane's: Close cancels it, and the shutdown Recover then ends the
+	// pending lease as failed/miner_restart.
+	workCtx, done, err := l.track(l.base)
+	if err != nil {
+		// Closed after the lease became durable: Recover ends it.
+		unlock()
+		return l.answerCommit(ctx, lease)
+	}
 	started := l.starts.begin(leaseID)
-	workCtx := context.WithoutCancel(ctx)
 	go func() {
+		defer done()
 		defer unlock()
 		if _, err := l.start(workCtx, lease, leaseID); err != nil {
 			slog.Warn("sandbox start", "lease_id", leaseID, "error", err)
@@ -284,13 +372,14 @@ func (l *SandboxLane) Commit(ctx context.Context, lease protocol.SandboxLeaseV1,
 	return l.answerCommit(ctx, lease)
 }
 
-// await waits for a start to end, at most answerWithin.
+// await waits for a start to end, at most answerWithin, and not past Close.
 func (l *SandboxLane) await(started <-chan struct{}) {
 	timer := time.NewTimer(l.answerWithin)
 	defer timer.Stop()
 	select {
 	case <-started:
 	case <-timer.C:
+	case <-l.closed:
 	}
 }
 
@@ -308,14 +397,22 @@ func (l *SandboxLane) answerCommit(ctx context.Context, lease protocol.SandboxLe
 
 // start runs the sandbox of a lease that was just written as pending and
 // answers with its durable stage.
+//
+// ctx ends only when the lane closes for shutdown. A create it cancels is
+// not recorded as a failed start: the lease stays pending, and the shutdown
+// Recover destroys its sandbox and ends it as failed/miner_restart. The
+// durable writes after the create do not inherit ctx.
 func (l *SandboxLane) start(ctx context.Context, lease protocol.SandboxLeaseV1, leaseID string) (durable.SandboxOutcome, error) {
 	instance := SandboxInstanceName(leaseID)
 	code := l.unsupported(lease)
 	workCtx := context.WithoutCancel(ctx)
 	if code == "" {
-		createCtx, cancel := context.WithTimeout(workCtx, sandboxCreateTimeout)
+		createCtx, cancel := context.WithTimeout(ctx, sandboxCreateTimeout)
 		err := l.backend.Create(createCtx, instance, lease)
 		cancel()
+		if err != nil && ctx.Err() != nil {
+			return durable.SandboxOutcome{}, fmt.Errorf("sandbox start stopped for shutdown: %w", err)
+		}
 		if err == nil {
 			completedAt := l.now().UTC()
 			// A release or sweep can move the lease to cleanup during
@@ -418,6 +515,11 @@ func (l *SandboxLane) Release(ctx context.Context, r protocol.SandboxReleaseV1, 
 	if err := l.admit(r.Subnet, r.MinerID); err != nil {
 		return protocol.SandboxReceiptV1{}, err
 	}
+	ctx, done, err := l.track(ctx)
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	defer done()
 	outcome, teardown, err := l.store.Release(ctx, r, now)
 	if err != nil {
 		return protocol.SandboxReceiptV1{}, err
@@ -437,6 +539,11 @@ func (l *SandboxLane) Release(ctx context.Context, r protocol.SandboxReleaseV1, 
 // cleanup, destroys every sandbox in cleanup, and destroys orphans. Run it
 // periodically.
 func (l *SandboxLane) Sweep(ctx context.Context) error {
+	ctx, done, err := l.track(ctx)
+	if err != nil {
+		return err
+	}
+	defer done()
 	now := l.now().UTC()
 	records, err := l.store.Sweep(ctx, now)
 	if err != nil {
