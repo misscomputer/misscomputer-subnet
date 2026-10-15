@@ -1,0 +1,117 @@
+{
+ "builder": "build_probe_images.py",
+ "builder_sha256": "9f1c4094f45c5731cbc26f085e38cd14a4778f7efd200816e3ae70ea12c97f89",
+ "images": {
+  "probe-arm64-elf": {
+   "config_digest": "sha256:956912d67a22508a1214f3a6355c4ec655c5bd7861ea0385450b711e56b83907",
+   "entrypoint": [
+    "/probe-arm64"
+   ],
+   "expected": "D23: never started (observed run 38661083069 via docker run)",
+   "layer_digest": "sha256:0bed4199973e892beef99b41a84eecd4409e03bca1cac379b6c98e5297a84d4f",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:27a0f777c2fd99798bdc1ac7b1ab180729badf4fb471dfd53b7ac6e351f71ca1",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-exits": {
+   "config_digest": "sha256:5775840128ad1dbbb2853e29554198341dd161172cb6f6240274d3567ade83ca",
+   "entrypoint": [
+    "/probe-exits"
+   ],
+   "expected": "D11: starts and exits 0; served, not a fault",
+   "layer_digest": "sha256:9ad2543ee531b70d375d570f214339da183386dde8bae1b015bd5741127587cc",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:228eddc01cb41c951cc2966d4bc985fc1727651f754f36af55ec8ab763a879aa",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-missing-command": {
+   "config_digest": "sha256:d9417789fa721f333e0b939dc632e41ac57e488794a25c6a91fd1952c2662d4f",
+   "entrypoint": [
+    "/no/such/command"
+   ],
+   "expected": "D23: never started (observed run 38661083069 via docker run)",
+   "layer_digest": "sha256:d614bfb9f875bcc19cff9c0acf20b28995bcadbaf5a29159e263f1483e0b72c0",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:8c34a048271307fa124f890f58200a9f3ddd1f4677eeef918d9cfc9f21c6a2b2",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-missing-elf-loader": {
+   "config_digest": "sha256:e3f957278ff3fe7480de56840b939ebe15bd5a0aed852b018fc7945c8aa4b545",
+   "entrypoint": [
+    "/probe-dynamic"
+   ],
+   "expected": "D23 expected: never started (NOT yet observed)",
+   "layer_digest": "sha256:71a019ec725d27b6e185826122b1953336e03631cdca3560dcdd932a85411660",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:57a2379eb3a1140ec99e7d3fa09719e584c96bf8c838564edc845bf6844561f0",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-missing-interpreter": {
+   "config_digest": "sha256:29d8bfa6ec25aba963ed3746f6f7ca5400436024654d684cfe75191f4b9ad63a",
+   "entrypoint": [
+    "/probe-script"
+   ],
+   "expected": "D23 expected: never started (NOT yet observed)",
+   "layer_digest": "sha256:ab8ff5d5819540cbfdce0b30c83fd1482ed7d77b9d20ca57f02ff0765760c084",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:54bfeebcaf0ef5dbe995e8413992d50456476304aa43f1e3e38b87020c4fb7b2",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-no-command": {
+   "config_digest": "sha256:437ea2330a54ffb418f05e33016c3142038076d27d255a4c5ed18256c2c8318f",
+   "entrypoint": null,
+   "expected": "D19: no Entrypoint/Cmd; image_unavailable before container create",
+   "layer_digest": "sha256:9ad2543ee531b70d375d570f214339da183386dde8bae1b015bd5741127587cc",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:b95ff56224d4d9259b0a5e95931008f0df104bc54536e93049934cb724c50da5",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-noexec": {
+   "config_digest": "sha256:5ef7b514f996bcb09822e539e5f6b871fdac7030b2b5311d6b94d8e32f94d1ef",
+   "entrypoint": [
+    "/probe-noexec"
+   ],
+   "expected": "D23: never started (observed run 38661083069 via docker run)",
+   "layer_digest": "sha256:34bb91fa6dee3fd288c2b43b678d16f24a66e19971821471776c926d99b64ee4",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:131bcb3f0ae721dad7551e6b366ae4f4beeae7962092abcefb206716f8e1ffa9",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-pause": {
+   "config_digest": "sha256:b5a2f8c80f91cd3f7065af12c85093df739263f14a0abe16b92313f6496304b1",
+   "entrypoint": [
+    "/probe-pause"
+   ],
+   "expected": "positive control: runs; Create ready",
+   "layer_digest": "sha256:6b102351f313ce6475fe865cba698d74a03bdaf6e9b251c27cbe1fa71067dd0b",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:6af656b1be6991ede796a958e54b5b3eb3f7506319f2384382ec5f6e5858f86f",
+   "platform": "linux/amd64 (config)",
+   "user": null
+  },
+  "probe-unknown-user": {
+   "config_digest": "sha256:4a55213311ea3afe6eba6da90a7633d26af79aba0f060fba076f2a2b414f1dd7",
+   "entrypoint": [
+    "/probe-exits"
+   ],
+   "expected": "D23 expected: never started; dockerd resolves the user at start (NOT yet observed)",
+   "layer_digest": "sha256:9ad2543ee531b70d375d570f214339da183386dde8bae1b015bd5741127587cc",
+   "layer_media_type": "application/vnd.oci.image.layer.v1.tar",
+   "manifest_digest": "sha256:7c8bb0708ab14fd2af6c93cc81dbc2b06e9cfdb5d367d9b5f647007614e14e1b",
+   "platform": "linux/amd64 (config)",
+   "user": "probe-nosuchuser"
+  }
+ },
+ "layout_index_digest": "sha256:09fa09cc2b1339cd11f8953a9f14ffbc4c07f7fbdfc7d31eb32ecbf091631131",
+ "platform": "image config linux/amd64; layers uncompressed OCI tar (application/vnd.oci.image.layer.v1.tar)",
+ "publication_note": "NOT published anywhere. Digests are content addresses: any registry copy that preserves bytes yields the same repository@digest.",
+ "published": false,
+ "schema": "lane-1-p3-probe-images.v1"
+}
