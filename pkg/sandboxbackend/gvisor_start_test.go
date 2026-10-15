@@ -225,6 +225,13 @@ func TestCreateWaitsForAFailedStartToSettle(t *testing.T) {
 // returned func is called.
 func captureAttributions(t *testing.T) func() []map[string]any {
 	t.Helper()
+	return captureRecords(t, "sandbox start attribution")
+}
+
+// captureRecords records the events with message msg logged until the
+// returned func is called.
+func captureRecords(t *testing.T, msg string) func() []map[string]any {
+	t.Helper()
 	var buffer bytes.Buffer
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buffer, nil)))
@@ -233,7 +240,7 @@ func captureAttributions(t *testing.T) func() []map[string]any {
 		var records []map[string]any
 		for _, line := range strings.Split(strings.TrimSpace(buffer.String()), "\n") {
 			var record map[string]any
-			if json.Unmarshal([]byte(line), &record) == nil && record["msg"] == "sandbox start attribution" {
+			if json.Unmarshal([]byte(line), &record) == nil && record["msg"] == msg {
 				records = append(records, record)
 			}
 		}
