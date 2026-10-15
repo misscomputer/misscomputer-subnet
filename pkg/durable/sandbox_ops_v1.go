@@ -105,16 +105,20 @@ type SandboxOpLeaseState struct {
 	ExpiresAt     time.Time
 }
 
-// SandboxOpAdmission is the durable decision on one op request. At most one
-// of Replay, Unavailable and Limited is set; when none is, the op was
-// admitted now.
+// SandboxOpAdmission is the durable decision on one op request. When
+// Unavailable is set, the answer comes from the lease state, whether or not
+// Replay is also set. Limited is never set together with Replay or
+// Unavailable. When none of Replay, Unavailable and Limited is set, the op
+// was admitted now.
 type SandboxOpAdmission struct {
 	// DecidedAt is the in-transaction clock reading of this decision.
 	DecidedAt time.Time
 	// AdmittedAt is the decision time of the first admission; zero when
 	// nothing was admitted.
 	AdmittedAt time.Time
-	// Replay is true when this exact document was admitted before.
+	// Replay is true when this exact document was admitted before. A
+	// replay never permits an effect. Its answer is the recorded admission
+	// only while the lease still runs ops; otherwise Unavailable is also set.
 	Replay bool
 	// Start is true only on the first admission of an exec_start. Its exec
 	// record is durable, and the caller may now ask the backend to start
@@ -130,10 +134,20 @@ type SandboxOpAdmission struct {
 
 // AdmitOp decides one verified op request in a single transaction. The
 // caller has already run VerifyBoundSandboxOpRequestV1 and the miner
-// identity check. The store re-validates the shape, fences the request to
-// the exact stored lease, and re-decides the window and lease liveness
-// with its own clock, so a window that closes between those checks and
-// this call is refused here.
+// identity check. The order is:
+//
+//  1. lease fence (foreign);
+//  2. equivocation (conflict);
+//  3. exact replay, which never permits an effect and is answered from the
+//     current lease state when the lease has stopped;
+//  4. the request window, for unrecorded ops only;
+//  5. lease state;
+//  6. caps;
+//  7. insert.
+//
+// The store re-decides the window and liveness with its own clock, so a
+// window that closes between the earlier checks and this call is refused
+// here.
 func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV1) (SandboxOpAdmission, error) {
 	if err := req.Validate(); err != nil {
 		return SandboxOpAdmission{}, err
@@ -166,15 +180,23 @@ func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV
 	case err == nil && existingDigest != digest:
 		return SandboxOpAdmission{}, ErrSandboxConflict
 	case err == nil:
+		// An exact replay never permits a second effect, but it is
+		// answered from the lease as it is now: once the lease stopped
+		// running (release, expiry, restart), the lease state answers,
+		// not the recorded admission (SC-1).
 		decision.Replay, decision.AdmittedAt = true, time.Unix(0, admitted).UTC()
+		if !sandboxOpLeaseLive(state, now) {
+			decision.Unavailable = &state
+		}
 		return decision, tx.Commit()
 	case !errors.Is(err, sql.ErrNoRows):
 		return SandboxOpAdmission{}, err
 	}
+	// The request window decides only ops not recorded yet.
 	if !now.Before(expires) {
 		return SandboxOpAdmission{}, ErrSandboxOpExpired
 	}
-	if state.Status != "running" || !now.Before(state.ExpiresAt) {
+	if !sandboxOpLeaseLive(state, now) {
 		decision.Unavailable = &state
 		return decision, tx.Commit()
 	}
@@ -205,6 +227,11 @@ func (o *SandboxOps) AdmitOp(ctx context.Context, req protocol.SandboxOpRequestV
 	}
 	decision.AdmittedAt, decision.Start = now, start
 	return decision, nil
+}
+
+// sandboxOpLeaseLive reports whether the lease runs ops at now.
+func sandboxOpLeaseLive(state SandboxOpLeaseState, now time.Time) bool {
+	return state.Status == "running" && now.Before(state.ExpiresAt)
 }
 
 // sandboxOpLeaseTx loads the lease req names and fences req to it.
@@ -272,7 +299,7 @@ func (o *SandboxOps) LookupExec(ctx context.Context, req protocol.SandboxOpReque
 		return SandboxExecLookup{}, err
 	}
 	lookup := SandboxExecLookup{DecidedAt: now}
-	if state.Status != "running" || !now.Before(state.ExpiresAt) {
+	if !sandboxOpLeaseLive(state, now) {
 		lookup.Unavailable = &state
 		return lookup, tx.Commit()
 	}

@@ -494,3 +494,73 @@ func TestSandboxOpRecordsHoldNoPath(t *testing.T) {
 		t.Fatal("negative control: the op record itself is not in the database file")
 	}
 }
+
+// SC-1: an exact replay never permits a second effect, but its answer comes
+// from the lease's current state. After a release, or after a miner restart
+// (lease Recover through the real lane), replaying an admitted exec_start
+// must not come back as a live replay of a running exec. An equivocating
+// document is still a conflict whatever the lease state.
+func TestSandboxOpReplayOnLeaseThatStoppedAnswersLeaseState(t *testing.T) {
+	ctx := context.Background()
+	leaseID := func(f *opsFixture) string { return protocol.SandboxLeaseIDV1(f.lease) }
+	for _, stop := range []struct {
+		name       string
+		apply      func(t *testing.T, f *opsFixture)
+		wantStatus string
+	}{
+		{"release", func(t *testing.T, f *opsFixture) {
+			if _, _, err := f.leases.Release(ctx, f.parties.release(t, 1, f.clock.read()), f.clock.read()); err != nil {
+				t.Fatal(err)
+			}
+		}, "cleanup"},
+		{"restart", func(t *testing.T, f *opsFixture) {
+			if _, err := f.leases.Recover(ctx, f.clock.read()); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.leases.CompleteLeaseCleanup(ctx, leaseID(f), f.clock.read()); err != nil {
+				t.Fatal(err)
+			}
+		}, "failed"},
+	} {
+		t.Run(stop.name, func(t *testing.T) {
+			f := newOpsFixture(t)
+			at := f.clock.read()
+			start := f.op(t, sandbox.OpExecStart, 1, at, nil)
+			if first, err := f.ops.AdmitOp(ctx, start); err != nil || !first.Start {
+				t.Fatalf("first admission %+v %v", first, err)
+			}
+			f.clock.set(at.Add(5 * time.Second))
+			stop.apply(t, f)
+			replay, err := f.ops.AdmitOp(ctx, start)
+			if err != nil || replay.Start || replay.Unavailable == nil || replay.Unavailable.Status != stop.wantStatus {
+				t.Fatalf("replay after %s answered %+v %v; want the lease state %q and no start", stop.name, replay, err, stop.wantStatus)
+			}
+			other := f.op(t, sandbox.OpExecStart, 1, at, func(r *protocol.SandboxOpRequestV1) { r.TimeoutMS = u64p(1000) })
+			if _, err := f.ops.AdmitOp(ctx, other); !errors.Is(err, ErrSandboxConflict) {
+				t.Fatalf("equivocation after %s: %v", stop.name, err)
+			}
+			if ops, execs := opRows(t, f.store); ops != 1 || execs != 1 {
+				t.Fatalf("rows after %s: %d ops %d execs", stop.name, ops, execs)
+			}
+		})
+	}
+}
+
+// A replay on a lease that is still running but has passed its expiry also
+// answers from the lease state.
+func TestSandboxOpReplayPastLeaseExpiryAnswersLeaseState(t *testing.T) {
+	f := newOpsFixture(t)
+	ctx := context.Background()
+	issued := sandboxT0.Add(10*time.Minute - 10*time.Second)
+	f.clock.set(issued)
+	start := f.op(t, sandbox.OpExecStart, 1, issued, nil)
+	if first, err := f.ops.AdmitOp(ctx, start); err != nil || !first.Start {
+		t.Fatalf("first admission %+v %v", first, err)
+	}
+	f.clock.set(sandboxT0.Add(10 * time.Minute))
+	replay, err := f.ops.AdmitOp(ctx, start)
+	if err != nil || replay.Start || replay.Unavailable == nil || replay.Unavailable.Status != "running" ||
+		!replay.Unavailable.ExpiresAt.Equal(sandboxT0.Add(10*time.Minute)) {
+		t.Fatalf("replay at lease expiry %+v %v", replay, err)
+	}
+}

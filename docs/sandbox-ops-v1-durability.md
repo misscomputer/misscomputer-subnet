@@ -32,10 +32,24 @@ ops lane wires it.
 
   Any failed check records nothing. A window that closed after the bound
   admission check passed is `ErrSandboxOpExpired`.
-- **Replay and equivocation.** An exact replay returns the recorded
-  admission, never another `Start`. The same `op_id` with a different
-  document is `ErrSandboxConflict` and changes nothing. Every op kind is
-  recorded, reads included, so equivocation detection is uniform.
+- **Replay and equivocation.** An exact replay never yields another
+  `Start`. While the lease still runs ops, the replay is answered from the
+  recorded admission. Once the lease has stopped (release, expiry, or
+  failure after a miner restart), the replay is answered from the current
+  lease state (`Replay` plus `Unavailable`). A replay can therefore never
+  report a live exec on a stopped lease. The same `op_id` with a different
+  document is `ErrSandboxConflict` whatever the lease state, and changes
+  nothing. Every op kind is recorded, reads included, so equivocation
+  detection is uniform.
+
+  The order of checks is:
+  1. lease fence;
+  2. equivocation;
+  3. exact replay;
+  4. request window (unrecorded ops only);
+  5. lease state;
+  6. caps;
+  7. insert.
 - **Truthful `exec_not_found`.** `LookupExec` reports `Found` false exactly
   when no `exec_start` with that `exec_id` was admitted on the lease, and
   returns `DecidedAt`, its in-transaction clock reading. Admissions and
