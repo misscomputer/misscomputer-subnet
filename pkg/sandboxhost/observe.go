@@ -7,9 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/netip"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -24,84 +22,11 @@ import (
 // read-only; nothing is created, written or signalled.
 type Host struct {
 	Proc string
-	// ListNFTable returns `nft list table inet <name>`; nil runs the nft
-	// binary read-only. An agent that reads the ruleset another way (for
-	// example through a privileged helper) supplies it here.
-	ListNFTable func(name string) (string, error)
-}
-
-func (h Host) listEgressTable(name string) (string, error) {
-	if h.ListNFTable != nil {
-		return h.ListNFTable(name)
-	}
-	out, err := exec.Command("nft", "list", "table", "inet", name).Output()
-	if err != nil {
-		return "", fmt.Errorf("nft list table inet %s: %w", name, err)
-	}
-	return string(out), nil
-}
-
-// Destinations the engine slice must never reach.
-var egressDenied = []string{
-	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-	"192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
-	"::/127", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "ff00::/8",
-}
-
-// localReject is the rule body that rejects every address of this host,
-// whichever interface carries it (a public address on an interface is not
-// covered by any fixed prefix). It must apply to both families.
-const localReject = "fib daddr type local"
-
-// egressRestricted checks the listed table: an output hook; reject rules
-// matching the engine slice by name (a stale cgroup ID prints as a number)
-// that together cover every denied prefix; a reject rule for every local
-// address of the host in both families; and accept rules that only admit
-// the local resolver on port 53.
-func egressRestricted(listing, engineSlice string) error {
-	match := `socket cgroupv2 level 1 "` + engineSlice + `"`
-	if !strings.Contains(listing, "hook output") {
-		return errors.New("egress table has no output hook")
-	}
-	covered := map[netip.Prefix]bool{}
-	local := false
-	for _, line := range strings.Split(listing, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "socket cgroupv2") {
-			continue
-		}
-		if !strings.HasPrefix(line, match+" ") {
-			return fmt.Errorf("rule does not match %s by name (stale cgroup?): %s", engineSlice, line)
-		}
-		switch {
-		case strings.Contains(line, " reject") && strings.Contains(line, localReject):
-			// Family-limited forms (ip/ip6/nfproto) would leave the other family open.
-			body := strings.TrimPrefix(line, match+" ")
-			if strings.HasPrefix(body, localReject+" ") {
-				local = true
-			}
-		case strings.Contains(line, " reject"):
-			// nft may print a prefix in another textual form (for example
-			// ::ffff:0.0.0.0/96), so compare parsed, masked prefixes.
-			for _, token := range strings.FieldsFunc(line, func(r rune) bool { return r == ' ' || r == ',' || r == '{' || r == '}' }) {
-				if prefix, err := netip.ParsePrefix(token); err == nil {
-					covered[prefix.Masked()] = true
-				}
-			}
-		case strings.HasSuffix(line, " accept") && strings.Contains(line, "ip daddr 127.0.0.53 ") && strings.Contains(line, "th dport 53 "):
-		default:
-			return fmt.Errorf("unexpected engine egress rule: %s", line)
-		}
-	}
-	for _, text := range egressDenied {
-		if !covered[netip.MustParsePrefix(text).Masked()] {
-			return fmt.Errorf("engine egress does not reject %s", text)
-		}
-	}
-	if !local {
-		return errors.New("engine egress does not reject the host's own addresses (fib daddr type local) for both families")
-	}
-	return nil
+	// ListNFTable returns `nft -j list table inet <name>` when asJSON is
+	// set and `nft list table inet <name>` otherwise; nil runs the nft binary
+	// read-only. An agent that reads the ruleset another way (for example
+	// through a privileged helper) supplies it here.
+	ListNFTable func(name string, asJSON bool) (string, error)
 }
 
 func (h Host) proc(parts ...string) string {
@@ -227,11 +152,15 @@ func (h Host) Preflight(profile Profile, exclusive []string) []Check {
 	}
 	r.add("budget.within_observed", budgetErr, fmt.Sprintf("profile within observed slice; disk %d MiB + overhead = %d MiB <= %d MiB", a.DiskMiB, a.DiskRequiredMiB(), dataBytes>>20))
 
-	listing, egressErr := h.listEgressTable(profile.Engine.EgressTable)
+	jsonListing, egressErr := h.listEgress(profile.Engine.EgressTable, true)
+	var textListing string
 	if egressErr == nil {
-		egressErr = egressRestricted(listing, profile.EngineSlice)
+		textListing, egressErr = h.listEgress(profile.Engine.EgressTable, false)
 	}
-	r.add("network.engine_egress_restricted", egressErr, fmt.Sprintf("nft table inet %s rejects non-public destinations for %s", profile.Engine.EgressTable, profile.EngineSlice))
+	if egressErr == nil {
+		egressErr = egressRestricted(jsonListing, textListing, profile.Engine.EgressTable, profile.EngineSlice)
+	}
+	r.add("network.engine_egress_restricted", egressErr, fmt.Sprintf("nft table inet %s is exactly the provisioned engine egress chain for %s (host-local, private and reserved destinations rejected)", profile.Engine.EgressTable, profile.EngineSlice))
 
 	r.gap("storage.images_cache_unreserved", "image and pull bytes share the data filesystem; the image reserve is arithmetic, not a quota")
 	r.gap("storage.shim_socket_dir_shared", "containerd shim sockets live in the host-wide /run/containerd/s directory")
