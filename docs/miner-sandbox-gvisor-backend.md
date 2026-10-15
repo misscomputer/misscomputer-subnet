@@ -69,10 +69,22 @@ single-label names, absolute names ending in `.`, and the `.localhost`,
 `.local`, `.internal` and `.home.arpa` namespaces), and any registry host
 (Docker Hub as `registry-1.docker.io`) that does not resolve, or that
 resolves to any address in the `pkg/netpolicy` special-purpose prefixes: loopback, link-local and metadata, RFC 1918,
-CGNAT, ULA, unspecified and the rest of that list. The daemon resolves the
-name again and follows registry redirects, so this check keeps a signed
-reference from naming a host-local service but does not replace host-level
-pull egress policy.
+CGNAT, ULA, unspecified and the rest of that list, and any registry host
+that resolves to an address assigned to one of this host's interfaces
+(contract D8 item 2b), read fresh before every pull; if this host's
+addresses cannot be read, the pull is refused as a miner fault. The daemon
+resolves the name again and follows registry redirects, so this check keeps
+a signed reference from naming a host-local service but does not replace
+host-level pull egress policy (`network.engine_egress_restricted`, which
+also rejects fib-local destinations).
+
+Limits of the host-address check: it sees the interfaces of the agent's own
+network namespace, which must be the host's (the dedicated daemon's)
+namespace; a public address the host answers on without holding it on an
+interface (for example a cloud provider's 1:1 NAT address) and addresses
+reachable only through local routes are not listed; and a registry that
+resolves differently when the daemon resolves it again is caught only by
+the host egress rule.
 
 Image: pulled by its exact digest for `linux/amd64`, only while the data
 root has the per-image limit free (otherwise a miner fault). The pull is
