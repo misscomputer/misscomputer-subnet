@@ -86,7 +86,10 @@ func run() error {
 		staticCacheMaxBytes   = flag.Int64("static-cache-max-bytes", 8<<30, "byte quota of pinned static site files")
 		staticFetchTimeout    = flag.Duration("static-fetch-timeout", miner.DefaultStaticFetchTimeout, "bound on fetching and verifying one static site")
 		staticConcurrency     = flag.Int("static-request-concurrency", miner.DefaultStaticRequestConcurrency, "in-flight requests per static endpoint")
-		sandboxLeases         = flag.String("sandbox-leases", "off", "sandbox-lease-v1 workload: off (default); on needs a sandbox isolation backend, none is available yet")
+		sandboxLeases         = flag.String("sandbox-leases", "off", "sandbox-lease-v1 workload: off (default) or on (gVisor on a dedicated Docker daemon; the host preflight report must pass)")
+		sandboxHostProfile    = flag.String("sandbox-host-profile", "", "sandbox-host-profile.v1 document of this host (required with --sandbox-leases on)")
+		sandboxDeployment     = flag.String("sandbox-deployment-cgroup", "", "cgroup v2 path deployment.v4 replicas run in, kept disjoint from sandboxes (required with --sandbox-leases on)")
+		sandboxDaemonConfig   = flag.String("sandbox-daemon-config", "", "configuration file of the dedicated sandbox Docker daemon (required with --sandbox-leases on)")
 	)
 	flag.Parse()
 	if err := service.ValidateBind(*bind, *allowNonLoopback); err != nil {
@@ -140,7 +143,11 @@ func run() error {
 	if agent.Static, err = openStaticSites(*staticSites, *staticCacheDir, *staticCacheMaxBytes, *staticFetchTimeout, *staticConcurrency); err != nil {
 		return err
 	}
-	sandboxLane, err := openSandboxLeases(*sandboxLeases)
+	sandboxCtx, sandboxCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	sandboxLane, err := openSandboxLeases(sandboxCtx, sandboxOptions{
+		Mode: *sandboxLeases, HostProfile: *sandboxHostProfile, DeploymentCgroup: *sandboxDeployment, DaemonConfig: *sandboxDaemonConfig,
+	}, agent, store)
+	sandboxCancel()
 	if err != nil {
 		return err
 	}
@@ -149,13 +156,16 @@ func run() error {
 		recoveryCancel()
 		return fmt.Errorf("restart cleanup: %w", err)
 	}
+	recoveryCancel()
 	if sandboxLane != nil {
-		if err := sandboxLane.Recover(recoveryCtx); err != nil {
-			recoveryCancel()
+		// Its own budget: recovery may remove every sandbox left running.
+		sandboxRecovery, sandboxRecoveryCancel := context.WithTimeout(context.Background(), sandboxRecoveryTimeout)
+		err := sandboxLane.Recover(sandboxRecovery)
+		sandboxRecoveryCancel()
+		if err != nil {
 			return fmt.Errorf("sandbox restart cleanup: %w", err)
 		}
 	}
-	recoveryCancel()
 	var minerUID *uint16
 	if *uid >= 0 {
 		value := uint16(*uid)

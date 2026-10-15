@@ -48,13 +48,8 @@ func advertised(t *testing.T, service *api) []string {
 // advertises exactly the features it did before the lane existed, and "on"
 // refuses to start because no isolation backend is available.
 func TestSandboxLeasesOffKeepsRoutesAndFeaturesUnchanged(t *testing.T) {
-	if lane, err := openSandboxLeases("off"); lane != nil || err != nil {
+	if lane, err := openSandboxLeases(context.Background(), sandboxOptions{Mode: "off"}, nil, nil); lane != nil || err != nil {
 		t.Fatalf("default sandbox mode: %v %v", lane, err)
-	}
-	for _, mode := range []string{"on", "true", ""} {
-		if lane, err := openSandboxLeases(mode); lane != nil || err == nil {
-			t.Fatalf("--sandbox-leases %q started: %v %v", mode, lane, err)
-		}
 	}
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	for _, test := range []struct {
@@ -265,5 +260,81 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	answer = sandboxResponse{}
 	if err := decodeJSON(bytes.NewReader(response.Body.Bytes()), &answer); err != nil || answer.Receipt.Stage != sandbox.StageReleased || len(backend.live) != 0 {
 		t.Fatalf("replayed release: %d %s live=%d", response.Code, response.Body.String(), len(backend.live))
+	}
+}
+
+// sandboxProfile writes a valid sandbox-host-profile.v1 document whose
+// cgroup root holds deployment, and whose dedicated daemon socket does not
+// exist, so no daemon or host is ever reached.
+func sandboxProfile(t *testing.T) (profile, cgroupRoot string) {
+	t.Helper()
+	dir := t.TempDir()
+	cgroupRoot = filepath.Join(dir, "cgroup")
+	if err := os.MkdirAll(filepath.Join(cgroupRoot, "deployment.slice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupRoot, "deployment.slice", "cgroup.procs"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	profile = filepath.Join(dir, "profile.json")
+	document := `{"schema": "miss.computer/misscomputer-subnet/sandbox-host-profile", "schema_version": 1,
+		"docker_host": "unix://` + dir + `/run/docker.sock",
+		"containerd": {"address": "` + dir + `/run/containerd.sock", "namespace": "mc-sandbox", "plugins_namespace": "mc-sandbox-plugins"},
+		"data_root": "` + dir + `/data", "docker_data_root": "` + dir + `/data/docker", "run_root": "` + dir + `/run",
+		"runtime": {"name": "runsc", "path": "` + dir + `/bin/runsc", "sha256": "` + strings.Repeat("a", 64) + `",
+			"sentry_path": "` + dir + `/bin/gvisor_sentry", "sentry_sha256": "` + strings.Repeat("b", 64) + `",
+			"args": ["--systemd-cgroup", "--overlay2=none"], "release": "release-20261005.0"},
+		"engine": {"docker_version": "28.0.4", "egress_table": "mcsbx_engine_egress"},
+		"cgroup_root": "` + cgroupRoot + `", "lease_slice": "mcsbxlease.slice", "engine_slice": "mcsbxengine.slice",
+		"aggregate": {"cpu_millis": 2000, "memory_mib": 1024, "pids": 1024, "data_fs_mib": 4096, "run_tmpfs_mib": 64,
+			"image_reserve_mib": 512, "engine_overhead_mib": 512, "image_max_mib": 256, "log_mib": 16, "disk_mib": 1984, "sandboxes": 4},
+		"per_lease": {"default_writable_mib": 64, "log_max_size_mib": 8, "log_max_file": 2, "pids_max": 64,
+			"mounts": "none", "image_volumes": "refuse", "network_modes": ["none"], "isolation": ["gvisor"]}}`
+	if err := os.WriteFile(profile, []byte(document), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return profile, cgroupRoot
+}
+
+// --sandbox-leases stays off unless asked for, refuses a configured but
+// unused sandbox setting, and with "on" starts nothing unless every input
+// is given and valid and the host preflight passes. None of these cases
+// reaches a daemon: the profile's socket does not exist.
+func TestSandboxLeasesStartOnlyAfterTheHostPreflight(t *testing.T) {
+	profile, _ := sandboxProfile(t)
+	daemonConfig := filepath.Join(t.TempDir(), "daemon.json")
+	if err := os.WriteFile(daemonConfig, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := durable.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	on := sandboxOptions{Mode: "on", HostProfile: profile, DeploymentCgroup: "/deployment.slice", DaemonConfig: daemonConfig}
+	for _, test := range []struct {
+		name    string
+		options sandboxOptions
+		want    string
+	}{
+		{name: "off with a profile", options: sandboxOptions{Mode: "off", HostProfile: profile}, want: "require --sandbox-leases on"},
+		{name: "off with a deployment cgroup", options: sandboxOptions{Mode: "off", DeploymentCgroup: "/deployment.slice"}, want: "require --sandbox-leases on"},
+		{name: "off with a daemon configuration", options: sandboxOptions{Mode: "off", DaemonConfig: daemonConfig}, want: "require --sandbox-leases on"},
+		{name: "unknown mode", options: sandboxOptions{Mode: "true"}, want: "unsupported"},
+		{name: "empty mode", options: sandboxOptions{}, want: "unsupported"},
+		{name: "on without a profile", options: sandboxOptions{Mode: "on", DeploymentCgroup: "/deployment.slice", DaemonConfig: daemonConfig}, want: "requires --sandbox-host-profile"},
+		{name: "on without a deployment cgroup", options: sandboxOptions{Mode: "on", HostProfile: profile, DaemonConfig: daemonConfig}, want: "requires --sandbox-host-profile"},
+		{name: "on without a daemon configuration", options: sandboxOptions{Mode: "on", HostProfile: profile, DeploymentCgroup: "/deployment.slice"}, want: "requires --sandbox-host-profile"},
+		{name: "on with a missing profile", options: sandboxOptions{Mode: "on", HostProfile: profile + ".missing", DeploymentCgroup: "/deployment.slice", DaemonConfig: daemonConfig}, want: "sandbox host profile"},
+		{name: "on with a relative deployment cgroup", options: sandboxOptions{Mode: "on", HostProfile: profile, DeploymentCgroup: "deployment.slice", DaemonConfig: daemonConfig}, want: "clean absolute cgroup path"},
+		{name: "on with a deployment cgroup that does not exist", options: sandboxOptions{Mode: "on", HostProfile: profile, DeploymentCgroup: "/typo.slice", DaemonConfig: daemonConfig}, want: "is not a cgroup"},
+		{name: "on with a host whose daemon does not answer", options: on, want: "sandbox host preflight"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lane, err := openSandboxLeases(context.Background(), test.options, miner.NewAgent("miner", nil, nil, nil, nil, nil), store)
+			if lane != nil || err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("openSandboxLeases = %v, %v, want an error containing %q", lane, err, test.want)
+			}
+		})
 	}
 }
