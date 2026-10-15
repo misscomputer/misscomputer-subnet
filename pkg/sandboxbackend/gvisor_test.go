@@ -132,6 +132,7 @@ func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
 	e := &fakeEngine{
 		version: PinnedDockerVersion,
 		info: map[string]any{
+			"ID": "SANDBOX-ENGINE-ID", "LoggingDriver": "json-file",
 			"DockerRootDir": dataRoot, "Driver": "overlay2", "CgroupDriver": "systemd", "CgroupVersion": "2",
 			"DriverStatus": [][]string{{"Backing Filesystem", "xfs"}, {"Supports d_type", "true"}, {"Using metacopy", "false"}, {"Native Overlay Diff", "true"}, {"userxattr", "false"}},
 			"Runtimes":     map[string]any{"runsc": map[string]any{"path": runsc, "runtimeArgs": []string{"--systemd-cgroup", "--overlay2=none"}}},
@@ -447,7 +448,7 @@ func newHost(t *testing.T) *host {
 		DockerHost: "unix://" + socket, Runtime: "runsc", RunscPath: runsc, RunscSHA256: digestOf("runsc binary"),
 		SentryPath: sentry, SentrySHA256: digestOf("sentry binary"), DataRoot: dataRoot, Slice: testSlice,
 		CgroupRoot: filepath.Join(root, "cgroup"), ProcRoot: filepath.Join(root, "proc"),
-		DiskMiB: 1024, Sandboxes: 2, ImageMaxMiB: 64, LogMiB: 4,
+		DiskMiB: 1024, Sandboxes: 2, ImageMaxMiB: 64, LogMiB: 4, PIDsMax: 4096,
 	}}
 	var err error
 	if h.sentryFile, err = os.Stat(sentry); err != nil {
@@ -486,7 +487,7 @@ func (h *host) process(exe, cgroup string, r sandbox.Resources) {
 // it directly; TestOpenRefusesUnverifiableHosts covers Open.
 func (h *host) backend() *GVisor {
 	return &GVisor{
-		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, slicePIDs: 4096, sandboxExe: h.sentry, sandboxFile: h.sentryFile, runscFile: h.runscFile,
+		config: h.config, engine: newEngine(h.socket), sliceCgroup: "/mc.slice/" + testSlice, sandboxExe: h.sentry, sandboxFile: h.sentryFile, runscFile: h.runscFile,
 		lookup: func(_ context.Context, name string) ([]netip.Addr, error) {
 			if addresses, ok := h.dns[name]; ok {
 				return addresses, nil
@@ -898,7 +899,7 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 	}{
 		{name: "kata isolation", lease: func(l *protocol.SandboxLeaseV1) { l.Isolation = sandbox.IsolationKata }, code: "isolation_unsupported", policy: true},
 		{name: "public network", lease: func(l *protocol.SandboxLeaseV1) { l.Network.Mode = sandbox.NetworkPublic }, code: "network_policy_unsupported", policy: true},
-		{name: "more pids than the slice", lease: func(l *protocol.SandboxLeaseV1) { l.Resources.PIDs = 8192 }, code: "resources_unsupported", policy: true},
+		{name: "more pids than the per-lease limit", lease: func(l *protocol.SandboxLeaseV1) { l.Resources.PIDs = 8192 }, code: "resources_unsupported", policy: true},
 		{name: "registry has no such manifest", lease: func(l *protocol.SandboxLeaseV1) {
 			l.ImageReference = "ghcr.io/nobody/missing@" + testImageDigest
 		}, code: "image_unavailable"},
@@ -1106,7 +1107,6 @@ func TestOpenRefusesUnverifiableHosts(t *testing.T) {
 		mutate func(*host, *Config)
 		want   string
 	}{
-		{name: "valid host up to the cgroup mount", want: "not on a cgroup v2 filesystem"},
 		{name: "tcp daemon", mutate: func(_ *host, c *Config) { c.DockerHost = "tcp://127.0.0.1:2375" }, want: "unix://"},
 		{name: "runc runtime", mutate: func(_ *host, c *Config) { c.Runtime = "runc" }, want: "runsc runtime"},
 		{name: "runsc digest mismatch", mutate: func(_ *host, c *Config) { c.RunscSHA256 = strings.Repeat("0", 64) }, want: "pinned"},
@@ -1158,7 +1158,7 @@ func TestOpenRefusesUnverifiableHosts(t *testing.T) {
 		{name: "daemon runs another workload", mutate: func(h *host, _ *Config) {
 			h.engine.containers["web"] = &engineContainer{Name: "web", Labels: map[string]string{}}
 		}, want: "must be dedicated"},
-		{name: "data root too small", mutate: func(_ *host, c *Config) { c.DiskMiB = 1 << 40 }, want: "need"},
+		{name: "no per-lease pids limit", mutate: func(_ *host, c *Config) { c.PIDsMax = 0 }, want: "pids limit"},
 		{name: "invalid slice", mutate: func(_ *host, c *Config) { c.Slice = "../escape.slice" }, want: "systemd slice"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

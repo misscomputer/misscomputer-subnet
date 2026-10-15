@@ -232,11 +232,19 @@ func captureAttributions(t *testing.T) func() []map[string]any {
 // returned func is called.
 func captureRecords(t *testing.T, msg string) func() []map[string]any {
 	t.Helper()
+	logs := captureLogs(t)
+	return func() []map[string]any { return logs(msg) }
+}
+
+// captureLogs records every event logged until the returned func, which
+// selects the events with one message, is called.
+func captureLogs(t *testing.T) func(msg string) []map[string]any {
+	t.Helper()
 	var buffer bytes.Buffer
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buffer, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
-	return func() []map[string]any {
+	return func(msg string) []map[string]any {
 		var records []map[string]any
 		for _, line := range strings.Split(strings.TrimSpace(buffer.String()), "\n") {
 			var record map[string]any
