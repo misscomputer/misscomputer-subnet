@@ -83,7 +83,11 @@ from .organic_manifest import (
     verify_assignment_manifest_v3,
 )
 from .score_checkpoint_relay_cli import InputFile, _normalized_absolute_path
-from .static_crawl import fetch_static_index_documents, send_static_probe
+from .static_crawl import (
+    fetch_static_index_documents,
+    read_private_static_index_documents,
+    send_static_probe,
+)
 from .static_evidence import StaticEvidenceJournal
 from .static_index import (
     StaticIndexAbstention,
@@ -146,8 +150,8 @@ class StaticSitesConfig:
     release_trust_policy: InputFile
     #: The pinned ``static-handler.v1`` implementation digest (``sha256:<hex>``).
     server_implementation_digest: str
-    #: HTTPS origin of the §1 public static index (``static-sites/v1/...``).
-    index_origin: str
+    #: Exactly one index source: HTTPS origin or owner-private local spool.
+    index_origin: str | None
     manifest_archive_dir: str
     epoch_output: str
     journal: str
@@ -161,6 +165,7 @@ class StaticSitesConfig:
     #: Operator-delivered snapshot/evidence envelope offered to the high water.
     revocation_snapshot: str | None = None
     revocation_max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS
+    index_root: str | None = None
 
 
 @dataclass(slots=True)
@@ -447,14 +452,42 @@ def preflight_static(
     *,
     organic_state_root: str | None = None,
     organic_inputs: set[str] | None = None,
-) -> tuple[StaticSiteReleaseTrustPolicy, str, str]:
+) -> tuple[StaticSiteReleaseTrustPolicy, str, str | None]:
     """Refuse an unsafe or aliased static configuration before anything is probed."""
 
     server_digest = _pinned_digest(config.server_implementation_digest)
     _check_revocation_options(config)
-    index_origin = _validated_https_url(config.index_origin, code="static_index_origin_invalid")
-    index_origin = index_origin.rstrip("/")
+    if (config.index_origin is None) == (config.index_root is None):
+        _fail("static_index_source_invalid")
+    index_origin = (
+        _validated_https_url(config.index_origin, code="static_index_origin_invalid").rstrip("/")
+        if config.index_origin is not None
+        else None
+    )
+    index_root = (
+        _normalized_absolute_path(config.index_root, code="static_index_root_unsafe")
+        if config.index_root is not None
+        else None
+    )
+    if index_root == "/":
+        _fail("static_index_root_unsafe")
     static_root = _normalized_absolute_path(config.state_root, code="state_root_path_unsafe")
+    if index_root is not None:
+        # Output/state mutation must never share the read-only inventory tree.
+        for path in (
+            config.state_root,
+            config.manifest_archive_dir,
+            config.epoch_output,
+            config.journal,
+            *((organic_state_root,) if organic_state_root is not None else ()),
+        ):
+            normalized = _normalized_absolute_path(path, code="static_index_root_unsafe")
+            if (
+                normalized == index_root
+                or normalized.startswith(index_root + "/")
+                or index_root.startswith(normalized + "/")
+            ):
+                _fail("static_index_root_alias")
     if organic_state_root is not None and (
         static_root == organic_state_root
         or static_root.startswith(organic_state_root + "/")
@@ -510,7 +543,7 @@ def load_static_epoch(
     policy: AssignmentManifestTrustPolicy,
     release_policy: StaticSiteReleaseTrustPolicy,
     server_digest: str,
-    index_origin: str,
+    index_origin: str | None,
     epoch_index: int,
     evaluation_epoch: int,
     current_finalized_height: int,
@@ -570,7 +603,7 @@ def load_static_epoch(
         return
     run.verification = verification
     held = run.revocation.held if run.revocation is not None else None
-    server_name = urlsplit(index_origin).hostname or ""
+    server_name = urlsplit(index_origin).hostname or "" if index_origin is not None else ""
     deadline = time.monotonic() + STATIC_INDEX_LOAD_BUDGET_SECONDS
     targets = static_deployment_targets(verification)
     # A fixed prefix lets slow low-ID indexes consume the budget forever.
@@ -591,13 +624,19 @@ def load_static_epoch(
                 StaticIndexAbstention(target.deployment_id, target.site_digest, "index_unavailable")
             )
             continue
-        manifest_bytes, release_bytes = fetch_static_index_documents(
-            transport,
-            target,
-            index_origin=index_origin,
-            server_name=server_name,
-            deadline=deadline,
-        )
+        if run.config.index_root is not None:
+            manifest_bytes, release_bytes = read_private_static_index_documents(
+                run.config.index_root, target, deadline=deadline
+            )
+        else:
+            assert index_origin is not None
+            manifest_bytes, release_bytes = fetch_static_index_documents(
+                transport,
+                target,
+                index_origin=index_origin,
+                server_name=server_name,
+                deadline=deadline,
+            )
         result = ingest_static_index(
             target,
             manifest_bytes,

@@ -491,11 +491,14 @@ def config_argv(config: AssignmentProbeCLIConfig) -> list[str]:
         "--static-release-trust-policy", static.release_trust_policy.path,
         "--static-release-trust-policy-sha256", static.release_trust_policy.sha256,
         "--static-server-implementation-digest", static.server_implementation_digest,
-        "--static-index-origin", static.index_origin,
         "--static-manifest-archive-dir", static.manifest_archive_dir,
         "--static-epoch-output", static.epoch_output,
         "--static-journal", static.journal,
     ]  # fmt: skip
+    if static.index_root is not None:
+        values += ["--static-index-root", static.index_root]
+    if static.index_origin is not None:
+        values += ["--static-index-origin", static.index_origin]
     if static.revocation_policy is not None:
         values += [
             "--static-release-revocation-policy", static.revocation_policy,
