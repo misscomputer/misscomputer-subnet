@@ -166,7 +166,15 @@ process remains anywhere below the slice except in the cgroups of other
 sandboxes: those the engine reports running, and those an earlier readback
 found a sandbox's process in, until that sandbox's container is removed.
 Sandboxes start and are verified one at a time, so no other sandbox is
-starting while this check runs. The per-process checks are logged as `not_run`, the
+starting while this check runs. The engine records the exit, and the runtime
+tears the sandbox's processes down, after the process is gone, so the
+inspection and the slice check are repeated every 50 ms for at most 2 s:
+while the engine still reports the sandbox running, its process is read
+again (a passing readback serves it as running; any value that differs from
+the lease is a miner fault), a stop that is not a clean exit is a miner
+fault at once, and no clean, quiet exit within 2 s is a miner fault. Each
+such decision is logged as one `sandbox exit attribution` record. The
+per-process checks are logged as `not_run`, the
 exited container is never restarted, and it keeps its lease, writable layer
 and logs until release or expiry.
 

@@ -694,12 +694,7 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	}
 	cgroup, err := b.verifyProcess(existing, s)
 	if err == nil {
-		b.mu.Lock()
-		if b.cgroups == nil {
-			b.cgroups = map[string]string{}
-		}
-		b.cgroups[instanceID] = cgroup
-		b.mu.Unlock()
+		b.recordCgroup(instanceID, cgroup)
 		return nil
 	}
 	if !errors.Is(err, errProcessVanished) {
@@ -708,18 +703,118 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 		return err
 	}
 	// The workload may have exited by itself before or during the kernel
-	// readback (contract D11-C2): accept that only from a fresh inspection.
-	again, found, inspectErr := b.inspect(ctx, instanceID)
-	if inspectErr != nil || !found || again.ID != existing.ID || !workloadExited(again) {
-		return err
+	// readback (contract D11-C2).
+	return b.settleExit(ctx, instanceID, existing.ID, s, err)
+}
+
+func (b *GVisor) recordCgroup(instanceID, cgroup string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cgroups == nil {
+		b.cgroups = map[string]string{}
 	}
-	if err := b.verifyEngine(again, s); err != nil {
-		return err
+	b.cgroups[instanceID] = cgroup
+}
+
+// ExitAttribution is the per-instance record of a workload whose process
+// was gone at the kernel readback (contract D11): the decision and what the
+// last inspection showed.
+type ExitAttribution struct {
+	Instance, ContainerID string
+	// Decision is "exited" (served), "running" (a later readback of the
+	// live process passed) or "fault: <condition>".
+	Decision                      string
+	Inspections                   int
+	Status, StartedAt, FinishedAt string
+	Pid                           int
+	StartError                    bool
+	SliceQuiet                    bool
+	Settled, SettleBound          time.Duration
+}
+
+func (r ExitAttribution) log() {
+	slog.Info("sandbox exit attribution", "sandbox", r.Instance, "container_id", r.ContainerID, "decision", r.Decision,
+		"inspections", r.Inspections, "status", r.Status, "started_at", r.StartedAt, "finished_at", r.FinishedAt,
+		"pid", r.Pid, "start_error", r.StartError, "slice_quiet", r.SliceQuiet,
+		"settled", r.Settled.String(), "settle_bound", r.SettleBound.String())
+}
+
+// settleExit decides a sandbox whose process was gone at the kernel
+// readback. The engine records the exit, and the runtime tears down its
+// processes, asynchronously, so the inspection, and the slice check of an
+// exited workload, are repeated every startSettleInterval for at most
+// startSettleBound. The workload is served only when an inspection shows
+// it exited by itself (D11-C1) with its configuration intact and nothing
+// left below the slice; while the engine still reports it running, the
+// kernel readback is repeated, and any value it reads that differs from
+// the lease is a miner fault (D11-C2). A state the engine reports as
+// failed, or no exit within the bound, is a miner fault.
+func (b *GVisor) settleExit(ctx context.Context, instanceID, containerID string, s spec, vanished error) error {
+	record := ExitAttribution{Instance: instanceID, ContainerID: containerID, SettleBound: startSettleBound}
+	// Logged as decided, not as first built.
+	defer func() { record.log() }()
+	fault := func(condition string, err error) error {
+		record.Decision = "fault: " + condition
+		return fmt.Errorf("sandbox %s %s: %w", instanceID, condition, err)
 	}
-	if err := b.sliceQuiet(ctx, instanceID); err != nil {
-		return err
+	begun := time.Now()
+	last := vanished
+	for {
+		again, found, err := b.inspect(ctx, instanceID)
+		record.Inspections++
+		if err != nil || !found || again.ID != containerID {
+			if err == nil {
+				err = last
+			}
+			return fault("re-inspection not answered", err)
+		}
+		record.Status, record.StartedAt, record.FinishedAt = again.State.Status, again.State.StartedAt, again.State.FinishedAt
+		record.Pid, record.StartError = again.State.Pid, again.State.Error != ""
+		switch {
+		case workloadExited(again):
+			if err := b.verifyEngine(again, s); err != nil {
+				return fault("engine configuration", err)
+			}
+			quiet := b.sliceQuiet(ctx, instanceID)
+			record.SliceQuiet = quiet == nil
+			if quiet == nil {
+				record.Decision, record.Settled = "exited", time.Since(begun)
+				return b.exited(again)
+			}
+			if !errors.Is(quiet, errProcessesRemain) {
+				return fault("slice unreadable", quiet)
+			}
+			last = quiet
+		case again.State.Running || again.State.Pid > 0:
+			// The engine has not recorded the exit yet, or the process
+			// is in fact running: read it again.
+			cgroup, err := b.verifyProcess(again, s)
+			if err == nil {
+				b.recordCgroup(instanceID, cgroup)
+				record.Decision, record.Settled = "running", time.Since(begun)
+				return nil
+			}
+			if !errors.Is(err, errProcessVanished) {
+				return fault("live process differs from the lease", err)
+			}
+			last = err
+		default:
+			// Stopped without a clean exit: a start the engine or runtime
+			// failed, or an exit time not after the start.
+			return fault("did not exit by itself", last)
+		}
+		record.Settled = time.Since(begun)
+		if record.Settled >= startSettleBound {
+			return fault("did not settle", last)
+		}
+		timer := time.NewTimer(startSettleInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fault("did not settle", ctx.Err())
+		case <-timer.C:
+		}
 	}
-	return b.exited(again)
 }
 
 // Settling of a start the engine refused: the runtime tears down the

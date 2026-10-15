@@ -666,7 +666,14 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 		leftover string
 		// other runs another sandbox whose process is in docker-1.scope.
 		other bool
-		want  string // "" for success, else the miner fault
+		// leftoverFor removes the leftover process after this long, as a
+		// runtime finishing its teardown.
+		leftoverFor time.Duration
+		// onInspect runs after the n-th inspection of the sandbox.
+		onInspect func(h *host, n int, c *engineContainer)
+		want      string // "" for success, else the miner fault
+		// decision is the recorded exit decision, when asserted.
+		decision string
 	}{
 		// The backend does not read the exit code or OOM flag: exit 0,
 		// non-zero and an OOM kill within the lease limit look alike to it.
@@ -692,11 +699,38 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 			c.Status, c.Error = "exited", "OCI runtime create failed: runsc: exit status 1"
 		}, want: "is exited, not running"},
 		{name: "never started", started: func(c *engineContainer) { c.Status, c.StartedAt = "exited", "" }, want: "is exited, not running"},
-		{name: "process vanished while running", noProcess: true, want: "process executable"},
+		{name: "process vanished while running", noProcess: true, want: "process executable", decision: "fault: did not settle"},
+		// The engine records an exit, and the runtime tears its processes
+		// down, after the process is gone (DEP-3 run 38673113182).
+		{name: "engine records the exit after the process is gone", noProcess: true,
+			onInspect: func(_ *host, n int, c *engineContainer) {
+				if n == 3 {
+					exit(c)
+				}
+			}, decision: "exited"},
+		{name: "its own processes linger briefly after the exit", started: exit, leftover: "docker-%s.scope",
+			leftoverFor: 200 * time.Millisecond, decision: "exited"},
+		// A process read live again while the engine still reports it
+		// running is held to the lease (D11-C2).
+		{name: "live process read again differs from the lease", noProcess: true,
+			onInspect: func(h *host, n int, _ *engineContainer) {
+				if n == 2 {
+					h.process(h.config.RunscPath+"-other", scope, resources)
+				}
+			}, want: "not the pinned gVisor binary", decision: "fault: live process differs from the lease"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newHost(t)
 			h.engine.applied, h.engine.started, h.engine.inspected = test.applied, test.started, test.inspected
+			if test.onInspect != nil {
+				inspections := 0
+				h.engine.inspected = func(c *engineContainer) {
+					if c.Status != "created" {
+						inspections++
+						test.onInspect(h, inspections, c)
+					}
+				}
+			}
 			if test.process != nil {
 				test.process(h)
 			}
@@ -708,13 +742,21 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 			lease := testLease(nil)
 			if test.leftover != "" {
 				dir := strings.ReplaceAll(test.leftover, "%s", containerIDOf(instanceOf(lease)))
-				writeFile(t, filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, dir, "cgroup.procs"), "4243\n")
+				procs := filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, dir, "cgroup.procs")
+				writeFile(t, procs, "4243\n")
+				if test.leftoverFor > 0 {
+					time.AfterFunc(test.leftoverFor, func() { _ = os.WriteFile(procs, nil, 0o644) })
+				}
 			}
 			if test.other {
 				h.engine.containers["other"] = &engineContainer{Name: "other", Image: testImageID, Status: "running",
 					Labels: map[string]string{LabelSandbox: sandboxLabelV1, LabelLeaseID: "other-lease"}}
 			}
+			records := captureRecords(t, "sandbox exit attribution")
 			err := h.backend().Create(context.Background(), instanceOf(lease), lease)
+			if got := records(); test.decision != "" && (len(got) != 1 || got[0]["decision"] != test.decision) {
+				t.Errorf("exit records = %v, want one %q decision", got, test.decision)
+			}
 			switch {
 			case test.want == "" && err != nil:
 				t.Fatalf("create = %v, want the exited workload served", err)
