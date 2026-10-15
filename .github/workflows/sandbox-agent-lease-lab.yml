@@ -1,0 +1,221 @@
+name: sandbox agent lease lab
+
+# One bounded lab pass of the merged miner agent (AGENT_SHA) with
+# --sandbox-leases on, on a host provisioned by scripts/sandbox-host from
+# this PR's head. It records the combined startup report (OpenFromProfile
+# JSON and the agent's own log), then drives one real lease through the
+# agent's authenticated bridge: a lab validator key signs a reservation, a
+# lease for a digest-pinned public image and a release; the backend pulls
+# and creates the sandbox under runsc, and its instance report is captured
+# from the agent log. GitHub-hosted only; no customer secret, no network
+# routing, no activation; the VM is discarded.
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+env:
+  AGENT_SHA: 1c0c26d47ed68824a35e0e36fbcdc408f8ca1208
+  # nginx:stable-alpine OCI index, resolved 2026-10-15: default command runs
+  # until stopped, no image VOLUMEs, about 28 MB compressed (linux/amd64).
+  LEASE_IMAGE: docker.io/library/nginx@sha256:ed84151ed2d47ef93c0939eb9b9754c6990db6092cd2081e11988a47a83d47ea
+  MINER_HOTKEY: 5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty
+  VALIDATOR_HOTKEY: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
+
+jobs:
+  agent-lease-lab:
+    if: >-
+      github.event.label.name == 'run-sandbox-agent-lease-lab' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: host
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.AGENT_SHA }}
+          path: agent
+          persist-credentials: false
+      - name: Record exact source pins
+        run: |
+          host_sha=$(git -C host rev-parse HEAD)
+          agent_sha=$(git -C agent rev-parse HEAD)
+          # shellcheck disable=SC2153 # AGENT_SHA is the workflow-level pin
+          [[ $agent_sha == "$AGENT_SHA" ]] || { echo "agent checkout $agent_sha != pin $AGENT_SHA"; exit 1; }
+          catalog=$(sha256sum agent/pkg/sandboxhost/check-catalog.v1.json | cut -d' ' -f1)
+          printf 'host scripts: %s\nagent source: %s (tree %s)\ncatalog sha256: %s\nlease image: %s\n' \
+            "$host_sha" "$agent_sha" "$(git -C agent rev-parse 'HEAD^{tree}')" "$catalog" "$LEASE_IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.23.12"
+          cache: false
+      - name: Build the agent, the lab harnesses and the observer from the pinned source
+        run: |
+          mkdir -p agent/cmd/mcsbx-lab-preflight agent/cmd/mcsbx-lab-lease
+          cp host/scripts/sandbox-host/lab/openfromprofile.go.txt agent/cmd/mcsbx-lab-preflight/main.go
+          cp host/scripts/sandbox-host/lab/agentlease.go.txt agent/cmd/mcsbx-lab-lease/main.go
+          (cd agent && go build -trimpath -o "$RUNNER_TEMP/miner-agent" ./cmd/miner-agent)
+          (cd agent && go build -trimpath -o "$RUNNER_TEMP/mcsbx-lab-preflight" ./cmd/mcsbx-lab-preflight)
+          (cd agent && go build -trimpath -o "$RUNNER_TEMP/mcsbx-lab-lease" ./cmd/mcsbx-lab-lease)
+          (cd agent && go build -trimpath -o "$RUNNER_TEMP/sandbox-host-observe" ./cmd/sandbox-host-observe)
+      - name: Install pinned XFS and nftables tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xfsprogs=6.6.0-1ubuntu2.1 nftables
+      - name: Provision dedicated engine
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+          MC_SANDBOX_HOST_DATA_FS_MIB: "8192"
+          MC_SANDBOX_HOST_LEASE_MEMORY_MIB: "2048"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,MC_SANDBOX_HOST_DATA_FS_MIB,MC_SANDBOX_HOST_LEASE_MEMORY_MIB,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/provision-disposable.sh
+      - name: Lab deployment cgroup (exists, holds nothing)
+        run: |
+          sudo systemd-run --quiet --unit mcsbxdeployanchor.service --slice mcsbxdeploy.slice --remain-after-exit /bin/true
+          sudo test -f /sys/fs/cgroup/mcsbxdeploy.slice/cgroup.procs
+          mkdir -p "$RUNNER_TEMP/lab-out"
+          echo 'deployment cgroup: /mcsbxdeploy.slice (lab stand-in; no deployment.v4 replicas run in it)' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Startup report through OpenFromProfile (JSON)
+        run: |
+          sudo "$RUNNER_TEMP/mcsbx-lab-preflight" "$RUNNER_TEMP/mcsbx/profile.json" "$RUNNER_TEMP/mcsbx/daemon.json" /mcsbxdeploy.slice | tee "$RUNNER_TEMP/lab-out/openfromprofile.json" >/dev/null
+          python3 - "$RUNNER_TEMP/lab-out/openfromprofile.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          r = d['report']
+          counts = {}
+          for c in r['checks']:
+              counts[c['status']] = counts.get(c['status'], 0) + 1
+          print(f"OpenFromProfile: opened={d['opened']} error={d['error']} verdict={r['verdict']} checks={len(r['checks'])} {counts}")
+          sys.exit(0 if d['opened'] and r['verdict'] == 'pass' and d['error'] is None else 1)
+          PY
+      - name: Start the agent with --sandbox-leases on
+        run: |
+          mkdir -p "$RUNNER_TEMP/agent/artifacts" "$RUNNER_TEMP/agent/docker-state"
+          # Per-run random bridge secret; nothing durable is stored.
+          (umask 077; openssl rand -hex 32 > "$RUNNER_TEMP/agent/bridge.secret")
+          # The runner user writes the log under RUNNER_TEMP; only the agent needs root.
+          # shellcheck disable=SC2024
+          sudo nohup "$RUNNER_TEMP/miner-agent" --bridge-secret-file "$RUNNER_TEMP/agent/bridge.secret" \
+            --network mock --netuid 1 --hotkey "$MINER_HOTKEY" --uid -1 \
+            --service-key-file "$RUNNER_TEMP/agent/service.key" --state-db "$RUNNER_TEMP/agent/state.db" \
+            --artifact-dir "$RUNNER_TEMP/agent/artifacts" --docker-state-dir "$RUNNER_TEMP/agent/docker-state" \
+            --miner-transport http --allow-insecure-mock-http --bind 127.0.0.1:19101 \
+            --sandbox-leases on --sandbox-host-profile "$RUNNER_TEMP/mcsbx/profile.json" \
+            --sandbox-deployment-cgroup /mcsbxdeploy.slice --sandbox-daemon-config "$RUNNER_TEMP/mcsbx/daemon.json" \
+            > "$RUNNER_TEMP/lab-out/agent.log" 2>&1 &
+          for _ in $(seq 1 240); do
+            grep -q 'miner agent ready' "$RUNNER_TEMP/lab-out/agent.log" && break
+            pgrep -x miner-agent >/dev/null || break
+            sleep 0.5
+          done
+          agent_pid=$(pgrep -x miner-agent | head -1 || true)
+          echo "agent pid=${agent_pid:-none} ready=$(grep -c 'miner agent ready' "$RUNNER_TEMP/lab-out/agent.log")" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "healthz=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:19101/healthz || true)" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 host/scripts/sandbox-host/lab/parse_agent_log.py "$RUNNER_TEMP/lab-out/agent.log" "$RUNNER_TEMP/lab-out" | tee "$RUNNER_TEMP/lab-out/startup-report.txt" | head -1 | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ -n $agent_pid ]] && grep -q 'miner agent ready' "$RUNNER_TEMP/lab-out/agent.log"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r and r["verdict"]=="pass" else 1)' "$RUNNER_TEMP/lab-out/startup-report.json"
+      - name: One real lease through the agent bridge (reserve, commit, readback)
+        run: |
+          engine=(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock")
+          echo "engine containers before lease: $("${engine[@]}" ps -aq | wc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo "$RUNNER_TEMP/mcsbx-lab-lease" lease "$RUNNER_TEMP/lease-state.json" \
+            -agent http://127.0.0.1:19101 -secret "$RUNNER_TEMP/agent/bridge.secret" -service-key "$RUNNER_TEMP/agent/service.key" \
+            -network mock -netuid 1 -miner "$MINER_HOTKEY" -validator "$VALIDATOR_HOTKEY" -image "$LEASE_IMAGE" \
+            -cpu 1000 -memory 1024 -disk 5120 -pids 64 | tee -a "$GITHUB_STEP_SUMMARY"
+          sleep 3
+          "${engine[@]}" ps -a --no-trunc --format '{{.ID}} {{.Names}} {{.Status}}' | tee "$RUNNER_TEMP/lab-out/engine-ps.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+          ids=$("${engine[@]}" ps -aq)
+          if [[ -n $ids ]]; then
+            # shellcheck disable=SC2086 # ids are engine container ids
+            "${engine[@]}" inspect $ids > "$RUNNER_TEMP/lab-out/engine-inspect.json"
+            python3 - "$RUNNER_TEMP/lab-out/engine-inspect.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          for c in json.load(open(sys.argv[1])):
+              h, s = c['HostConfig'], c['State']
+              print(f"container {c['Name']} image={c['Image'][:19]} runtime={h['Runtime']} network={h['NetworkMode']} cgroup_parent={h.get('CgroupParent')} "
+                    f"status={s['Status']} running={s['Running']} pid={s['Pid']} memory={h['Memory']} nano_cpus={h['NanoCpus']} pids_limit={h['PidsLimit']} "
+                    f"readonly_rootfs={h.get('ReadonlyRootfs')} storage_opt={h.get('StorageOpt')} mounts={len(c.get('Mounts') or [])}")
+          PY
+            pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["State"]["Pid"])' "$RUNNER_TEMP/lab-out/engine-inspect.json")
+            if [[ $pid -gt 0 ]]; then
+              sudo "$RUNNER_TEMP/sandbox-host-observe" -profile "$RUNNER_TEMP/mcsbx/profile.json" instance -pid "$pid" | tee "$RUNNER_TEMP/lab-out/observer-instance.json" >/dev/null
+              python3 - "$RUNNER_TEMP/lab-out/observer-instance.json" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          for c in json.load(open(sys.argv[1])):
+              print(f"observer instance {c['id']} {c['status']}: {c['evidence'][:160]}")
+          PY
+            fi
+          fi
+          python3 host/scripts/sandbox-host/lab/parse_agent_log.py "$RUNNER_TEMP/lab-out/agent.log" "$RUNNER_TEMP/lab-out" > "$RUNNER_TEMP/lab-out/reports.txt"
+          grep -E '^instance' "$RUNNER_TEMP/lab-out/reports.txt" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          grep -E 'sandbox (start|exit) attribution|sandbox start|create budget| WARN | ERROR ' "$RUNNER_TEMP/lab-out/agent.log" | cut -c1-400 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          python3 - "$RUNNER_TEMP/lease-state.json" "$RUNNER_TEMP/lab-out/instance-reports.json" <<'PY'
+          import json, sys
+          state = json.load(open(sys.argv[1]))
+          stages = [r['stage'] for r in state['receipts']]
+          instances = json.load(open(sys.argv[2]))
+          running = [r for r in instances if r.get('decision') == 'running' and r['verdict'] == 'pass']
+          print(f"receipt stages={stages} instance reports={[(r.get('decision'), r['verdict']) for r in instances]}")
+          sys.exit(0 if stages[:1] == ['held'] and stages[-1] == 'ready' and running else 1)
+          PY
+      - name: Release the lease and verify the sandbox is gone
+        run: |
+          sudo "$RUNNER_TEMP/mcsbx-lab-lease" release "$RUNNER_TEMP/lease-state.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          left=$(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq | wc -l)
+          children=$(find /sys/fs/cgroup/mcsbxlease.slice -mindepth 1 -type d | wc -l)
+          echo "after release: engine containers=$left lease slice child cgroups=$children" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $left == 0 ]]
+      - name: Stop the agent (SIGTERM) and record the exit
+        if: always()
+        run: |
+          agent_pid=$(pgrep -x miner-agent | head -1 || true)
+          if [[ -n $agent_pid ]]; then
+            sudo kill -TERM "$agent_pid"
+            for _ in $(seq 1 120); do sudo kill -0 "$agent_pid" 2>/dev/null || break; sleep 0.5; done
+            if sudo kill -0 "$agent_pid" 2>/dev/null; then echo 'agent still running 60s after SIGTERM; killing'; sudo kill -KILL "$agent_pid"; fi
+          fi
+          grep -E 'miner agent stopped|level=ERROR| ERROR ' "$RUNNER_TEMP/lab-out/agent.log" | cut -c1-300 | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo "agent stopped: pid=${agent_pid:-none}; engine containers=$(sudo docker -H "unix://$RUNNER_TEMP/mcsbx/run/docker/docker.sock" ps -aq 2>/dev/null | wc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Default off - a sandbox setting without --sandbox-leases on is refused
+        run: |
+          rc=0
+          out=$(sudo "$RUNNER_TEMP/miner-agent" --bridge-secret-file "$RUNNER_TEMP/agent/bridge.secret" \
+            --network mock --netuid 1 --hotkey "$MINER_HOTKEY" --uid -1 \
+            --service-key-file "$RUNNER_TEMP/agent/service.key" --state-db "$RUNNER_TEMP/agent/state-off.db" \
+            --artifact-dir "$RUNNER_TEMP/agent/artifacts" --docker-state-dir "$RUNNER_TEMP/agent/docker-state" \
+            --miner-transport http --allow-insecure-mock-http --bind 127.0.0.1:19102 \
+            --sandbox-host-profile "$RUNNER_TEMP/mcsbx/profile.json" 2>&1) || rc=$?
+          echo "default-off with a --sandbox-* flag: exit $rc: $(tail -1 <<< "$out" | cut -c1-300)" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ $rc != 0 ]] && grep -q -- '--sandbox-\* settings require --sandbox-leases on' <<< "$out"
+      - name: Remove the lab deployment cgroup
+        if: always()
+        run: |
+          sudo systemctl stop mcsbxdeployanchor.service mcsbxdeploy.slice >/dev/null 2>&1 || true
+          ! test -e /sys/fs/cgroup/mcsbxdeploy.slice
+      - name: Teardown and verify cleanup
+        if: always()
+        env:
+          MC_SANDBOX_HOST_DISPOSABLE: "1"
+        run: sudo --preserve-env=MC_SANDBOX_HOST_DISPOSABLE,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_STEP_SUMMARY,ImageOS,ImageVersion bash host/scripts/sandbox-host/teardown-disposable.sh
+      - name: Collect lab outputs (lab validator key removed)
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/lab-out"
+          if sudo test -f "$RUNNER_TEMP/lease-state.json"; then
+            sudo python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); s["validator_key"]="(removed)"; json.dump(s, open(sys.argv[2], "w"), indent=1)' \
+              "$RUNNER_TEMP/lease-state.json" "$RUNNER_TEMP/lab-out/lease-documents.json"
+          fi
+          sudo chmod -R a+r "$RUNNER_TEMP/lab-out"
+          ls -l "$RUNNER_TEMP/lab-out"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sandbox-agent-lease-lab-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/lab-out/
+          if-no-files-found: warn
+          retention-days: 30
