@@ -86,7 +86,13 @@ def _private_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, combined: b
 def test_private_index_cli_scores_without_inventory_network_access(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, combined: bool
 ) -> None:
-    publication, _spool, config, cli, argv = _private_run(tmp_path, monkeypatch, combined=combined)
+    publication, spool, config, cli, argv = _private_run(tmp_path, monkeypatch, combined=combined)
+    # The first read advances atime on relatime/strictatime filesystems. That
+    # normal access must not make freshly published, valid objects unavailable.
+    for key in publication.world.documents:
+        path = spool / key
+        modified = path.stat().st_mtime_ns
+        os.utime(path, ns=(modified - 86_400_000_000_000, modified))
 
     assert cli.run_cli(argv) == EXIT_OK
 

@@ -163,12 +163,29 @@ def read_private_static_index_documents(
                 remaining -= len(chunk)
             payload = b"".join(chunks)
             after = os.fstat(descriptor)
-            # Include nanosecond timestamps: stat_result equality omits these.
-            if (
-                len(payload) > maximum
-                or before != after
-                or (before.st_mtime_ns, before.st_ctime_ns)
-                != (after.st_mtime_ns, after.st_ctime_ns)
+            # Reading may update atime without changing the object. Compare
+            # identity, access controls and mutation metadata, with nanosecond
+            # timestamps (which stat_result equality would omit).
+            if len(payload) > maximum or (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
             ):
                 return None
             for index, original in enumerate([*snapshots, before]):
