@@ -81,13 +81,22 @@ per-image limit (`image_unavailable`). The engine must record the image under th
 repository (after Docker normalization) and digest. A wrong record is a
 miner fault. The image must be `linux/amd64` and within the stored-size
 limit (otherwise `image_unavailable`). It must declare no `VOLUME`, whose
-bytes no quota counts (otherwise `resources_unsupported`). A refused image
-is removed. Every pull failure the engine reports is `image_unavailable`:
+bytes no quota counts (otherwise `resources_unsupported`). It must name a
+command: an entrypoint or a command whose first argument is not empty, after
+an entrypoint of `[""]` is cleared as the engine clears it (otherwise
+`image_unavailable`, decided before the container is created, contract
+D19). A refused image is removed. Every pull failure the engine reports is `image_unavailable`:
 registry answers of any status, transport failures to the registry, a pull
 that outlasts the create budget, and running out of space after the
 headroom check passed, because the engine relays registry-chosen text and
-only the headroom check is local evidence about the miner's disk. A daemon
-that does not answer or breaks its progress stream is a miner fault. No
+only the headroom check is local evidence about the miner's disk. Once the
+engine has answered the pull, every failure of its progress stream is
+`image_unavailable` too (contract D15(c)): a line longer than the 1 MiB
+reader bound (the registry chooses the length of the error text the engine
+relays), a line that does not decode, a stream that breaks off, and one that
+ends before the engine's final `Status:` line. An image such a pull may have
+stored is removed. A daemon that gives no answer to the pull request (no
+HTTP status) is a miner fault. No
 registry credentials are supported.
 For an index digest the engine records the index digest and the image
 (config) ID it ran; the chosen platform manifest digest is not recorded.
@@ -125,7 +134,10 @@ if the process exits afterwards. `Create` then succeeds only when the engine
 configuration above matches, a fresh inspection shows the container exited
 with no start error, no PID and an exit time after its start time, and no
 process remains anywhere below the slice except in the cgroups of other
-running sandboxes. The per-process checks are logged as `not_run`, the
+sandboxes: those the engine reports running, and those an earlier readback
+found a sandbox's process in, until that sandbox's container is removed.
+Sandboxes start and are verified one at a time, so no other sandbox is
+starting while this check runs. The per-process checks are logged as `not_run`, the
 exited container is never restarted, and it keeps its lease, writable layer
 and logs until release or expiry.
 
@@ -165,6 +177,11 @@ container uses it; a missing container is success.
   from customer code, not customer code from the operator.
 
 ## Disposable-host proof
+
+`TestEnginePullOversizedRegistryErrorOnDisposableHost` (same gate) has the
+real daemon pull from a loopback registry that answers every blob request
+with a 600 KiB error body, and requires an engine-answered classification.
+It needs the daemon to reach a registry on 127.0.0.1 over HTTP.
 
 `TestGVisorLaneOnDisposableHost` (skipped unless `MC_SANDBOX_BACKEND_IT=1`)
 opens the backend against the real host, then drives the real lane with

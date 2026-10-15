@@ -14,10 +14,12 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
@@ -43,8 +45,13 @@ type engineImage struct {
 	Os, Arch     string
 	Size         int64
 	Volumes      map[string]any
+	Entrypoint   []string
+	Cmd          []string
 	PullStatus   int
 	PullMessages []string
+	// PullDrop closes the connection before the engine answers the pull;
+	// PullBreakOff closes it after PullMessages, mid-stream.
+	PullDrop, PullBreakOff bool
 }
 
 type engineContainer struct {
@@ -77,6 +84,11 @@ type fakeEngine struct {
 	// started rewrites a container after start and inspected after each
 	// inspection, standing in for a workload that exits.
 	started, inspected func(*engineContainer)
+	// holdStart, when it returns a channel, holds a start in progress
+	// (without blocking other requests) until that channel closes, standing
+	// in for a runtime whose processes exist before the engine reports the
+	// container running.
+	holdStart func(*engineContainer) <-chan struct{}
 }
 
 func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
@@ -99,6 +111,7 @@ func newFakeEngine(t *testing.T, dataRoot, runsc string) (*fakeEngine, string) {
 		catalog: map[string]engineImage{
 			"docker.io/library/busybox@" + testImageDigest: {
 				ID: testImageID, RepoDigests: []string{"busybox@" + testImageDigest}, Os: "linux", Arch: "amd64", Size: 4 << 20,
+				Cmd:          []string{"sh"},
 				PullMessages: []string{`{"id":"layer1","status":"Downloading","progressDetail":{"current":1,"total":2097152}}`, `{"status":"Status: Downloaded"}`},
 			},
 		},
@@ -156,6 +169,10 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		// The image is stored before the stream is answered, as when a pull
 		// completes before the client reads its progress, unless the stream
 		// reports an error.
+		if image.PullDrop {
+			// The daemon gives no answer: no status line reaches the client.
+			panic(http.ErrAbortHandler)
+		}
 		failed := false
 		for _, line := range image.PullMessages {
 			failed = failed || strings.Contains(line, `"error"`)
@@ -166,6 +183,12 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		for _, line := range image.PullMessages {
 			fmt.Fprintln(w, line)
+		}
+		if image.PullBreakOff {
+			// Send what was written, then drop the connection without
+			// ending the chunked answer.
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
 		}
 	case r.Method == http.MethodGet && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/json"):
 		name := strings.TrimSuffix(strings.TrimPrefix(p, "/images/"), "/json")
@@ -178,7 +201,7 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reply(w, 200, map[string]any{"Id": image.ID, "RepoDigests": image.RepoDigests, "Os": image.Os, "Architecture": image.Arch,
-			"Size": image.Size, "Config": map[string]any{"Volumes": image.Volumes}})
+			"Size": image.Size, "Config": map[string]any{"Volumes": image.Volumes, "Entrypoint": image.Entrypoint, "Cmd": image.Cmd}})
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/images/"):
 		id := strings.TrimPrefix(p, "/images/")
 		if _, ok := e.images[id]; !ok {
@@ -221,8 +244,15 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		image, _ := body["Image"].(string)
-		if _, ok := e.images[image]; !ok {
+		stored, ok := e.images[image]
+		if !ok {
 			reply(w, 404, map[string]string{"message": "No such image: " + image})
+			return
+		}
+		if len(stored.Entrypoint) == 0 && len(stored.Cmd) == 0 {
+			// dockerd's answer when neither the image nor the request
+			// names a command.
+			reply(w, 400, map[string]string{"message": "no command specified"})
 			return
 		}
 		e.created = append(e.created, body)
@@ -241,6 +271,13 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			reply(w, 404, map[string]string{"message": "No such container"})
 			return
+		}
+		if e.holdStart != nil {
+			if hold := e.holdStart(c); hold != nil {
+				e.mu.Unlock()
+				<-hold
+				e.mu.Lock()
+			}
 		}
 		c.Status, c.StartedAt = "running", "2026-10-14T12:00:01Z"
 		if e.started != nil {
@@ -476,6 +513,28 @@ func TestCreateRunsTheLeaseUnderGVisorAndDestroyRemovesEverything(t *testing.T) 
 	}
 }
 
+// The command check (contract D19) refuses only images with nothing to run:
+// an entrypoint alone, as the pause image has, or a command after a cleared
+// entrypoint still runs.
+func TestCreateRunsImagesThatNameACommandEitherWay(t *testing.T) {
+	key := "docker.io/library/busybox@" + testImageDigest
+	for name, set := range map[string]func(*engineImage){
+		"entrypoint only":                    func(i *engineImage) { i.Entrypoint, i.Cmd = []string{"/pause"}, nil },
+		"command after a cleared entrypoint": func(i *engineImage) { i.Entrypoint = []string{""} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHost(t)
+			image := h.engine.catalog[key]
+			set(&image)
+			h.engine.catalog[key] = image
+			lease := testLease(nil)
+			if err := h.backend().Create(context.Background(), instanceOf(lease), lease); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 // A container that exists but was never started (a crash between create and
 // start) is started and verified by a replayed Create; a container of the
 // same name made for another lease is never adopted.
@@ -592,6 +651,96 @@ func TestCreateServesAWorkloadThatExitedByItself(t *testing.T) {
 	}
 }
 
+// With more than one sandbox, another sandbox's processes are not this
+// one's leftovers (SR-26-16/INT-26-13): neither while the other sandbox's
+// workload winds down or its container is removed, nor while it is starting
+// and the engine does not yet report it running. Once the other container
+// is gone, processes left in its cgroup count again.
+func TestCreateServesAnExitBesideOtherSandboxes(t *testing.T) {
+	exit := func(c *engineContainer) { c.Status, c.FinishedAt = "exited", "2026-10-14T12:00:02.5Z" }
+	leaseOf := func(n int) protocol.SandboxLeaseV1 {
+		return testLease(func(l *protocol.SandboxLeaseV1) { l.SandboxID = "sbx-" + strings.Repeat("0", 31) + strconv.Itoa(n) })
+	}
+	otherProcs := func(h *host) string {
+		return filepath.Join(h.config.CgroupRoot, "mc.slice", testSlice, "docker-1.scope", "cgroup.procs")
+	}
+	exitsAtOnce := func(h *host, names ...string) {
+		h.engine.started = func(c *engineContainer) {
+			if slices.Contains(names, c.Name) {
+				exit(c)
+			}
+		}
+	}
+
+	t.Run("while another winds down or is removed", func(t *testing.T) {
+		h := newHost(t)
+		b := h.backend()
+		ctx := context.Background()
+		first, second, third := leaseOf(1), leaseOf(2), leaseOf(3)
+		if err := b.Create(ctx, instanceOf(first), first); err != nil {
+			t.Fatal(err)
+		}
+		// The first sandbox's workload exits; its processes linger.
+		exit(h.engine.containers[instanceOf(first)])
+		writeFile(t, otherProcs(h), "4243\n")
+		exitsAtOnce(h, instanceOf(second), instanceOf(third))
+		if err := b.Create(ctx, instanceOf(second), second); err != nil {
+			t.Fatalf("create = %v, want the exit served beside a winding-down sandbox", err)
+		}
+		if err := b.Destroy(ctx, instanceOf(first)); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Create(ctx, instanceOf(third), third); err == nil || !strings.Contains(err.Error(), "processes remain") {
+			t.Fatalf("create = %v, want processes left by a removed sandbox to count", err)
+		}
+	})
+
+	t.Run("while another is starting", func(t *testing.T) {
+		h := newHost(t)
+		b := h.backend()
+		ctx := context.Background()
+		first, second := leaseOf(1), leaseOf(2)
+		entered, release := make(chan struct{}), make(chan struct{})
+		h.engine.holdStart = func(c *engineContainer) <-chan struct{} {
+			if c.Name != instanceOf(first) {
+				return nil
+			}
+			// The runtime's processes exist before the engine reports
+			// the container running.
+			writeFile(t, otherProcs(h), "4243\n")
+			close(entered)
+			return release
+		}
+		exitsAtOnce(h, instanceOf(second))
+		firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+		go func() { firstDone <- b.Create(ctx, instanceOf(first), first) }()
+		<-entered
+		go func() { secondDone <- b.Create(ctx, instanceOf(second), second) }()
+		select {
+		case err := <-secondDone:
+			close(release)
+			<-firstDone
+			t.Fatalf("second sandbox was checked while the first was starting: %v", err)
+		case <-time.After(300 * time.Millisecond):
+		}
+		close(release)
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-secondDone; err != nil {
+			t.Fatalf("create = %v, want the exit served once the other sandbox started", err)
+		}
+	})
+}
+
+// dockerdErrorLine is the line dockerd writes for a pull error once its
+// answer has started (moby streamformatter.FormatError): the error text
+// twice, as errorDetail.message and error.
+func dockerdErrorLine(message string) string {
+	line, _ := json.Marshal(map[string]any{"errorDetail": map[string]string{"message": message}, "error": message})
+	return string(line)
+}
+
 func mustDigest(t *testing.T, lease protocol.SandboxLeaseV1) string {
 	t.Helper()
 	digest, err := protocol.SandboxDigestV1(lease)
@@ -648,6 +797,11 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 		{name: "unpacked image exceeds the limit", image: func(i *engineImage) { i.Size = 65<<20 + 1 }, code: "image_unavailable"},
 		{name: "image declares a volume", image: func(i *engineImage) { i.Volumes = map[string]any{"/data": map[string]any{}} }, code: "resources_unsupported"},
 		{name: "image is not linux/amd64", image: func(i *engineImage) { i.Arch = "arm64" }, code: "image_unavailable"},
+		{name: "image has no command", image: func(i *engineImage) { i.Cmd = nil }, code: "image_unavailable"},
+		{name: "image clears its entrypoint and has no command", image: func(i *engineImage) {
+			i.Entrypoint, i.Cmd = []string{""}, nil
+		}, code: "image_unavailable"},
+		{name: "image command is the empty string", image: func(i *engineImage) { i.Cmd = []string{""} }, code: "image_unavailable"},
 		{name: "localhost registry", lease: func(l *protocol.SandboxLeaseV1) {
 			l.ImageReference = "localhost:5000/busybox@" + testImageDigest
 		}, code: "image_unavailable", policy: true},
@@ -679,7 +833,18 @@ func TestCreateRefusesWhatItCannotEnforce(t *testing.T) {
 			i.RepoDigests = []string{"evil/busybox@" + testImageDigest}
 		}, fault: "is not recorded as"},
 		{name: "data root lacks the pull reserve", config: func(c *Config) { c.ImageMaxMiB = 1 << 40 }, fault: "a pull reserves"},
-		{name: "daemon breaks off the progress stream", image: func(i *engineImage) { i.PullMessages = []string{`{"error":`} }, fault: "decode docker pull progress"},
+		// Once the engine answered the pull, nothing in its progress stream
+		// is evidence about the miner (D15(c)): the registry chooses the
+		// text, and so the length, of the errors the engine relays.
+		{name: "registry error line longer than the reader bound", image: func(i *engineImage) {
+			i.PullMessages = []string{i.PullMessages[0], dockerdErrorLine("unknown: " + strings.Repeat("A", 600<<10))}
+		}, code: "image_unavailable"},
+		{name: "undecodable progress line", image: func(i *engineImage) { i.PullMessages = []string{`{"error":`} }, code: "image_unavailable"},
+		{name: "progress stream breaks off mid-pull", image: func(i *engineImage) {
+			i.PullMessages, i.PullBreakOff = i.PullMessages[:1], true
+		}, code: "image_unavailable"},
+		{name: "progress stream ends before the pull completes", image: func(i *engineImage) { i.PullMessages = i.PullMessages[:1] }, code: "image_unavailable"},
+		{name: "daemon gives no answer to the pull", image: func(i *engineImage) { i.PullDrop = true }, fault: "docker engine POST /images/create"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newHost(t)
