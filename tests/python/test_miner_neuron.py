@@ -119,6 +119,7 @@ async def test_registered_inactive_miner_and_validator_keep_serving(tmp_path: Pa
         bridge=FakeBridge(),  # type: ignore[arg-type]
         nonce_store=SQLiteNonceStore(str(tmp_path / "state.db")),
         min_validator_stake=1_000,
+        operator_hotkeys=(VALIDATOR.ss58_address,),
         sync_interval=10,
         max_concurrency=1,
         mock_http=True,
@@ -137,14 +138,24 @@ async def test_registered_inactive_miner_and_validator_keep_serving(tmp_path: Pa
     chain.sync = one_sync  # type: ignore[method-assign]
     await neuron._sync_loop()
     assert neuron.ready.is_set()
-    caller = await AuthorizationPolicy(neuron.state, min_validator_stake=1_000).authorize(
-        VALIDATOR.ss58_address
-    )
+    caller = await AuthorizationPolicy(
+        neuron.state, min_validator_stake=1_000, operator_hotkeys=(VALIDATOR.ss58_address,)
+    ).authorize(VALIDATOR.ss58_address)
     assert caller.hotkey == VALIDATOR.ss58_address
 
 
 @pytest.mark.asyncio
-async def test_btauth_capability_authorization_replay_and_priority_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("operator_hotkeys", "expected_status"),
+    [
+        ((VALIDATOR.ss58_address, UNAUTHORIZED.ss58_address), 200),
+        ((), 403),
+        ((UNAUTHORIZED.ss58_address,), 403),
+    ],
+)
+async def test_btauth_capability_authorization_replay_and_priority_policy(
+    tmp_path: Path, operator_hotkeys: tuple[str, ...], expected_status: int
+) -> None:
     peers = (
         MockPeer("//Validator", 0, None, True, 2_000),
         MockPeer("//Miner1", 1, "http://miner.invalid", False, 10),
@@ -160,6 +171,7 @@ async def test_btauth_capability_authorization_replay_and_priority_policy(tmp_pa
         bridge=FakeBridge(),  # type: ignore[arg-type]
         nonce_store=SQLiteNonceStore(str(tmp_path / "state.db")),
         min_validator_stake=1_000,
+        operator_hotkeys=operator_hotkeys,
         sync_interval=10,
         max_concurrency=1,
         mock_http=True,
@@ -188,7 +200,10 @@ async def test_btauth_capability_authorization_replay_and_priority_policy(tmp_pa
     transport = httpx.ASGITransport(app=neuron.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://miner") as client:
         response = await client.post("/api/v1/capabilities", content=body, headers=headers)
-        assert response.status_code == 200, response.text
+        assert response.status_code == expected_status, response.text
+        if expected_status == 403:
+            assert response.json()["detail"] == "caller is not a configured operator"
+            return
         assert response.json()["service_binding"]["hotkey"] == MINER.ss58_address
         replay = await client.post("/api/v1/capabilities", content=body, headers=headers)
         assert replay.status_code == 401
@@ -254,6 +269,7 @@ async def test_deploy_rejects_cross_identity_and_expired_ticket(
         bridge=FakeBridge(),  # type: ignore[arg-type]
         nonce_store=SQLiteNonceStore(str(tmp_path / "state.db")),
         min_validator_stake=1_000,
+        operator_hotkeys=(VALIDATOR.ss58_address,),
         sync_interval=10,
         max_concurrency=1,
         mock_http=True,
@@ -350,6 +366,7 @@ async def test_deploy_accepts_validator_binding_one_block_ahead(tmp_path: Path) 
         bridge=bridge,  # type: ignore[arg-type]
         nonce_store=SQLiteNonceStore(str(tmp_path / "skew.db")),
         min_validator_stake=1_000,
+        operator_hotkeys=(VALIDATOR.ss58_address,),
         sync_interval=10,
         max_concurrency=1,
         mock_http=True,
@@ -465,6 +482,7 @@ def runtime_neuron(tmp_path: Path, transport: httpx.AsyncBaseTransport) -> Miner
         ),
         nonce_store=SQLiteNonceStore(str(tmp_path / "runtime.db")),
         min_validator_stake=1_000,
+        operator_hotkeys=(VALIDATOR.ss58_address,),
         sync_interval=10,
         max_concurrency=1,
         mock_http=True,

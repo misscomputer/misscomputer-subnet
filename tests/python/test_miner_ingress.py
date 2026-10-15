@@ -103,6 +103,7 @@ def ingress_neuron(tmp_path: Path) -> tuple[MinerNeuron, int]:
         bridge=CapabilityBridge(),  # type: ignore[arg-type]
         nonce_store=SQLiteNonceStore(str(tmp_path / "ingress.db")),
         min_validator_stake=1_000,
+        operator_hotkeys=(VALIDATOR.ss58_address,),
         sync_interval=10,
         max_concurrency=1,
         mock_http=True,

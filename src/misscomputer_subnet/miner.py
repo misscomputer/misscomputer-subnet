@@ -12,7 +12,7 @@ import os
 import re
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +46,7 @@ from .chain import (
 )
 from .ingress import DEFAULT_BODY_IDLE_TIMEOUT, DEFAULT_BODY_TOTAL_TIMEOUT, read_request_body
 from .logging import configure_logging
+from .operator_policy import configured_operator_hotkeys, validate_operator_hotkeys
 from .organic_contracts import SYNAPSE_VERSION as ORGANIC_SYNAPSE_VERSION
 from .organic_contracts import (
     DeployResponseV3,
@@ -186,9 +187,11 @@ class AuthorizationPolicy:
         state: MetagraphState,
         *,
         min_validator_stake: float,
+        operator_hotkeys: Collection[str] = (),
         max_requests_per_window: int = 120,
         window_seconds: float = 60.0,
     ) -> None:
+        self.operator_hotkeys = validate_operator_hotkeys(operator_hotkeys)
         self.state = state
         self.min_validator_stake = min_validator_stake
         self.max_requests = max_requests_per_window
@@ -197,6 +200,8 @@ class AuthorizationPolicy:
         self._lock = asyncio.Lock()
 
     async def authorize(self, hotkey: str) -> Caller:
+        if hotkey not in self.operator_hotkeys:
+            raise HTTPException(status_code=403, detail="caller is not a configured operator")
         snapshot = await self.state.get()
         # Metagraph active tracks recent weight updates, not registration.
         matches = tuple(neuron for neuron in snapshot.neurons if neuron.hotkey == hotkey)
@@ -282,6 +287,7 @@ class MinerNeuron:
         max_concurrency: int,
         mock_http: bool,
         tls_config: MinerTLSConfig | None,
+        operator_hotkeys: Collection[str] = (),
         capability_fault_file: str | None = None,
         body_idle_timeout: float = DEFAULT_BODY_IDLE_TIMEOUT,
         body_total_timeout: float = DEFAULT_BODY_TOTAL_TIMEOUT,
@@ -299,7 +305,9 @@ class MinerNeuron:
         self.nonce_store = nonce_store
         self.state = MetagraphState()
         self.authorization = AuthorizationPolicy(
-            self.state, min_validator_stake=min_validator_stake
+            self.state,
+            min_validator_stake=min_validator_stake,
+            operator_hotkeys=operator_hotkeys,
         )
         self.gate = PriorityGate(max_concurrency)
         self.sync_interval = sync_interval
@@ -899,6 +907,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--go-agent-url", default="http://127.0.0.1:9101")
     parser.add_argument("--bridge-secret-file", required=True)
     parser.add_argument("--state-db", required=True)
+    parser.add_argument(
+        "--operator-hotkey",
+        action="append",
+        help="allowed operator SS58 hotkey (repeatable); overrides MC_OPERATOR_HOTKEYS",
+    )
     parser.add_argument("--min-validator-stake", type=float, default=1_000.0)
     parser.add_argument("--sync-interval", type=float, default=12.0)
     parser.add_argument("--max-concurrency", type=int, default=4)
@@ -942,6 +955,12 @@ def make_chain(args: argparse.Namespace) -> tuple[ChainQuery, HotkeySigningFacad
 
 def main() -> None:
     args = build_parser().parse_args()
+    try:
+        operator_hotkeys = configured_operator_hotkeys(
+            args.operator_hotkey, os.getenv("MC_OPERATOR_HOTKEYS")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.mock_capability_fault_file and not args.mock_uri:
         raise SystemExit("--mock-capability-fault-file is a mock-only flag and requires --mock-uri")
     if args.allow_insecure_mock_http:
@@ -969,6 +988,7 @@ def main() -> None:
         bridge=BridgeClient(args.go_agent_url, secret, timeout=120.0, retries=0),
         nonce_store=SQLiteNonceStore(args.state_db),
         min_validator_stake=args.min_validator_stake,
+        operator_hotkeys=operator_hotkeys,
         sync_interval=args.sync_interval,
         max_concurrency=args.max_concurrency,
         mock_http=args.allow_insecure_mock_http,

@@ -75,6 +75,7 @@ async def _neuron(tmp_path: Path, bridge: FakeBridge, **options: Any) -> tuple[M
         bridge=bridge,  # type: ignore[arg-type]
         nonce_store=SQLiteNonceStore(str(tmp_path / "static.db")),
         min_validator_stake=1_000,
+        operator_hotkeys=(VALIDATOR.ss58_address,),
         sync_interval=10,
         max_concurrency=1,
         mock_http=True,

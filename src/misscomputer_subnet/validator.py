@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections import Counter, deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Final, TypeVar
@@ -57,6 +57,7 @@ from .chain import (
 from .chain_quorum import build_chain_query, json_stderr_alert
 from .logging import configure_logging
 from .netpolicy import canonical_public_address
+from .operator_policy import configured_operator_hotkeys, validate_operator_hotkeys
 from .organic_contracts import (
     BridgeAssignRequestV3,
     DeployResponseV3,
@@ -781,7 +782,9 @@ class ValidatorNeuron:
         discovery_backoff_base_rounds: int = 1,
         discovery_backoff_max_rounds: int = 16,
         sandbox_leases: bool = False,
+        operator_hotkeys: Collection[str] = (),
     ) -> None:
+        self.operator_hotkeys = validate_operator_hotkeys(operator_hotkeys)
         if discovery_concurrency < 1:
             raise ValueError("discovery concurrency must be positive")
         if discovery_max_attempts < 1:
@@ -3074,8 +3077,8 @@ class ValidatorNeuron:
         """Verify one organic probe authorization for the Go edge (§17.2).
 
         The edge owns freshness, the one-time nonce and endpoint routing; this
-        hop supplies what only the neuron holds: the metagraph membership of
-        the signing validator and sr25519 verification of its hotkey
+        hop enforces the configured operator allowlist, metagraph membership
+        of the signing validator and sr25519 verification of its hotkey
         signature over the canonical organic-probe message.
         """
 
@@ -3085,6 +3088,8 @@ class ValidatorNeuron:
             )
         except (ValueError, ValidationError) as exc:
             raise HTTPException(status_code=400, detail="probe authorization is invalid") from exc
+        if authorization.validator_hotkey not in self.operator_hotkeys:
+            raise HTTPException(status_code=403, detail="probe signer is not a configured operator")
         try:
             snapshot = await self.state.get()
         except RuntimeError as exc:
@@ -3346,6 +3351,11 @@ def _http_host(host: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--netuid", type=int, required=True)
+    parser.add_argument(
+        "--operator-hotkey",
+        action="append",
+        help="allowed probe operator SS58 hotkey (repeatable); overrides MC_OPERATOR_HOTKEYS",
+    )
     parser.add_argument("--subtensor-network", default=os.getenv("BT_NETWORK", "finney"))
     parser.add_argument(
         "--rpc-endpoint",
@@ -3482,6 +3492,12 @@ def main() -> None:
             "misscomputer-score-checkpoint-relay"
         )
     args = build_parser().parse_args()
+    try:
+        operator_hotkeys = configured_operator_hotkeys(
+            args.operator_hotkey, os.getenv("MC_OPERATOR_HOTKEYS")
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.allow_private_axons and not args.mock_uri:
         raise SystemExit("--allow-private-axons is restricted to --mock-uri")
     if args.allow_insecure_mock_http and not args.mock_uri:
@@ -3528,6 +3544,7 @@ def main() -> None:
         discovery_backoff_base_rounds=args.discovery_backoff_base_rounds,
         discovery_backoff_max_rounds=args.discovery_backoff_max_rounds,
         sandbox_leases=args.sandbox_leases == "on",
+        operator_hotkeys=operator_hotkeys,
     )
     uvicorn.run(neuron.app, host=args.bridge_host, port=args.bridge_port, log_config=None)
 

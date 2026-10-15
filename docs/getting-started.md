@@ -137,7 +137,10 @@ secrets and must never hold funds. In a second terminal:
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18091/healthz
 ```
 
-Expected: `204`. The miner logs one JSON object per line on stderr, including:
+Expected: `204`. This health-only smoke test intentionally configures no
+operator hotkeys, so all signed control requests are denied. A real serving
+setup must configure [operator access](operator-access.md) explicitly.
+The miner logs one JSON object per line on stderr, including:
 
 ```text
 {"timestamp":"...","level":"info","logger":"misscomputer_subnet.miner","message":"metagraph synchronized","hotkey":"5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY","block":...}

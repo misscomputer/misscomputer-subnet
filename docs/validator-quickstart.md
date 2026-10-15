@@ -356,6 +356,11 @@ follow [weight-reconciliation.md](weight-reconciliation.md) before any retry.
 
 ## Reference: `misscomputer-validator`
 
+Customer-linked organic probes now require an explicit operator hotkey allowlist.
+Being a registered/permitted validator, or the elected Null weight setter, does
+not grant probe access. This is separate from offline checkpoint verification
+and weight tooling described above. See [operator access](operator-access.md).
+
 The long-running neuron is used together with the operator-owned Go control
 service described above. It serves a loopback-only HTTP bridge (it refuses a
 non-loopback `--bridge-host`), discovers miners from the metagraph, performs
@@ -367,6 +372,7 @@ It never prepares or submits weights; the old weight flags
 | Flag | Default |
 | --- | --- |
 | `--netuid` | required |
+| `--operator-hotkey` (repeatable) | `$MC_OPERATOR_HOTKEYS` (comma-separated) or empty; CLI replaces env; empty denies all organic probes |
 | `--subtensor-network` | `$BT_NETWORK` or `finney` |
 | `--rpc-endpoint` (repeatable) | none; give none or at least two, or exactly one with `--subtensor-network test` |
 | `--rpc-max-finalized-lag` | `8` |
