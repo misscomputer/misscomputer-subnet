@@ -138,3 +138,17 @@ def test_profile_rejects_unprovable_or_shared_configuration(case: dict[str, Any]
     target[case["path"][-1]] = case["value"]
     with pytest.raises(report.ReportError):
         report.check_profile(profile)
+
+
+def test_recorded_egress_fixture_matches_the_provisioning_script() -> None:
+    """The readback fixtures must be regenerated whenever the provisioned table changes."""
+    spec = importlib.util.spec_from_file_location(
+        "gen_egress_fixtures",
+        Path(__file__).resolve().parents[2] / "scripts" / "sandbox-host" / "gen-egress-fixtures.py",
+    )
+    assert spec and spec.loader
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    recorded = (generator.OUT / "provisioned.nft").read_text(encoding="utf-8")
+    assert recorded == generator.provisioned()
+    assert set(generator.variants(recorded)) == {p.stem for p in generator.OUT.glob("*.nft")}

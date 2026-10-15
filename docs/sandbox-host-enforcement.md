@@ -190,3 +190,39 @@ remains.
   directory (`storage.shim_socket_dir_shared`).
 - Startup recovery and orphan reconciliation of a real backend, and any
   live miner path. No activation may be inferred from a green job.
+
+## Engine egress readback (INT-27-07)
+
+`network.engine_egress_restricted` parses `nft -j list table inet
+mcsbx_engine_egress` structurally and accepts exactly the provisioned table:
+one output filter chain with policy accept and four rules, in order, each
+starting with the engine slice's `socket cgroupv2` match by name, namely the
+resolver accept, the `fib daddr type local` reject, and the IPv4 and IPv6
+prefix-set rejects. Any other table object, rule, statement, qualifier,
+operator, verdict or comment fails, and the sets must contain every denied
+prefix. nft 1.0.9 omits the cgroupv2 level from JSON, so the `nft -a` text
+listing confirms `level 1` on all four rules; it may contain nothing but the
+table and chain framing and those four rules, and their handles must equal
+the JSON rule handles in order, which binds the two listings to the same
+rules.
+
+`scripts/sandbox-host/gen-egress-fixtures.py` renders the table from
+`provision-disposable.sh`, derives the unsafe variants (lane 8's P1-P8,
+level 2, missing prefixes, an extra chain, a fifth rule after the rejects, a
+nat output chain, a rule comment, a named counter, policy drop and a dormant
+table; nft 1.0.9 truncates the JSON listing of a dormant table, which the
+parser refuses, so unit tests also exercise each dormant guard alone), loads each into a throwaway
+network namespace with the real nft and records its JSON and text listings
+under `pkg/sandboxhost/testdata/egress`. Unit tests read the recordings, and
+a Python test fails if the recorded provisioned form drifts from the script.
+Conformance (`effect.egress_readback_refuses_unsafe_tables`) loads the same
+variants into a scratch table on the disposable host and requires the built
+observer to refuse every unsafe one and to pass the provisioned form.
+
+The IPv6 host-address probe now requires the engine-slice curl to exit 7
+(connect failed) with the fib-local counter rising for that attempt alone,
+after a positive control from the same slice connects to a permitted public
+endpoint (SR-27-12).
+
+These are lab proofs of the readback. They do not activate anything; a live
+host must still pass its own preflight.

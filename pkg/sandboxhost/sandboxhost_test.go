@@ -230,7 +230,7 @@ func TestPreflightReadsActualSliceLimits(t *testing.T) {
 	f := newFakeHost(t)
 	f.slice("mcsbxlease.slice", "200000 100000", "1073741824", "0", "1024")
 	f.slice("mcsbxengine.slice", "max 100000", "1610612736", "0", "4096")
-	checks := Host{Proc: f.proc, ListNFTable: func(string) (string, error) { return egressListing, nil }}.Preflight(f.profile(), []string{"/deploy.slice"})
+	checks := Host{Proc: f.proc, ListNFTable: egressFixture(t, "provisioned")}.Preflight(f.profile(), []string{"/deploy.slice"})
 	for _, id := range []string{"cgroup.lease_slice_finite", "cgroup.lease_slice_swap_zero", "cgroup.engine_slice_finite", "cgroup.pids_finite_covers_sum", "cgroup.disjoint_from_caller", "network.engine_egress_restricted"} {
 		if c := find(checks, id); c.Status != StatusPass {
 			t.Errorf("%s: %+v", id, c)
@@ -272,7 +272,7 @@ func TestPreflightRejectsUnboundedSharedOrSubstitutedSlices(t *testing.T) {
 			f := newFakeHost(t)
 			f.slice("mcsbxengine.slice", "max 100000", "1610612736", "0", "4096")
 			c.setup(f)
-			got := find(Host{Proc: f.proc, ListNFTable: func(string) (string, error) { return egressListing, nil }}.Preflight(f.profile(), c.exclusive), c.id)
+			got := find(Host{Proc: f.proc, ListNFTable: egressFixture(t, "provisioned")}.Preflight(f.profile(), c.exclusive), c.id)
 			if got.Status != StatusFail || !strings.Contains(got.Evidence, c.want) {
 				t.Fatalf("%+v", got)
 			}
@@ -296,7 +296,7 @@ func TestPreflightRequiresEngineSocketHoldersInEngineSlice(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got := find(Host{Proc: f.proc, ListNFTable: func(string) (string, error) { return egressListing, nil }}.Preflight(profile, nil), "cgroup.engine_processes_member")
+	got := find(Host{Proc: f.proc, ListNFTable: egressFixture(t, "provisioned")}.Preflight(profile, nil), "cgroup.engine_processes_member")
 	if got.Status != StatusFail || !strings.Contains(got.Evidence, "PID 11") || !strings.Contains(got.Evidence, "/system.slice/containerd.service") {
 		t.Fatalf("containerd outside the engine slice: %+v", got)
 	}
@@ -341,57 +341,142 @@ func TestObserveInstanceReadsTheSentryNetworkNamespaceAndRuntimeCgroups(t *testi
 	}
 }
 
-const egressListing = `table inet mcsbx_engine_egress {
-	chain output {
-		type filter hook output priority filter; policy accept;
-		socket cgroupv2 level 1 "mcsbxengine.slice" ip daddr 127.0.0.53 meta l4proto { tcp, udp } th dport 53 accept
-		socket cgroupv2 level 1 "mcsbxengine.slice" fib daddr type local counter packets 0 bytes 0 reject with icmpx admin-prohibited
-		socket cgroupv2 level 1 "mcsbxengine.slice" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } counter packets 0 bytes 0 reject with icmpx admin-prohibited
-		socket cgroupv2 level 1 "mcsbxengine.slice" ip6 daddr { ::/127, ::ffff:0.0.0.0/96, 64:ff9b::/96, 64:ff9b:1::/48, fc00::/7, fe80::/10, ff00::/8 } counter packets 0 bytes 0 reject with icmpx admin-prohibited
+// egressFixture serves a listing recorded from the real nft printer by
+// scripts/sandbox-host/gen-egress-fixtures.py.
+func egressFixture(t *testing.T, name string) func(string, bool) (string, error) {
+	t.Helper()
+	read := func(ext string) string {
+		raw, err := os.ReadFile(filepath.Join("testdata", "egress", name+ext))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	jsonListing, textListing := read(".json"), read(".txt")
+	return func(table string, asJSON bool) (string, error) {
+		if table != "mcsbx_engine_egress" {
+			t.Fatalf("listed table %q", table)
+		}
+		if asJSON {
+			return jsonListing, nil
+		}
+		return textListing, nil
 	}
 }
-`
 
-func TestPreflightReadsBackTheEngineEgressRestriction(t *testing.T) {
-	cases := map[string]struct {
-		listing string
-		err     error
-		want    string
-	}{
-		"restricted":         {egressListing, nil, ""},
-		"table absent":       {"", errors.New("No such file or directory"), "No such file"},
-		"stale slice id":     {strings.ReplaceAll(egressListing, `"mcsbxengine.slice"`, "4242"), nil, "stale cgroup"},
-		"metadata reachable": {strings.Replace(egressListing, "169.254.0.0/16, ", "", 1), nil, "169.254.0.0/16"},
-		"extra accept rule":  {strings.Replace(egressListing, "accept\n", "accept\n\t\tsocket cgroupv2 level 1 \"mcsbxengine.slice\" ip daddr 10.0.0.5 accept\n", 1), nil, "unexpected engine egress rule"},
-		"input hook only":    {strings.Replace(egressListing, "hook output", "hook input", 1), nil, "no output hook"},
-		// SR-27-08: a public address on a host interface is covered by no fixed prefix.
-		"host's own addresses reachable": {strings.Replace(egressListing, "\t\tsocket cgroupv2 level 1 \"mcsbxengine.slice\" fib daddr type local counter packets 0 bytes 0 reject with icmpx admin-prohibited\n", "", 1), nil, "fib daddr type local"},
-		"local reject for IPv4 only":     {strings.Replace(egressListing, "\"mcsbxengine.slice\" fib daddr", "\"mcsbxengine.slice\" meta nfproto ipv4 fib daddr", 1), nil, "fib daddr type local"},
+func egressStatus(t *testing.T, list func(string, bool) (string, error)) Check {
+	t.Helper()
+	f := newFakeHost(t)
+	return find(Host{Proc: f.proc, ListNFTable: list}.Preflight(f.profile(), nil), "network.engine_egress_restricted")
+}
+
+// INT-27-07: only the provisioned table passes. Every variant was loaded
+// into real nft and recorded; lane 8 found P1-P8 accepted by the old
+// substring readback.
+func TestEgressReadbackAcceptsOnlyTheProvisionedTable(t *testing.T) {
+	entries, err := os.ReadDir(filepath.Join("testdata", "egress"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Every denied prefix is required on its own (SR-27-10).
-	for _, prefix := range egressDenied {
-		listing := egressListing
-		for _, form := range []string{prefix, strings.Replace(prefix, "::ffff:0:0/96", "::ffff:0.0.0.0/96", 1)} {
-			listing = strings.Replace(listing, " "+form+",", "", 1)
-			listing = strings.Replace(listing, ", "+form+" }", " }", 1)
+	seen := 0
+	for _, entry := range entries {
+		name, ok := strings.CutSuffix(entry.Name(), ".json")
+		if !ok {
+			continue
 		}
-		cases["missing "+prefix] = struct {
-			listing string
-			err     error
-			want    string
-		}{listing, nil, "does not reject " + prefix}
-	}
-	for name, c := range cases {
+		seen++
 		t.Run(name, func(t *testing.T) {
-			f := newFakeHost(t)
-			host := Host{Proc: f.proc, ListNFTable: func(table string) (string, error) {
-				if table != "mcsbx_engine_egress" {
-					t.Fatalf("listed table %q", table)
+			got := egressStatus(t, egressFixture(t, name))
+			if (got.Status == StatusPass) != (name == "provisioned") {
+				t.Fatalf("%+v", got)
+			}
+		})
+	}
+	if seen < 13 {
+		t.Fatalf("only %d recorded fixtures", seen)
+	}
+}
+
+// Every required destination is checked on its own, from a list kept here
+// rather than taken from the code under test (SR-27-10 E2/F3).
+func TestEgressReadbackRequiresEveryDeniedPrefix(t *testing.T) {
+	required := []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+		"192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
+		"::/127", "::ffff:0.0.0.0/96", "64:ff9b::/96", "64:ff9b:1::/48", "fc00::/7", "fe80::/10", "ff00::/8",
+	}
+	provisioned := egressFixture(t, "provisioned")
+	jsonListing, _ := provisioned("mcsbx_engine_egress", true)
+	textListing, _ := provisioned("mcsbx_engine_egress", false)
+	for _, prefix := range required {
+		addr, length, _ := strings.Cut(prefix, "/")
+		element := `{"prefix": {"addr": "` + addr + `", "len": ` + length + `}}`
+		for _, form := range []string{element + ", ", ", " + element} {
+			if !strings.Contains(jsonListing, form) {
+				continue
+			}
+			t.Run(prefix, func(t *testing.T) {
+				dropped := strings.Replace(jsonListing, form, "", 1)
+				got := egressStatus(t, func(_ string, asJSON bool) (string, error) {
+					if asJSON {
+						return dropped, nil
+					}
+					return textListing, nil
+				})
+				if got.Status != StatusFail || !strings.Contains(got.Evidence, "does not reject") {
+					t.Fatalf("%+v", got)
 				}
-				return c.listing, c.err
-			}}
-			got := find(host.Preflight(f.profile(), nil), "network.engine_egress_restricted")
-			if wantPass := c.want == ""; (got.Status == StatusPass) != wantPass || !strings.Contains(got.Evidence, c.want) {
+			})
+			break
+		}
+	}
+}
+
+func TestEgressReadbackRefusesStaleOrMissingTables(t *testing.T) {
+	provisioned := egressFixture(t, "provisioned")
+	jsonListing, _ := provisioned("mcsbx_engine_egress", true)
+	textListing, _ := provisioned("mcsbx_engine_egress", false)
+	cases := map[string]func(string, bool) (string, error){
+		"table absent": func(string, bool) (string, error) { return "", errors.New("No such file or directory") },
+		// A recreated slice leaves the rules naming a cgroup ID, not the slice.
+		"stale slice id": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return strings.ReplaceAll(jsonListing, `"mcsbxengine.slice"`, "4242"), nil
+			}
+			return strings.ReplaceAll(textListing, `"mcsbxengine.slice"`, "4242"), nil
+		},
+		// nft 1.0.9 truncates the JSON of a dormant table (recorded in
+		// testdata/egress/dormant_table.json), so each dormant guard is also
+		// exercised alone with a well-formed listing (INT-33-01).
+		"dormant flag in JSON only": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return strings.Replace(jsonListing, `"name": "mcsbx_engine_egress", "handle": 1}`, `"name": "mcsbx_engine_egress", "handle": 1, "flags": "dormant"}`, 1), nil
+			}
+			return textListing, nil
+		},
+		"dormant flag in text only": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return jsonListing, nil
+			}
+			return strings.Replace(textListing, "# handle 1\n", "# handle 1\n\tflags dormant\n", 1), nil
+		},
+		// The text listing must describe the same rules as the JSON (INT-33-02).
+		"text handles differ from JSON": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return jsonListing, nil
+			}
+			return strings.Replace(textListing, "admin-prohibited # handle 4", "admin-prohibited # handle 40", 1), nil
+		},
+		"named set object": func(_ string, asJSON bool) (string, error) {
+			if asJSON {
+				return strings.Replace(jsonListing, `{"chain":`, `{"set": {"family": "inet", "name": "x", "table": "mcsbx_engine_egress"}}, {"chain":`, 1), nil
+			}
+			return textListing, nil
+		},
+	}
+	for name, list := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := egressStatus(t, list); got.Status != StatusFail {
 				t.Fatalf("%+v", got)
 			}
 		})
