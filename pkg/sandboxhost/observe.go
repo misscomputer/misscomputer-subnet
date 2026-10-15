@@ -494,10 +494,16 @@ func (h Host) socketOwnersIn(cgroup string, sockets ...string) (string, error) {
 }
 
 // socketHolders maps each unix socket path to the PIDs (in h.Proc) holding
-// a descriptor of the socket bound to it, read from net/unix and every
-// process's fd table. A process whose fd table is unreadable is skipped.
+// a descriptor of the socket bound to it, read from the caller's net/unix
+// and every process's fd table.
 func (h Host) socketHolders(sockets ...string) (map[string][]string, error) {
-	raw, err := os.ReadFile(h.proc("net", "unix"))
+	return h.socketHoldersIn(h.proc("net", "unix"), sockets...)
+}
+
+// socketHoldersIn is socketHolders with the net/unix table of a chosen
+// network namespace. A process whose fd table is unreadable is skipped.
+func (h Host) socketHoldersIn(table string, sockets ...string) (map[string][]string, error) {
+	raw, err := os.ReadFile(table)
 	if err != nil {
 		return nil, err
 	}
@@ -560,7 +566,10 @@ func (h Host) sharesEngineNamespaces(socket string) (string, error) {
 		return "", fmt.Errorf("listener of %s is not visible in the caller's PID namespace (SO_PEERCRED PID %d)", socket, pid)
 	}
 	peer := strconv.Itoa(pid)
-	holders, err := h.socketHolders(socket)
+	// The listener's own net/unix: a caller in another network namespace
+	// sees only its own table, which would hide the listener and report the
+	// wrong cause instead of the namespace difference.
+	holders, err := h.socketHoldersIn(h.proc(peer, "net", "unix"), socket)
 	if err != nil {
 		return "", err
 	}

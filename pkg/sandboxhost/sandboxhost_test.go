@@ -366,7 +366,9 @@ func TestPreflightRequiresTheCallerInTheEngineListenersNamespaces(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			f.write(f.proc, "net/unix", "Num RefCount Protocol Flags Type St Inode Path\n0: 00000002 00000000 00010000 0001 01 301 "+socket+"\n")
+			// Only the listener's network namespace lists the socket; the
+			// caller's own net/unix (f.proc/net/unix) stays empty.
+			f.write(f.proc, me+"/net/unix", "Num RefCount Protocol Flags Type St Inode Path\n0: 00000002 00000000 00010000 0001 01 301 "+socket+"\n")
 			link := func(from, to string) {
 				if err := os.MkdirAll(filepath.Dir(from), 0o755); err != nil {
 					t.Fatal(err)
