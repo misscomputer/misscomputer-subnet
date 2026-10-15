@@ -51,32 +51,29 @@ def run(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, capture_output=True, text=True, timeout=15, check=False)  # noqa: S603
 
 
+def sentry_cgroups(sentry_path: str, lease_prefix: str) -> dict[str, int]:
+    """Live sentry processes below the lease slice, keyed by their cgroup."""
+    found: dict[str, int] = {}
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if os.readlink(f"/proc/{pid}/exe") != sentry_path:
+                continue
+            with open(f"/proc/{pid}/cgroup", encoding="utf-8") as handle:
+                cgroup = next(ln.strip()[3:] for ln in handle if ln.startswith("0::"))
+        except (OSError, StopIteration):
+            continue
+        if cgroup.startswith(lease_prefix):
+            found.setdefault(cgroup, int(pid))
+    return found
+
+
 def observe(
-    profile_path: str, profile: dict[str, Any], observer: str, cid: str
-) -> dict[str, Any] | None:
-    inspected = run("docker", "-H", profile["docker_host"], "inspect", cid)
-    try:
-        item = json.loads(inspected.stdout)[0]
-    except (ValueError, IndexError):
-        return None
-    pid = item["State"]["Pid"]
-    if not pid:
-        return None
-    record: dict[str, Any] = {
-        "id": cid,
-        "state": {key: item["State"].get(key) for key in STATE_KEYS},
-        "observed_at": time.time(),
-        "image": item["Config"]["Image"],
-        "labels": item["Config"].get("Labels") or {},
-        "mounts": item["Mounts"],
-        "pid": pid,
-        "host": {key: item["HostConfig"].get(key) for key in HOST_KEYS},
-    }
+    profile_path: str, profile: dict[str, Any], observer: str, cgroup: str, pid: int
+) -> dict[str, Any]:
+    """Read the kernel first (the sandbox may be short-lived), then the engine."""
+    record: dict[str, Any] = {"observed_at": time.time(), "pid": pid, "cgroup": cgroup}
     try:
         record["exe"] = os.readlink(f"/proc/{pid}/exe")
-        with open(f"/proc/{pid}/cgroup", encoding="utf-8") as cgroup_file:
-            cgroup = next(line.strip()[3:] for line in cgroup_file if line.startswith("0::"))
-        record["cgroup"] = cgroup
         for name in ("cpu.max", "memory.max", "memory.swap.max", "pids.max"):
             with open(profile["cgroup_root"] + cgroup + "/" + name, encoding="utf-8") as limit:
                 record[name] = limit.read().strip()
@@ -85,37 +82,50 @@ def observe(
         record["xfs_projects"] = run(
             "xfs_quota", "-x", "-c", "report -p -b -N", profile["data_root"]
         ).stdout
-    except (OSError, StopIteration, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         record["error"] = f"{type(exc).__name__}: {exc}"
-    # A sentry that is gone by the end of the observation makes every field
-    # read after it vanished meaningless: record that, never a mismatch.
+    # A sentry that is gone by the end of the kernel reads makes those reads
+    # meaningless: record that, never a mismatch.
     if not os.path.exists(f"/proc/{pid}"):
         record["disappeared"] = True
-        after = run("docker", "-H", profile["docker_host"], "inspect", cid)
-        try:
-            gone = json.loads(after.stdout)[0]["State"]
-            record["state_after"] = {key: gone.get(key) for key in STATE_KEYS}
-        except (ValueError, IndexError, KeyError):
-            record["state_after"] = {"inspect": "container no longer exists"}
+    scope = cgroup.rsplit("/", 1)[-1]
+    cid = scope.removeprefix("docker-").removesuffix(".scope")
+    record["id"] = cid
+    inspected = run("docker", "-H", profile["docker_host"], "inspect", cid)
+    try:
+        item = json.loads(inspected.stdout)[0]
+        record["state"] = {key: item["State"].get(key) for key in STATE_KEYS}
+        record["image"] = item["Config"]["Image"]
+        record["labels"] = item["Config"].get("Labels") or {}
+        record["mounts"] = item["Mounts"]
+        record["host"] = {key: item["HostConfig"].get(key) for key in HOST_KEYS}
+    except (ValueError, IndexError, KeyError):
+        record["state"] = {"inspect": "container no longer exists"}
+        record.setdefault("image", "?")
+        record.setdefault("host", {})
+        record["engine_gone"] = True
     return record
 
 
 def watch(profile_path: str, observer: str, out: str, stop: str) -> None:
     with open(profile_path, encoding="utf-8") as handle:
         profile = json.load(handle)
+    sentry, lease_prefix = profile["runtime"]["sentry_path"], "/" + profile["lease_slice"] + "/"
     seen: set[str] = set()
     with open(out, "a", encoding="utf-8") as sink:
         while not os.path.exists(stop):
-            listed = run("docker", "-H", profile["docker_host"], "ps", "-q", "--no-trunc")
-            for cid in listed.stdout.split():
-                if cid in seen:
+            for cgroup, pid in sentry_cgroups(sentry, lease_prefix).items():
+                if cgroup in seen:
                     continue
-                record = observe(profile_path, profile, observer, cid)
-                if record is not None:
-                    seen.add(cid)
-                    sink.write(json.dumps(record, sort_keys=True) + "\n")
-                    sink.flush()
-            time.sleep(0.05)
+                seen.add(cgroup)
+                sink.write(
+                    json.dumps(
+                        observe(profile_path, profile, observer, cgroup, pid), sort_keys=True
+                    )
+                    + "\n"
+                )
+                sink.flush()
+            time.sleep(0.01)
 
 
 def summarize(profile_path: str, out: str) -> int:
@@ -126,14 +136,14 @@ def summarize(profile_path: str, out: str) -> int:
         with open(out, encoding="utf-8") as handle:
             records = [json.loads(line) for line in handle if line.strip()]
     for record in records:
-        if record.get("disappeared"):
+        if record.get("disappeared") or record.get("engine_gone"):
             print(
                 f"DISAPPEARED sandbox {record['id'][:12]} image={record['image'][:60]} "
                 f"pid={record['pid']} state={record.get('state')} "
                 f"state_after={record.get('state_after')} captured exe={record.get('exe')} "
                 f"cgroup={record.get('cgroup')} error={record.get('error')}"
             )
-    records = [r for r in records if not r.get("disappeared")]
+    records = [r for r in records if not r.get("disappeared") and not r.get("engine_gone")]
     if not records:
         print("FAIL: no backend sandbox stayed alive for a complete observation")
         return 1
