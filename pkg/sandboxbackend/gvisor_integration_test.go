@@ -50,7 +50,7 @@ func TestGVisorLaneOnDisposableHost(t *testing.T) {
 		RunscPath: os.Getenv("MC_SANDBOX_RUNSC_PATH"), RunscSHA256: os.Getenv("MC_SANDBOX_RUNSC_SHA256"),
 		SentryPath: os.Getenv("MC_SANDBOX_SENTRY_PATH"), SentrySHA256: os.Getenv("MC_SANDBOX_SENTRY_SHA256"),
 		DataRoot: os.Getenv("MC_SANDBOX_DATA_ROOT"), Slice: os.Getenv("MC_SANDBOX_SLICE"),
-		DiskMiB: sandbox.MinDiskMiB, Sandboxes: 1, ImageMaxMiB: 64, LogMiB: 4,
+		DiskMiB: sandbox.MinDiskMiB, Sandboxes: 1, ImageMaxMiB: 64, LogMiB: 4, PIDsMax: sandbox.MinPIDs,
 	}
 	backend, err := sandboxbackend.Open(ctx, config)
 	if err != nil {

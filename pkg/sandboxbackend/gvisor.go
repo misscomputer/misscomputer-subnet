@@ -35,6 +35,7 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/netpolicy"
 	"github.com/misscomputer/misscomputer-subnet/pkg/protocol"
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
+	"github.com/misscomputer/misscomputer-subnet/pkg/sandboxhost"
 	"golang.org/x/sys/unix"
 )
 
@@ -72,7 +73,6 @@ var (
 var sandboxCapabilities = []string{}
 
 const (
-	cgroupFSMagic   = 0x63677270
 	logFiles        = 2
 	sandboxHostname = "sandbox"
 	removalTimeout  = 2 * time.Minute
@@ -115,6 +115,30 @@ type Config struct {
 	// ImageMaxMiB bounds the stored size of one sandbox's image and LogMiB
 	// its container log; both are reserved on the data root per sandbox.
 	ImageMaxMiB, LogMiB int
+	// PIDsMax is the most pids one lease may ask for; more is refused as
+	// resources_unsupported (per_lease.pids_max of the host profile).
+	PIDsMax int
+	// Layout is the provisioned host layout of the sandbox-host-profile.v1
+	// document. ConfigFromProfile sets it; the preflight report needs it.
+	Layout *Layout
+}
+
+// Layout is the part of the host profile the engine checks compare against
+// beyond the backend configuration itself.
+type Layout struct {
+	// RunRoot holds the engine sockets; DataFS is the dedicated data
+	// filesystem's mount (the profile's data_root), under which DataRoot
+	// and containerd's root lie.
+	RunRoot, DataFS string
+	// Containerd is the dedicated containerd's address and namespaces.
+	ContainerdAddress, ContainerdNamespace, ContainerdPluginsNamespace string
+	// RuntimeArgs are the runtime arguments the daemon registers runsc with.
+	RuntimeArgs []string
+	// LogMaxSizeMiB and LogMaxFile are the daemon's default log bounds.
+	LogMaxSizeMiB, LogMaxFile int
+	// DaemonConfig is the dedicated daemon's configuration file, evidence
+	// for the two configured engine checks.
+	DaemonConfig string
 }
 
 // GVisor is the gVisor-on-dedicated-Docker sandbox backend.
@@ -122,7 +146,6 @@ type GVisor struct {
 	config      Config
 	engine      *engine
 	sliceCgroup string
-	slicePIDs   int
 	// sandboxExe is the resolved path of the binary every sandbox process
 	// must execute: the sentry, or runsc when no sentry is configured, and
 	// sandboxFile the file Open hashed there, so that a binary replaced or
@@ -137,6 +160,11 @@ type GVisor struct {
 	// hostAddresses lists the addresses assigned to this host's
 	// interfaces; Open sets interfaceAddresses.
 	hostAddresses func() ([]netip.Addr, error)
+	// profile and observeInstance are set by OpenFromProfile: the host
+	// profile instance reports are built against, and lane 2's instance
+	// observation of a served sandbox's process.
+	profile         *sandboxhost.Profile
+	observeInstance func(pid int) []sandboxhost.Check
 	// localReserve is the part of the create budget the steps after a pull
 	// run under; zero means localStepReserve (contract D15(d)).
 	localReserve time.Duration
@@ -164,6 +192,24 @@ var _ miner.SandboxBackend = (*GVisor)(nil)
 // backend. It changes nothing on the host. Every failure refuses the
 // backend: a property that cannot be verified is not enforced.
 func Open(ctx context.Context, config Config) (*GVisor, error) {
+	b, err := newGVisor(config)
+	if err != nil {
+		return nil, err
+	}
+	// The engine checks this backend owns (engine.* in the host check
+	// catalog) must not fail. The host's cgroup, storage and budget checks
+	// belong to pkg/sandboxhost; OpenFromProfile runs both into one report.
+	for _, check := range b.EngineChecks(ctx) {
+		if check.Status == sandboxhost.StatusFail {
+			return nil, errors.New(check.Evidence)
+		}
+	}
+	return b, nil
+}
+
+// newGVisor validates config and the pinned binaries and builds the
+// backend, without asking the daemon or the host anything.
+func newGVisor(config Config) (*GVisor, error) {
 	if config.CgroupRoot == "" {
 		config.CgroupRoot = miner.DefaultCgroupRoot
 	}
@@ -198,17 +244,7 @@ func Open(ctx context.Context, config Config) (*GVisor, error) {
 	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		return nil, err
 	}
-	b := &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, sandboxFile: file, runscFile: runscFile, lookup: lookupHost, hostAddresses: interfaceAddresses}
-	if err := b.verifyDaemon(ctx); err != nil {
-		return nil, err
-	}
-	if err := b.verifyDataRoot(); err != nil {
-		return nil, err
-	}
-	if b.slicePIDs, err = b.verifySlice(); err != nil {
-		return nil, err
-	}
-	return b, nil
+	return &GVisor{config: config, engine: newEngine(socket), sliceCgroup: sliceCgroup, sandboxExe: exe, sandboxFile: file, runscFile: runscFile, lookup: lookupHost, hostAddresses: interfaceAddresses}, nil
 }
 
 func validateConfig(c Config) error {
@@ -232,6 +268,9 @@ func validateConfig(c Config) error {
 	}
 	if c.DiskMiB <= 0 || c.Sandboxes <= 0 || c.ImageMaxMiB <= 0 || c.LogMiB < logFiles {
 		return fmt.Errorf("sandbox disk, count and image limits must be positive and the log limit at least %d MiB", logFiles)
+	}
+	if c.PIDsMax <= 0 {
+		return errors.New("sandbox per-lease pids limit must be positive")
 	}
 	return nil
 }
@@ -293,7 +332,9 @@ func verifyBinary(file, want string) (fs.FileInfo, error) {
 }
 
 type daemonInfo struct {
+	ID            string `json:"ID"`
 	DockerRootDir string `json:"DockerRootDir"`
+	LoggingDriver string `json:"LoggingDriver"`
 	Driver        string `json:"Driver"`
 	// DriverStatus is the storage driver's [name, value] pairs.
 	DriverStatus  [][]string `json:"DriverStatus"`
@@ -318,74 +359,6 @@ type daemonInfo struct {
 			Plugins    string `json:"Plugins"`
 		} `json:"Namespaces"`
 	} `json:"Containerd"`
-}
-
-func (b *GVisor) verifyDaemon(ctx context.Context) error {
-	var version struct {
-		Version string `json:"Version"`
-	}
-	if err := b.engine.call(ctx, http.MethodGet, "/version", nil, nil, &version); err != nil {
-		return fmt.Errorf("sandbox docker daemon: %w", err)
-	}
-	if version.Version != PinnedDockerVersion {
-		return fmt.Errorf("sandbox docker daemon is %q; only %s is reviewed", version.Version, PinnedDockerVersion)
-	}
-	var info daemonInfo
-	if err := b.engine.call(ctx, http.MethodGet, "/info", nil, nil, &info); err != nil {
-		return fmt.Errorf("sandbox docker daemon info: %w", err)
-	}
-	if info.DockerRootDir != b.config.DataRoot || info.Driver != "overlay2" || info.CgroupDriver != "systemd" || info.CgroupVersion != "2" {
-		return fmt.Errorf("sandbox docker daemon root=%q storage=%q cgroup=%q/v%s, want root=%q overlay2 systemd/v2",
-			info.DockerRootDir, info.Driver, info.CgroupDriver, info.CgroupVersion, b.config.DataRoot)
-	}
-	if driver := driverStatus(info); driver["Backing Filesystem"] != "xfs" || driver["Supports d_type"] != "true" {
-		return fmt.Errorf("sandbox docker daemon overlay2 is backed by %q with d_type %q, want xfs with d_type",
-			driver["Backing Filesystem"], driver["Supports d_type"])
-	}
-	if err := verifyContainerd(info); err != nil {
-		return err
-	}
-	if err := verifyRegistryConfig(info); err != nil {
-		return err
-	}
-	var networks []struct {
-		Name   string `json:"Name"`
-		Driver string `json:"Driver"`
-	}
-	if err := b.engine.call(ctx, http.MethodGet, "/networks", nil, nil, &networks); err != nil {
-		return fmt.Errorf("list sandbox daemon networks: %w", err)
-	}
-	for _, network := range networks {
-		if !(network.Name == "none" && network.Driver == "null") && !(network.Name == "host" && network.Driver == "host") {
-			return fmt.Errorf("sandbox docker daemon manages network %q (%s); it must run with no bridge and only host and none", network.Name, network.Driver)
-		}
-	}
-	runtime, ok := info.Runtimes[b.config.Runtime]
-	if !ok || runtime.Path != b.config.RunscPath {
-		return fmt.Errorf("sandbox docker daemon does not register runtime %q at %s", b.config.Runtime, b.config.RunscPath)
-	}
-	seen := map[string]bool{}
-	for _, arg := range runtime.RuntimeArgs {
-		if !allowedRuntimeArgs[arg] {
-			return fmt.Errorf("runtime %q has unreviewed argument %q", b.config.Runtime, arg)
-		}
-		seen[arg] = true
-	}
-	for _, arg := range requiredRuntimeArgs {
-		if !seen[arg] {
-			return fmt.Errorf("runtime %q lacks required argument %s", b.config.Runtime, arg)
-		}
-	}
-	var containers []listedContainer
-	if err := b.engine.call(ctx, http.MethodGet, "/containers/json", url.Values{"all": {"1"}}, nil, &containers); err != nil {
-		return fmt.Errorf("list sandbox daemon containers: %w", err)
-	}
-	for _, container := range containers {
-		if container.Labels[LabelSandbox] != sandboxLabelV1 {
-			return fmt.Errorf("sandbox docker daemon runs container %s that is not a sandbox; the daemon must be dedicated", container.ID)
-		}
-	}
-	return nil
 }
 
 // driverStatus indexes the storage driver's reported [name, value] pairs.
@@ -452,46 +425,6 @@ func verifyRegistryConfig(info daemonInfo) error {
 	return nil
 }
 
-// verifyDataRoot requires the data root to be a filesystem with room for
-// every sandbox's writable layer, image and logs. Writable layers are
-// quota-limited per container (StorageOpt), images by ImageMaxMiB and logs
-// by rotation, so the data root cannot outgrow its filesystem.
-func (b *GVisor) verifyDataRoot() error {
-	var stat unix.Statfs_t
-	if err := unix.Statfs(b.config.DataRoot, &stat); err != nil {
-		return fmt.Errorf("sandbox data root: %w", err)
-	}
-	sizeMiB := int64(stat.Blocks) * int64(stat.Bsize) >> 20
-	need := int64(b.config.DiskMiB) + int64(b.config.Sandboxes)*int64(b.config.ImageMaxMiB+b.config.LogMiB)
-	if need > sizeMiB {
-		return fmt.Errorf("sandbox data root holds %d MiB; disk, image and log budgets need %d MiB", sizeMiB, need)
-	}
-	return nil
-}
-
-// verifySlice requires the slice's cgroup directory to be a real cgroup v2
-// directory with a finite pids.max. The lane checks its cpu.max and
-// memory.max (miner.VerifySandboxCgroup).
-func (b *GVisor) verifySlice() (int, error) {
-	dir := filepath.Join(b.config.CgroupRoot, b.sliceCgroup)
-	var stat unix.Statfs_t
-	if err := unix.Statfs(dir, &stat); err != nil {
-		return 0, fmt.Errorf("sandbox slice cgroup %s: %w", b.sliceCgroup, err)
-	}
-	if stat.Type != cgroupFSMagic {
-		return 0, fmt.Errorf("sandbox slice %s is not on a cgroup v2 filesystem", b.sliceCgroup)
-	}
-	value, err := readSmall(filepath.Join(dir, "pids.max"))
-	if err != nil {
-		return 0, err
-	}
-	pids, err := strconv.Atoi(value)
-	if err != nil || pids <= 0 {
-		return 0, fmt.Errorf("sandbox slice pids.max %q is not a finite limit", value)
-	}
-	return pids, nil
-}
-
 // Budget reports the slice cgroup and the disk and count limits.
 func (b *GVisor) Budget(context.Context) (miner.SandboxBudget, error) {
 	return miner.SandboxBudget{Cgroup: b.sliceCgroup, DiskMiB: b.config.DiskMiB, Sandboxes: b.config.Sandboxes}, nil
@@ -506,7 +439,7 @@ func (b *GVisor) Unsupported(lease protocol.SandboxLeaseV1) string {
 		return "isolation_unsupported"
 	case lease.Network.Mode != sandbox.NetworkNone:
 		return "network_policy_unsupported"
-	case lease.Resources.PIDs > b.slicePIDs:
+	case lease.Resources.PIDs > b.config.PIDsMax:
 		return "resources_unsupported"
 	}
 	return ""
@@ -637,6 +570,13 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 		return err
 	}
 	defer budget.close()
+	err = b.create(budget, instanceID, lease, leaseDigest)
+	budget.log(instanceID, err)
+	return err
+}
+
+// create runs Create under budget.
+func (b *GVisor) create(budget *createBudget, instanceID string, lease protocol.SandboxLeaseV1, leaseDigest string) error {
 	existing, found, err := b.inspect(budget.local(), instanceID)
 	if err != nil {
 		return err
@@ -648,7 +588,7 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	}
 	// Every step from here runs under the local deadline that started when
 	// the last pull returned (or at the start, without a pull).
-	ctx = budget.local()
+	ctx := budget.local()
 	if !found {
 		if existing, found, err = b.inspect(ctx, instanceID); err != nil {
 			return err
@@ -694,8 +634,9 @@ func (b *GVisor) Create(ctx context.Context, instanceID string, lease protocol.S
 	}
 	cgroup, err := b.verifyProcess(existing, s)
 	if err == nil {
-		b.recordCgroup(instanceID, cgroup)
-		return nil
+		if err = b.serveLive(instanceID, existing, cgroup); err == nil {
+			return nil
+		}
 	}
 	if !errors.Is(err, errProcessVanished) {
 		// A value read from the live process that differs from the lease:
@@ -790,9 +731,10 @@ func (b *GVisor) settleExit(ctx context.Context, instanceID, containerID string,
 			// is in fact running: read it again.
 			cgroup, err := b.verifyProcess(again, s)
 			if err == nil {
-				b.recordCgroup(instanceID, cgroup)
-				record.Decision, record.Settled = "running", time.Since(begun)
-				return nil
+				if err = b.serveLive(instanceID, again, cgroup); err == nil {
+					record.Decision, record.Settled = "running", time.Since(begun)
+					return nil
+				}
 			}
 			if !errors.Is(err, errProcessVanished) {
 				return fault("live process differs from the lease", err)
@@ -929,6 +871,7 @@ func (b *GVisor) startRefused(ctx context.Context, instanceID, containerID strin
 	}
 	record.CleanedUp = true
 	record.Decision = "never_started"
+	b.logInstanceReport(instanceID, "never_started", nil, nil)
 	return &miner.SandboxRefusal{Code: "image_unavailable"}
 }
 
@@ -1058,11 +1001,16 @@ const localStepReserve = 2 * time.Minute
 // reserve, started fresh when a pull returns, so a pull cannot consume
 // them. Pull share plus local reserve never exceed the budget.
 type createBudget struct {
-	parent       context.Context
-	pullDeadline time.Time // zero when the lane gave no deadline
-	reserve      time.Duration
-	localCtx     context.Context
-	cancelLocal  func()
+	// began is when Create started, pullElapsed how long the registry
+	// phases took and localBegan when the current local deadline started:
+	// the D15(d) timing evidence of one create (SR-34-02).
+	began, localBegan time.Time
+	pullElapsed       time.Duration
+	parent            context.Context
+	pullDeadline      time.Time // zero when the lane gave no deadline
+	reserve           time.Duration
+	localCtx          context.Context
+	cancelLocal       func()
 }
 
 func (b *GVisor) newCreateBudget(parent context.Context) (*createBudget, error) {
@@ -1070,7 +1018,7 @@ func (b *GVisor) newCreateBudget(parent context.Context) (*createBudget, error) 
 	if reserve <= 0 {
 		reserve = localStepReserve
 	}
-	budget := &createBudget{parent: parent, reserve: reserve}
+	budget := &createBudget{parent: parent, reserve: reserve, began: time.Now()}
 	if deadline, ok := parent.Deadline(); ok {
 		if left := time.Until(deadline); left <= reserve {
 			return nil, fmt.Errorf("create budget of %v leaves no pull share beside the %v local-step reserve", left.Round(time.Millisecond), reserve)
@@ -1100,6 +1048,7 @@ func (c *createBudget) restartLocal() {
 		}
 	})
 	c.localCtx = local
+	c.localBegan = time.Now()
 	c.cancelLocal = func() {
 		stop()
 		cancel()
@@ -1107,6 +1056,25 @@ func (c *createBudget) restartLocal() {
 }
 
 func (c *createBudget) local() context.Context { return c.localCtx }
+
+// log records how one create used its budget (contract D15(d)).
+func (c *createBudget) log(instanceID string, err error) {
+	share := time.Duration(0)
+	if !c.pullDeadline.IsZero() {
+		share = c.pullDeadline.Sub(c.began)
+	}
+	outcome := "ok"
+	var refusal *miner.SandboxRefusal
+	switch {
+	case errors.As(err, &refusal):
+		outcome = "refused: " + refusal.Code
+	case err != nil:
+		outcome = "fault"
+	}
+	slog.Info("sandbox create timing", "sandbox", instanceID, "outcome", outcome,
+		"pull_elapsed", c.pullElapsed.String(), "pull_share", share.String(),
+		"local_elapsed", time.Since(c.localBegan).String(), "local_reserve", c.reserve.String())
+}
 
 func (c *createBudget) close() {
 	if c.cancelLocal != nil {
@@ -1236,9 +1204,77 @@ func (b *GVisor) liveSandboxCgroups(ctx context.Context, instanceID string) ([]s
 // lease is served and stays leased until release or expiry. Its engine
 // configuration was verified; the kernel readbacks did not run.
 func (b *GVisor) exited(c inspectedContainer) error {
+	instanceID := strings.TrimPrefix(c.Name, "/")
 	slog.Info("sandbox workload exited before the kernel readback; per-process checks not_run",
-		"sandbox", strings.TrimPrefix(c.Name, "/"), "started_at", c.State.StartedAt)
+		"sandbox", instanceID, "started_at", c.State.StartedAt)
+	b.logInstanceReport(instanceID, "exited", nil, nil)
 	return nil
+}
+
+// serveLive accepts a sandbox whose live process the kernel readback
+// matched to the lease, once lane 2's instance observation of that process
+// (OpenFromProfile) passes too, records its cgroup and logs its instance
+// report. An observation that fails while the process is gone is a vanished
+// process (contract D11-C2): a check carries no error kind, so the process
+// directory decides. One that fails while the process exists is a miner
+// fault.
+func (b *GVisor) serveLive(instanceID string, c inspectedContainer, cgroup string) error {
+	var observed []sandboxhost.Check
+	if b.observeInstance != nil {
+		observed = b.observeInstance(c.State.Pid)
+		for _, check := range observed {
+			if check.Status == sandboxhost.StatusPass {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(b.config.ProcRoot, strconv.Itoa(c.State.Pid))); gone(err) {
+				return fmt.Errorf("%w: sandbox %s process ended during host observation %s: %s", errProcessVanished, c.Name, check.ID, check.Evidence)
+			}
+			return fmt.Errorf("sandbox %s host observation %s %s: %s", c.Name, check.ID, check.Status, check.Evidence)
+		}
+	}
+	b.recordCgroup(instanceID, cgroup)
+	b.logInstanceReport(instanceID, "running", &liveReadback{pid: c.State.Pid, cgroup: cgroup}, observed)
+	return nil
+}
+
+// liveReadback is what a passing kernel readback of a sandbox's process saw.
+type liveReadback struct {
+	pid    int
+	cgroup string
+}
+
+// logInstanceReport logs the sandbox-host-preflight.v1 instance report of
+// one Create decision (INT-26-12): this backend's instance checks, from the
+// readback when it ran and not_run otherwise, and lane 2's observation of
+// the live process. It is built only for a backend opened from a host
+// profile.
+func (b *GVisor) logInstanceReport(instanceID, decision string, live *liveReadback, observed []sandboxhost.Check) {
+	if b.profile == nil {
+		return
+	}
+	var r checkRecorder
+	r.add("lease.engine_config_matches", nil, "engine configuration read back and matched the sandbox spec")
+	if live != nil {
+		r.add("lease.sentry_pinned_exe", nil, fmt.Sprintf("PID %d executes the pinned %s", live.pid, b.sandboxExe))
+		r.add("lease.sentry_in_lease_child_cgroup", nil, fmt.Sprintf("PID %d in %s below %s", live.pid, live.cgroup, b.sliceCgroup))
+		r.add("lease.child_limits_match", nil, live.cgroup+": cpu.max, memory.max and pids.max equal the lease, memory.swap.max 0")
+	} else {
+		for _, id := range []string{"lease.sentry_pinned_exe", "lease.sentry_in_lease_child_cgroup", "lease.child_limits_match"} {
+			r.notRun(id, "no process to read: "+decision)
+		}
+	}
+	checks := append(r.checks, observed...)
+	if observed == nil {
+		for _, id := range []string{"lease.runtime_processes_in_finite_cgroups", "lease.host_netns_lo_only_no_routes"} {
+			checks = append(checks, sandboxhost.Check{ID: id, Class: catalogClass(id), Status: sandboxhost.StatusNotRun, Evidence: "no process to observe: " + decision})
+		}
+	}
+	report, err := sandboxhost.BuildReport(sandboxhost.ModeInstance, *b.profile, checks, sandboxhost.Environment{})
+	if err != nil {
+		slog.Warn("sandbox instance report", "sandbox", instanceID, "decision", decision, "error", err)
+		return
+	}
+	slog.Info("sandbox instance report", "sandbox", instanceID, "decision", decision, "report", report)
 }
 
 // createContainer pulls and verifies the lease's image and creates, but
@@ -1316,16 +1352,19 @@ func (b *GVisor) pullImage(budget *createBudget, lease protocol.SandboxLeaseV1) 
 	// under the pull deadline: the registry controls how long it takes.
 	pullCtx, cancelPull := budget.pull()
 	defer cancelPull()
+	pullBegan := time.Now()
 	pullExpired := func() bool {
 		return errors.Is(pullCtx.Err(), context.DeadlineExceeded) && budget.parent.Err() == nil
 	}
 	if err := b.publicRegistry(pullCtx, name); err != nil {
+		budget.pullElapsed += time.Since(pullBegan)
 		if pullExpired() {
 			return "", &miner.SandboxRefusal{Code: "image_unavailable"}
 		}
 		return "", err
 	}
 	err = b.engine.pull(pullCtx, name, lease.ImageDigest, limit)
+	budget.pullElapsed += time.Since(pullBegan)
 	// The steps after the pull get the whole local reserve, however long
 	// the pull took.
 	budget.restartLocal()

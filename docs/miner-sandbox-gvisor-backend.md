@@ -11,49 +11,110 @@ through the real backend and must run only on a disposable provisioned host
 (see [Disposable-host proof](#disposable-host-proof)). Host provisioning is
 not part of this package.
 
-## Activation
+## Activation wiring
 
-Not wired yet. `miner-agent --sandbox-leases on` still refuses to start. The
-agent will enable this backend only in a separate change, after the
-host-preflight package for the dedicated daemon, slice and data root has
-merged. Agent startup must then require every kernel, cgroup and filesystem
-check, and every engine check below, to pass as an observed state. Until
-then the backend runs only under `TestGVisorLaneOnDisposableHost`.
+`miner-agent --sandbox-leases on` is wired but stays opt-in: the default is
+`off`, and with `off` any `--sandbox-*` setting is refused. Wired is not
+activated: no production host runs it, and the gates below remain.
 
-The lane's restart recovery already uses the backend contract. Every lease
-whose sandbox may exist answers `failed/miner_restart` and is destroyed.
-Every other sandbox container on the daemon is destroyed as an orphan, and
-images no container uses are pruned.
+With `on`, the agent needs three inputs and starts only if all of the
+following hold:
 
-## What Open verifies (no host changes)
+- `--sandbox-host-profile`: the `sandbox-host-profile.v1` document the
+  host's provisioner wrote (see [host enforcement](sandbox-host-enforcement.md)).
+  Every backend value comes from it: socket, runtime and sentry pins, data
+  roots, slice, cgroup root, aggregate disk, sandbox count, image and log
+  limits, per-lease pids limit, and the Docker version pin, which must be
+  this backend's `28.0.4`.
+- `--sandbox-deployment-cgroup`: the cgroup v2 path deployment.v4 replicas
+  run in. It must be a clean absolute path that exists under the profile's
+  cgroup root. It and the agent's own cgroup must be disjoint from the
+  sandbox and engine slices. That replicas actually run in it is not
+  observed.
+- `--sandbox-daemon-config`: the dedicated daemon's configuration file,
+  evidence for the two `configured` engine checks.
+- **The preflight report passes.** The backend's engine checks (below) and
+  `pkg/sandboxhost`'s host checks are merged into one
+  `sandbox-host-preflight.v1` report. That report is logged once, and must
+  pass: every check `pass`, every `unenforced` entry `gap`.
+- **The lane accepts its budget.** The lane is then built with the
+  profile's aggregate as its budget and verifies it against the slice.
+- **Restart recovery** gets its own 5-minute budget.
 
-- the socket is not the default daemon's, the server is Docker `28.0.4` (the
-  version the [disposable gate](gvisor-disposable-gate.md) proved the quota
-  on), its data root is the configured `DataRoot`, storage is `overlay2` on
-  an XFS backing filesystem with d_type, the cgroup driver is `systemd` on
-  cgroup v2, it reports a containerd socket other than the host's shared or
-  the daemon-managed default with namespaces other than the default engine's
-  (where that containerd stores its data is not visible to the Engine API),
-  and it manages no network beyond `host` and `none` (no bridge);
-- the runtime is registered at the pinned runsc path with arguments drawn
-  only from `--overlay2=none`, `--systemd-cgroup`, `--platform=systrap`,
-  `--platform=kvm`, and including the first two (the quota holds only with
-  them); any other argument, such as host networking, is refused;
-- runsc and sentry binaries match their SHA-256 pins (opened without
-  following symlinks);
-- the daemon trusts no insecure registry beyond the loopback prefixes Docker
-  always lists, uses no mirror, and has Docker Hub as its only, secure index;
-- the data root's filesystem holds at least `disk + count × (image max +
-  log)` (the host-preflight check adds engine overhead and an image reserve);
-- the slice directory is on cgroup v2 with a finite `pids.max`; the lane
-  separately requires finite `cpu.max` and `memory.max` covering the budget,
-  disjoint from the agent's and the deployment cgroup;
-- the daemon runs no container without the sandbox label.
+The lane's restart recovery uses the backend contract. Every lease whose
+sandbox may exist answers `failed/miner_restart` and is destroyed. Every
+other sandbox container on the daemon is destroyed as an orphan, and images
+no container uses are pruned.
 
-These checks run once at startup; a binary or daemon changed later is caught
-only by the per-sandbox checks below. They do not yet require the data root
-to be its own XFS project-quota filesystem or the slice to have swap
-disabled; those are host-preflight checks, and activation waits for them.
+Gates that remain before any activation:
+- AG-SHIM (another containerd on the host);
+- D20 (the containerd root location has no lane 2 catalog id; the backend
+  checks the provisioning layout `<data_root>/containerd`);
+- PID-ATTR-1 and ACT-PID-1/2 (process-limit exits);
+- INT-B-08 (lease-only runtime socket);
+- the real-host proof through `Create` (DEP-3, the never-started probe
+  images, and the D11 settle path);
+- that the agent shares the dedicated daemon's PID and network namespaces;
+- INT-26-13 and INT-34-03 (capacity above 1);
+- FG-9.
+
+## Engine checks (no host changes)
+
+The backend records the catalog's lane 1 preflight ids. `Open` refuses a
+host on which any of them fails; checks that need the profile layout or the
+daemon configuration are skipped there.
+
+- `engine.socket_dedicated`: the socket is not the default daemon's. With
+  the profile, it lies under `run_root` with mode 0660 owned by root, and
+  the default daemon's socket (if any) answers with another engine ID.
+- `engine.version_pinned`: the server is Docker `28.0.4`, the version the
+  [disposable gate](gvisor-disposable-gate.md) proved the quota on.
+- `engine.data_root_on_data_fs`: `DockerRootDir` is the profile's
+  `docker_data_root`, on the device of `data_root`.
+- `engine.storage_overlay2_xfs`: `overlay2` on an XFS backing filesystem
+  with d_type.
+- `engine.cgroup_driver_systemd_v2`: `systemd` on cgroup v2.
+- `engine.containerd_dedicated`: a containerd socket other than the host's
+  shared or the daemon-managed default, with namespaces other than the
+  default engine's. With the profile, these are the profile's, and the
+  metadata store `<data_root>/containerd/io.containerd.metadata.v1.bolt/meta.db`
+  is on the data device.
+- `engine.network_management_off`: no network beyond `host` and `none`.
+- `engine.firewall_management_off` (configured): the daemon configuration
+  sets `iptables`, `ip6tables`, `ip-forward` and `ip-masq` false and
+  `bridge` to `none`.
+- `engine.runtime_runsc_pinned`:
+  - runsc is registered at the pinned path, with arguments drawn only from
+    `--overlay2=none`, `--systemd-cgroup`, `--platform=systrap` and
+    `--platform=kvm`, and including the first two; with the profile, the
+    arguments are exactly the profile's;
+  - the runsc and sentry binaries match their SHA-256 pins, opened without
+    following symlinks.
+- `engine.default_bounded_logs` (configured): `LoggingDriver` is
+  `json-file`, and the daemon configuration's default log options equal the
+  profile's per-lease sizes.
+- `engine.insecure_registries_empty`: no insecure registry beyond the
+  loopback prefixes Docker always lists, no mirror, and Docker Hub as the
+  only, secure index.
+- `engine.no_unlabelled_containers`: no container without the sandbox label.
+
+The cgroup, storage, budget, network-egress and kernel checks belong to
+`pkg/sandboxhost`, and this backend has no second implementation of them.
+The per-lease pids refusal uses the profile's `per_lease.pids_max`. The
+checks run once at startup; a binary or daemon changed later is caught only
+by the per-sandbox checks below.
+
+Every `Create` decision is also recorded:
+- **instance report:** a `sandbox instance report`, a
+  `sandbox-host-preflight.v1` report in instance mode, is logged. It holds
+  the backend's per-process checks (`not_run` when there was no process to
+  read) and `pkg/sandboxhost`'s observation of the live process.
+- **lane 2 observation on a live process:**
+  - a failing observation is a miner fault;
+  - a failing observation of a process that ended during it takes the D11
+    path.
+- **timing:** `sandbox create timing` records the pull's time and share,
+  and the local steps' time and reserve.
 
 ## What one sandbox is
 
@@ -227,10 +288,10 @@ container uses it; a missing container is success.
 - **Exec, files, secrets, inbound access, GPUs, private registries:** not
   supported. With no capabilities, images that need root to change file
   ownership or switch users fail inside the sandbox.
-- **Host network of the sandbox process:** not yet observed per sandbox. The
-  container's recorded `NetworkMode=none` is checked; the observation that
-  the sentry's host network namespace has only loopback and no routes
-  belongs to the host-preflight package and is required before activation.
+- **Host network of the sandbox process:** observed per sandbox by
+  `pkg/sandboxhost` (`lease.host_netns_lo_only_no_routes`) when the backend
+  is opened from a host profile; the container's recorded `NetworkMode=none`
+  is checked either way.
 - **Trust:** the miner operator controls the host; gVisor isolates the host
   from customer code, not customer code from the operator.
 
