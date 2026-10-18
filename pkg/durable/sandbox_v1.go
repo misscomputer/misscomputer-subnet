@@ -85,6 +85,13 @@ CREATE INDEX IF NOT EXISTS sandbox_leases_cleanup ON sandbox_leases(lease_id) WH
 // and produces no receipt.
 var ErrSandboxConflict = errors.New("sandbox identity conflicts with another exact document")
 
+// Replay refusals never create or renew sandbox state.
+var (
+	ErrSandboxReplayAbsent  = errors.New("sandbox replay hold absent")
+	ErrSandboxReplayFenced  = errors.New("sandbox replay identity fenced")
+	ErrSandboxReplayNotHeld = errors.New("sandbox replay reservation is not held")
+)
+
 // SandboxLeases is the miner-side durable sandbox-lease-v1 state. Callers
 // pass only documents that passed the matching VerifyBoundSandbox*V1
 // admission check; the store re-validates their shape, not their signature.
@@ -102,6 +109,9 @@ func (s *Store) EnableSandboxLeases(ctx context.Context) (*SandboxLeases, error)
 // SandboxOutcome is the durable answer to one validator document, the
 // content of the receipt the miner signs.
 type SandboxOutcome struct {
+	// ObservedAt is set by read-only replay at its database snapshot, not at
+	// request arrival or receipt delivery.
+	ObservedAt time.Time
 	Stage      string
 	ErrorCode  *string
 	LeaseID    *string
@@ -111,6 +121,68 @@ type SandboxOutcome struct {
 	// Start is true only on the first acceptance of a lease: the lease is
 	// durable as pending and the caller must now create its runtime.
 	Start bool
+}
+
+// ReplayHeldReservation observes one exact uncommitted hold in a consistent
+// read transaction. Unlike Hold it cannot insert, renew, expire or resurrect
+// anything. A successful answer describes this snapshot only; a subsequent
+// commit or release is allowed to win before its receipt is delivered.
+func (l *SandboxLeases) ReplayHeldReservation(ctx context.Context, r protocol.SandboxReservationV1, now time.Time) (SandboxOutcome, error) {
+	started := time.Now()
+	if err := r.Validate(); err != nil {
+		return SandboxOutcome{}, err
+	}
+	digest, err := protocol.SandboxDigestV1(r)
+	if err != nil {
+		return SandboxOutcome{}, err
+	}
+	payload, err := json.Marshal(r)
+	if err != nil {
+		return SandboxOutcome{}, err
+	}
+	tx, err := l.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return SandboxOutcome{}, err
+	}
+	defer tx.Rollback()
+	var storedDigest, validator, holdID, nonce, status string
+	var expires int64
+	var stored []byte
+	var cpu, memory, disk int
+	err = tx.QueryRowContext(ctx, `SELECT reservation_digest,validator_hotkey,hold_id,reservation_nonce,status,hold_expires_at_ns,reservation_json,cpu_millis,memory_mib,disk_mib FROM sandbox_holds WHERE sandbox_id=? AND generation=? AND miner_hotkey=?`, r.SandboxID, r.Generation, r.MinerID).Scan(&storedDigest, &validator, &holdID, &nonce, &status, &expires, &stored, &cpu, &memory, &disk)
+	// Account for time waiting for the connection/snapshot; an old request
+	// timestamp cannot keep a hold alive while another operation owns the DB.
+	observed := now.Add(time.Since(started))
+	if errors.Is(err, sql.ErrNoRows) {
+		return SandboxOutcome{}, ErrSandboxReplayAbsent
+	}
+	if err != nil {
+		return SandboxOutcome{}, err
+	}
+	if storedDigest != digest || !bytes.Equal(stored, payload) || validator != sandboxValidator(r.Subnet) || holdID != protocol.SandboxHoldIDV1(r) || nonce != r.ReservationNonce || expires != sandboxTime(r.HoldExpiresAt).UnixNano() || cpu != r.Resources.CPUMillis || memory != r.Resources.MemoryMiB || disk != r.Resources.DiskMiB {
+		return SandboxOutcome{}, ErrSandboxConflict
+	}
+	fenced, err := sandboxFencedTx(ctx, tx, r.SandboxID, r.Generation, r.MinerID, validator)
+	if err != nil {
+		return SandboxOutcome{}, err
+	}
+	if fenced {
+		return SandboxOutcome{}, ErrSandboxReplayFenced
+	}
+	var leaseCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sandbox_leases WHERE sandbox_id=? AND generation=? AND miner_hotkey=?`, r.SandboxID, r.Generation, r.MinerID).Scan(&leaseCount); err != nil {
+		return SandboxOutcome{}, err
+	}
+	if leaseCount != 0 || status == "committed" || status == "released" {
+		return SandboxOutcome{}, ErrSandboxReplayNotHeld
+	}
+	outcome := SandboxOutcome{Stage: sandbox.StageHeld, ObservedAt: observed}
+	if status == "expired" || observed.UnixNano() >= expires {
+		outcome.Stage, outcome.ErrorCode = sandbox.StageRefused, sandboxCode("hold_expired")
+	} else if status != "held" {
+		return SandboxOutcome{}, ErrSandboxReplayNotHeld
+	}
+	return l.finish(ctx, tx, observed, outcome)
 }
 
 // SandboxLeaseRecord is one durable lease.

@@ -20,6 +20,8 @@ const (
 	// CapabilityFeature is reserved for a miner agent that runs the sandbox
 	// lane. No released miner agent advertises it yet.
 	CapabilityFeature = "sandbox-lease-v1"
+	// ReservationReplayFeature promises the explicit non-creating operation.
+	ReservationReplayFeature = "sandbox-reservation-replay-v1"
 	// WorkloadKind distinguishes sandbox documents from web workloads.
 	WorkloadKind = "sandbox"
 

@@ -42,7 +42,8 @@ type api struct {
 	public  ed25519.PublicKey
 	// sandbox is the sandbox-lease-v1 lane; nil (the default) leaves its
 	// routes and capability absent.
-	sandbox *miner.SandboxLane
+	sandbox                  *miner.SandboxLane
+	sandboxReservationReplay bool
 }
 
 func main() {
@@ -86,12 +87,19 @@ func run() error {
 		staticCacheMaxBytes   = flag.Int64("static-cache-max-bytes", 8<<30, "byte quota of pinned static site files")
 		staticFetchTimeout    = flag.Duration("static-fetch-timeout", miner.DefaultStaticFetchTimeout, "bound on fetching and verifying one static site")
 		staticConcurrency     = flag.Int("static-request-concurrency", miner.DefaultStaticRequestConcurrency, "in-flight requests per static endpoint")
+		sandboxReplay         = flag.String("sandbox-reservation-replay", "off", "existing-hold-only replay: off (default) or on; requires --sandbox-leases on")
 		sandboxLeases         = flag.String("sandbox-leases", "off", "sandbox-lease-v1 workload: off (default) or on (gVisor on a dedicated Docker daemon; the host preflight report must pass)")
 		sandboxHostProfile    = flag.String("sandbox-host-profile", "", "sandbox-host-profile.v1 document of this host (required with --sandbox-leases on)")
 		sandboxDeployment     = flag.String("sandbox-deployment-cgroup", "", "cgroup v2 path deployment.v4 replicas run in, kept disjoint from sandboxes (required with --sandbox-leases on)")
 		sandboxDaemonConfig   = flag.String("sandbox-daemon-config", "", "configuration file of the dedicated sandbox Docker daemon (required with --sandbox-leases on)")
 	)
 	flag.Parse()
+	if *sandboxReplay != "off" && *sandboxReplay != "on" {
+		return errors.New("unsupported --sandbox-reservation-replay mode")
+	}
+	if *sandboxReplay == "on" && *sandboxLeases != "on" {
+		return errors.New("--sandbox-reservation-replay on requires --sandbox-leases on")
+	}
 	if err := service.ValidateBind(*bind, *allowNonLoopback); err != nil {
 		return err
 	}
@@ -173,7 +181,7 @@ func run() error {
 	}
 	serviceAPI := &api{
 		agent: agent, store: store, network: *network, netuid: uint16(*netuid), hotkey: *hotkey, uid: minerUID,
-		public: privateKey.Public().(ed25519.PublicKey), sandbox: sandboxLane,
+		public: privateKey.Public().(ed25519.PublicKey), sandbox: sandboxLane, sandboxReservationReplay: *sandboxReplay == "on",
 	}
 	protected := serviceAPI.routes()
 	authenticator := bridge.Authenticator{Secret: secret, Store: store}
@@ -361,6 +369,9 @@ func (a *api) features() []string {
 	}
 	if a.sandbox != nil {
 		features = append(features, sandbox.CapabilityFeature)
+		if a.sandboxReservationReplay {
+			features = append(features, sandbox.ReservationReplayFeature)
+		}
 	}
 	return features
 }
