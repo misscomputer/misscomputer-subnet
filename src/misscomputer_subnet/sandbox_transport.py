@@ -37,6 +37,21 @@ from misscomputer_subnet.static_contracts import RequestID, StaticSubnetBinding
 SYNAPSE_VERSION: Final = "subnet-sandbox-synapse.v1"
 #: Advertised by a miner agent that runs the sandbox lane (``pkg/sandbox``).
 CAPABILITY_FEATURE: Final = "sandbox-lease-v1"
+REPLAY_CAPABILITY_FEATURE: Final = "sandbox-reservation-replay-v1"
+# Typed agent refusals that must survive both Python hops. A 410 remains
+# ambiguous until the caller proves every non-hold authority window current.
+REPLAY_REFUSAL_CODES: Final = frozenset(
+    {
+        "sandbox_replay_hold_absent",
+        "sandbox_replay_fenced",
+        "sandbox_replay_not_held",
+        "sandbox_conflict",
+        "sandbox_lane_closed",
+        "expired_assignment",
+        "expired_binding",
+        "binding_rollback",
+    }
+)
 _SCHEMA_PREFIX: Final = "miss.computer/misscomputer-subnet/"
 #: Route segment -> the one validator document schema that route carries.
 #: Miner axon ``/api/v1/sandbox/<kind>``, Go agent ``/v1/sandbox/<kind>``,

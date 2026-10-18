@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import contextlib
 import hashlib
 import hmac
 import ipaddress
@@ -55,6 +54,7 @@ from .chain import (
     load_mock_peers,
 )
 from .chain_quorum import build_chain_query, json_stderr_alert
+from .ingress import read_request_body
 from .logging import configure_logging
 from .netpolicy import canonical_public_address
 from .organic_contracts import (
@@ -781,6 +781,7 @@ class ValidatorNeuron:
         discovery_backoff_base_rounds: int = 1,
         discovery_backoff_max_rounds: int = 16,
         sandbox_leases: bool = False,
+        sandbox_reservation_replay: bool = False,
     ) -> None:
         if discovery_concurrency < 1:
             raise ValueError("discovery concurrency must be positive")
@@ -832,7 +833,19 @@ class ValidatorNeuron:
         self.discovery_backoff_base_rounds = discovery_backoff_base_rounds
         self.discovery_backoff_max_rounds = discovery_backoff_max_rounds
         # Default off: without it no /v1/miners/{hotkey}/sandbox-* route exists.
+        if sandbox_reservation_replay and not sandbox_leases:
+            raise ValueError("sandbox reservation replay requires sandbox leases")
         self.sandbox_leases = sandbox_leases
+        self.sandbox_reservation_replay = sandbox_reservation_replay
+        self._replay_view_budget = max(5.0, 3 * sync_interval)
+        if sandbox_reservation_replay and self._replay_view_budget > 30:
+            raise ValueError("sandbox replay requires a chain freshness budget of at most 30s")
+        # One process-local, immutable observation, never restored from disk.
+        # Publication work may await the runtime without owning this state.
+        self._replay_view: tuple[MetagraphSnapshot, float, int] | None = None
+        self._chain_version = 0
+        self._chain_changed = asyncio.Event()
+        self._replay_tasks: set[asyncio.Task[Any]] = set()
         self.state = MetagraphState()
         self.ready = asyncio.Event()
         self.fully_synced = asyncio.Event()
@@ -881,13 +894,33 @@ class ValidatorNeuron:
         self._discovery_backoff: dict[DiscoveryIdentity, DiscoveryBackoff] = {}
         self._discovery_inflight: set[DiscoveryIdentity] = set()
         self._restore_durable_publications()
+        self._replay_block_floor = max(
+            (
+                lane.snapshot.block
+                for lane in (
+                    *self._historical_publications,
+                    *self._ambiguous_publications.values(),
+                    *self._quarantined_publications.values(),
+                )
+            ),
+            default=0,
+        )
+        self._replay_floor_views = tuple(
+            lane.snapshot
+            for lane in (
+                *self._historical_publications,
+                *self._ambiguous_publications.values(),
+                *self._quarantined_publications.values(),
+            )
+            if lane.snapshot.block == self._replay_block_floor
+        )
         self.app = FastAPI(lifespan=self._lifespan)
         self.app.add_exception_handler(HTTPException, self._http_error)
         self.app.add_exception_handler(ValidationError, self._validation_error)
         self._routes()
 
     @staticmethod
-    async def _http_error(_: Request, exc: Exception) -> JSONResponse:
+    async def _http_error(request: Request, exc: Exception) -> JSONResponse:
         assert isinstance(exc, HTTPException)
         message = str(exc.detail)[:512]
         codes = {
@@ -912,6 +945,10 @@ class ValidatorNeuron:
                     "code": (
                         message
                         if message in CAPABILITY_REFUSAL_CODES
+                        or (
+                            request.url.path.endswith("/sandbox-reservations/replay")
+                            and message in sandbox_transport.REPLAY_REFUSAL_CODES
+                        )
                         else codes.get(exc.status_code, "bridge_error")
                     ),
                     "message": message,
@@ -938,24 +975,81 @@ class ValidatorNeuron:
     async def _lifespan(self, _: FastAPI) -> AsyncIterator[None]:
         await self.chain.open()
         task = asyncio.create_task(self._block_loop(), name="validator-block-loop")
+        chain_task = (
+            asyncio.create_task(self._chain_loop(), name="validator-chain-view")
+            if self.sandbox_reservation_replay
+            else None
+        )
         try:
             yield
         finally:
             self.stop.set()
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            await self.chain.close()
+            tasks = [task, *self._replay_tasks]
+            if chain_task is not None:
+                tasks.append(chain_task)
+            for owned in tasks:
+                owned.cancel()
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self._replay_view = None
+                await self.chain.close()
+
+    async def _chain_loop(self) -> None:
+        """Sole chain producer with replay enabled; no runtime dependency."""
+        try:
+            while not self.stop.is_set():
+                try:
+                    async with asyncio.timeout(self._replay_view_budget):
+                        snapshot = await self.chain.sync()
+                    self._admit_snapshot(snapshot)
+                    if not snapshot.finalized or snapshot.block < self._replay_block_floor:
+                        raise RuntimeError("replay chain view is unfinalized or behind history")
+                    if snapshot.block == self._replay_block_floor and any(
+                        snapshot.identity_fingerprint() != prior.identity_fingerprint()
+                        for prior in self._replay_floor_views
+                    ):
+                        raise RuntimeError("replay chain view conflicts with restored high water")
+                    await self.state.set(snapshot)
+                    self._chain_version += 1
+                    self._replay_view = (snapshot, time.monotonic(), self._chain_version)
+                except Exception:
+                    self._replay_view = None
+                    LOGGER.exception("validator replay chain view failed")
+                self._chain_changed.set()
+                try:
+                    await asyncio.wait_for(self.stop.wait(), timeout=self.sync_interval)
+                except TimeoutError:
+                    pass
+        finally:
+            self._replay_view = None
+            self._chain_changed.set()
+
+    def _current_replay_view(self) -> tuple[MetagraphSnapshot, float, int]:
+        view = self._replay_view
+        if (
+            self.stop.is_set()
+            or view is None
+            or time.monotonic() - view[1] > self._replay_view_budget
+        ):
+            raise HTTPException(status_code=503, detail="replay_authority_unavailable")
+        return view
 
     async def _block_loop(self) -> None:
         while not self.stop.is_set():
             try:
-                snapshot = await self.chain.sync()
+                if self.sandbox_reservation_replay:
+                    await self._chain_changed.wait()
+                    self._chain_changed.clear()
+                    snapshot, _, _ = self._current_replay_view()
+                else:
+                    snapshot = await self.chain.sync()
                 validator, candidates, admission = self._admit_snapshot(snapshot)
                 # Admission and monotonic/reorg checks run before either local
                 # plane stages the new snapshot. A rejected chain view can
                 # therefore never displace the last committed scheduling view.
-                await self.state.set(snapshot)
+                if not self.sandbox_reservation_replay:
+                    await self.state.set(snapshot)
                 self._log_admission(snapshot, admission)
                 capabilities = await self.bridge.request(
                     "GET", "/v1/capabilities", response_model=ControlCapabilities
@@ -2474,7 +2568,13 @@ class ValidatorNeuron:
                 if not self._cleanup_handle_is_current(retained, snapshot):
                     del self._cleanup_miners[hotkey]
 
-    async def _handshake(self, snapshot: MetagraphSnapshot, neuron: NeuronRecord) -> RemoteMiner:
+    async def _handshake(
+        self,
+        snapshot: MetagraphSnapshot,
+        neuron: NeuronRecord,
+        *,
+        expected: RemoteMiner | None = None,
+    ) -> RemoteMiner:
         challenge = secrets.token_urlsafe(32)
         request_id = secrets.token_hex(16)
         axon_url = _axon_url(
@@ -2493,6 +2593,16 @@ class ValidatorNeuron:
                 timeout=min(self.dendrite_timeout, 10.0),
             )
             certificate_pin = hashlib.sha256(certificate_der).hexdigest()
+        # Replay must not send even its challenge to a replacement TLS leaf.
+        # Ordinary discovery has no historical pin; its behavior is unchanged.
+        if expected is not None and (
+            axon_url != expected.axon_url
+            or neuron.hotkey != expected.neuron.hotkey
+            or neuron.uid != expected.neuron.uid
+            or certificate_pin != expected.binding.transport_certificate_sha256
+            or certificate_der != expected.certificate_der
+        ):
+            raise HTTPException(status_code=403, detail="replay miner transport changed")
         synapse = CapabilitiesSynapse(
             request_id=request_id,
             network=self.network,
@@ -2672,8 +2782,9 @@ class ValidatorNeuron:
             message = "miner request timed out" if timed_out else "miner transport failed"
             raise HTTPException(status_code=status, detail=message) from exc
 
-    async def _verify_local_bridge(self, request: Request) -> bytes:
-        body = await request.body()
+    async def _verify_local_bridge(self, request: Request, *, body: bytes | None = None) -> bytes:
+        if body is None:
+            body = await request.body()
         if len(body) > BRIDGE_MAX_BODY:
             raise HTTPException(status_code=413, detail="request body exceeds one MiB")
         target = request.scope["raw_path"].decode()
@@ -3106,6 +3217,154 @@ class ValidatorNeuron:
         if not verified:
             raise HTTPException(status_code=403, detail="probe authorization signature is invalid")
 
+    def _check_replay_authority(
+        self,
+        handle: _TicketHandle,
+        snapshot: MetagraphSnapshot,
+    ) -> None:
+        remote, binding = handle.remote, handle.validator_binding
+        if snapshot.block < max(self._replay_block_floor, handle.snapshot.block):
+            raise HTTPException(status_code=409, detail="replay chain view precedes history")
+        if snapshot.block == handle.snapshot.block and (
+            snapshot.identity_fingerprint() != handle.snapshot.identity_fingerprint()
+        ):
+            raise HTTPException(status_code=409, detail="replay chain view conflicts with history")
+        if snapshot.block >= min(
+            handle.ticket_expires_at_block,
+            binding.expires_at_block,
+            remote.binding.expires_at_block,
+        ):
+            raise HTTPException(status_code=409, detail="replay original authority expired")
+        try:
+            validator, candidates, _ = self._admit_snapshot(snapshot)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=403, detail="replay current identity invalid") from exc
+        candidate = next(
+            (item for item in candidates if item.neuron.hotkey == remote.neuron.hotkey),
+            None,
+        )
+        if (
+            validator.uid != binding.uid
+            or candidate is None
+            or not self._remote_matches_candidate(remote, candidate)
+        ):
+            raise HTTPException(status_code=403, detail="replay current identity changed")
+
+    async def _replay_handle(self, hotkey: str, ticket: SubnetBinding) -> _TicketHandle:
+        # Only acknowledged publications supply history. In particular do not
+        # use _ticket_handles_locked: it deliberately includes staged lanes.
+        async with self._lock:
+            publications = list(self._historical_publications)
+            if self._committed_publication is not None:
+                publications.append(self._committed_publication)
+            uncertain = list(self._ambiguous_publications.values()) + list(
+                self._quarantined_publications.values()
+            )
+            if self._staged_publication is not None:
+                uncertain.append(self._staged_publication)
+            for lane in uncertain:
+                handle = self._ticket_handle(lane, hotkey)
+                if handle is not None and self._ticket_matches_handle(ticket, handle):
+                    raise HTTPException(status_code=409, detail="replay publication is ambiguous")
+            exact = [
+                handle
+                for lane in publications
+                if (handle := self._ticket_handle(lane, hotkey)) is not None
+                and self._ticket_matches_handle(ticket, handle)
+            ]
+        if not exact:
+            raise HTTPException(
+                status_code=403, detail="replay requires an exact committed publication"
+            )
+        selected = exact[0]
+        if any(
+            item.remote != selected.remote
+            or item.snapshot != selected.snapshot
+            or item.validator_binding != selected.validator_binding
+            or item.ticket_expires_at_block != selected.ticket_expires_at_block
+            for item in exact[1:]
+        ):
+            raise HTTPException(status_code=409, detail="replay publication is ambiguous")
+        return selected
+
+    async def _sandbox_replay(self, hotkey: str, request: Request) -> SandboxResponseV1:
+        if self.stop.is_set():
+            raise HTTPException(status_code=503, detail="validator is stopping")
+        task = asyncio.current_task()
+        assert task is not None
+        self._replay_tasks.add(task)
+        try:
+            async with asyncio.timeout(min(self.dendrite_timeout * 2 + 1, 30.0)):
+                return await self._sandbox_replay_request(hotkey, request)
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="sandbox replay timed out") from exc
+        finally:
+            self._replay_tasks.discard(task)
+
+    async def _sandbox_replay_request(self, hotkey: str, request: Request) -> SandboxResponseV1:
+        body = await read_request_body(request, max_bytes=BRIDGE_MAX_BODY)
+        await self._verify_local_bridge(request, body=body)
+        try:
+            local = parse_document(body, BridgeSandboxRequestV1)
+            header = sandbox_transport.document_header(local.document, "reservations")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            # This budget bounds handshake, publication-lock waits and send.
+            async with asyncio.timeout(min(self.dendrite_timeout * 2 + 1, 30.0)):
+                handle = await self._replay_handle(hotkey, header.subnet)
+                snapshot, _, _ = self._current_replay_view()
+                self._check_replay_authority(handle, snapshot)
+                remote = handle.remote
+                checked = await self._handshake(snapshot, remote.neuron, expected=remote)
+                if (
+                    sandbox_transport.REPLAY_CAPABILITY_FEATURE not in checked.features
+                    or sandbox_transport.CAPABILITY_FEATURE not in checked.features
+                ):
+                    raise HTTPException(
+                        status_code=409, detail=sandbox_transport.SANDBOX_CAPABILITY_UNSUPPORTED
+                    )
+                if not self._ticket_matches_remote(header.subnet, checked):
+                    raise HTTPException(
+                        status_code=403, detail="replay miner service identity changed"
+                    )
+                # The handshake awaited I/O. Re-resolve ambiguity and current
+                # identity/freshness immediately before building the envelope.
+                latest = await self._replay_handle(hotkey, header.subnet)
+                if latest != handle:
+                    raise HTTPException(status_code=409, detail="replay publication changed")
+                snapshot, _, _ = self._current_replay_view()
+                self._check_replay_authority(handle, snapshot)
+                synapse = SandboxSynapseV1(
+                    protocol=sandbox_transport.SYNAPSE_VERSION,
+                    request_id=local.request_id,
+                    current_block=snapshot.block,
+                    caller_hotkey=self.hotkey,
+                    validator_binding=handle.validator_binding,
+                    document=local.document,
+                )
+                result = await self._forward_signed_post(
+                    remote.axon_url,
+                    hotkey,
+                    "/api/v1/sandbox/reservations/replay",
+                    synapse,
+                    SandboxResponseV1,
+                    certificate_der=remote.certificate_der,
+                )
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="sandbox replay timed out") from exc
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503, detail="replay miner capability unavailable"
+            ) from exc
+        try:
+            if result.request_id != local.request_id:
+                raise ValueError(sandbox_transport.SANDBOX_RECEIPT_MISMATCH)
+            sandbox_transport.receipt_answers(result.receipt, header, "reservations")
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result
+
     async def _sandbox_bridge(self, kind: str, hotkey: str, request: Request) -> SandboxResponseV1:
         """Send one runtime-signed sandbox document to exactly one miner.
 
@@ -3171,6 +3430,14 @@ class ValidatorNeuron:
         )
 
     def _routes(self) -> None:
+        if self.sandbox_reservation_replay:
+            self.app.add_api_route(
+                "/v1/miners/{hotkey}/sandbox-reservations/replay",
+                self._sandbox_replay,
+                methods=["POST"],
+                response_model=None,
+                name="sandbox_reservation_replay",
+            )
         if self.sandbox_leases:
             for kind in sandbox_transport.DOCUMENT_SCHEMAS:
                 self._sandbox_route(kind)
@@ -3412,6 +3679,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-netuid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--mock-uri")
     parser.add_argument("--mock-peers")
+    parser.add_argument(
+        "--mock-tempo", type=int, help="explicit mock-only block tempo (default 12)"
+    )
     parser.add_argument("--allow-private-axons", action="store_true")
     parser.add_argument(
         "--allow-insecure-mock-http",
@@ -3424,11 +3694,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="bridge runtime sandbox documents to miners (default off)",
     )
+    parser.add_argument(
+        "--sandbox-reservation-replay",
+        choices=("on", "off"),
+        default="off",
+        help="existing-hold-only replay; requires --sandbox-leases on",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
 
 def make_chain(args: argparse.Namespace) -> tuple[ChainQuery, HotkeySigningFacade]:
+    mock_tempo = getattr(args, "mock_tempo", None)
+    if mock_tempo is not None and (not args.mock_uri or mock_tempo < 1):
+        raise ValueError("--mock-tempo requires --mock-uri and a positive tempo")
     if args.mock_uri:
         if not args.mock_peers:
             raise ValueError("--mock-peers is required with --mock-uri")
@@ -3437,6 +3716,7 @@ def make_chain(args: argparse.Namespace) -> tuple[ChainQuery, HotkeySigningFacad
             netuid=args.netuid,
             own_uri=args.mock_uri,
             peers=load_mock_peers(args.mock_peers),
+            tempo=12 if mock_tempo is None else mock_tempo,
         )
         return chain, chain.hotkey_signer
     query = build_chain_query(
@@ -3528,6 +3808,7 @@ def main() -> None:
         discovery_backoff_base_rounds=args.discovery_backoff_base_rounds,
         discovery_backoff_max_rounds=args.discovery_backoff_max_rounds,
         sandbox_leases=args.sandbox_leases == "on",
+        sandbox_reservation_replay=args.sandbox_reservation_replay == "on",
     )
     uvicorn.run(neuron.app, host=args.bridge_host, port=args.bridge_port, log_config=None)
 

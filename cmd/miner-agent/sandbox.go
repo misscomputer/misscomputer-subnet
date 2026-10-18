@@ -136,6 +136,9 @@ func selfCgroup() (string, error) {
 // enabled lane, so a miner without one serves exactly the routes it did
 // before the lane existed.
 func (a *api) registerSandboxRoutes(mux *http.ServeMux) {
+	if a.sandboxReservationReplay {
+		mux.HandleFunc("POST /v1/sandbox/reservations/replay", sandboxHandler(a, a.sandbox.ReplayReservation))
+	}
 	mux.HandleFunc("POST /v1/sandbox/reservations", sandboxHandler(a, a.sandbox.Reserve))
 	mux.HandleFunc("POST /v1/sandbox/leases", sandboxHandler(a, a.sandbox.Commit))
 	mux.HandleFunc("POST /v1/sandbox/renewals", sandboxHandler(a, a.sandbox.Renew))
@@ -191,6 +194,20 @@ func sandboxHandler[T any](a *api, apply func(context.Context, T, miner.SandboxR
 		if errors.Is(err, durable.ErrSandboxConflict) {
 			bridge.WriteError(w, http.StatusConflict, "sandbox_conflict", err.Error(), false)
 			return
+		}
+		for _, refusal := range []struct {
+			err    error
+			status int
+			code   string
+		}{
+			{durable.ErrSandboxReplayAbsent, http.StatusNotFound, "sandbox_replay_hold_absent"},
+			{durable.ErrSandboxReplayFenced, http.StatusConflict, "sandbox_replay_fenced"},
+			{durable.ErrSandboxReplayNotHeld, http.StatusConflict, "sandbox_replay_not_held"},
+		} {
+			if errors.Is(err, refusal.err) {
+				bridge.WriteError(w, refusal.status, refusal.code, err.Error(), false)
+				return
+			}
 		}
 		if errors.Is(err, miner.ErrSandboxLaneClosed) {
 			bridge.WriteError(w, http.StatusServiceUnavailable, "sandbox_lane_closed", err.Error(), true)

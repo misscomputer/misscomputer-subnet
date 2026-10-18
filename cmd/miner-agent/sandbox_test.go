@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -19,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/misscomputer/misscomputer-subnet/pkg/bridge"
 	"github.com/misscomputer/misscomputer-subnet/pkg/durable"
 	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
 	"github.com/misscomputer/misscomputer-subnet/pkg/neuron"
@@ -26,12 +28,105 @@ import (
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandbox"
 )
 
-var sandboxPaths = []string{"/v1/sandbox/reservations", "/v1/sandbox/leases", "/v1/sandbox/renewals", "/v1/sandbox/releases"}
+var sandboxPaths = []string{"/v1/sandbox/reservations/replay", "/v1/sandbox/reservations", "/v1/sandbox/leases", "/v1/sandbox/renewals", "/v1/sandbox/releases"}
 
 func serve(handler http.Handler, method, path string, body []byte) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(method, path, bytes.NewReader(body)))
 	return response
+}
+
+// TestSandboxReplayProcessFixture is the Go side of the Python subprocess
+// contract test. Only the isolation backend/cgroup are fixtures: HTTP routes,
+// HMAC/nonces, binding high-water, signed admission, SQLite and receipts are
+// the real owners. No fixture endpoint exists in the production binary.
+func TestSandboxReplayProcessFixture(t *testing.T) {
+	root := os.Getenv("MC_REPLAY_FIXTURE_DIR")
+	if root == "" {
+		t.Skip("launched only by the authenticated Python boundary test")
+	}
+	ctx := context.Background()
+	validatorKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x11}, 32))
+	minerKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x22}, 32))
+	const minerHotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+	store, err := durable.Open(filepath.Join(root, "agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	leaselane, err := store.EnableSandboxLeases(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cgroup := filepath.Join(root, "cgroup", "mc-sandboxes")
+	if err := os.MkdirAll(cgroup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"cpu.max": "400000 100000\n", "memory.max": "8589934592\n"} {
+		if err := os.WriteFile(filepath.Join(cgroup, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	agent := miner.NewAgent(minerHotkey, nil, minerKey, nil, nil, nil)
+	agent.MinerTransport = neuron.TransportHTTP
+	backend := &sandboxBackend{live: map[string]bool{}}
+	lane, err := miner.NewSandboxLane(ctx, agent, leaselane, backend, miner.SandboxLaneConfig{
+		Budget:     sandbox.Capacity{CPUMillis: 4000, MemoryMiB: 8192, DiskMiB: 40960, Sandboxes: 4},
+		CgroupRoot: filepath.Join(root, "cgroup"), AgentCgroup: "/agent", DeploymentCgroup: "/deployments",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lane.Close(ctx)
+	uid := uint16(1)
+	service := &api{agent: agent, store: store, network: "local", netuid: 24, hotkey: minerHotkey, uid: &uid,
+		public: minerKey.Public().(ed25519.PublicKey), sandbox: lane, sandboxReservationReplay: true}
+	auth := bridge.Authenticator{Secret: []byte("sandbox-replay-local-test-secret-32"), Store: store}
+	server := httptest.NewServer(auth.Middleware(service.routes()))
+	defer server.Close()
+	encoder := json.NewEncoder(os.Stdout)
+	if err := encoder.Encode(map[string]string{"url": server.URL, "miner_key": hex.EncodeToString(service.public), "validator_key": hex.EncodeToString(validatorKey.Public().(ed25519.PublicKey))}); err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		var command struct {
+			Operation   string                        `json:"operation"`
+			Reservation protocol.SandboxReservationV1 `json:"reservation"`
+			Receipt     protocol.SandboxReceiptV1     `json:"receipt"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &command); err != nil {
+			t.Fatal(err)
+		}
+		switch command.Operation {
+		case "sign":
+			if err := protocol.SignSandboxReservationV1(&command.Reservation, validatorKey); err != nil {
+				t.Fatal(err)
+			}
+			if err := encoder.Encode(command.Reservation); err != nil {
+				t.Fatal(err)
+			}
+		case "verify":
+			if err := protocol.VerifySandboxReceiptV1(command.Receipt, service.public); err != nil {
+				t.Fatal(err)
+			}
+			if err := protocol.SandboxReceiptAnswersV1(command.Receipt, command.Reservation); err != nil {
+				t.Fatal(err)
+			}
+			if err := encoder.Encode(map[string]bool{"verified": true}); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatal("unknown fixture operation")
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.live) != 0 {
+		t.Fatal("read-only test created a backend instance")
+	}
 }
 
 func advertised(t *testing.T, service *api) []string {
@@ -145,7 +240,7 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &api{agent: agent, store: state, network: "mock", netuid: 24, hotkey: minerHotkey, public: minerPublic, sandbox: lane}
+	service := &api{agent: agent, store: state, network: "mock", netuid: 24, hotkey: minerHotkey, public: minerPublic, sandbox: lane, sandboxReservationReplay: true}
 	if !slices.Contains(advertised(t, service), sandbox.CapabilityFeature) {
 		t.Fatal("enabled lane does not advertise sandbox-lease-v1")
 	}
@@ -188,6 +283,32 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 		return body
 	}
 	held := reservation(strings.Repeat("a1", 16))
+	replayPath := "/v1/sandbox/reservations/replay"
+	assertReplayError := func(r protocol.SandboxReservationV1, status int, code string) {
+		t.Helper()
+		response := serve(service.routes(), http.MethodPost, replayPath, envelope(r, nil))
+		if response.Code != status || !strings.Contains(response.Body.String(), `"`+code+`"`) {
+			t.Fatalf("replay: %d %s, want %d %s", response.Code, response.Body.String(), status, code)
+		}
+	}
+	// A missing hold cannot be fabricated by the replay route.
+	assertReplayError(held, http.StatusNotFound, "sandbox_replay_hold_absent")
+	used, active, err := leases.Occupancy(ctx, now)
+	if err != nil || used.Sandboxes != 0 || active.Sandboxes != 0 || len(backend.live) != 0 {
+		t.Fatalf("absent replay acquired capacity/backend: %+v %+v %v", used, active, err)
+	}
+	// Having the lease lane alone is insufficient: replay remains default off.
+	service.sandboxReservationReplay = false
+	if slices.Contains(advertised(t, service), sandbox.ReservationReplayFeature) {
+		t.Fatal("disabled replay advertised")
+	}
+	if got := serve(service.routes(), http.MethodPost, replayPath, envelope(held, nil)); got.Code != http.StatusNotFound {
+		t.Fatalf("disabled replay returned %d", got.Code)
+	}
+	service.sandboxReservationReplay = true
+	if !slices.Contains(advertised(t, service), sandbox.ReservationReplayFeature) {
+		t.Fatal("enabled replay not advertised")
+	}
 	response := serve(service.routes(), http.MethodPost, "/v1/sandbox/reservations", envelope(held, nil))
 	var answer sandboxResponse
 	if err := decodeJSON(bytes.NewReader(response.Body.Bytes()), &answer); err != nil {
@@ -201,6 +322,24 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 		t.Fatalf("reservation receipt %+v", answer.Receipt)
 	}
 
+	// Existing-only replay is an independent contract: the exact signed hold
+	// must be observable without ordinary Reserve or backend work.
+	replayed := serve(service.routes(), http.MethodPost, "/v1/sandbox/reservations/replay", envelope(held, nil))
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("existing-hold replay contract: status %d body %s", replayed.Code, replayed.Body.String())
+	}
+	var replayAnswer sandboxResponse
+	if err := decodeJSON(bytes.NewReader(replayed.Body.Bytes()), &replayAnswer); err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.VerifySandboxReceiptV1(replayAnswer.Receipt, minerPublic); err != nil {
+		t.Fatal(err)
+	}
+	if replayAnswer.Receipt.Stage != sandbox.StageHeld || protocol.SandboxReceiptAnswersV1(replayAnswer.Receipt, held) != nil {
+		t.Fatalf("replay did not answer the exact held document: %+v", replayAnswer)
+	}
+
+	assertReplayError(reservation(strings.Repeat("b2", 16)), http.StatusConflict, "sandbox_conflict")
 	for _, test := range []struct {
 		name   string
 		body   []byte
@@ -242,6 +381,7 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	if response := serve(service.routes(), http.MethodPost, "/v1/sandbox/leases", envelope(lease, nil)); response.Code != http.StatusOK || len(backend.live) != 1 {
 		t.Fatalf("lease: %d %s live=%d", response.Code, response.Body.String(), len(backend.live))
 	}
+	assertReplayError(held, http.StatusConflict, "sandbox_replay_not_held")
 	release := protocol.SandboxReleaseV1{
 		Generation: 1, IssuedAt: *protocol.StaticTime(now), MinerID: minerHotkey, Reason: sandbox.ReleaseCustomerDelete,
 		SandboxID: held.SandboxID, Schema: protocol.SandboxReleaseSchema, SchemaVersion: 1, Subnet: binding,
@@ -261,10 +401,25 @@ func TestSandboxRoutesAnswerSignedReceiptsThroughTheBridge(t *testing.T) {
 	if err := decodeJSON(bytes.NewReader(response.Body.Bytes()), &answer); err != nil || answer.Receipt.Stage != sandbox.StageReleased || len(backend.live) != 0 {
 		t.Fatalf("replayed release: %d %s live=%d", response.Code, response.Body.String(), len(backend.live))
 	}
+	assertReplayError(held, http.StatusConflict, "sandbox_replay_fenced")
+	// All chain/binding windows remain current: this 410 is the original
+	// hold timestamp, not an expired ticket or forged admission envelope.
+	expired := reservation(strings.Repeat("d4", 16))
+	expired.SandboxID = "sbx-" + strings.Repeat("0", 31) + "2"
+	expired.IssuedAt = *protocol.StaticTime(now.Add(-2 * time.Minute))
+	expired.HoldExpiresAt = *protocol.StaticTime(now.Add(-time.Minute))
+	if err := protocol.SignSandboxReservationV1(&expired, validatorPrivate); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leases.Hold(ctx, expired, sandbox.Capacity{CPUMillis: 4000, MemoryMiB: 8192, DiskMiB: 40960, Sandboxes: 4}, now.Add(-90*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	assertReplayError(expired, http.StatusGone, "expired_assignment")
 	// Once shutdown closed the lane, documents are refused as retryable.
 	if err := service.sandbox.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	assertReplayError(held, http.StatusServiceUnavailable, "sandbox_lane_closed")
 	response = serve(service.routes(), http.MethodPost, "/v1/sandbox/releases", envelope(release, nil))
 	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"sandbox_lane_closed"`) ||
 		!strings.Contains(response.Body.String(), `"retryable":true`) {
