@@ -18,6 +18,7 @@ from misscomputer_subnet.auth import (
     SQLiteNonceStore,
     sign_service_binding,
     verify_bridge_headers,
+    verify_service_binding,
 )
 from misscomputer_subnet.chain import MetagraphSnapshot, MockChain, MockPeer
 from misscomputer_subnet.miner import (
@@ -26,7 +27,8 @@ from misscomputer_subnet.miner import (
     MinerNeuron,
     PriorityGate,
 )
-from misscomputer_subnet.protocol import LocalCapabilities, ServiceKeyBinding
+from misscomputer_subnet.protocol import LocalCapabilities, MinerRegistration, ServiceKeyBinding
+from misscomputer_subnet.validator import ValidatorNeuron
 
 
 class FakeBridge:
@@ -144,21 +146,12 @@ async def test_registered_inactive_miner_and_validator_keep_serving(tmp_path: Pa
     assert caller.hotkey == VALIDATOR.ss58_address
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("operator_hotkeys", "expected_status"),
-    [
-        ((VALIDATOR.ss58_address, UNAUTHORIZED.ss58_address), 200),
-        ((), 403),
-        ((UNAUTHORIZED.ss58_address,), 403),
-    ],
-)
-async def test_btauth_capability_authorization_replay_and_priority_policy(
-    tmp_path: Path, operator_hotkeys: tuple[str, ...], expected_status: int
-) -> None:
+def capability_neuron(
+    tmp_path: Path, operator_hotkeys: tuple[str, ...]
+) -> tuple[MockChain, MinerNeuron]:
     peers = (
         MockPeer("//Validator", 0, None, True, 2_000),
-        MockPeer("//Miner1", 1, "http://miner.invalid", False, 10),
+        MockPeer("//Miner1", 1, "http://127.0.0.1:18091", False, 10),
         MockPeer("//Unpermitted", 2, None, False, 10_000),
     )
     chain = MockChain(network="local", netuid=24, own_uri="//Miner1", peers=peers)
@@ -177,6 +170,22 @@ async def test_btauth_capability_authorization_replay_and_priority_policy(
         mock_http=True,
         tls_config=None,
     )
+    return chain, neuron
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operator_hotkeys", "expected_status"),
+    [
+        ((VALIDATOR.ss58_address, UNAUTHORIZED.ss58_address), 200),
+        ((), 403),
+        ((UNAUTHORIZED.ss58_address,), 403),
+    ],
+)
+async def test_btauth_capability_authorization_replay_and_priority_policy(
+    tmp_path: Path, operator_hotkeys: tuple[str, ...], expected_status: int
+) -> None:
+    chain, neuron = capability_neuron(tmp_path, operator_hotkeys)
     snapshot = await chain.sync()
     await neuron.state.set(snapshot)
     neuron.ready.set()
@@ -248,6 +257,117 @@ async def test_btauth_capability_authorization_replay_and_priority_policy(
             "/api/v1/capabilities", content=malformed_body, headers=malformed_headers
         )
         assert malformed.status_code == 400
+
+
+class CapabilityCapture(httpx.ASGITransport):
+    def __init__(self, neuron: MinerNeuron) -> None:
+        super().__init__(app=neuron.app)
+        self.exchanges: list[tuple[dict[str, Any], httpx.Response]] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await super().handle_async_request(request)
+        await response.aread()
+        self.exchanges.append((json.loads(request.content), response))
+        return response
+
+
+class CapabilityRegistrationSink:
+    def __init__(self) -> None:
+        self.registrations: list[MinerRegistration] = []
+
+    async def request(self, method: str, path: str, *, value: Any) -> dict[str, Any]:
+        assert (method, path) == ("POST", "/v1/miners")
+        assert isinstance(value, MinerRegistration)
+        self.registrations.append(value)
+        return {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("miner_block", "request_blocks", "expected_status"),
+    [
+        pytest.param(98, (100,), 200, id="miner-behind-two"),
+        pytest.param(99, (100,), 200, id="miner-behind-one"),
+        pytest.param(100, (100,), 200, id="same-block"),
+        pytest.param(101, (100,), 200, id="miner-ahead-one"),
+        # Fresh challenges at one miner snapshot must not vary generation/expiry.
+        pytest.param(102, (100, 101, 102), 200, id="miner-ahead-two-refresh"),
+        pytest.param(97, (100,), 409, id="miner-behind-out-of-range"),
+        pytest.param(103, (100,), 409, id="miner-ahead-out-of-range"),
+        pytest.param(108, (107,), 200, id="tempo12-epoch-boundary"),
+        pytest.param(0, (0,), 200, id="block-zero"),
+        pytest.param(2, (0,), 200, id="block-zero-miner-ahead"),
+    ],
+)
+async def test_capability_discovery_uses_admitted_request_snapshot(
+    tmp_path: Path, miner_block: int, request_blocks: tuple[int, ...], expected_status: int
+) -> None:
+    # Only the local Go capability provider and registration sink are replaced.
+    # The btauth request, miner signature, validator handshake and discovery are real.
+    chain, miner = capability_neuron(tmp_path, (VALIDATOR.ss58_address,))
+    snapshot = replace(await chain.sync(), block=miner_block, tempo=12)
+    await miner.state.set(snapshot)
+    miner.ready.set()
+    validator_chain = MockChain(
+        network="local", netuid=24, own_uri="//Validator", peers=chain.peers
+    )
+    sink = CapabilityRegistrationSink()
+    async with CapabilityCapture(miner) as transport:
+        validator = ValidatorNeuron(
+            chain=validator_chain,
+            hotkey_signer=validator_chain.hotkey_signer,
+            network="local",
+            netuid=24,
+            bridge=sink,  # type: ignore[arg-type]
+            bridge_secret=b"d" * 32,
+            state_db=str(tmp_path / "validator.db"),
+            bridge_url="http://127.0.0.1:9200",
+            sync_interval=10,
+            dendrite_timeout=2,
+            dendrite_retries=0,
+            allow_private_axons=True,
+            mock_http_axons=True,
+            dendrite_transport=transport,
+            operator_hotkeys=(VALIDATOR.ss58_address,),
+        )
+        previous: ServiceKeyBinding | None = None
+        for index, request_block in enumerate(request_blocks, start=1):
+            discovered = await validator._discover_miners(replace(snapshot, block=request_block))
+            assert len(transport.exchanges) == index  # One attempt; no aligning retry.
+            request, response = transport.exchanges[-1]
+            assert response.status_code == expected_status, response.text
+            if expected_status == 409:
+                assert response.json()["detail"] == "request block is stale or from the future"
+                assert not discovered
+                assert not sink.registrations
+                continue
+            binding = ServiceKeyBinding.model_validate(response.json()["service_binding"])
+            try:
+                verify_service_binding(
+                    binding,
+                    expected_hotkey=MINER.ss58_address,
+                    expected_role="miner",
+                    expected_network="local",
+                    expected_netuid=24,
+                    expected_challenge=request["challenge"],
+                    expected_transport="http",
+                    expected_transport_certificate_sha256=None,
+                    current_block=request_block,
+                )
+            except ValueError as exc:
+                pytest.fail(
+                    f"HTTP200 capability unusable: {exc}; M={miner_block}, R={request_block}, "
+                    f"start={binding.valid_from_block}, discovered={len(discovered)}, "
+                    f"registrations={len(sink.registrations)}"
+                )
+            assert set(discovered) == {MINER.ss58_address}
+            assert len(sink.registrations) == index
+            assert sink.registrations[-1].service_binding == binding
+            if previous is not None:
+                assert binding.challenge != previous.challenge
+                assert binding.generation == previous.generation
+                assert binding.expires_at_block == previous.expires_at_block
+            previous = binding
 
 
 @pytest.mark.asyncio

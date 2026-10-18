@@ -627,7 +627,10 @@ class MinerNeuron:
                     uid=self.uid,
                     service_public_key=local.service_public_key,
                     generation=snapshot.block + 1,
-                    valid_from_block=snapshot.block,
+                    # Delegate now for the authenticated, admitted request snapshot;
+                    # this is not an assertion of historical metagraph membership.
+                    # Keep generation and expiry miner-derived across fresh challenges.
+                    valid_from_block=min(snapshot.block, synapse.chain_block),
                     expires_at_block=snapshot.block + max(snapshot.tempo * 2, 12),
                     challenge=synapse.challenge,
                 ),
