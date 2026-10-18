@@ -369,6 +369,57 @@ Malformed documents are refused with stable codes
 echo document members. Full document validation, signatures and
 `VerifyBoundSandbox*V1` admission stay in Go.
 
+## Existing-hold-only reservation replay (opt-in)
+
+`--sandbox-reservation-replay on` is independently **off by default** on the
+Go miner agent, Python miner, and Python validator, and requires
+`--sandbox-leases on` at every hop. The miner advertises
+`sandbox-reservation-replay-v1` only when its agent and neuron both enable it.
+Missing capability or mixed versions fail closed; there is no ordinary
+reservation fallback.
+
+The reservation-only routes are:
+
+- Validator loopback: `POST /v1/miners/{hotkey}/sandbox-reservations/replay`.
+- Miner axon: `POST /api/v1/sandbox/reservations/replay`.
+- Miner agent loopback: `POST /v1/sandbox/reservations/replay`.
+
+They retain the existing v1 envelopes, actual-path HMAC/btauth and original
+signed document. A fresh validator uses only authenticated, acknowledged,
+exact publication history, plus a newly synchronized finalized chain view.
+Staged, ambiguous and legacy records cannot authorize replay. Current
+validator permit/UID and miner UID/axon must still match; every original
+ticket and service-binding expiry remains enforced. A fresh capability
+handshake verifies the same key and TLS leaf (the old leaf is checked before
+sending the challenge), followed by another current-authority check.
+
+With this feature enabled, one chain producer is independent of runtime
+publication I/O. Its freshness budget is `max(5s, 3 * sync_interval)` and
+configurations exceeding 30 seconds are rejected. Errors/staleness close
+replay admission. Historical state never sets normal readiness or enables
+scheduling: a freshly restarted validator with an unavailable runtime keeps
+`/healthz` at 503. Shutdown cancels and joins replay requests and both loops.
+
+The Go lane applies unchanged reservation admission, then reads the exact
+hold, document/owner/resources/expiry, lease presence and release fence in
+one consistent transaction. It never calls `Hold`, creates/renews a row,
+expires state, or touches the backend. A signed `held` receipt is an
+observation of that snapshot, **not** a promise the hold remains held when
+the response arrives. Missing holds return `404 sandbox_replay_hold_absent`;
+fenced and committed/non-held identities return typed 409 refusals. Expired
+original authority is never extended. Ordinary sweeping and runtime-signed
+release remain the only expiry/settlement owners.
+
+For explicit mock chains only, both Python CLIs accept `--mock-tempo N` with
+`--mock-uri`; the default remains 12, and live configuration rejects the flag.
+A two-minute hold generally outlives the default mock ticket horizon. A
+larger mock tempo (for example 180) is configuration, not proof of remaining
+authority: outage acceptance must measure the unchanged original ticket,
+both bindings and current blocks at each call. A generic 410 alone cannot
+prove hold-time expiry because other expired authority can also return 410.
+The local replay tests do not establish the disposable outage canary, host
+isolation, nonce-store durability, or production activation.
+
 ## Known limits
 
 - No TEE. Isolation from the miner operator is not provided; capacity checks

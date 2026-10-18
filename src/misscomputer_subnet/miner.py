@@ -292,6 +292,7 @@ class MinerNeuron:
         body_idle_timeout: float = DEFAULT_BODY_IDLE_TIMEOUT,
         body_total_timeout: float = DEFAULT_BODY_TOTAL_TIMEOUT,
         sandbox_leases: bool = False,
+        sandbox_reservation_replay: bool = False,
     ) -> None:
         if mock_http == (tls_config is not None):
             raise ValueError("miner must use either validated TLS or explicit mock HTTP")
@@ -321,7 +322,10 @@ class MinerNeuron:
         # discovery refresh omits an assigned miner.
         self.capability_fault_file = capability_fault_file
         # Default off: without it no /api/v1/sandbox/* route exists.
+        if sandbox_reservation_replay and not sandbox_leases:
+            raise ValueError("sandbox reservation replay requires sandbox leases")
         self.sandbox_leases = sandbox_leases
+        self.sandbox_reservation_replay = sandbox_reservation_replay
         self.ready = asyncio.Event()
         self.stop = asyncio.Event()
         self.app = FastAPI(lifespan=self._lifespan)
@@ -495,7 +499,9 @@ class MinerNeuron:
         assert isinstance(result, (StaticDeployResponseV1, StaticStatusResponseV1))
         return result
 
-    async def _sandbox_forward(self, kind: str, request: Request) -> SandboxResponseV1:
+    async def _sandbox_forward(
+        self, kind: str, request: Request, *, replay: bool = False
+    ) -> SandboxResponseV1:
         """Forward one validator-signed sandbox document to the Go agent.
 
         The same btauth and Bittensor identity checks as a static ticket run
@@ -533,7 +539,10 @@ class MinerNeuron:
         async with self.gate.slot(caller.priority):
             try:
                 result = await self.bridge.request(
-                    "POST", f"/v1/sandbox/{kind}", value=local, response_model=SandboxResponseV1
+                    "POST",
+                    f"/v1/sandbox/{kind}" + ("/replay" if replay else ""),
+                    value=local,
+                    response_model=SandboxResponseV1,
                 )
             except BridgeError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
@@ -559,6 +568,12 @@ class MinerNeuron:
         )
 
     def _routes(self) -> None:
+        if self.sandbox_reservation_replay:
+
+            @self.app.post("/api/v1/sandbox/reservations/replay", response_model=None)
+            async def replay_reservation(request: Request) -> SandboxResponseV1:
+                return await self._sandbox_forward("reservations", request, replay=True)
+
         if self.sandbox_leases:
             for kind in sandbox_transport.DOCUMENT_SCHEMAS:
                 self._sandbox_route(kind)
@@ -622,7 +637,12 @@ class MinerNeuron:
                 request_id=synapse.request_id,
                 miner_hotkey=self.hotkey,
                 miner_uid=self.uid,
-                features=local.features,
+                features=[
+                    feature
+                    for feature in local.features
+                    if feature != sandbox_transport.REPLAY_CAPABILITY_FEATURE
+                    or self.sandbox_reservation_replay
+                ],
                 max_body_bytes=local.max_body_bytes,
                 service_binding=binding,
             )
@@ -917,6 +937,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concurrency", type=int, default=4)
     parser.add_argument("--mock-uri")
     parser.add_argument("--mock-peers")
+    parser.add_argument(
+        "--mock-tempo", type=int, help="explicit mock-only block tempo (default 12)"
+    )
     parser.add_argument("--mock-capability-fault-file")
     parser.add_argument(
         "--sandbox-leases",
@@ -924,11 +947,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="forward subnet-sandbox-synapse.v1 documents to the Go agent (default off)",
     )
+    parser.add_argument(
+        "--sandbox-reservation-replay",
+        choices=("on", "off"),
+        default="off",
+        help="existing-hold-only replay; requires --sandbox-leases on",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
 
 def make_chain(args: argparse.Namespace) -> tuple[ChainQuery, HotkeySigningFacade]:
+    mock_tempo = getattr(args, "mock_tempo", None)
+    if mock_tempo is not None and (not args.mock_uri or mock_tempo < 1):
+        raise ValueError("--mock-tempo requires --mock-uri and a positive tempo")
     if args.mock_uri:
         if not args.mock_peers:
             raise ValueError("--mock-peers is required with --mock-uri")
@@ -937,6 +969,7 @@ def make_chain(args: argparse.Namespace) -> tuple[ChainQuery, HotkeySigningFacad
             netuid=args.netuid,
             own_uri=args.mock_uri,
             peers=load_mock_peers(args.mock_peers),
+            tempo=12 if mock_tempo is None else mock_tempo,
         )
         return chain, chain.hotkey_signer
     query = BittensorChain(
@@ -995,6 +1028,7 @@ def main() -> None:
         tls_config=tls_config,
         capability_fault_file=args.mock_capability_fault_file,
         sandbox_leases=args.sandbox_leases == "on",
+        sandbox_reservation_replay=args.sandbox_reservation_replay == "on",
     )
     if tls_config is None:
         uvicorn.run(

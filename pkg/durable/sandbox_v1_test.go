@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -24,6 +25,146 @@ var sandboxT0 = time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
 type sandboxParties struct {
 	validator, miner ed25519.PrivateKey
 	validatorHotkey  string
+}
+
+// The read-only contract is stronger than idempotent Hold: even expired and
+// corrupt state must remain byte-for-byte unchanged. The HTTP owner covers
+// signed admission/receipts; this owner covers storage faults and races.
+func TestSandboxReplayReadSnapshotNeverWrites(t *testing.T) {
+	ctx := context.Background()
+	parties := newSandboxParties(0x11, "5Hvalidator")
+	for _, state := range []string{"held", "expired", "corrupt-json", "corrupt-owner", "corrupt-expiry", "missing-table"} {
+		t.Run(state, func(t *testing.T) {
+			store, lane := openSandboxLeases(t)
+			r := parties.reservation(t, 1, nonce(1), sandboxT0)
+			mustHold(t, lane, r, capacityFor(1), sandboxT0)
+			at := sandboxT0
+			switch state {
+			case "expired":
+				at = sandboxT0.Add(time.Minute)
+			case "corrupt-json":
+				_, _ = store.db.Exec(`UPDATE sandbox_holds SET reservation_json='{}'`)
+			case "corrupt-owner":
+				_, _ = store.db.Exec(`UPDATE sandbox_holds SET validator_hotkey='foreign'`)
+			case "corrupt-expiry":
+				_, _ = store.db.Exec(`UPDATE sandbox_holds SET hold_expires_at_ns=hold_expires_at_ns+1`)
+			case "missing-table":
+				_, _ = store.db.Exec(`DROP TABLE sandbox_release_fences`)
+			}
+			before := sandboxStateDump(t, store)
+			outcome, err := lane.ReplayHeldReservation(ctx, r, at)
+			switch state {
+			case "held":
+				wantStage(t, outcome, err, sandbox.StageHeld, "")
+			case "expired":
+				wantStage(t, outcome, err, sandbox.StageRefused, "hold_expired")
+			default:
+				if err == nil {
+					t.Fatal("corrupt storage produced an answer")
+				}
+			}
+			if after := sandboxStateDump(t, store); before != after {
+				t.Fatal("read-only replay mutated sandbox state")
+			}
+		})
+	}
+}
+
+func sandboxStateDump(t *testing.T, store *Store) string {
+	t.Helper()
+	var result []any
+	for _, table := range []string{"sandbox_holds", "sandbox_leases", "sandbox_release_fences"} {
+		rows, err := store.db.Query(`SELECT * FROM ` + table + ` ORDER BY 1`)
+		if err != nil {
+			result = append(result, err.Error())
+			continue
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				t.Fatal(err)
+			}
+			result = append(result, values)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func TestSandboxReplayRacesTerminalTransitionsWithoutRevival(t *testing.T) {
+	ctx := context.Background()
+	parties := newSandboxParties(0x11, "5Hvalidator")
+	for _, transition := range []string{"commit", "release", "sweep"} {
+		t.Run(transition, func(t *testing.T) {
+			store, lane := openSandboxLeases(t)
+			r := parties.reservation(t, 1, nonce(1), sandboxT0)
+			mustHold(t, lane, r, capacityFor(1), sandboxT0)
+			lease := parties.lease(t, r, nonce(2), sandboxT0, nil)
+			start := make(chan struct{})
+			errorsSeen := make(chan error, 21)
+			var wg sync.WaitGroup
+			for range 20 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					out, err := lane.ReplayHeldReservation(ctx, r, sandboxT0)
+					if err != nil && !errors.Is(err, ErrSandboxReplayFenced) && !errors.Is(err, ErrSandboxReplayNotHeld) {
+						errorsSeen <- err
+					}
+					if err == nil && out.Stage != sandbox.StageHeld && !(out.Stage == sandbox.StageRefused && out.ErrorCode != nil && *out.ErrorCode == "hold_expired") {
+						errorsSeen <- fmt.Errorf("invalid replay outcome: %+v", out)
+					}
+				}()
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				var err error
+				switch transition {
+				case "commit":
+					_, err = lane.CommitLease(ctx, lease, sandboxT0)
+				case "release":
+					_, _, err = lane.Release(ctx, parties.release(t, 1, sandboxT0), sandboxT0)
+				case "sweep":
+					_, err = lane.Sweep(ctx, sandboxT0.Add(time.Minute))
+				}
+				if err != nil {
+					errorsSeen <- err
+				}
+			}()
+			close(start)
+			wg.Wait()
+			close(errorsSeen)
+			for err := range errorsSeen {
+				t.Error(err)
+			}
+			before := sandboxStateDump(t, store)
+			out, err := lane.ReplayHeldReservation(ctx, r, sandboxT0)
+			if err == nil && out.Stage == sandbox.StageHeld {
+				t.Fatal("terminal hold revived")
+			}
+			if sandboxStateDump(t, store) != before {
+				t.Fatal("terminal replay changed storage")
+			}
+		})
+	}
 }
 
 func newSandboxParties(seed byte, validatorHotkey string) sandboxParties {

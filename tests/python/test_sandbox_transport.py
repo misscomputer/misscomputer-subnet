@@ -46,7 +46,9 @@ KINDS = {
     "renewals": "renewal",
     "releases": "release",
 }
-SANDBOX_ROUTES = [f"/api/v1/sandbox/{kind}" for kind in KINDS]
+SANDBOX_ROUTES = [f"/api/v1/sandbox/{kind}" for kind in KINDS] + [
+    "/api/v1/sandbox/reservations/replay"
+]
 SANDBOX = "subnet-sandbox-synapse.v1"
 LEASES = "/api/v1/sandbox/leases"
 RESERVATIONS = "/api/v1/sandbox/reservations"
@@ -176,7 +178,7 @@ async def test_sandbox_lane_is_absent_by_default(tmp_path: Path) -> None:
 
     (tmp_path / "validator").mkdir()
     bridge, _, _ = make_harness(tmp_path / "validator")
-    for kind in KINDS:
+    for kind in (*KINDS, "reservations/replay"):
         target = f"/v1/miners/{MINER_A.hotkey}/sandbox-{kind}"
         assert (await _post_bridge(bridge, target, {"protocol": "x"})).status_code == 404
     assert (
@@ -407,3 +409,297 @@ async def test_validator_sends_documents_only_to_capable_bound_miners(tmp_path: 
     response = await _post_bridge(neuron, target, request)
     assert response.status_code == 502, response.text
     assert response.json()["error"]["message"] == "sandbox_receipt_mismatch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "status"),
+    [
+        ("no-current-view", 503),
+        ("uncommitted", 409),
+        ("quarantined", 409),
+        ("miner-removed", 403),
+        ("miner-conflict", 403),
+        ("miner-rebound", 403),
+        ("permit-lost", 503),
+        ("expired", 409),
+        ("unsupported", 409),
+        ("key-changed", 403),
+        ("changed-during-handshake", 403),
+    ],
+)
+async def test_replay_denies_uncertain_history_or_current_authority(
+    tmp_path: Path,
+    fault: str,
+    status: int,
+) -> None:
+    """New replay admission owns these refusals, before any reservation send.
+
+    Unlike the process positive control this test never supplies a receipt.
+    Existing cleanup tests intentionally permit drain-only identity history;
+    they cannot protect this stricter replay-only current-authority gate.
+    """
+    import asyncio
+    from dataclasses import replace
+
+    old, chain, sim = make_harness(tmp_path, sandbox_leases=True)
+    snapshot = await refresh(old, chain, sim)
+    assert old._committed_publication is not None
+    if fault == "uncommitted":
+        import sqlite3
+
+        # Store.save intentionally cannot downgrade an acknowledged row.
+        # Build an actually unacknowledged, authenticated fixture instead.
+        with sqlite3.connect(tmp_path / "cleanup.db") as db:
+            db.execute("DELETE FROM validator_publication_lanes")
+        old._persist_publication(old._committed_publication, committed=False, drain_only=False)
+    elif fault == "quarantined":
+        import sqlite3
+
+        with sqlite3.connect(tmp_path / "cleanup.db") as db:
+            db.execute("UPDATE validator_publication_lanes SET record_mac=''")
+    neuron, current_chain, current_sim = make_harness(
+        tmp_path,
+        sandbox_leases=True,
+        sandbox_reservation_replay=True,
+    )
+    sent: list[str] = []
+
+    def capabilities(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/api/v1/capabilities":
+            sent.append(request.url.path)
+            raise AssertionError("refused replay forwarded a reservation")
+        if fault == "key-changed":
+            current_sim.service_keys[MINER_A.hotkey] = "cd" * 32
+        response = current_sim.handler(request)
+        payload = response.json()
+        payload["features"].append("sandbox-lease-v1")
+        if fault != "unsupported":
+            payload["features"].append("sandbox-reservation-replay-v1")
+        if fault == "changed-during-handshake":
+            # A chain update during the awaited handshake must be rechecked;
+            # use the same production snapshot observation the producer owns.
+            assert neuron._replay_view is not None
+            view, completed, version = neuron._replay_view
+            changed = replace(
+                view,
+                block=view.block + 1,
+                neurons=tuple(n for n in view.neurons if n.hotkey != MINER_A.hotkey),
+            )
+            neuron._replay_view = (changed, completed, version + 1)
+        return httpx.Response(200, json=payload)
+
+    neuron.dendrite_transport = httpx.MockTransport(capabilities)
+    if fault == "miner-removed":
+        current_chain.peers = tuple(p for p in current_chain.peers if p.hotkey != MINER_A.hotkey)
+    elif fault == "miner-conflict":
+        current_chain.peers += (replace(MINER_A, uri="//Conflict"),)
+    elif fault == "miner-rebound":
+        current_chain.peers = tuple(
+            replace(p, axon="http://other:8091") if p.hotkey == MINER_A.hotkey else p
+            for p in current_chain.peers
+        )
+    elif fault == "permit-lost":
+        current_chain.peers = tuple(
+            replace(p, validator_permit=False) if p.hotkey == chain.hotkey else p
+            for p in current_chain.peers
+        )
+    elif fault == "expired":
+        current_chain.block = snapshot.block + 12
+    current_chain.block = max(current_chain.block, snapshot.block)
+    task = None
+    try:
+        if fault != "no-current-view":
+            task = asyncio.create_task(neuron._chain_loop())
+            await asyncio.wait_for(neuron._chain_changed.wait(), timeout=5)
+        response = await _post_bridge(
+            neuron,
+            f"/v1/miners/{MINER_A.hotkey}/sandbox-reservations/replay",
+            {
+                "protocol": SANDBOX,
+                "request_id": "replay-refusal",
+                "document": _document(
+                    "reservations", MINER_A.hotkey, _validator_subnet(chain, snapshot)
+                ),
+            },
+        )
+        assert response.status_code == status, response.text
+        assert sent == []
+        assert not neuron.ready.is_set() and not neuron.fully_synced.is_set()
+    finally:
+        neuron.stop.set()
+        if task is not None:
+            await task
+
+
+@pytest.mark.parametrize("module", [miner, validator])
+def test_mock_tempo_is_explicit_and_rejected_for_live_chain(module: Any) -> None:
+    args = module.build_parser().parse_args(
+        [
+            "--netuid",
+            "24",
+            "--bridge-secret-file",
+            "unused",
+            "--state-db",
+            "unused",
+            "--mock-tempo",
+            "180",
+        ]
+    )
+    with pytest.raises(ValueError, match="--mock-uri"):
+        module.make_chain(args)
+    args.mock_uri = "//Alice"
+    args.mock_peers = '[{"uri":"//Alice","uid":0}]'
+    chain, _ = module.make_chain(args)
+    assert chain.tempo == 180
+    args.mock_tempo = None
+    default, _ = module.make_chain(args)
+    assert default.tempo == 12
+
+
+@pytest.mark.asyncio
+async def test_replay_shutdown_retires_hung_runtime_and_handshake(tmp_path: Path) -> None:
+    """Publication I/O cannot freeze fresh-chain production or escape shutdown.
+
+    The only fake here is blocking external I/O; it produces no admission or
+    receipt. An actual authenticated bridge request must be cancelled/joined.
+    """
+    import asyncio
+
+    old, chain, sim = make_harness(tmp_path, sandbox_leases=True)
+    snapshot = await refresh(old, chain, sim)
+    neuron, fresh_chain, _ = make_harness(
+        tmp_path, sandbox_leases=True, sandbox_reservation_replay=True
+    )
+    fresh_chain.block = snapshot.block
+    runtime_entered, runtime_retired = asyncio.Event(), asyncio.Event()
+    handshake_entered, handshake_retired = asyncio.Event(), asyncio.Event()
+
+    class HungRuntime:
+        async def request(self, *args: Any, **kwargs: Any) -> Any:
+            runtime_entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                runtime_retired.set()
+
+    async def hung_handshake(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/capabilities"
+        handshake_entered.set()
+        try:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+        finally:
+            handshake_retired.set()
+
+    neuron.bridge = HungRuntime()  # type: ignore[assignment]
+    neuron.dendrite_transport = httpx.MockTransport(hung_handshake)
+    request_task = None
+    try:
+        async with neuron._lifespan(neuron.app):
+            await asyncio.wait_for(runtime_entered.wait(), timeout=5)
+            request_task = asyncio.create_task(
+                _post_bridge(
+                    neuron,
+                    f"/v1/miners/{MINER_A.hotkey}/sandbox-reservations/replay",
+                    {
+                        "protocol": SANDBOX,
+                        "request_id": "shutdown-replay",
+                        "document": _document(
+                            "reservations", MINER_A.hotkey, _validator_subnet(chain, snapshot)
+                        ),
+                    },
+                )
+            )
+            entering = asyncio.create_task(handshake_entered.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {entering, request_task}, timeout=5, return_when=asyncio.FIRST_COMPLETED
+                )
+                if request_task in done:
+                    response = request_task.result()
+                    pytest.fail(
+                        f"request never entered handshake: {response.status_code} {response.text}"
+                    )
+                assert entering in done
+            finally:
+                entering.cancel()
+                await asyncio.gather(entering, return_exceptions=True)
+            before = (await neuron.state.get()).block
+            neuron._chain_changed.clear()
+            await asyncio.wait_for(neuron._chain_changed.wait(), timeout=5)
+            assert (await neuron.state.get()).block > before
+            assert not neuron.ready.is_set() and not neuron.fully_synced.is_set()
+        assert runtime_retired.is_set() and handshake_retired.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+    finally:
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["failed", "overdue"])
+async def test_replay_loses_authority_on_failed_or_overdue_sync(
+    tmp_path: Path, failure: str
+) -> None:
+    """A real producer's failed/stalled next read retires previously valid authority."""
+    import asyncio
+
+    old, chain, sim = make_harness(tmp_path, sandbox_leases=True)
+    snapshot = await refresh(old, chain, sim)
+    neuron, current_chain, current_sim = make_harness(
+        tmp_path, sandbox_leases=True, sandbox_reservation_replay=True
+    )
+    current_chain.block = snapshot.block
+    sync = current_chain.sync
+    entered = asyncio.Event()
+    calls = 0
+
+    async def next_sync() -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await sync()
+        entered.set()
+        if failure == "failed":
+            raise RuntimeError("chain unavailable")
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    current_chain.sync = next_sync  # type: ignore[method-assign]
+    contacts: list[str] = []
+
+    def capability(request: httpx.Request) -> httpx.Response:
+        contacts.append(request.url.path)
+        assert request.url.path == "/api/v1/capabilities"
+        return current_sim.handler(request)  # Deliberately unsupported peer.
+
+    neuron.dendrite_transport = httpx.MockTransport(capability)
+    task = asyncio.create_task(neuron._chain_loop())
+    path = f"/v1/miners/{MINER_A.hotkey}/sandbox-reservations/replay"
+    value = {
+        "protocol": SANDBOX,
+        "request_id": "freshness",
+        "document": _document("reservations", MINER_A.hotkey, _validator_subnet(chain, snapshot)),
+    }
+    try:
+        await asyncio.wait_for(neuron._chain_changed.wait(), timeout=5)
+        control = await _post_bridge(neuron, path, value)
+        assert control.status_code == 409, control.text
+        assert contacts == ["/api/v1/capabilities"]
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        if failure == "overdue":
+            # Budget is the real minimum 5s. The second read began at +1s;
+            # test the stale view before that read's own +5s timeout fires.
+            await asyncio.sleep(4.1)
+            assert neuron._replay_view is not None
+        denied = await _post_bridge(neuron, path, value)
+        assert denied.status_code == 503, denied.text
+        assert "replay_authority_unavailable" in denied.text
+        assert contacts == ["/api/v1/capabilities"]
+    finally:
+        neuron.stop.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

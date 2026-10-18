@@ -283,6 +283,33 @@ func (l *SandboxLane) Reserve(ctx context.Context, r protocol.SandboxReservation
 	return l.receipt(protocol.SandboxReservationSchema, r, r.SandboxID, r.Generation, r.Subnet, outcome, now)
 }
 
+// ReplayReservation authenticates the original reservation exactly as Reserve
+// does, but only observes an existing hold. It cannot touch the backend.
+func (l *SandboxLane) ReplayReservation(ctx context.Context, r protocol.SandboxReservationV1, req SandboxRequest) (protocol.SandboxReceiptV1, error) {
+	ctx, done, err := l.track(ctx)
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	defer done()
+	now := l.now().UTC()
+	if err := protocol.VerifyBoundSandboxReservationV1(r, req.ValidatorKey, now, req.CurrentBlock, req.Network, req.NetUID, req.CallerHotkey, req.MinerHotkey, req.MinerUID); err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	if err := l.admit(r.Subnet, r.MinerID); err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	// Admission may itself take time (including signature verification).
+	// Start the store's snapshot clock after it, not at request admission.
+	outcome, err := l.store.ReplayHeldReservation(ctx, r, l.now().UTC())
+	if err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return protocol.SandboxReceiptV1{}, err
+	}
+	return l.receipt(protocol.SandboxReservationSchema, r, r.SandboxID, r.Generation, r.Subnet, outcome, outcome.ObservedAt)
+}
+
 // Commit commits a verified lease to its hold, starts its sandbox on the
 // first acceptance, and resumes a pending lease on replay. The lease is
 // durable as pending before the backend is asked to create anything. The
