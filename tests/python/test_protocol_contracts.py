@@ -174,17 +174,18 @@ def test_hotkey_signed_service_binding_is_challenge_and_block_bound() -> None:
         ),
         signer,
     )
-    verify_service_binding(
-        binding,
-        expected_hotkey=signer.ss58_address,
-        expected_role="miner",
-        expected_network="test",
-        expected_netuid=24,
-        expected_challenge="fresh-challenge",
-        expected_transport="https",
-        expected_transport_certificate_sha256="22" * 32,
-        current_block=101,
-    )
+    for current_block in (100, 119):
+        verify_service_binding(
+            binding,
+            expected_hotkey=signer.ss58_address,
+            expected_role="miner",
+            expected_network="test",
+            expected_netuid=24,
+            expected_challenge="fresh-challenge",
+            expected_transport="https",
+            expected_transport_certificate_sha256="22" * 32,
+            current_block=current_block,
+        )
     with pytest.raises(ValueError, match="challenge"):
         verify_service_binding(
             binding,
@@ -197,18 +198,19 @@ def test_hotkey_signed_service_binding_is_challenge_and_block_bound() -> None:
             expected_transport_certificate_sha256="22" * 32,
             current_block=101,
         )
-    with pytest.raises(ValueError, match="current"):
-        verify_service_binding(
-            binding,
-            expected_hotkey=signer.ss58_address,
-            expected_role="miner",
-            expected_network="test",
-            expected_netuid=24,
-            expected_challenge="fresh-challenge",
-            expected_transport="https",
-            expected_transport_certificate_sha256="22" * 32,
-            current_block=120,
-        )
+    for current_block in (99, 120):
+        with pytest.raises(ValueError, match="current"):
+            verify_service_binding(
+                binding,
+                expected_hotkey=signer.ss58_address,
+                expected_role="miner",
+                expected_network="test",
+                expected_netuid=24,
+                expected_challenge="fresh-challenge",
+                expected_transport="https",
+                expected_transport_certificate_sha256="22" * 32,
+                current_block=current_block,
+            )
     wrong_signer = bt.sp_core.Keypair.create_from_uri("//Bob")
     with pytest.raises(ValueError, match="signing wallet"):
         sign_service_binding(binding.model_copy(update={"signature": ""}), wrong_signer)

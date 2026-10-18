@@ -112,6 +112,30 @@ The miner capability challenge prevents replay of a captured response into a lat
 
 The binding does not make the Go key a Bittensor key. It proves that the registered hotkey authorizes that specific local Go service key for this subnet and block window.
 
+For miner capabilities, let `R` be the authenticated request's `chain_block`
+and `M` and `T` be the block and tempo of the miner snapshot returned by the
+existing admission check. Requests outside `M - 2 <= R <= M + 2` are refused.
+The miner signs a validity start of `min(M, R)`, generation `M + 1`, and expiry
+`M + max(2*T, 12)`. The validator still checks the strict half-open window
+`valid_from_block <= R < expires_at_block` at its original request snapshot.
+Generation and expiry remain miner-derived: fresh challenges at the same miner
+snapshot cannot change either, preserving Go's same-generation persistence checks.
+
+This is a current, challenge-bound signer delegation for an admitted request
+snapshot, not a claim that the miner observed historical registration or that
+the service key existed at every block in the window. Each peer's independent
+metagraph identity, authorization, signature, challenge and transport checks
+still apply. Local chain monotonicity/same-height conflict and assignment epoch
+guards are unchanged; capabilities do not negotiate peer tempo or prove
+cross-node canonical-chain agreement. No original binding, ticket or hold window
+is extended, and explicitly invalid responses are not carried into discovery.
+
+Publication remains separately guarded: `publication_id` is the existing digest
+of the publication block and selected miner identity fields, not the complete
+signed registration. Exact registration readback and authenticated publication
+payload-integrity checks remain necessary; digest equality alone does not prove
+that binding bytes, validity windows or capability features match.
+
 ## Bound assignment ticket
 
 The validator Go service signs JSON with the `signature` field blank. The ticket contains the existing immutable deployment fields plus `subnet`:
