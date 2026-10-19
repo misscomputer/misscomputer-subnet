@@ -37,6 +37,8 @@ type engine struct {
 	// D15(d)) rather than by the local answer timeout.
 	client, pullClient *http.Client
 	base               string
+	// socket is the daemon socket, dialed directly for an attached exec.
+	socket string
 }
 
 // engineAnswerTimeout bounds how long a local Engine API call may wait for
@@ -64,6 +66,7 @@ func newEngineWithAnswerTimeout(socket string, answerTimeout time.Duration) *eng
 		client:     &http.Client{Transport: transport(answerTimeout)},
 		pullClient: &http.Client{Transport: transport(0)},
 		base:       "http://docker/" + engineAPIVersion,
+		socket:     socket,
 	}
 }
 

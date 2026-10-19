@@ -181,3 +181,107 @@ class SandboxResponseV1(StrictFrozenModel):
     protocol: Literal["subnet-sandbox-synapse.v1"]
     request_id: RequestID
     receipt: SandboxDocument
+
+
+# ``subnet-sandbox-ops-synapse.v1``: transport for sandbox-ops-v1 op requests
+# (``docs/sandbox-ops-v1.md``). Off by default and separate from the lease
+# envelope: the neurons register the ops routes only with ``--sandbox-ops on``
+# (which requires ``--sandbox-leases on``). As for leases, Python only
+# authenticates and forwards: the op document, its payload and the receipt's
+# result bytes travel unchanged; the Go agent verifies the document and the
+# payload binding, and the Go runtime verifies the receipt and result.
+
+OPS_SYNAPSE_VERSION: Final = "subnet-sandbox-ops-synapse.v1"
+#: Advertised by a miner agent whose lane runs the ops extension.
+OPS_CAPABILITY_FEATURE: Final = "sandbox-ops-v1"
+OP_REQUEST_SCHEMA: Final = _SCHEMA_PREFIX + "sandbox-op-request"
+OP_RECEIPT_SCHEMA: Final = _SCHEMA_PREFIX + "sandbox-op-receipt"
+#: Stable bridge detail for an op the validator refused to send because the
+#: miner does not advertise both ``sandbox-lease-v1`` and ``sandbox-ops-v1``.
+SANDBOX_OPS_CAPABILITY_UNSUPPORTED: Final = "sandbox_ops_capability_unsupported"
+#: A payload or result chunk: at most 512 KiB raw, standard padded base64.
+OpChunk = Annotated[str, StringConstraints(max_length=699052, pattern=r"^[A-Za-z0-9+/]*={0,2}$")]
+
+
+def op_header(document: SandboxDocument) -> SandboxDocumentHeader:
+    """The routing header of a validator-signed op request.
+
+    Raises ``ValueError`` with ``sandbox_document_kind_mismatch`` for any other
+    document and ``sandbox_document_invalid`` for a missing or malformed
+    identity or binding.
+    """
+
+    if document.get("schema") != OP_REQUEST_SCHEMA:
+        raise ValueError("sandbox_document_kind_mismatch")
+    try:
+        return SandboxDocumentHeader.model_validate(document)
+    except ValueError as exc:
+        raise ValueError("sandbox_document_invalid") from exc
+
+
+class _OpReceiptView(_RoutingView):
+    op_id: str
+
+
+def op_receipt_answers(receipt: SandboxDocument, header: SandboxDocumentHeader) -> None:
+    """Refuse an agent answer that is not an op receipt for this request.
+
+    The miner signature, the document digest and the result binding are
+    verified by the Go runtime; this only keeps a miswired answer from being
+    relayed.
+    """
+
+    try:
+        view = _OpReceiptView.model_validate(receipt)
+    except ValueError as exc:
+        raise ValueError(SANDBOX_RECEIPT_MISMATCH) from exc
+    if (
+        view.contract_schema != OP_RECEIPT_SCHEMA
+        or view.sandbox_id != header.sandbox_id
+        or view.generation != header.generation
+        or view.miner_id != header.miner_id
+    ):
+        raise ValueError(SANDBOX_RECEIPT_MISMATCH)
+
+
+class SandboxOpsSynapseV1(StrictFrozenModel):
+    """Validator -> miner: one validator-signed op request and its payload."""
+
+    protocol: Literal["subnet-sandbox-ops-synapse.v1"]
+    request_id: RequestID
+    current_block: Count
+    caller_hotkey: Hotkey
+    validator_binding: ServiceKeyBinding
+    document: SandboxDocument
+    payload_b64: OpChunk | None
+
+
+class LocalSandboxOpsRequestV1(StrictFrozenModel):
+    """Miner Python -> Go agent loopback form of one btauth-verified op."""
+
+    protocol: Literal["subnet-sandbox-ops-synapse.v1"]
+    request_id: RequestID
+    current_block: Count
+    caller_hotkey: Hotkey
+    binding_verified: Literal[True]
+    validator_binding: ServiceKeyBinding
+    document: SandboxDocument
+    payload_b64: OpChunk | None
+
+
+class BridgeSandboxOpsRequestV1(StrictFrozenModel):
+    """Validator runtime -> validator neuron loopback request to send one op."""
+
+    protocol: Literal["subnet-sandbox-ops-synapse.v1"]
+    request_id: RequestID
+    document: SandboxDocument
+    payload_b64: OpChunk | None
+
+
+class SandboxOpsResponseV1(StrictFrozenModel):
+    """Go agent -> miner -> validator: the miner-signed op receipt and result."""
+
+    protocol: Literal["subnet-sandbox-ops-synapse.v1"]
+    request_id: RequestID
+    receipt: SandboxDocument
+    result_b64: OpChunk | None

@@ -132,6 +132,8 @@ type SandboxLane struct {
 	closed chan struct{}
 	gate   sync.Mutex
 	work   sync.WaitGroup
+	// ops is the sandbox-ops-v1 extension; nil unless EnableOps succeeded.
+	ops *sandboxOps
 }
 
 // NewSandboxLane enables the lane only with a backend that runs sandboxes
@@ -506,6 +508,7 @@ func (l *SandboxLane) unsupported(lease protocol.SandboxLeaseV1) string {
 // destroy leaves the lease in cleanup, still consuming capacity, for the
 // next Sweep or Recover to retry.
 func (l *SandboxLane) teardown(ctx context.Context, leaseID, instance string, now time.Time) error {
+	l.forgetOps(leaseID)
 	if err := l.backend.Destroy(ctx, instance); err != nil {
 		return fmt.Errorf("destroy sandbox %s: %w", leaseID, err)
 	}

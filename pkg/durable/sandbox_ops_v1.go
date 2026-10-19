@@ -16,9 +16,9 @@ import (
 
 // Durable admission for sandbox-ops-v1 (docs/sandbox-ops-v1.md; contract
 // D13; review SR-28-05; docs/sandbox-ops-v1-durability.md). This is an
-// inert development slice. Nothing in the miner, its startup or its
-// transport calls it, and Open never creates its tables. Its tables and
-// semantics are provisional until the ops contract freezes.
+// opt-in development slice: only the default-off miner ops lane calls it,
+// and Open never creates its tables. Its tables and semantics are
+// provisional until the ops contract freezes.
 //
 // What it guarantees:
 //
@@ -46,7 +46,7 @@ import (
 // completion (U3, U4, U5, U6). Nor does it cap non-exec ops (N_ops) or
 // prune records (U7, INT-OPS-01). Both build on the high-water time, but
 // their parameters are not reviewed yet. Records therefore grow until then,
-// which is acceptable only while nothing calls this code.
+// which is acceptable only on disposable lab hosts; it blocks activation.
 //
 // Rows hold identities, digests, states and times only, never a path,
 // argv, payload or result.
@@ -403,6 +403,42 @@ func (o *SandboxOps) LookupExec(ctx context.Context, req protocol.SandboxOpReque
 		return SandboxExecLookup{}, err
 	}
 	return lookup, tx.Commit()
+}
+
+// ExecState is the lane's own read of one exec row, for the start owner and
+// the kill path: they act only on execs of a live lease (U3-L8-1), decided by
+// the same high-water clock as admission. Found is false when no exec_start
+// with execID was admitted. When the lease is not live, Unavailable holds its
+// raw state and the exec must be left to sandbox destruction. LeaseExpiresAt
+// is the lease's current expiry, which follows renewals.
+func (o *SandboxOps) ExecState(ctx context.Context, execID string) (SandboxExecLookup, time.Time, error) {
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SandboxExecLookup{}, time.Time{}, err
+	}
+	defer tx.Rollback()
+	now, err := o.nowTx(ctx, tx)
+	if err != nil {
+		return SandboxExecLookup{}, time.Time{}, err
+	}
+	lookup := SandboxExecLookup{DecidedAt: now}
+	var state SandboxOpLeaseState
+	var admitted, expires int64
+	err = tx.QueryRowContext(ctx, `SELECT e.state,e.error_code,e.admitted_at_ns,l.status,l.cleanup_status,l.lease_expires_at_ns
+FROM sandbox_execs e JOIN sandbox_leases l ON l.lease_id=e.lease_id WHERE e.exec_id=?`, execID).
+		Scan(&lookup.State, &lookup.ErrorCode, &admitted, &state.Status, &state.CleanupStatus, &expires)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return lookup, time.Time{}, tx.Commit()
+	case err != nil:
+		return SandboxExecLookup{}, time.Time{}, err
+	}
+	lookup.Found, lookup.AdmittedAt = true, time.Unix(0, admitted).UTC()
+	state.ExpiresAt = time.Unix(0, expires).UTC()
+	if !sandboxOpLeaseLive(state, now) {
+		lookup.Unavailable = &state
+	}
+	return lookup, state.ExpiresAt, tx.Commit()
 }
 
 var sandboxExecTerminal = map[string]bool{

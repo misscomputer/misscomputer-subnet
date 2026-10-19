@@ -83,7 +83,14 @@ from .protocol import (
     parse_miner_registration,
     registration_features,
 )
-from .sandbox_transport import BridgeSandboxRequestV1, SandboxResponseV1, SandboxSynapseV1
+from .sandbox_transport import (
+    BridgeSandboxOpsRequestV1,
+    BridgeSandboxRequestV1,
+    SandboxOpsResponseV1,
+    SandboxOpsSynapseV1,
+    SandboxResponseV1,
+    SandboxSynapseV1,
+)
 from .static_contracts import (
     BridgeStaticAssignRequestV1,
     StaticDeployResponseV1,
@@ -103,7 +110,11 @@ ORGANIC_STATIC_FEATURE = static_contracts.CAPABILITY_FEATURE
 #: work, never as faulty.
 STATIC_CAPABILITY_UNSUPPORTED = "static_capability_unsupported"
 CAPABILITY_REFUSAL_CODES = frozenset(
-    {STATIC_CAPABILITY_UNSUPPORTED, sandbox_transport.SANDBOX_CAPABILITY_UNSUPPORTED}
+    {
+        STATIC_CAPABILITY_UNSUPPORTED,
+        sandbox_transport.SANDBOX_CAPABILITY_UNSUPPORTED,
+        sandbox_transport.SANDBOX_OPS_CAPABILITY_UNSUPPORTED,
+    }
 )
 PUBLICATION_LANE_SCHEMA_VERSION = 1
 PUBLICATION_RECORD_MAC_DOMAIN = "miss.computer/misscomputer-subnet/publication-record/v1"
@@ -784,6 +795,7 @@ class ValidatorNeuron:
         sandbox_leases: bool = False,
         operator_hotkeys: Collection[str] = (),
         sandbox_reservation_replay: bool = False,
+        sandbox_ops: bool = False,
     ) -> None:
         self.operator_hotkeys = validate_operator_hotkeys(operator_hotkeys)
         if discovery_concurrency < 1:
@@ -838,6 +850,9 @@ class ValidatorNeuron:
         # Default off: without it no /v1/miners/{hotkey}/sandbox-* route exists.
         if sandbox_reservation_replay and not sandbox_leases:
             raise ValueError("sandbox reservation replay requires sandbox leases")
+        if sandbox_ops and not sandbox_leases:
+            raise ValueError("sandbox ops require sandbox leases")
+        self.sandbox_ops = sandbox_ops
         self.sandbox_leases = sandbox_leases
         self.sandbox_reservation_replay = sandbox_reservation_replay
         self._replay_view_budget = max(5.0, 3 * sync_interval)
@@ -3422,6 +3437,58 @@ class ValidatorNeuron:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return result
 
+    async def _sandbox_ops_bridge(self, hotkey: str, request: Request) -> SandboxOpsResponseV1:
+        """Send one runtime-signed op request to exactly one miner.
+
+        Refused before any miner contact unless the miner advertises both
+        ``sandbox-lease-v1`` and ``sandbox-ops-v1``; then delivered in
+        ``subnet-sandbox-ops-synapse.v1`` with its payload, unchanged.
+        """
+
+        body = await self._verify_local_bridge(request)
+        try:
+            local = parse_document(body, BridgeSandboxOpsRequestV1)
+            header = sandbox_transport.op_header(local.document)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        remote, validator_binding, snapshot = await self._remote_for_ticket(hotkey, header.subnet)
+        for feature in (
+            sandbox_transport.CAPABILITY_FEATURE,
+            sandbox_transport.OPS_CAPABILITY_FEATURE,
+        ):
+            if not await self._remote_has_feature(snapshot, remote, feature):
+                raise HTTPException(
+                    status_code=409, detail=sandbox_transport.SANDBOX_OPS_CAPABILITY_UNSUPPORTED
+                )
+        if self._ticket_binding_differs(
+            hotkey, header.miner_id, header.subnet, remote, validator_binding, snapshot
+        ):
+            raise HTTPException(status_code=403, detail="Go ticket binding differs from handshake")
+        synapse = SandboxOpsSynapseV1(
+            protocol=sandbox_transport.OPS_SYNAPSE_VERSION,
+            request_id=local.request_id,
+            current_block=snapshot.block,
+            caller_hotkey=self.hotkey,
+            validator_binding=validator_binding,
+            document=local.document,
+            payload_b64=local.payload_b64,
+        )
+        result = await self._forward_signed_post(
+            remote.axon_url,
+            hotkey,
+            "/api/v1/sandbox/ops",
+            synapse,
+            SandboxOpsResponseV1,
+            certificate_der=remote.certificate_der,
+        )
+        try:
+            if result.request_id != local.request_id:
+                raise ValueError(sandbox_transport.SANDBOX_RECEIPT_MISMATCH)
+            sandbox_transport.op_receipt_answers(result.receipt, header)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result
+
     def _sandbox_route(self, kind: str) -> None:
         async def bridge(hotkey: str, request: Request) -> SandboxResponseV1:
             return await self._sandbox_bridge(kind, hotkey, request)
@@ -3446,6 +3513,14 @@ class ValidatorNeuron:
         if self.sandbox_leases:
             for kind in sandbox_transport.DOCUMENT_SCHEMAS:
                 self._sandbox_route(kind)
+        if self.sandbox_ops:
+            self.app.add_api_route(
+                "/v1/miners/{hotkey}/sandbox-ops",
+                self._sandbox_ops_bridge,
+                methods=["POST"],
+                response_model=None,
+                name="sandbox_ops_bridge",
+            )
 
         @self.app.get("/healthz")
         async def health() -> Response:
@@ -3710,6 +3785,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="existing-hold-only replay; requires --sandbox-leases on",
     )
+    parser.add_argument(
+        "--sandbox-ops",
+        choices=("on", "off"),
+        default="off",
+        help="bridge runtime op requests to miners; requires --sandbox-leases on",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -3826,6 +3907,7 @@ def main() -> None:
         sandbox_leases=args.sandbox_leases == "on",
         operator_hotkeys=operator_hotkeys,
         sandbox_reservation_replay=args.sandbox_reservation_replay == "on",
+        sandbox_ops=args.sandbox_ops == "on",
     )
     uvicorn.run(neuron.app, host=args.bridge_host, port=args.bridge_port, log_config=None)
 

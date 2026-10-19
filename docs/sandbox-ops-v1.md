@@ -1,13 +1,16 @@
 # Sandbox operations (`sandbox-ops-v1`): exec and files, contract slice 1
 
-Status: **proposed contract, standalone code only, off by default, not
-customer-ready.** This slice adds the vocabulary (`pkg/sandbox/ops_v1.go`),
-the two signed documents and their validation (`pkg/protocol/sandbox_ops_v1.go`),
-cross-language vectors (`pkg/protocol/testdata/sandbox-ops-v1-vectors.json`)
-and the helper's in-sandbox path resolver
-(`cmd/sandbox-ops-helper/internal/fsroot`). No miner
-route, flag, capability, durable table, backend method, helper binary or
-neuron transport exists yet, and no running binary behaves differently.
+Status: **proposed contract, off by default, not customer-ready.** The
+vocabulary (`pkg/sandbox/ops_v1.go`), the two signed documents and their
+validation (`pkg/protocol/sandbox_ops_v1.go`), cross-language vectors
+(`pkg/protocol/testdata/sandbox-ops-v1-vectors.json`) and the helper's
+in-sandbox path resolver (`cmd/sandbox-ops-helper/internal/fsroot`) are
+joined by a default-off draft of the remaining slices: the helper binary, the
+miner ops lane, the backend's ops mode, the agent route and the neuron
+transport ([sandbox-ops-v1-lane.md](sandbox-ops-v1-lane.md)). With
+`--sandbox-ops off` (the default) no running binary behaves differently. The
+draft is unactivated: the probes and parameters listed in the lane document
+gate any advertisement.
 
 `sandbox-ops-v1` is a separately versioned extension of
 [`sandbox-lease-v1`](sandbox-lease-v1.md). It changes no member, digest,
@@ -247,13 +250,14 @@ exists, and an exec-level `env` would bypass that rule.
   refused without blocking. Without `openat2` it refuses with
   `ops_unsupported`; there is no fallback.
 
-## In-sandbox helper (later slice, requirements)
+## In-sandbox helper (requirements)
 
-File operations and exec run through one helper binary inside the sandbox.
+File operations and exec run through one helper binary inside the sandbox
+(`cmd/sandbox-ops-helper`; draft, see the lane document).
 Docker cannot kill an exec instance, so the helper is also what kills a
-whole process group at a deadline and caps output at the producer. This
-slice ships no helper and no mount. These requirements come from the
-security design review, and the helper slice must meet them:
+whole process group at a deadline and caps output at the producer. These
+requirements come from the security design review, and the helper slice
+must meet them:
 
 - **Delivery:** a root-owned, read-only `0555` host **directory** containing
   only the helper, bind-mounted read-only, `nosuid`, `nodev`, `rprivate`
@@ -344,7 +348,7 @@ confidential, and no secret belongs in argv, stdin or files. Protocol code
 never persists or logs payload or result bytes; durable rows hold digests
 and counts only. That is a logging rule, not confidentiality.
 
-## Transport and compatibility (later slices)
+## Transport and compatibility (default-off draft)
 
 - Capability feature `sandbox-ops-v1`, advertised only with
   `sandbox-lease-v1` and an ops-capable backend. A validator refuses a miner
