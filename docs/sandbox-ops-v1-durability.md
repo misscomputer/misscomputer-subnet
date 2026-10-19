@@ -1,11 +1,11 @@
 # Sandbox operations: durable admission (development draft)
 
-Status: **inert, unwired, provisional.** `pkg/durable/sandbox_ops_v1.go` adds an
+Status: **opt-in, provisional.** `pkg/durable/sandbox_ops_v1.go` adds an
 opt-in durable admission store for [`sandbox-ops-v1`](sandbox-ops-v1.md).
-Nothing calls it: no miner route, startup step, flag, capability,
-transport or helper. `durable.Open` never creates its tables. Its tables
-and semantics may change freely until the ops contract freezes and the miner
-ops lane wires it.
+Only the default-off miner ops lane calls it, when the agent runs with
+`--sandbox-ops on` ([sandbox-ops-v1-lane.md](sandbox-ops-v1-lane.md)).
+`durable.Open` never creates its tables. Its tables and semantics may change
+freely until the ops contract freezes.
 
 ## What it guarantees
 
@@ -110,7 +110,7 @@ the swarm readiness record.
 | U4 | Who writes exec transitions and when, how races between them resolve, and re-capping of reported output. |
 | U5 | `file_write` completion, partial writes after a crash, and the source of `offset_mismatch`. |
 | U6 | Restart recovery of op and exec rows. No recovery method exists. Lease `Recover` already makes every lease non-running. |
-| U7, INT-OPS-01, `N_ops` | Retention and the non-exec op cap. The design is accepted (terminal-lease and closed-window pruning in tracked batches, and an `N_ops` cap with `exec_cancel` headroom), but its parameters are not reviewed yet. This slice therefore has **no pruning and no `N_ops` cap**. Records grow until then, which is acceptable only while nothing calls the store. |
+| U7, INT-OPS-01, `N_ops` | Retention and the non-exec op cap. The design is accepted (terminal-lease and closed-window pruning in tracked batches, and an `N_ops` cap with `exec_cancel` headroom), but its parameters are not reviewed yet. This slice therefore has **no pruning and no `N_ops` cap**. Records grow until then, which is acceptable only on disposable lab hosts and blocks activation. |
 | U8–U10 | Per-agent output budget, guest spawn-storm mapping, capability advertisement. These are outside the durable store. |
 
 ## Merge and activation

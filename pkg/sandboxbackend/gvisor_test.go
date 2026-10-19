@@ -110,6 +110,8 @@ type fakeEngine struct {
 	// inspectDelay and imageRemovalDelay hold every container inspection
 	// and image removal answer that long, the same way.
 	inspectDelay, imageRemovalDelay time.Duration
+	// ops scripts the exec and ping endpoints of ops mode (ops_test.go).
+	ops *fakeOpsEngine
 }
 
 // hold waits d with the engine lock released, as a daemon still working on
@@ -186,6 +188,9 @@ func (e *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p := r.URL.Path
+	if e.serveOps(w, r) {
+		return
+	}
 	switch {
 	case r.Method == http.MethodGet && p == "/version":
 		reply(w, 200, map[string]string{"Version": e.version})

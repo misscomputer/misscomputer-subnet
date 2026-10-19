@@ -64,7 +64,14 @@ from .protocol import (
     StatusSynapse,
     SubnetBinding,
 )
-from .sandbox_transport import LocalSandboxRequestV1, SandboxResponseV1, SandboxSynapseV1
+from .sandbox_transport import (
+    LocalSandboxOpsRequestV1,
+    LocalSandboxRequestV1,
+    SandboxOpsResponseV1,
+    SandboxOpsSynapseV1,
+    SandboxResponseV1,
+    SandboxSynapseV1,
+)
 from .static_contracts import (
     LocalStaticAssignRequestV1,
     StaticDeployResponseV1,
@@ -293,6 +300,7 @@ class MinerNeuron:
         body_total_timeout: float = DEFAULT_BODY_TOTAL_TIMEOUT,
         sandbox_leases: bool = False,
         sandbox_reservation_replay: bool = False,
+        sandbox_ops: bool = False,
     ) -> None:
         if mock_http == (tls_config is not None):
             raise ValueError("miner must use either validated TLS or explicit mock HTTP")
@@ -324,8 +332,11 @@ class MinerNeuron:
         # Default off: without it no /api/v1/sandbox/* route exists.
         if sandbox_reservation_replay and not sandbox_leases:
             raise ValueError("sandbox reservation replay requires sandbox leases")
+        if sandbox_ops and not sandbox_leases:
+            raise ValueError("sandbox ops require sandbox leases")
         self.sandbox_leases = sandbox_leases
         self.sandbox_reservation_replay = sandbox_reservation_replay
+        self.sandbox_ops = sandbox_ops
         self.ready = asyncio.Event()
         self.stop = asyncio.Event()
         self.app = FastAPI(lifespan=self._lifespan)
@@ -555,6 +566,54 @@ class MinerNeuron:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return result
 
+    async def _sandbox_ops_forward(self, request: Request) -> SandboxOpsResponseV1:
+        """Forward one validator-signed op request and its payload to the Go
+        agent, after the same btauth and identity checks as a lease document.
+        The agent verifies the document and the payload binding."""
+
+        body = await self._body(request)
+        caller = await self._authenticated(request, body)
+        if _envelope_protocol(body) != sandbox_transport.OPS_SYNAPSE_VERSION:
+            raise HTTPException(
+                status_code=422,
+                detail="only subnet-sandbox-ops-synapse.v1 op requests are accepted",
+            )
+        try:
+            synapse = parse_document(body, SandboxOpsSynapseV1)
+            header = sandbox_transport.op_header(synapse.document)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if synapse.caller_hotkey != caller.hotkey:
+            raise HTTPException(status_code=403, detail="body caller differs from btauth caller")
+        await self._verify_assignment_identity(
+            caller.hotkey, synapse.current_block, synapse.validator_binding, header.subnet
+        )
+        local = LocalSandboxOpsRequestV1(
+            protocol=sandbox_transport.OPS_SYNAPSE_VERSION,
+            request_id=synapse.request_id,
+            current_block=synapse.current_block,
+            caller_hotkey=caller.hotkey,
+            binding_verified=True,
+            validator_binding=synapse.validator_binding,
+            document=synapse.document,
+            payload_b64=synapse.payload_b64,
+        )
+        async with self.gate.slot(caller.priority):
+            try:
+                result = await self.bridge.request(
+                    "POST", "/v1/sandbox/ops", value=local, response_model=SandboxOpsResponseV1
+                )
+            except BridgeError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+        assert isinstance(result, SandboxOpsResponseV1)
+        try:
+            if result.request_id != synapse.request_id:
+                raise ValueError(sandbox_transport.SANDBOX_RECEIPT_MISMATCH)
+            sandbox_transport.op_receipt_answers(result.receipt, header)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return result
+
     def _sandbox_route(self, kind: str) -> None:
         async def forward(request: Request) -> SandboxResponseV1:
             return await self._sandbox_forward(kind, request)
@@ -577,6 +636,14 @@ class MinerNeuron:
         if self.sandbox_leases:
             for kind in sandbox_transport.DOCUMENT_SCHEMAS:
                 self._sandbox_route(kind)
+        if self.sandbox_ops:
+            self.app.add_api_route(
+                "/api/v1/sandbox/ops",
+                self._sandbox_ops_forward,
+                methods=["POST"],
+                response_model=None,
+                name="sandbox_ops",
+            )
 
         @self.app.get("/healthz")
         async def health() -> Response:
@@ -643,8 +710,11 @@ class MinerNeuron:
                 features=[
                     feature
                     for feature in local.features
-                    if feature != sandbox_transport.REPLAY_CAPABILITY_FEATURE
-                    or self.sandbox_reservation_replay
+                    if (
+                        feature != sandbox_transport.REPLAY_CAPABILITY_FEATURE
+                        or self.sandbox_reservation_replay
+                    )
+                    and (feature != sandbox_transport.OPS_CAPABILITY_FEATURE or self.sandbox_ops)
                 ],
                 max_body_bytes=local.max_body_bytes,
                 service_binding=binding,
@@ -956,6 +1026,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="existing-hold-only replay; requires --sandbox-leases on",
     )
+    parser.add_argument(
+        "--sandbox-ops",
+        choices=("on", "off"),
+        default="off",
+        help="forward subnet-sandbox-ops-synapse.v1 op requests; requires --sandbox-leases on",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -1032,6 +1108,7 @@ def main() -> None:
         capability_fault_file=args.mock_capability_fault_file,
         sandbox_leases=args.sandbox_leases == "on",
         sandbox_reservation_replay=args.sandbox_reservation_replay == "on",
+        sandbox_ops=args.sandbox_ops == "on",
     )
     if tls_config is None:
         uvicorn.run(

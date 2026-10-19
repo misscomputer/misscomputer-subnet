@@ -50,6 +50,9 @@ type sandboxOptions struct {
 	DeploymentCgroup string
 	// DaemonConfig is the dedicated sandbox daemon's configuration file.
 	DaemonConfig string
+	// OpsHelper, set only with --sandbox-ops on, puts the backend in ops
+	// mode with this pinned helper before any sandbox is created.
+	OpsHelper *sandboxbackend.OpsHelper
 }
 
 // openSandboxLeases enables the sandbox-lease-v1 workload only when
@@ -91,6 +94,11 @@ func openSandboxLeases(ctx context.Context, options sandboxOptions, agent *miner
 	}
 	if err != nil {
 		return nil, fmt.Errorf("sandbox host preflight: %w", err)
+	}
+	if options.OpsHelper != nil {
+		if err := backend.EnableOps(*options.OpsHelper); err != nil {
+			return nil, fmt.Errorf("sandbox ops helper: %w", err)
+		}
 	}
 	leases, err := store.EnableSandboxLeases(ctx)
 	if err != nil {
@@ -143,6 +151,9 @@ func (a *api) registerSandboxRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/sandbox/leases", sandboxHandler(a, a.sandbox.Commit))
 	mux.HandleFunc("POST /v1/sandbox/renewals", sandboxHandler(a, a.sandbox.Renew))
 	mux.HandleFunc("POST /v1/sandbox/releases", sandboxHandler(a, a.sandbox.Release))
+	if a.sandbox.OpsEnabled() {
+		mux.HandleFunc("POST /v1/sandbox/ops", a.sandboxOps)
+	}
 }
 
 // sandboxRequest is one validator document forwarded by the miner neuron

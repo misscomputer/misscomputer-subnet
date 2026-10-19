@@ -92,6 +92,8 @@ func run() error {
 		sandboxHostProfile    = flag.String("sandbox-host-profile", "", "sandbox-host-profile.v1 document of this host (required with --sandbox-leases on)")
 		sandboxDeployment     = flag.String("sandbox-deployment-cgroup", "", "cgroup v2 path deployment.v4 replicas run in, kept disjoint from sandboxes (required with --sandbox-leases on)")
 		sandboxDaemonConfig   = flag.String("sandbox-daemon-config", "", "configuration file of the dedicated sandbox Docker daemon (required with --sandbox-leases on)")
+		sandboxOpsMode        = flag.String("sandbox-ops", "off", "sandbox-ops-v1 exec and file operations: off (default) or on; requires --sandbox-leases on and --sandbox-ops-config")
+		sandboxOpsConfig      = flag.String("sandbox-ops-config", "", "sandbox-ops-v1 helper pin and parameters (required with --sandbox-ops on)")
 	)
 	flag.Parse()
 	if *sandboxReplay != "off" && *sandboxReplay != "on" {
@@ -99,6 +101,10 @@ func run() error {
 	}
 	if *sandboxReplay == "on" && *sandboxLeases != "on" {
 		return errors.New("--sandbox-reservation-replay on requires --sandbox-leases on")
+	}
+	opsSettings, err := loadSandboxOps(*sandboxOpsMode, *sandboxOpsConfig, *sandboxLeases)
+	if err != nil {
+		return err
 	}
 	if err := service.ValidateBind(*bind, *allowNonLoopback); err != nil {
 		return err
@@ -152,9 +158,13 @@ func run() error {
 		return err
 	}
 	sandboxCtx, sandboxCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	sandboxLane, err := openSandboxLeases(sandboxCtx, sandboxOptions{
+	options := sandboxOptions{
 		Mode: *sandboxLeases, HostProfile: *sandboxHostProfile, DeploymentCgroup: *sandboxDeployment, DaemonConfig: *sandboxDaemonConfig,
-	}, agent, store)
+	}
+	if opsSettings != nil {
+		options.OpsHelper = &opsSettings.helper
+	}
+	sandboxLane, err := openSandboxLeases(sandboxCtx, options, agent, store)
 	sandboxCancel()
 	if err != nil {
 		return err
@@ -172,6 +182,15 @@ func run() error {
 		sandboxRecoveryCancel()
 		if err != nil {
 			return fmt.Errorf("sandbox restart cleanup: %w", err)
+		}
+		if opsSettings != nil {
+			// After both startup Recover steps, before serving (OPS-U6).
+			opsCtx, opsCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := enableSandboxOps(opsCtx, sandboxLane, store, opsSettings)
+			opsCancel()
+			if err != nil {
+				return fmt.Errorf("sandbox ops: %w", err)
+			}
 		}
 	}
 	var minerUID *uint16
@@ -371,6 +390,9 @@ func (a *api) features() []string {
 		features = append(features, sandbox.CapabilityFeature)
 		if a.sandboxReservationReplay {
 			features = append(features, sandbox.ReservationReplayFeature)
+		}
+		if a.sandbox.OpsEnabled() {
+			features = append(features, sandbox.OpsCapabilityFeature)
 		}
 	}
 	return features

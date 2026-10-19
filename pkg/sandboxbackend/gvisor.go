@@ -179,6 +179,9 @@ type GVisor struct {
 	// its process in. It keeps an instance's cgroup attributed to it while
 	// its workload winds down or its container is removed.
 	cgroups map[string]string
+	// opsHelper is the pinned sandbox-ops-v1 helper; nil (the default)
+	// leaves create bodies and readbacks exactly as without ops (ops.go).
+	opsHelper *OpsHelper
 }
 
 type imageLock struct {
@@ -468,7 +471,11 @@ type inspectedContainer struct {
 	} `json:"Config"`
 	HostConfig hostConfig `json:"HostConfig"`
 	Mounts     []struct {
-		Type string `json:"Type"`
+		Type        string `json:"Type"`
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+		Propagation string `json:"Propagation"`
 	} `json:"Mounts"`
 }
 
@@ -499,6 +506,16 @@ type hostConfig struct {
 	} `json:"RestartPolicy"`
 	Binds   []string `json:"Binds"`
 	Devices []any    `json:"Devices"`
+	// Mounts is read back only in ops mode (ops.go).
+	Mounts []struct {
+		Type        string `json:"Type"`
+		Source      string `json:"Source"`
+		Target      string `json:"Target"`
+		ReadOnly    bool   `json:"ReadOnly"`
+		BindOptions *struct {
+			Propagation string `json:"Propagation"`
+		} `json:"BindOptions"`
+	} `json:"Mounts"`
 	// Init is set to false; the backend sets none of the rest, and each
 	// must stay at its empty default.
 	Init              *bool             `json:"Init"`
@@ -527,6 +544,8 @@ type logConfig struct {
 type spec struct {
 	labels map[string]string
 	host   hostConfig
+	// helper is the ops helper mount, nil without ops.
+	helper *OpsHelper
 }
 
 func (b *GVisor) spec(lease protocol.SandboxLeaseV1, leaseDigest, imageID string) spec {
@@ -534,6 +553,7 @@ func (b *GVisor) spec(lease protocol.SandboxLeaseV1, leaseDigest, imageID string
 	memory := int64(lease.Resources.MemoryMiB) << 20
 	logSize := b.config.LogMiB / logFiles
 	return spec{
+		helper: b.opsHelper,
 		labels: map[string]string{
 			LabelSandbox: sandboxLabelV1, LabelLeaseID: protocol.SandboxLeaseIDV1(lease), LabelLeaseDigest: leaseDigest,
 			LabelImageDigest: lease.ImageDigest, LabelImageID: imageID,
@@ -1378,6 +1398,13 @@ func (b *GVisor) createContainer(budget *createBudget, instanceID string, lease 
 			unlock()
 			return err
 		}
+		if !missing && b.opsHelper != nil {
+			// B-2: the helper pin is re-verified before every create.
+			if err := verifyHelper(*b.opsHelper); err != nil {
+				unlock()
+				return fmt.Errorf("create sandbox %s: %w", instanceID, err)
+			}
+		}
 		if !missing {
 			err = b.engine.call(ctx, http.MethodPost, "/containers/create",
 				url.Values{"name": {instanceID}, "platform": {"linux/amd64"}}, b.createBody(b.spec(lease, leaseDigest, imageID), imageID), nil)
@@ -1402,7 +1429,7 @@ func (b *GVisor) createContainer(budget *createBudget, instanceID string, lease 
 }
 
 func (b *GVisor) createBody(s spec, imageID string) map[string]any {
-	return map[string]any{
+	body := map[string]any{
 		"Image": imageID, "Hostname": sandboxHostname, "Labels": s.labels,
 		"AttachStdin": false, "AttachStdout": false, "AttachStderr": false, "Tty": false, "OpenStdin": false,
 		"HostConfig": map[string]any{
@@ -1417,6 +1444,10 @@ func (b *GVisor) createBody(s spec, imageID string) map[string]any {
 			"Init": false,
 		},
 	}
+	if s.helper != nil {
+		body["HostConfig"].(map[string]any)["Mounts"] = []any{helperMount(s.helper)}
+	}
+	return body
 }
 
 // pullImage pulls the lease's image by digest and returns its engine ID
@@ -1730,7 +1761,7 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 	case h.LogConfig.Type != wantLog.Type || len(h.LogConfig.Config) != len(wantLog.Config) ||
 		h.LogConfig.Config["max-size"] != wantLog.Config["max-size"] || h.LogConfig.Config["max-file"] != wantLog.Config["max-file"]:
 		return fmt.Errorf("sandbox %s log bounds differ from the sandbox spec", c.Name)
-	case h.Privileged || h.ReadonlyRootfs || len(h.Binds) != 0 || len(h.Devices) != 0 || len(c.Mounts) != 0 || h.RestartPolicy.Name != "no":
+	case h.Privileged || h.ReadonlyRootfs || len(h.Binds) != 0 || len(h.Devices) != 0 || (s.helper == nil && len(c.Mounts) != 0) || h.RestartPolicy.Name != "no":
 		return fmt.Errorf("sandbox %s has privileges, mounts, devices or a restart policy", c.Name)
 	case !sameSet(h.CapDrop, s.host.CapDrop) || !sameSet(h.CapAdd, s.host.CapAdd) || !sameSet(h.SecurityOpt, s.host.SecurityOpt):
 		return fmt.Errorf("sandbox %s capabilities or security options differ from the sandbox spec", c.Name)
@@ -1739,6 +1770,9 @@ func (b *GVisor) verifyEngine(c inspectedContainer, s spec) error {
 		len(h.Links) != 0 || len(h.GroupAdd) != 0 || len(h.ExtraHosts) != 0 || len(h.DNS) != 0 || len(h.DNSOptions) != 0 ||
 		len(h.DNSSearch) != 0 || h.OomScoreAdj != 0:
 		return fmt.Errorf("sandbox %s has host settings the sandbox spec does not set", c.Name)
+	}
+	if s.helper != nil {
+		return verifyHelperMount(c, s.helper)
 	}
 	return nil
 }
