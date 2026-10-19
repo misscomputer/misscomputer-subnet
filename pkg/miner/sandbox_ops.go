@@ -138,8 +138,15 @@ type opExec struct {
 	exitCode *int
 	endedAt  time.Time
 	timer    *time.Timer
-	// owned is set once a start owner was launched for this exec.
+	// owned is set once a start owner was launched for this exec, or once
+	// the lane decided no owner ever will (an orphaned admission).
 	owned bool
+	// requestExpires is the exec_start request's expires_at: from then on no
+	// admission of this op ID can happen any more.
+	requestExpires time.Time
+	// gaveUp is set when the start owner could not read or record the
+	// exec's state and handed it to armResolve.
+	gaveUp bool
 	// kill serializes the kill path of this exec.
 	kill sync.Mutex
 }
@@ -584,8 +591,9 @@ func (l *SandboxLane) execStart(ctx context.Context, ops *sandboxOps, r protocol
 	opID := protocol.SandboxOpIDV1(r)
 	// The exec is known to the lane before it can be admitted, so a read
 	// that finds the durable row always finds this entry too.
+	expires, _ := time.Parse(time.RFC3339Nano, r.ExpiresAt)
 	exec := &opExec{leaseID: r.LeaseID, instance: SandboxInstanceName(r.LeaseID),
-		timeout: time.Duration(*r.TimeoutMS) * time.Millisecond, maxOutput: *r.MaxOutputBytes}
+		timeout: time.Duration(*r.TimeoutMS) * time.Millisecond, maxOutput: *r.MaxOutputBytes, requestExpires: expires}
 	ops.mu.Lock()
 	if existing := ops.execs[opID]; existing != nil {
 		exec = existing
@@ -608,6 +616,13 @@ func (l *SandboxLane) execStart(ctx context.Context, ops *sandboxOps, r protocol
 		ops.mu.Unlock()
 	}
 	if err != nil {
+		if !exec.isOwned() {
+			// The admission may or may not have committed. Once its window
+			// closed no admission of this op ID can happen any more, and the
+			// durable row decides: none, the entry is dropped; one that no
+			// owner took, it ends failed (never started).
+			l.armResolve(ops, opID, exec, exec.requestExpires.Sub(l.now().UTC()))
+		}
 		return protocol.SandboxOpReceiptV1{}, err
 	}
 	switch {
@@ -642,6 +657,11 @@ func (l *SandboxLane) launchStart(ops *sandboxOps, opID string, exec *opExec, ad
 		return
 	}
 	exec.owned, exec.admittedAt = true, admittedAt
+	if exec.timer != nil {
+		// A resolution armed for a failed admission is moot: this owner
+		// takes the exec.
+		exec.timer.Stop()
+	}
 	exec.mu.Unlock()
 	if work, done, err := l.track(l.base); err == nil {
 		go func() {
@@ -676,17 +696,90 @@ func (l *SandboxLane) execState(ctx context.Context, ops *sandboxOps, opID strin
 	return durable.SandboxExecLookup{}, time.Time{}, err
 }
 
-// fallbackDeadline arms the kill path at the exec's own deadline when a
-// durable step stayed unknown, so the exec cannot stay non-terminal with
-// nothing left to end it. The kill path re-reads the durable state first.
-func (l *SandboxLane) fallbackDeadline(ops *sandboxOps, opID string, exec *opExec) {
+// armResolve schedules, after delay, the resolution of an exec whose durable
+// state a step could not read or write, or whose admission answered an
+// error. It reads the durable state (retrying D_state) and acts on it:
+//
+//   - the store still fails: try again after D_state, while the lane holds
+//     the entry (lease teardown drops it with forgetOps);
+//   - no durable row: the admission never committed; once its request
+//     window closed the entry is dropped;
+//   - admitted and no start owner took it: a replay may still adopt it
+//     until the window closes; then it ends failed, never started;
+//   - admitted with an owner that could not read or record (nothing was
+//     started, or what started was killed by identity): it ends failed;
+//   - running: the deadline is armed;
+//   - terminal, or the lease no longer runs ops: nothing (teardown).
+//
+// One timer per exec; each try runs once per D_state at most.
+func (l *SandboxLane) armResolve(ops *sandboxOps, opID string, exec *opExec, delay time.Duration) {
 	if l.base.Err() != nil {
 		return
 	}
 	exec.mu.Lock()
-	deadline := exec.admittedAt.Add(exec.timeout)
+	defer exec.mu.Unlock()
+	if exec.timer != nil {
+		exec.timer.Stop()
+	}
+	exec.timer = time.AfterFunc(max(delay, 0), func() {
+		work, done, err := l.track(l.base)
+		if err != nil {
+			return
+		}
+		defer done()
+		if ops.execEntry(opID) != exec {
+			return
+		}
+		lookup, leaseExpiry, err := l.execState(work, ops, opID)
+		switch {
+		case err != nil:
+			l.armResolve(ops, opID, exec, ops.config.StateTimeout)
+			return
+		case !lookup.Found:
+			if lookup.DecidedAt.Before(exec.requestExpires) {
+				l.armResolve(ops, opID, exec, exec.requestExpires.Sub(lookup.DecidedAt))
+				return
+			}
+			ops.mu.Lock()
+			if ops.execs[opID] == exec && !exec.isOwned() {
+				delete(ops.execs, opID)
+			}
+			ops.mu.Unlock()
+			return
+		case lookup.Unavailable != nil || execTerminal[lookup.State]:
+			return
+		case lookup.State == "admitted":
+			exec.mu.Lock()
+			if !exec.owned && !lookup.DecidedAt.Before(exec.requestExpires) {
+				// No replay can adopt it any more: claim it so none starts.
+				exec.owned, exec.gaveUp, exec.admittedAt = true, true, lookup.AdmittedAt
+			}
+			owned, gaveUp := exec.owned, exec.gaveUp
+			exec.mu.Unlock()
+			switch {
+			case !owned:
+				l.armResolve(ops, opID, exec, exec.requestExpires.Sub(lookup.DecidedAt))
+			case !gaveUp:
+				// A start owner is at work and records the outcome itself.
+			default:
+				if _, err := l.recordExec(work, ops, opID, exec, sandbox.ExecStateFailed, failure(sandbox.OpCodeSandboxFailed)); err != nil {
+					l.armResolve(ops, opID, exec, ops.config.StateTimeout)
+				}
+			}
+		default:
+			l.armDeadline(ops, opID, exec, exec.deadline(leaseExpiry).Sub(lookup.DecidedAt))
+		}
+	})
+}
+
+// giveUp hands an exec whose start owner could not read or record its state
+// to armResolve: once the store answers, an exec still admitted ends failed
+// (it was never started, or what started was killed by identity).
+func (l *SandboxLane) giveUp(ops *sandboxOps, opID string, exec *opExec) {
+	exec.mu.Lock()
+	exec.gaveUp = true
 	exec.mu.Unlock()
-	l.armDeadline(ops, opID, exec, deadline.Sub(l.now().UTC()))
+	l.armResolve(ops, opID, exec, ops.config.StateTimeout)
 }
 
 // startOwner issues the one backend start of an admitted exec and records
@@ -694,10 +787,10 @@ func (l *SandboxLane) fallbackDeadline(ops *sandboxOps, opID string, exec *opExe
 func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, command sandbox.ExecCommand) {
 	lookup, leaseExpiry, err := l.execState(ctx, ops, opID)
 	if err != nil {
-		// Nothing was started; the deadline ends the exec if the store
-		// stays unavailable.
+		// Nothing was started. The exec ends failed once the store answers
+		// again; it is never started late.
 		slog.Warn("sandbox exec start state", "exec_id", opID, "error", err)
-		l.fallbackDeadline(ops, opID, exec)
+		l.giveUp(ops, opID, exec)
 		return
 	}
 	if !lookup.Found || lookup.Unavailable != nil || lookup.State != "admitted" {
@@ -706,7 +799,9 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 	deadline := exec.deadline(leaseExpiry)
 	if !lookup.DecidedAt.Before(deadline) {
 		// D4: the deadline passed before the call; no process.
-		l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateTimedOut, nil)
+		if _, err := l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateTimedOut, nil); err != nil {
+			l.giveUp(ops, opID, exec)
+		}
 		return
 	}
 	remaining := deadline.Sub(lookup.DecidedAt)
@@ -767,10 +862,10 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 }
 
 // recordFailed records a start failure; when the store stays unavailable the
-// fallback deadline ends the exec.
+// exec is resolved once it answers again (armResolve).
 func (l *SandboxLane) recordFailed(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, code string) {
 	if _, err := l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateFailed, failure(code)); err != nil {
-		l.fallbackDeadline(ops, opID, exec)
+		l.giveUp(ops, opID, exec)
 	}
 }
 
@@ -877,20 +972,37 @@ func (l *SandboxLane) armDeadline(ops *sandboxOps, opID string, exec *opExec, de
 			return
 		}
 		defer done()
-		stateCtx, cancel := ops.state(work)
-		lookup, leaseExpiry, err := ops.store.ExecState(stateCtx, opID)
-		cancel()
-		if err != nil || !lookup.Found || lookup.Unavailable != nil {
+		if ops.execEntry(opID) != exec {
+			return // the lease was torn down
+		}
+		lookup, leaseExpiry, err := l.execState(work, ops, opID)
+		switch {
+		case err != nil:
+			// The store did not answer: the deadline stays armed and is
+			// tried again after D_state.
+			l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
+			return
+		case !lookup.Found || lookup.Unavailable != nil && !leaseExpiring(lookup):
+			// Released, failed or in cleanup: teardown ends the exec.
 			return
 		}
 		// A renewal may have moved the lease expiry; the deadline never
-		// passes admitted_at + timeout_ms.
+		// passes admitted_at + timeout_ms. A lease past its expiry whose
+		// teardown has not begun is the lease-expiry deadline itself.
 		if next := exec.deadline(leaseExpiry); next.After(lookup.DecidedAt) {
 			l.armDeadline(ops, opID, exec, next.Sub(lookup.DecidedAt))
 			return
 		}
 		l.killPath(work, ops, opID, exec, sandbox.ExecStateTimedOut)
 	})
+}
+
+// leaseExpiring reports a lookup whose lease runs ops no longer only because
+// its expiry passed: still running, its teardown not begun. The exec deadline
+// min(admitted_at + timeout_ms, lease expiry) has then been reached, and the
+// kill path must still SIGTERM the exec rather than leave it to teardown.
+func leaseExpiring(lookup durable.SandboxExecLookup) bool {
+	return lookup.Unavailable != nil && lookup.Unavailable.Status == "running" && !lookup.DecidedAt.Before(lookup.Unavailable.ExpiresAt)
 }
 
 // killByIdentity ends whatever may run under opID without recording a state.
@@ -909,12 +1021,18 @@ var execTerminal = map[string]bool{sandbox.ExecStateExited: true, sandbox.ExecSt
 // confirmed. Guest code can stop the helper (B-5), so every helper call is
 // bounded: the cancel and the status polls by the grace window together, the
 // forced cancel by ExecKillGrace. It acts only on execs of a live lease
-// (U3-L8-1).
+// (U3-L8-1), or of a lease that has just reached its expiry, whose deadline
+// it enforces (leaseExpiring).
 func (l *SandboxLane) killPath(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, trigger string) {
 	exec.kill.Lock()
 	defer exec.kill.Unlock()
 	lookup, _, err := l.execState(ctx, ops, opID)
-	if err != nil || !lookup.Found || lookup.Unavailable != nil || execTerminal[lookup.State] {
+	if err != nil {
+		// The store did not answer: try the deadline again after D_state.
+		l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
+		return
+	}
+	if !lookup.Found || lookup.Unavailable != nil && !leaseExpiring(lookup) || execTerminal[lookup.State] {
 		return
 	}
 	if lookup.State == "admitted" {

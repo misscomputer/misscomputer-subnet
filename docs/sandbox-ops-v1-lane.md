@@ -90,13 +90,24 @@ without this code.
   releases its in-flight slot before it waits. An `exec_read` helper call
   has the 30 s op budget.
 - The exec deadline is `min(admitted_at + timeout_ms, lease expiry)` on the
-  durable clock; renewals move it.
+  durable clock; renewals move it. When the deadline is the lease expiry and
+  the lease reaches it unrenewed, the kill path still runs: the lease is
+  past its expiry but still running, its teardown not begun, and the exec
+  is SIGTERMed and recorded `timed_out` then, not at teardown. A released,
+  failed or cleaning-up lease is left to its teardown.
 - A durable exec-state step that runs out of `D_state` is retried (three
-  tries). If it stays unknown, the kill path is armed at the exec's own
-  deadline, so no exec stays non-terminal with nothing left to end it; a
-  started exec whose `running` record fails is killed and recorded failed.
-  An admission that committed but answered an error is started by its exact
-  replay, once.
+  tries). If the deadline's own read stays unknown, the deadline is tried
+  again every `D_state`, until the store answers or lease teardown drops
+  the exec. A start owner that could not read or record its exec's state
+  hands it to a resolution that also tries every `D_state`: once the store
+  answers, an exec still `admitted` ends `failed` (`sandbox_op_failed`),
+  never started late; a started exec whose `running` record fails is
+  killed by identity first. An admission that answered an error may have
+  committed: its exact replay inside the request window starts it, once;
+  when the window closes, the durable row decides: none, the in-memory
+  entry is dropped; one that no owner took, it ends `failed`, never
+  started. Each exec has at most one such timer; teardown stops it. A store
+  that never answers again leaves such execs until lease teardown.
 - An admitted op that fails in a way that is none of the lane's named
   answers is answered `500 sandbox_ops_internal` (retryable) by the agent,
   never a 4xx: it may follow an effect, and a 4xx is a refusal without one.
