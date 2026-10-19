@@ -69,10 +69,19 @@ finish() {
   local result=$?
   trap - EXIT ERR
   set +e
+  printf 'original_exit=%s\n' "$result" > "$work/conformance-exit.txt"
+  # Stop observation before cleanup itself removes the sampled child.
+  if [[ -n ${sampler:-} ]]; then
+    kill "$sampler" >/dev/null 2>&1
+    wait "$sampler" 2>/dev/null
+  fi
   mapfile -t leftovers < <(timeout 30 docker ps -aq --filter label=mcsbx.conformance=1 2>/dev/null)
   if (( ${#leftovers[@]} )); then timeout 60 docker rm -f -v "${leftovers[@]}" >/dev/null 2>&1; fi
-  [[ -n ${sampler:-} ]] && kill "$sampler" >/dev/null 2>&1
   [[ -n ${probe_link:-} ]] && ip link del "$probe_link" >/dev/null 2>&1
+  # Preserve known raw observations before deleting scratch, even on failure.
+  python3 "$here/evidence.py" export "$work" "$out_dir/raw-evidence.json"
+  local export_result=$?
+  if (( result == 0 && export_result != 0 )); then result=$export_result; fi
   rm -rf -- "$work"
   local env_args=(
     "source_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
@@ -110,6 +119,24 @@ engine_cg=$(systemctl show --property=ControlGroup --value "$p_engine_slice")
 cg() { cat "$p_cgroup_root$1/$2"; }
 within() { [[ $1 == "$2" || $1 == "$2"/* ]]; }
 proc_cgroup() { awk -F: '$1 == "0" {print $3}' "/proc/$1/cgroup"; }
+
+# A workload cannot start until a complete sample and its identity are durable.
+wait_sampler_ready() {
+  local kind=$1
+  for _ in {1..100}; do
+    [[ -s $work/$kind-ready.json ]] && return 0
+    kill -0 "$sampler" 2>/dev/null || break
+    sleep 0.05
+  done
+  bad "$kind sampler did not become ready (see raw evidence)"
+}
+stop_sampler() {
+  local status=0
+  kill "$sampler" >/dev/null 2>&1 || true
+  wait "$sampler" || status=$?
+  sampler=
+  (( status == 0 )) || bad "sampler failed with exit $status (see raw evidence)"
+}
 
 # ---- Host and cgroup state -------------------------------------------------
 begin host.cgroup2_mount_authentic observed_state
@@ -673,20 +700,18 @@ lease_run "$container" 256 64 64
 ppid=$(sentry_pid "$container")
 pcg=$(proc_cgroup "$ppid")
 pids_limit=$(cg "$pcg" pids.max)
-( while :; do
-    cat "$p_cgroup_root$pcg/pids.events" > "$work/pids.events.tmp" 2>/dev/null && mv "$work/pids.events.tmp" "$work/pids.events"
-    cat "$p_cgroup_root$pcg/pids.current" >> "$work/pids.current" 2>/dev/null
-    sleep 0.05
-  done ) &
+python3 "$here/evidence.py" sample pids "$p_cgroup_root$pcg" "$work" &
 sampler=$!
+wait_sampler_ready pids
 docker exec "$container" sh -c 'n=0; while [ $n -lt 200 ]; do sleep 120 & n=$((n+1)); done; echo "spawned=$n"; wait' > "$work/pids.log" 2>&1 &
 spawner=$!
 sleep 8
-kill "$sampler" >/dev/null 2>&1 || true; wait "$sampler" 2>/dev/null || true; sampler=
+stop_sampler
 pids_max_events=$(awk '$1 == "max" {print $2}' "$work/pids.events" 2>/dev/null || true)
 pids_peak=$(sort -n "$work/pids.current" 2>/dev/null | tail -1 || true)
 full_id=$(docker inspect --format '{{.Id}}' "$container")
 state=$(docker inspect --format '{{.State.Running}} exit={{.State.ExitCode}}' "$container")
+printf 'container=%s sentry_pid=%s cgroup=%s state=%s\n' "$full_id" "$ppid" "$pcg" "$state" > "$work/pids-control.txt"
 state_dir=$(python3 - "$root/bin/" "$full_id" <<'PY'
 import os, sys
 bindir, cid = sys.argv[1:]
@@ -736,17 +761,18 @@ container=mcsbx-lease-tmp
 lease_run "$container" 256 64 64
 tpid=$(sentry_pid "$container")
 tcg=$(proc_cgroup "$tpid")
-( while :; do
-    cat "$p_cgroup_root$tcg/memory.events.local" > "$work/tmp.events.tmp" 2>/dev/null && mv "$work/tmp.events.tmp" "$work/tmp.events"
-    cat "$p_cgroup_root$tcg/memory.peak" > "$work/tmp.peak.tmp" 2>/dev/null && mv "$work/tmp.peak.tmp" "$work/tmp.peak"
-    sleep 0.1
-  done ) &
+python3 "$here/evidence.py" sample memory "$p_cgroup_root$tcg" "$work" &
 sampler=$!
+wait_sampler_ready tmp
+python3 "$here/evidence.py" ancestors "$p_cgroup_root" "$p_cgroup_root$tcg" "$work/tmp-ancestors-before.json" || bad 'ancestor baseline unavailable'
 tmp_rc=0
 timeout 120 docker exec --user 0 "$container" dd if=/dev/zero of=/tmp/fill bs=1048576 count=512 > "$work/tmp.log" 2>&1 || tmp_rc=$?
 sleep 2
-kill "$sampler" >/dev/null 2>&1 || true; wait "$sampler" 2>/dev/null || true; sampler=
+python3 "$here/evidence.py" ancestors "$p_cgroup_root" "$p_cgroup_root$tcg" "$work/tmp-ancestors-after.json" || bad 'ancestor terminal snapshot unavailable'
+stop_sampler
 running=$(docker inspect --format '{{.State.Running}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' "$container")
+full_id=$(docker inspect --format '{{.Id}}' "$container")
+printf 'container=%s sentry_pid=%s cgroup=%s state=%s dd_exit=%s\n' "$full_id" "$tpid" "$tcg" "$running" "$tmp_rc" > "$work/tmp-control.txt"
 events=$(tr '\n' ' ' < "$work/tmp.events" 2>/dev/null || echo 'never sampled')
 limit_events=$(awk '$1 == "max" || $1 == "oom" || $1 == "oom_kill" {s+=$2} END {print s+0}' "$work/tmp.events" 2>/dev/null || echo 0)
 peak=$(cat "$work/tmp.peak" 2>/dev/null || echo 0)
