@@ -143,6 +143,21 @@ without this code.
   like any other; its end is recorded after that signal. Before this repair
   a cancel could record `cancelled` over a running process with no signal
   (R23-COMP-01).
+- In the opposite order, a `cancelled` receipt does not prove that a process
+  has exited (REV-B-05). When the kill path's `RecordAdmittedExecEnd` commits
+  `cancelled` while the start owner's helper start call is still under way,
+  the tenant's receipt reports that durable decision at once. When the start
+  call returns, the start owner's `running` write is refused and it sends a
+  forced cancel by identity (`killByIdentity`); a start that `D_start` did
+  not confirm is killed by identity the same way. The receipt therefore
+  records that nothing more is to run under the exec, and the process may
+  outlive it for the rest of the start call and the forced cancel. The
+  existing bounds still apply: the start call has `min(D_start, time left
+  to the deadline)`, and the forced cancel has `ExecKillGrace`. No
+  wall-clock bound on process exit is claimed. The forced cancel's outcome
+  is neither checked nor recorded, guest code can stop the helper (B-5), and
+  process-group kill under runsc is still unproven (D5-P3). The receipt, its
+  members and the exec vocabulary are unchanged.
 - The exec deadline is `min(admitted_at + timeout_ms, lease expiry)` on the
   durable clock; renewals move it. When the deadline is the lease expiry and
   the lease reaches it unrenewed, the kill path still runs: the lease is

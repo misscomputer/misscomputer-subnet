@@ -18,9 +18,23 @@ Every route keeps btauth, the operator list, the unique registration, the
 validator permit, the stake minimum and the signed service binding checks
 (`AuthorizationPolicy.identify`, `_verify_assignment_identity`). The rules
 below only change where an authenticated request's rate is counted and
-whether it may wait for a worker. Nothing is counted before btauth and the
-identity checks pass, so an unauthenticated or unauthorized request can
-never spend, or be exempt from, any window.
+whether it may wait for a worker.
+
+Rate accounting starts after btauth and after `AuthorizationPolicy.identify`
+(operator list, unique registration, validator permit, stake minimum)
+accept the caller. A request that fails any of those is refused without
+being counted. Requests rejected by btauth or these caller-eligibility
+checks do not spend a rate-window entry.
+
+The count is taken before the remaining checks, not after them. On the ops
+route the neuron decodes the request only far enough to choose its class
+(see below), counts it in that class's window, and only then compares the
+body's `caller_hotkey` with the btauth caller and verifies the signed
+assignment identity (`_verify_assignment_identity`). The lease-document
+routes likewise count a request before those checks. A request that fails a
+later check is still refused and is never forwarded to the agent, but it
+has already used one entry of its own validator's window. It spends only
+that authenticated validator's own window, never another validator's.
 
 The route a handler serves fixes its rate class. The one refinement is on the
 ops route: an op request is counted in the cancel reserve only when all of
@@ -48,8 +62,14 @@ per validator hotkey.
 Ops are never counted in the `default` window, so an exhausted ops budget
 cannot refuse a renewal or a handshake. Ordinary ops never spend the cancel
 reserve and cancels never spend ordinary budget. The reserve is finite: a
-cancel flood is refused exactly like an ops flood. As before, a refused
-request is not counted.
+cancel flood is refused exactly like an ops flood.
+
+A request refused because its window is full is not added to that window,
+as before. Every refusal that comes after the count is different: a body
+that cannot be decoded, a wrong body caller, a failed binding or
+assignment-identity check, a full ops capacity (`sandbox_ops_capacity_exhausted`),
+and any answer from the agent each leave the request counted in the window
+it was admitted to.
 
 ## Admission to the agent
 
