@@ -33,5 +33,6 @@ func main() {
 	if len(os.Args) != 1 {
 		os.Exit(2)
 	}
+	scrubEnvironment()
 	os.Exit(serveProcess(os.Stdin, os.Stdout))
 }

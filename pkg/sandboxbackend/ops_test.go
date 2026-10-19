@@ -30,6 +30,9 @@ type fakeOpsEngine struct {
 	// pingDown fails the liveness check; dropCreate drops the exec create
 	// connection without an answer.
 	pingDown, dropCreate bool
+	// runningInspects is how many inspects still report a finished exec
+	// running, as dockerd can right after the stream closed.
+	runningInspects int
 }
 
 func (e *fakeEngine) serveOps(w http.ResponseWriter, r *http.Request) bool {
@@ -99,7 +102,11 @@ func (e *fakeEngine) serveOps(w http.ResponseWriter, r *http.Request) bool {
 		o.exits[id] = exit
 		e.mu.Unlock()
 	case r.Method == http.MethodGet && strings.HasPrefix(p, "/exec/") && strings.HasSuffix(p, "/json"):
-		reply(w, 200, map[string]any{"Running": false, "ExitCode": o.exits[strings.TrimSuffix(strings.TrimPrefix(p, "/exec/"), "/json")]})
+		running := o.runningInspects > 0
+		if running {
+			o.runningInspects--
+		}
+		reply(w, 200, map[string]any{"Running": running, "ExitCode": o.exits[strings.TrimSuffix(strings.TrimPrefix(p, "/exec/"), "/json")]})
 	default:
 		return false
 	}
@@ -107,18 +114,16 @@ func (e *fakeEngine) serveOps(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // pinnedHelper writes a helper directory the B-2 pin accepts: root-owned
-// 0555 directory and file under root-owned, non-writable ancestors. Only a
-// root test run on such a checkout can create one.
+// 0555 directory and file under root-owned, non-writable ancestors. It is
+// created in the test's temporary directory, never in the checkout, so only
+// a root test run whose TMPDIR has such ancestors can create one (a
+// world-writable /tmp cannot); every other run skips with the reason.
 func pinnedHelper(t *testing.T, content string) OpsHelper {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("a root-owned helper pin needs a root test run")
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir, err := os.MkdirTemp(wd, ".ops-helper-")
+	dir, err := os.MkdirTemp(t.TempDir(), "ops-helper-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +140,7 @@ func pinnedHelper(t *testing.T, content string) OpsHelper {
 	}
 	helper := OpsHelper{Dir: dir, SHA256: digestOf(content)}
 	if err := verifyHelper(helper); err != nil && strings.Contains(err.Error(), "ancestor") {
-		t.Skipf("this checkout's ancestors cannot hold a pinned helper: %v", err)
+		t.Skipf("TMPDIR's ancestors cannot hold a pinned helper (use a root-owned, non-writable TMPDIR): %v", err)
 	}
 	return helper
 }
@@ -277,6 +282,14 @@ func TestRunHelperExecsTheFixedHelperAndClassifiesFailures(t *testing.T) {
 	if fmt.Sprint(body["Cmd"]) != "[/.misscomputer/sandbox-ops-helper]" || body["User"] != "" || fmt.Sprint(body["Env"]) != "[]" ||
 		body["Privileged"] != false || body["Tty"] != false || body["AttachStdin"] != true {
 		t.Fatalf("exec create body = %v", body)
+	}
+	// dockerd may still report the exec running right after its stream
+	// closed; the answer is kept once the exec is seen ended.
+	h.engine.mu.Lock()
+	h.engine.ops.runningInspects = 3
+	h.engine.mu.Unlock()
+	if out, err := b.RunHelper(context.Background(), instance, []byte("late")); err != nil || string(out) != "answer:late" {
+		t.Fatalf("RunHelper with a late exec end = %q, %v", out, err)
 	}
 
 	for _, tc := range []struct {

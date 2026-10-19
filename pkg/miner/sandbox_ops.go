@@ -57,6 +57,16 @@ var ErrSandboxOpsDisabled = errors.New("sandbox-ops-v1 is not enabled")
 // lane is open (U6-L8-5). Nothing was decided.
 var ErrSandboxOpsBusy = errors.New("sandbox ops are busy; retry")
 
+// SandboxOpsInternalError is an admitted op's failure that is none of the
+// lane's named answers. It may come after an effect started, so callers must
+// treat the outcome as unknown, never as a refusal without effect.
+type SandboxOpsInternalError struct{ Err error }
+
+func (e *SandboxOpsInternalError) Error() string {
+	return "sandbox op failed inside the miner: " + e.Err.Error()
+}
+func (e *SandboxOpsInternalError) Unwrap() error { return e.Err }
+
 // SandboxOpsConfig holds the ops parameters the frozen ops section leaves
 // symbolic until a reviewed measurement adopts them (OPS-U numeric and lab
 // gates). None has a default: an operator who enables ops supplies each.
@@ -88,6 +98,10 @@ func (c SandboxOpsConfig) validate() error {
 
 // killPoll is how often the kill path re-reads an exec it signalled.
 const killPoll = 250 * time.Millisecond
+
+// durableAttempts bounds the tries of one exec-state step whose D_state ran
+// out with the lane open; each try has its own D_state.
+const durableAttempts = 3
 
 type sandboxOps struct {
 	store   *durable.SandboxOps
@@ -124,6 +138,8 @@ type opExec struct {
 	exitCode *int
 	endedAt  time.Time
 	timer    *time.Timer
+	// owned is set once a start owner was launched for this exec.
+	owned bool
 	// kill serializes the kill path of this exec.
 	kill sync.Mutex
 }
@@ -276,16 +292,29 @@ func (l *SandboxLane) Op(ctx context.Context, r protocol.SandboxOpRequestV1, pay
 	case sandbox.OpExecStart:
 		receipt, err = l.execStart(ctx, ops, r, command)
 	case sandbox.OpExecRead, sandbox.OpExecCancel:
-		receipt, result, err = l.execLookup(ctx, ops, r)
+		receipt, result, err = l.execLookup(ctx, ops, r, release)
 	case sandbox.OpFileWrite, sandbox.OpFileRemove, sandbox.OpFileMkdir:
 		receipt, err = l.fileMutation(ctx, ops, r, payload)
 	default:
 		receipt, result, err = l.fileRead(ctx, ops, r)
 	}
 	if err != nil {
-		return protocol.SandboxOpReceiptV1{}, nil, l.laneErr(err)
+		return protocol.SandboxOpReceiptV1{}, nil, l.opFailure(err)
 	}
 	return receipt, result, nil
+}
+
+// opFailure keeps the lane's named answers of an admitted op and marks every
+// other failure internal: it may follow an effect, so it must never reach
+// the validator as a definitive refusal.
+func (l *SandboxLane) opFailure(err error) error {
+	err = l.laneErr(err)
+	for _, named := range []error{ErrSandboxLaneClosed, ErrSandboxOpsBusy, durable.ErrSandboxConflict, durable.ErrSandboxOpExpired, durable.ErrSandboxOpForeign} {
+		if errors.Is(err, named) {
+			return err
+		}
+	}
+	return &SandboxOpsInternalError{Err: err}
 }
 
 // opReceipt is an unsigned-then-signed receipt with only a stage and code.
@@ -558,8 +587,9 @@ func (l *SandboxLane) execStart(ctx context.Context, ops *sandboxOps, r protocol
 	exec := &opExec{leaseID: r.LeaseID, instance: SandboxInstanceName(r.LeaseID),
 		timeout: time.Duration(*r.TimeoutMS) * time.Millisecond, maxOutput: *r.MaxOutputBytes}
 	ops.mu.Lock()
-	created := ops.execs[opID] == nil
-	if created {
+	if existing := ops.execs[opID]; existing != nil {
+		exec = existing
+	} else {
 		ops.execs[opID] = exec
 	}
 	ops.mu.Unlock()
@@ -567,9 +597,12 @@ func (l *SandboxLane) execStart(ctx context.Context, ops *sandboxOps, r protocol
 	admission, err := ops.store.AdmitOp(stateCtx, r)
 	err = l.durableErr(stateCtx, err)
 	cancel()
-	if created && (err != nil || !admission.Start) {
+	if err == nil && !admission.Start && !admission.Replay {
+		// Refused: never admitted, so nothing can start under opID. A failed
+		// admission may have committed, so its entry stays for the replay
+		// that adopts it.
 		ops.mu.Lock()
-		if ops.execs[opID] == exec {
+		if ops.execs[opID] == exec && !exec.isOwned() {
 			delete(ops.execs, opID)
 		}
 		ops.mu.Unlock()
@@ -583,23 +616,12 @@ func (l *SandboxLane) execStart(ctx context.Context, ops *sandboxOps, r protocol
 	case admission.Limited:
 		return l.opReceipt(r, sandbox.OpStageRefused, "exec_limit_exceeded", admission.DecidedAt)
 	case admission.Replay:
+		// An admission whose answer was lost before any start owner ran
+		// (its durable step failed after committing) is started now, once.
+		l.launchStart(ops, opID, exec, admission.AdmittedAt, command)
 		return l.execAnswer(ctx, ops, r, opID, nil)
-	case !created:
-		// Unreachable: only one admission of an op ID can Start.
-		return protocol.SandboxOpReceiptV1{}, errors.New("sandbox exec admitted twice")
 	}
-	exec.mu.Lock()
-	exec.admittedAt = admission.AdmittedAt
-	exec.mu.Unlock()
-	// D2: the start owner is detached from the request after durable
-	// admission and runs under the lane's track; a Close before its backend
-	// call writes nothing (Recover ends the lease).
-	if work, done, err := l.track(l.base); err == nil {
-		go func() {
-			defer done()
-			l.startOwner(work, ops, opID, exec, command)
-		}()
-	}
+	l.launchStart(ops, opID, exec, admission.AdmittedAt, command)
 	status := exec.status(sandbox.ExecStateRunning, admission.AdmittedAt, admission.AdmittedAt)
 	receipt, err := l.opBase(r, sandbox.OpStageRunning, later(l.now().UTC(), admission.DecidedAt))
 	if err != nil {
@@ -609,13 +631,76 @@ func (l *SandboxLane) execStart(ctx context.Context, ops *sandboxOps, r protocol
 	return receipt, l.signOp(&receipt)
 }
 
+// launchStart hands an admitted exec to its one start owner, unless one was
+// launched already. D2: the owner is detached from the request after durable
+// admission and runs under the lane's track; a Close before its backend call
+// writes nothing (Recover ends the lease).
+func (l *SandboxLane) launchStart(ops *sandboxOps, opID string, exec *opExec, admittedAt time.Time, command sandbox.ExecCommand) {
+	exec.mu.Lock()
+	if exec.owned {
+		exec.mu.Unlock()
+		return
+	}
+	exec.owned, exec.admittedAt = true, admittedAt
+	exec.mu.Unlock()
+	if work, done, err := l.track(l.base); err == nil {
+		go func() {
+			defer done()
+			l.startOwner(work, ops, opID, exec, command)
+		}()
+	}
+}
+
+func (e *opExec) isOwned() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.owned
+}
+
+// execState reads an exec's durable state, retrying a D_state expiry while
+// the lane is open.
+func (l *SandboxLane) execState(ctx context.Context, ops *sandboxOps, opID string) (durable.SandboxExecLookup, time.Time, error) {
+	var err error
+	for attempt := 0; attempt < durableAttempts && l.base.Err() == nil; attempt++ {
+		stateCtx, cancel := ops.state(ctx)
+		lookup, leaseExpiry, readErr := ops.store.ExecState(stateCtx, opID)
+		cancel()
+		if readErr == nil {
+			return lookup, leaseExpiry, nil
+		}
+		err = readErr
+	}
+	if err == nil {
+		err = ErrSandboxLaneClosed
+	}
+	return durable.SandboxExecLookup{}, time.Time{}, err
+}
+
+// fallbackDeadline arms the kill path at the exec's own deadline when a
+// durable step stayed unknown, so the exec cannot stay non-terminal with
+// nothing left to end it. The kill path re-reads the durable state first.
+func (l *SandboxLane) fallbackDeadline(ops *sandboxOps, opID string, exec *opExec) {
+	if l.base.Err() != nil {
+		return
+	}
+	exec.mu.Lock()
+	deadline := exec.admittedAt.Add(exec.timeout)
+	exec.mu.Unlock()
+	l.armDeadline(ops, opID, exec, deadline.Sub(l.now().UTC()))
+}
+
 // startOwner issues the one backend start of an admitted exec and records
 // what it observed (OPS-U3 DP-5, D2-D4, INT-OPS-02).
 func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, command sandbox.ExecCommand) {
-	stateCtx, cancel := ops.state(ctx)
-	lookup, leaseExpiry, err := ops.store.ExecState(stateCtx, opID)
-	cancel()
-	if err != nil || !lookup.Found || lookup.Unavailable != nil || lookup.State != "admitted" {
+	lookup, leaseExpiry, err := l.execState(ctx, ops, opID)
+	if err != nil {
+		// Nothing was started; the deadline ends the exec if the store
+		// stays unavailable.
+		slog.Warn("sandbox exec start state", "exec_id", opID, "error", err)
+		l.fallbackDeadline(ops, opID, exec)
+		return
+	}
+	if !lookup.Found || lookup.Unavailable != nil || lookup.State != "admitted" {
 		return
 	}
 	deadline := exec.deadline(leaseExpiry)
@@ -625,9 +710,13 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 		return
 	}
 	remaining := deadline.Sub(lookup.DecidedAt)
+	// The helper's own timer gets the exec's own bound. The lease expiry
+	// bound stays with the lane's deadline (armDeadline), which renewals
+	// move; lease end destroys the sandbox in any case.
+	own := exec.admittedAt.Add(exec.timeout).Sub(lookup.DecidedAt)
 	startCtx, cancelStart := context.WithTimeout(ctx, min(ops.config.StartResolution, remaining))
 	response, code, timedOut := ops.call(startCtx, exec.instance, sandboxops.Request{Op: sandbox.OpExecStart, ExecID: &opID,
-		Exec: &sandboxops.ExecSpec{Command: command, MaxOutputBytes: exec.maxOutput, TimeoutMS: uint64(max(remaining.Milliseconds(), 1))}})
+		Exec: &sandboxops.ExecSpec{Command: command, MaxOutputBytes: exec.maxOutput, TimeoutMS: uint64(max(own.Milliseconds(), 1))}})
 	cancelStart()
 	if l.base.Err() != nil {
 		// Close during the call: Recover ends the lease; write nothing.
@@ -637,14 +726,14 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 	case timedOut || code == sandbox.OpCodeDeadline:
 		// Not confirmed by D_start: failed, and killed by identity in case
 		// the start did happen.
-		l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateFailed, failure(sandbox.OpCodeSandboxFailed))
+		l.recordFailed(ctx, ops, opID, exec, sandbox.OpCodeSandboxFailed)
 		l.killByIdentity(ctx, ops, opID, exec)
 		return
 	case code != "" && response.Exec == nil:
 		if code == "exec_not_found" {
 			code = sandbox.OpCodeSandboxFailed
 		}
-		l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateFailed, failure(code))
+		l.recordFailed(ctx, ops, opID, exec, code)
 		return
 	}
 	exec.observe(*response.Exec)
@@ -654,10 +743,17 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 		if code != "" {
 			failed = code
 		}
-		l.recordExec(ctx, ops, opID, exec, state, &failed)
+		l.recordFailed(ctx, ops, opID, exec, failed)
 		return
 	}
-	if !l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateRunning, nil) {
+	switch applied, err := l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateRunning, nil); {
+	case err != nil:
+		// The start happened but could not be recorded: end it rather than
+		// leave a process the lane does not track.
+		l.killByIdentity(ctx, ops, opID, exec)
+		l.recordFailed(ctx, ops, opID, exec, sandbox.OpCodeSandboxFailed)
+		return
+	case !applied:
 		// INT-OPS-02: the exec ended (cancel, D_start) before the start
 		// was confirmed; kill what may have started and never sign running.
 		l.killByIdentity(ctx, ops, opID, exec)
@@ -668,6 +764,14 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 		return
 	}
 	l.armDeadline(ops, opID, exec, deadline.Sub(lookup.DecidedAt))
+}
+
+// recordFailed records a start failure; when the store stays unavailable the
+// fallback deadline ends the exec.
+func (l *SandboxLane) recordFailed(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, code string) {
+	if _, err := l.recordExec(ctx, ops, opID, exec, sandbox.ExecStateFailed, failure(code)); err != nil {
+		l.fallbackDeadline(ops, opID, exec)
+	}
 }
 
 func failure(code string) *string { return &code }
@@ -726,16 +830,24 @@ func (e *opExec) status(state string, admittedAt, observed time.Time) *sandbox.E
 
 // recordExec stores a transition and reports whether it was applied. A
 // transition the store refuses (the exec is already terminal) is not an
-// error: the first terminal state wins.
-func (l *SandboxLane) recordExec(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, state string, code *string) bool {
-	stateCtx, cancel := ops.state(ctx)
-	defer cancel()
-	err := ops.store.RecordExecState(stateCtx, opID, state, code)
-	if err != nil {
-		if !errors.Is(err, durable.ErrSandboxExecTransition) {
-			slog.Warn("sandbox exec state", "exec_id", opID, "state", state, "error", err)
+// error: the first terminal state wins. Any other failure is retried while
+// the lane is open; err reports a transition whose outcome stayed unknown.
+func (l *SandboxLane) recordExec(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, state string, code *string) (bool, error) {
+	err := ErrSandboxLaneClosed
+	for attempt := 0; attempt < durableAttempts && l.base.Err() == nil; attempt++ {
+		stateCtx, cancel := ops.state(ctx)
+		err = ops.store.RecordExecState(stateCtx, opID, state, code)
+		cancel()
+		if err == nil || errors.Is(err, durable.ErrSandboxExecTransition) {
+			break
 		}
-		return false
+		slog.Warn("sandbox exec state", "exec_id", opID, "state", state, "attempt", attempt+1, "error", err)
+	}
+	switch {
+	case errors.Is(err, durable.ErrSandboxExecTransition):
+		return false, nil
+	case err != nil:
+		return false, err
 	}
 	if state != sandbox.ExecStateRunning {
 		exec.mu.Lock()
@@ -747,7 +859,7 @@ func (l *SandboxLane) recordExec(ctx context.Context, ops *sandboxOps, opID stri
 		}
 		exec.mu.Unlock()
 	}
-	return true
+	return true, nil
 }
 
 // armDeadline schedules the kill path after delay, the time from a durable
@@ -794,13 +906,14 @@ var execTerminal = map[string]bool{sandbox.ExecStateExited: true, sandbox.ExecSt
 // group, SIGKILL after ExecKillGrace), wait ExecKillGrace plus KillGrace for
 // a terminal observation, cancel once more by force if none came, then record
 // the terminal state and release the cap slot whether or not the helper
-// confirmed. It acts only on execs of a live lease (U3-L8-1).
+// confirmed. Guest code can stop the helper (B-5), so every helper call is
+// bounded: the cancel and the status polls by the grace window together, the
+// forced cancel by ExecKillGrace. It acts only on execs of a live lease
+// (U3-L8-1).
 func (l *SandboxLane) killPath(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, trigger string) {
 	exec.kill.Lock()
 	defer exec.kill.Unlock()
-	stateCtx, cancel := ops.state(ctx)
-	lookup, _, err := ops.store.ExecState(stateCtx, opID)
-	cancel()
+	lookup, _, err := l.execState(ctx, ops, opID)
 	if err != nil || !lookup.Found || lookup.Unavailable != nil || execTerminal[lookup.State] {
 		return
 	}
@@ -811,37 +924,46 @@ func (l *SandboxLane) killPath(ctx context.Context, ops *sandboxOps, opID string
 		return
 	}
 	cancelRequest := sandboxops.Request{Op: sandbox.OpExecCancel, ExecID: &opID}
-	ops.call(ctx, exec.instance, cancelRequest)
+	grace, endGrace := context.WithTimeout(ctx, sandbox.ExecKillGrace+ops.config.KillGrace)
+	ops.call(grace, exec.instance, cancelRequest)
 	observed := ""
-	until := time.Now().Add(sandbox.ExecKillGrace + ops.config.KillGrace)
-	for observed == "" && time.Now().Before(until) && ctx.Err() == nil {
+	for observed == "" && grace.Err() == nil {
 		timer := time.NewTimer(killPoll)
 		select {
-		case <-ctx.Done():
+		case <-grace.Done():
 		case <-timer.C:
 		}
 		timer.Stop()
-		response, _, _ := ops.call(ctx, exec.instance, sandboxops.Request{Op: sandboxops.OpExecStatus, ExecID: &opID})
+		if grace.Err() != nil {
+			break
+		}
+		response, _, _ := ops.call(grace, exec.instance, sandboxops.Request{Op: sandboxops.OpExecStatus, ExecID: &opID})
 		if response.Exec != nil && execTerminal[response.Exec.State] && response.Exec.State != sandbox.ExecStateFailed {
 			exec.observe(*response.Exec)
 			observed = response.Exec.State
 		}
 	}
+	endGrace()
 	if l.base.Err() != nil {
 		return
 	}
 	if observed == "" {
 		cancelRequest.Force = true
-		ops.call(ctx, exec.instance, cancelRequest)
+		forced, endForced := context.WithTimeout(ctx, sandbox.ExecKillGrace)
+		ops.call(forced, exec.instance, cancelRequest)
+		endForced()
 		observed = trigger
 	}
-	l.recordExec(ctx, ops, opID, exec, observed, nil)
+	if _, err := l.recordExec(ctx, ops, opID, exec, observed, nil); err != nil {
+		// The store stayed unavailable: try the kill path again later.
+		l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
+	}
 }
 
 // execLookup answers exec_read and exec_cancel. exec_not_found is signed at
 // exactly the lookup's decision time, so it is definitive under
 // SandboxExecNeverStartedV1 once that time passes the start's window.
-func (l *SandboxLane) execLookup(ctx context.Context, ops *sandboxOps, r protocol.SandboxOpRequestV1) (protocol.SandboxOpReceiptV1, []byte, error) {
+func (l *SandboxLane) execLookup(ctx context.Context, ops *sandboxOps, r protocol.SandboxOpRequestV1, release func()) (protocol.SandboxOpReceiptV1, []byte, error) {
 	stateCtx, cancel := ops.state(ctx)
 	_, err := ops.store.AdmitOp(stateCtx, r)
 	if err == nil {
@@ -861,7 +983,7 @@ func (l *SandboxLane) execLookup(ctx context.Context, ops *sandboxOps, r protoco
 			return receipt, nil, err
 		}
 		if r.Op == sandbox.OpExecCancel {
-			receipt, err := l.execCancel(ctx, ops, r, lookup)
+			receipt, err := l.execCancel(ctx, ops, r, lookup, release)
 			return receipt, nil, err
 		}
 		return l.execRead(ctx, ops, r, lookup)
@@ -878,9 +1000,14 @@ func (o *sandboxOps) execEntry(opID string) *opExec {
 	return o.execs[opID]
 }
 
-func (l *SandboxLane) execCancel(ctx context.Context, ops *sandboxOps, r protocol.SandboxOpRequestV1, lookup durable.SandboxExecLookup) (protocol.SandboxOpReceiptV1, error) {
+// execCancel runs the kill path of a non-terminal exec. The kill path waits
+// on the exec's own helper, which its guest code can stop, so the op's
+// in-flight slot is released first: kill paths are bounded per exec, not by
+// the agent-wide in-flight bound.
+func (l *SandboxLane) execCancel(ctx context.Context, ops *sandboxOps, r protocol.SandboxOpRequestV1, lookup durable.SandboxExecLookup, release func()) (protocol.SandboxOpReceiptV1, error) {
 	exec := ops.execEntry(*r.ExecID)
 	if exec != nil && !execTerminal[lookup.State] {
+		release()
 		work, stop := l.detached(ctx)
 		l.killPath(work, ops, *r.ExecID, exec, sandbox.ExecStateCancelled)
 		stop()
@@ -929,7 +1056,9 @@ func (l *SandboxLane) execAnswer(ctx context.Context, ops *sandboxOps, r protoco
 		}
 		receipt.ErrorCode = &code
 	}
-	if result != nil {
+	// A read that raced the start owner recording a failure answers the
+	// failure: a failed stage carries no read result.
+	if result != nil && state != sandbox.ExecStateFailed {
 		retained := receipt.Exec.StdoutRetained
 		if *r.Stream == sandbox.ExecStderr {
 			retained = receipt.Exec.StderrRetained
@@ -957,8 +1086,11 @@ func (l *SandboxLane) execRead(ctx context.Context, ops *sandboxOps, r protocol.
 	}
 	data := []byte{}
 	if lookup.State != "admitted" {
-		response, code, _ := ops.call(ctx, exec.instance, sandboxops.Request{Op: sandbox.OpExecRead, ExecID: &execID,
+		// Bounded like a file op: guest code can stop the helper (B-5).
+		readCtx, endRead := context.WithTimeout(ctx, sandbox.SyncOpBudget)
+		response, code, _ := ops.call(readCtx, exec.instance, sandboxops.Request{Op: sandbox.OpExecRead, ExecID: &execID,
 			Stream: r.Stream, Offset: r.Offset, Limit: r.Limit})
+		endRead()
 		if l.base.Err() != nil {
 			return protocol.SandboxOpReceiptV1{}, nil, ErrSandboxLaneClosed
 		}

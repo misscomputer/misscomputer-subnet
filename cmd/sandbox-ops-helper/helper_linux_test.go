@@ -300,3 +300,26 @@ func TestMalformedRequestIsSandboxOpFailed(t *testing.T) {
 		}
 	}
 }
+
+// The command inherits only its stdin, stdout and stderr: the supervisor's
+// spec and ready descriptors are closed on exec.
+func TestExecCommandInheritsOnlyItsStdio(t *testing.T) {
+	h := newHarness(t)
+	id := execID(10)
+	// ls lists the shell's descriptors while the shell itself holds no
+	// other descriptor open.
+	h.start(id, 30_000, 4096, nil, "sh", "-c", `ls -l /proc/$$/fd`)
+	if got := h.wait(id); got.State != sandbox.ExecStateExited {
+		t.Fatalf("observation = %+v", got)
+	}
+	for _, line := range strings.Split(string(h.read(id, sandbox.ExecStdout, 0, 4096)), "\n") {
+		fields := strings.Fields(line)
+		for index, field := range fields {
+			if field == "->" && index > 0 && index+1 < len(fields) {
+				if fd := fields[index-1]; fd != "0" && fd != "1" && fd != "2" {
+					t.Errorf("the command inherited descriptor %s -> %s", fd, fields[index+1])
+				}
+			}
+		}
+	}
+}

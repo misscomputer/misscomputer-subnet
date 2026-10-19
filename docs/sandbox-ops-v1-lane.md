@@ -25,18 +25,25 @@ without this code.
 
 - Invoked by `docker exec` at `/.misscomputer/sandbox-ops-helper`, image
   default user, `Privileged: false`, no added environment, no TTY, no
-  arguments (B-4). It reads one request of at most 1 MiB on stdin and writes
-  one response of at most 1 MiB on stdout (`pkg/sandboxops`).
+  arguments (B-4). Docker adds the image's own environment to every exec, so
+  a helper started with any environment first re-executes itself through
+  `/proc/self/exe` with an empty one. It reads one request of at most 1 MiB
+  on stdin and writes one response of at most 1 MiB on stdout
+  (`pkg/sandboxops`).
 - File operations go through `fsroot` opened at `/` (B-9) with the 30 s
   budget.
 - `exec_start` creates `/tmp/.misscomputer-ops/<exec_id>` (0700) and starts
   a supervisor (the helper re-executed through `/proc/self/exe` in its own
   session). The supervisor runs the command in its own process group with an
-  empty environment, keeps each stream's first `max_output_bytes` in the
+  empty environment and only its stdio (every other descriptor is
+  close-on-exec), keeps each stream's first `max_output_bytes` in the
   capture directory, counts the rest, writes `status.json`, and on SIGTERM
   (cancel) or at its deadline sends SIGTERM to the group and SIGKILL after
   5 s. A second `exec_start` of the same exec ID never runs the command
   again. A missing `/tmp` or an unusable capture root is `ops_unsupported`.
+  The supervisor's own deadline is the exec's own bound, `admitted_at +
+  timeout_ms`; the lease expiry bound is the miner lane's, which renewals
+  move.
 - Build: `scripts/sandbox-ops-helper/build.sh <out>` (static, `CGO_ENABLED=0`,
   `-trimpath`, `-buildvcs=false`, empty build ID, `go.mod` toolchain). Two
   builds of one commit are byte-identical.
@@ -55,7 +62,8 @@ without this code.
 - `RunHelper` creates an attached exec, writes the request, half-closes
   stdin, demultiplexes the raw stream (stdout kept up to 1 MiB, stderr
   dropped; more than either bound fails the call), and inspects the exit
-  code; a nonzero exit is `sandbox_op_failed`. A missing or stopped container is
+  code, re-reading for up to 0.5 s while dockerd still reports the exec
+  running after its stream closed; a nonzero exit is `sandbox_op_failed`. A missing or stopped container is
   `ErrSandboxNotRunning` (`sandbox_exited`). An engine call without an answer
   is a miner fault only when a `/_ping` of the same daemon also fails (D1);
   every engine-answered error is not (the allowlist is empty).
@@ -69,13 +77,29 @@ without this code.
   exec payload decoding, the in-flight bound, then durable admission
   (`AdmitOp`) before any effect.
 - `exec_start` answers `running` at once (R1, `B_exec = 0`); a start owner
-  issues the one backend start. `exec_read` and `exec_cancel` answer
-  `exec_not_found` with `observed_at` equal to the lookup's decision time.
+  issues the one backend start. A start failure is recorded afterwards and
+  answered on later exec ops as stage `failed` with the helper's code and an
+  `exec` member in state `failed` (P-5). `exec_read` and `exec_cancel`
+  answer `exec_not_found` with `observed_at` equal to the lookup's decision
+  time.
 - Kill path (B-7, DP-13): helper cancel, wait `ExecKillGrace` plus the kill
   grace for a terminal observation, a forced cancel if none came, then
-  record the terminal state whatever the helper said.
+  record the terminal state whatever the helper said. Guest code can stop
+  the helper (B-5), so the cancel and status polls share the grace window as
+  their deadline and the forced cancel has `ExecKillGrace`; an `exec_cancel`
+  releases its in-flight slot before it waits. An `exec_read` helper call
+  has the 30 s op budget.
 - The exec deadline is `min(admitted_at + timeout_ms, lease expiry)` on the
   durable clock; renewals move it.
+- A durable exec-state step that runs out of `D_state` is retried (three
+  tries). If it stays unknown, the kill path is armed at the exec's own
+  deadline, so no exec stays non-terminal with nothing left to end it; a
+  started exec whose `running` record fails is killed and recorded failed.
+  An admission that committed but answered an error is started by its exact
+  replay, once.
+- An admitted op that fails in a way that is none of the lane's named
+  answers is answered `500 sandbox_ops_internal` (retryable) by the agent,
+  never a 4xx: it may follow an effect, and a 4xx is a refusal without one.
 - Mutating file ops (`file_write`, `file_remove`, `file_mkdir`) keep their
   signed answer until `expires_at` plus the skew, so an exact replay is
   answered from it and never repeats the effect.
@@ -101,6 +125,11 @@ without this code.
   mount immutability from guest root, process-group kill, image-controlled
   mount target). Whether a supervisor started by a `docker exec` outlives it
   under runsc is part of these probes.
+- The contract's delivery requires a `nosuid,nodev,rprivate` bind; this
+  draft requests read-only `rprivate` only, because the Docker bind mount
+  API offers no `nosuid`/`nodev` option. Either the guest mount flags are
+  observed under runsc (D5-P9), or the delivery mechanism or the contract
+  text changes. Not decided here.
 - An image whose rootfs conflicts with `/.misscomputer` (B-11) fails create
   today with the backend's existing attribution; the non-fault lease code for
   it is a contract-owner decision.

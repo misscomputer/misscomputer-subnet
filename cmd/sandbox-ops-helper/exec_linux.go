@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,34 @@ import (
 // selfExecutable is how the helper starts its own supervisor: the mounted,
 // read-only helper binary this process runs from.
 const selfExecutable = "/proc/self/exe"
+
+// scrubEnvironment re-executes the helper with an empty environment when it
+// was given one: docker exec adds the image's Config.Env to every exec, and
+// the helper runs with none (B-4), so no image variable (GODEBUG,
+// GOMAXPROCS, GOMEMLIMIT, ...) shapes it beyond this first instant.
+func scrubEnvironment() {
+	if len(os.Environ()) == 0 {
+		return
+	}
+	if err := unix.Exec(selfExecutable, os.Args, []string{}); err != nil {
+		os.Exit(2)
+	}
+}
+
+// closeOnExecAbove marks every open descriptor above highest close-on-exec,
+// so a command started next inherits only its stdio: not the supervisor's
+// ready pipe, nor anything the supervisor itself inherited.
+func closeOnExecAbove(highest int) {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if fd, err := strconv.Atoi(entry.Name()); err == nil && fd > highest {
+			unix.CloseOnExec(fd)
+		}
+	}
+}
 
 const (
 	// startWait bounds how long exec_start waits for the supervisor to
@@ -385,6 +414,7 @@ func supervise(root, execID string) int {
 			return fail(fsroot.Code(err))
 		}
 	}
+	closeOnExecAbove(2)
 	if err := child.Start(); err != nil {
 		return fail(startCode(err))
 	}

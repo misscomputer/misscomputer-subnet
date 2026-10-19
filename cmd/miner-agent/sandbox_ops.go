@@ -144,8 +144,10 @@ func decodeChunk(encoded *string) ([]byte, error) {
 }
 
 // sandboxOps serves POST /v1/sandbox/ops. Every answer without a receipt is
-// one of sandbox_conflict, sandbox_lane_closed, sandbox_ops_busy (retryable)
-// or the existing validation and admission errors.
+// one of sandbox_conflict, sandbox_lane_closed, sandbox_ops_busy (retryable),
+// sandbox_ops_internal (500: an admitted op failed in a way that may follow
+// an effect, so it is never reported as a refusal without effect) or the
+// existing validation and admission errors.
 func (a *api) sandboxOps(w http.ResponseWriter, req *http.Request) {
 	var input sandboxOpsRequest
 	if err := decodeJSON(io.LimitReader(req.Body, bridge.MaxBodyBytes), &input); err != nil {
@@ -171,6 +173,7 @@ func (a *api) sandboxOps(w http.ResponseWriter, req *http.Request) {
 		bridge.WriteError(w, status, code, err.Error(), retryable)
 		return
 	}
+	var internal *miner.SandboxOpsInternalError
 	receipt, result, err := a.sandbox.Op(req.Context(), input.Document, payload, miner.SandboxRequest{
 		ValidatorKey: key, CurrentBlock: input.CurrentBlock, Network: a.network, NetUID: a.netuid,
 		CallerHotkey: input.CallerHotkey, MinerHotkey: a.hotkey, MinerUID: a.uid,
@@ -184,6 +187,8 @@ func (a *api) sandboxOps(w http.ResponseWriter, req *http.Request) {
 		bridge.WriteError(w, http.StatusServiceUnavailable, "sandbox_ops_busy", err.Error(), true)
 	case errors.Is(err, durable.ErrSandboxOpExpired):
 		bridge.WriteError(w, http.StatusGone, "expired_assignment", err.Error(), false)
+	case errors.As(err, &internal):
+		bridge.WriteError(w, http.StatusInternalServerError, "sandbox_ops_internal", "the op failed inside the miner; its outcome is unknown", true)
 	case err != nil && strings.HasPrefix(err.Error(), "sandbox_op_payload"):
 		bridge.WriteError(w, http.StatusBadRequest, "sandbox_op_payload_mismatch", err.Error(), false)
 	case err != nil:

@@ -80,11 +80,19 @@ func TestSandboxOpsRouteAnswersVerifiableReceipts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	state, err := durable.Open(filepath.Join(t.TempDir(), "state.db"))
+	statePath := filepath.Join(t.TempDir(), "state.db")
+	state, err := durable.Open(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer state.Close()
+	// The ops store gets its own handle on the same database, so a fault can
+	// be injected into it alone.
+	opsState, err := durable.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opsState.Close()
 	leases, err := state.EnableSandboxLeases(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +149,7 @@ func TestSandboxOpsRouteAnswersVerifiableReceipts(t *testing.T) {
 	if receipt, err := lane.Commit(ctx, lease, request); err != nil || receipt.Stage != sandbox.StageReady {
 		t.Fatalf("commit: %+v %v", receipt.Stage, err)
 	}
-	if err := enableSandboxOps(ctx, lane, state, &sandboxOpsSettings{config: miner.SandboxOpsConfig{
+	if err := enableSandboxOps(ctx, lane, opsState, &sandboxOpsSettings{config: miner.SandboxOpsConfig{
 		StartResolution: time.Second, StateTimeout: time.Second, KillGrace: time.Second, MaxInFlight: 4, MaxInFlightBytes: 4 << 20, MaxOutcomes: 4,
 	}}); err != nil {
 		t.Fatal(err)
@@ -208,6 +216,21 @@ func TestSandboxOpsRouteAnswersVerifiableReceipts(t *testing.T) {
 				t.Fatalf("status %d body %s, want %d %s", response.Code, response.Body.String(), tc.status, tc.code)
 			}
 		})
+	}
+	// A lane failure that is not one of its named answers can come after an
+	// effect started, so it is never a definitive 4xx refusal: the runtime
+	// treats any answer below 500 as having had no effect.
+	if err := opsState.Close(); err != nil {
+		t.Fatal(err)
+	}
+	failing := op
+	failing.OpNonce = strings.Repeat("f6", 16)
+	if err := protocol.SignSandboxOpRequestV1(&failing, validatorPrivate); err != nil {
+		t.Fatal(err)
+	}
+	if response := serve(service.routes(), http.MethodPost, "/v1/sandbox/ops", envelope(func(r *sandboxOpsRequest) { r.Document = failing })); response.Code < 500 ||
+		!strings.Contains(response.Body.String(), `"sandbox_ops_internal"`) {
+		t.Fatalf("op on a failed ops store: %d %s", response.Code, response.Body.String())
 	}
 	if err := lane.Close(ctx); err != nil {
 		t.Fatal(err)

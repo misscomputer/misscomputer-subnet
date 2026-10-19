@@ -11,6 +11,8 @@ import (
 
 const selfExecutable = ""
 
+func scrubEnvironment() {}
+
 // The helper runs only inside a Linux sandbox; elsewhere every exec op is
 // ops_unsupported, as file ops are through fsroot.
 type unsupportedExecs struct{}

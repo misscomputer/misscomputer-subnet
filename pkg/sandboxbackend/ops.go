@@ -48,6 +48,14 @@ const maxHelperStderrBytes = 64 << 10
 // livenessTimeout bounds the independent daemon liveness check of OPS-U3 D1.
 const livenessTimeout = 5 * time.Second
 
+// dockerd records an attached exec's end shortly after its stream closes, so
+// an inspect right after EOF can still report it running; it is re-read at
+// most exitSettleTries times, exitSettlePoll apart.
+const (
+	exitSettleTries = 20
+	exitSettlePoll  = 25 * time.Millisecond
+)
+
 var _ miner.SandboxOpsBackend = (*GVisor)(nil)
 
 // EnableOps turns on the ops mode with the pinned helper. It verifies the pin
@@ -177,8 +185,20 @@ func (b *GVisor) RunHelper(ctx context.Context, instanceID string, request []byt
 		Running  bool `json:"Running"`
 		ExitCode int  `json:"ExitCode"`
 	}
-	if err := b.engine.call(ctx, http.MethodGet, "/exec/"+url.PathEscape(created.ID)+"/json", nil, nil, &inspected); err != nil {
-		return nil, b.unanswered(ctx, err)
+	for try := 0; ; try++ {
+		if err := b.engine.call(ctx, http.MethodGet, "/exec/"+url.PathEscape(created.ID)+"/json", nil, nil, &inspected); err != nil {
+			return nil, b.unanswered(ctx, err)
+		}
+		if !inspected.Running || try == exitSettleTries {
+			break
+		}
+		timer := time.NewTimer(exitSettlePoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, b.unanswered(ctx, ctx.Err())
+		case <-timer.C:
+		}
 	}
 	if inspected.Running || inspected.ExitCode != 0 {
 		// The helper ended abnormally or was replaced: sandbox_op_failed.
