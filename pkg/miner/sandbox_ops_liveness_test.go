@@ -67,9 +67,10 @@ func waitFor(t *testing.T, what string, done func() bool) {
 
 // The exec deadline is min(admitted_at + timeout_ms, current lease expiry).
 // When the lease expiry is reached unrenewed, the lane's deadline still
-// SIGTERMs the exec through the kill path and records it timed_out: the
-// lease is past its expiry but its teardown has not begun. A renewal moves
-// the deadline, and a released lease is left to its teardown.
+// SIGTERMs the exec through the kill path and records it timed_out, although
+// the helper reports the exec it was asked to cancel as cancelled: the lease
+// is past its expiry but its teardown has not begun. A renewal moves the
+// deadline, and a released lease is left to its teardown.
 func TestSandboxExecLeaseExpiryEndsTheExec(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -83,17 +84,8 @@ func TestSandboxExecLeaseExpiryEndsTheExec(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newOpsFixture(t, testOpsConfig)
-			var cancels atomic.Int64
-			f.backend.answer = func(_ context.Context, request sandboxops.Request) ([]byte, error) {
-				state := sandbox.ExecStateRunning
-				if request.Op == sandbox.OpExecCancel {
-					cancels.Add(1)
-				}
-				if cancels.Load() > 0 {
-					state = sandbox.ExecStateTimedOut
-				}
-				return helperOut(t, sandboxops.Response{Exec: &sandboxops.ExecObservation{State: state}}), nil
-			}
+			helper := newSupervisedHelper()
+			f.backend.answer = helper.answer(t)
 			start := f.execStart(uint64(time.Hour / time.Millisecond))
 			if _, _, err := f.run(start, execPayload); err != nil {
 				t.Fatal(err)
@@ -122,14 +114,14 @@ func TestSandboxExecLeaseExpiryEndsTheExec(t *testing.T) {
 			f.lane.armDeadline(f.lane.ops, execID, exec, 0)
 			if tc.killed {
 				waitExecState(t, f, execID, sandbox.ExecStateTimedOut)
-				if cancels.Load() == 0 {
+				if helper.cancelCount() == 0 {
 					t.Fatal("recorded timed_out without signalling the exec")
 				}
 				return
 			}
 			time.Sleep(300 * time.Millisecond)
-			if cancels.Load() != 0 {
-				t.Fatalf("%d helper cancels at a deadline that did not pass", cancels.Load())
+			if n := helper.cancelCount(); n != 0 {
+				t.Fatalf("%d helper cancels at a deadline that did not pass", n)
 			}
 		})
 	}
@@ -142,13 +134,7 @@ func TestSandboxExecDeadlineSurvivesADurableFailure(t *testing.T) {
 	config := testOpsConfig
 	config.StateTimeout = 200 * time.Millisecond
 	f, slow := slowStoreFixture(t, config)
-	f.backend.answer = func(_ context.Context, request sandboxops.Request) ([]byte, error) {
-		state := sandbox.ExecStateRunning
-		if request.Op == sandbox.OpExecCancel || request.Op == sandboxops.OpExecStatus {
-			state = sandbox.ExecStateTimedOut
-		}
-		return helperOut(t, sandboxops.Response{Exec: &sandboxops.ExecObservation{State: state}}), nil
-	}
+	f.backend.answer = newSupervisedHelper().answer(t)
 	start := f.execStart(1000)
 	if _, _, err := f.run(start, execPayload); err != nil {
 		t.Fatal(err)
@@ -231,5 +217,105 @@ func TestSandboxExecFailedAdmissionsAreForgotten(t *testing.T) {
 	waitExecState(t, f, protocol.SandboxOpIDV1(admitted), sandbox.ExecStateRunning)
 	if got := entries(); got != 1 {
 		t.Fatalf("%d entries with one admitted exec", got)
+	}
+}
+
+// An exec_read that finds the helper's end while the lane's own deadline kill
+// is waiting for it records that end as the deadline's: the helper reports
+// every exec it was asked to cancel as cancelled, whoever asked. A tenant's
+// cancel stays cancelled.
+func TestSandboxExecReadDuringAKillKeepsItsCause(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deadline bool
+		want     string
+	}{
+		{"deadline kill", true, sandbox.ExecStateTimedOut},
+		{"tenant cancel", false, sandbox.ExecStateCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newOpsFixture(t, testOpsConfig)
+			helper := newSupervisedHelper()
+			helper.statusGate = make(chan struct{})
+			f.backend.answer = helper.answer(t)
+			timeoutMS := uint64(time.Hour / time.Millisecond)
+			if tc.deadline {
+				timeoutMS = 1000
+			}
+			start := f.execStart(timeoutMS)
+			if _, _, err := f.run(start, execPayload); err != nil {
+				t.Fatal(err)
+			}
+			execID := protocol.SandboxOpIDV1(start)
+			waitExecState(t, f, execID, sandbox.ExecStateRunning)
+			cancelled := make(chan error, 1)
+			if tc.deadline {
+				f.clock.Add(time.Second) // the start owner's deadline timer fires
+			} else {
+				cancel := f.execOp(sandbox.OpExecCancel, execID)
+				go func() {
+					_, _, err := f.run(cancel, nil)
+					cancelled <- err
+				}()
+			}
+			select {
+			case <-helper.cancelled:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the kill path never signalled the exec")
+			}
+			// The kill path waits for the helper; a read sees the end first.
+			read := f.execOp(sandbox.OpExecRead, execID)
+			receipt, result, err := f.run(read, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.verify(receipt, read, result, map[string]string{sandbox.ExecStateTimedOut: sandbox.OpStageTimedOut,
+				sandbox.ExecStateCancelled: sandbox.OpStageCancelled}[tc.want], "")
+			close(helper.statusGate)
+			if !tc.deadline {
+				if err := <-cancelled; err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitExecState(t, f, execID, tc.want)
+		})
+	}
+}
+
+// A resolution armed for an exec never displaces its deadline: an exact
+// replay whose admission answered an error can arm one after the start owner
+// armed the deadline, and a start owner that gave up after its running record
+// committed arms one for a running exec. The deadline still ends the exec at
+// its own time, and a resolution that finds the lease at its expiry, still
+// running, ends the exec as the deadline does. (Both orders come from races
+// the store cannot produce on demand, so the lane's arming functions are
+// called directly, in the order those races produce.)
+func TestSandboxExecResolutionNeverDisplacesTheDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		timeoutMS uint64
+		advance   time.Duration
+		resolveIn time.Duration
+	}{
+		{"resolution armed after the deadline", 1000, time.Second, time.Minute},
+		{"resolution at an unrenewed lease expiry", uint64(time.Hour / time.Millisecond), 10*time.Minute + time.Second, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newOpsFixture(t, testOpsConfig)
+			helper := newSupervisedHelper()
+			f.backend.answer = helper.answer(t)
+			start := f.execStart(tc.timeoutMS)
+			if _, _, err := f.run(start, execPayload); err != nil {
+				t.Fatal(err)
+			}
+			execID := protocol.SandboxOpIDV1(start)
+			waitExecState(t, f, execID, sandbox.ExecStateRunning)
+			f.lane.armResolve(f.lane.ops, execID, f.lane.ops.execEntry(execID), tc.resolveIn)
+			f.clock.Add(tc.advance)
+			waitExecState(t, f, execID, sandbox.ExecStateTimedOut)
+			if helper.cancelCount() == 0 {
+				t.Fatal("recorded timed_out without signalling the exec")
+			}
+		})
 	}
 }

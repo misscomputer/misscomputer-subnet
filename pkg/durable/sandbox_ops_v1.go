@@ -36,7 +36,10 @@ import (
 //     the high-water time to it. A wall clock stepped backward, before or
 //     across a restart, can therefore never re-open a request window that
 //     an earlier decision closed, nor admit an exec_start after a
-//     definitive exec_not_found.
+//     definitive exec_not_found;
+//   - on an agent that runs ops, a lease renewal decides on that same clock
+//     inside its own transaction (RenewLease), so it is ordered against
+//     every exec lookup, the lease-expiry kill's included.
 //
 // The U1 refusal code of a lease state is SandboxOpLeaseState.RefusalCode;
 // the store itself reports the raw state.
@@ -92,8 +95,9 @@ var ErrSandboxExecTransition = errors.New("sandbox exec state transition is not 
 
 // SandboxOps is the durable admission state of the ops extension.
 type SandboxOps struct {
-	db    *sql.DB
-	clock func() time.Time
+	db     *sql.DB
+	clock  func() time.Time
+	leases *SandboxLeases
 }
 
 // EnableSandboxOps creates the ops tables, if absent, in a store whose
@@ -108,7 +112,31 @@ func (l *SandboxLeases) EnableSandboxOps(ctx context.Context, clock func() time.
 	if _, err := l.db.ExecContext(ctx, sandboxOpsSchema); err != nil {
 		return nil, fmt.Errorf("migrate sandbox ops tables: %w", err)
 	}
-	return &SandboxOps{db: l.db, clock: clock}, nil
+	return &SandboxOps{db: l.db, clock: clock, leases: l}, nil
+}
+
+// RenewLease is SandboxLeases.Renew for an agent that runs ops. It decides
+// the renewal at this store's in-transaction high-water time (nowTx), the
+// clock every exec lookup decides on, instead of a time its caller read
+// before waiting for the store, and reports that decision time as
+// ObservedAt. The store's single connection orders it against every
+// ExecState: a renewal ordered before a read moved the lease expiry that
+// read sees, and one ordered after a read that found the lease at or past
+// its expiry decides at or after that read, so it is too late and is not
+// applied (Renew's rule: a renewal that arrives after expiry is not
+// applied).
+func (o *SandboxOps) RenewLease(ctx context.Context, r protocol.SandboxRenewalV1) (SandboxOutcome, error) {
+	var decided time.Time
+	outcome, err := o.leases.renew(ctx, r, func(ctx context.Context, tx *sql.Tx) (time.Time, error) {
+		now, err := o.nowTx(ctx, tx)
+		decided = now
+		return now, err
+	})
+	if err != nil {
+		return SandboxOutcome{}, err
+	}
+	outcome.ObservedAt = decided
+	return outcome, nil
 }
 
 // SandboxOpLeaseState is the raw durable state of the lease an op targets.
@@ -494,6 +522,51 @@ func (o *SandboxOps) RecordExecState(ctx context.Context, execID, state string, 
 		return err
 	}
 	return tx.Commit()
+}
+
+// RecordAdmittedExecEnd stores the end of an exec that has not started: state
+// is cancelled or timed_out. It applies only while the exec is still admitted.
+// Once a start has recorded it running, or it has ended, nothing is written and
+// the result is false, so a kill path that read the exec as admitted cannot end
+// a running exec without signalling it: its caller then kills it through the
+// helper. The check and the write are one transaction.
+func (o *SandboxOps) RecordAdmittedExecEnd(ctx context.Context, execID, state string) (bool, error) {
+	if state != sandbox.ExecStateCancelled && state != sandbox.ExecStateTimedOut {
+		return false, errors.New("an admitted sandbox exec can only end cancelled or timed_out")
+	}
+	tx, err := o.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	now, err := o.nowTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	var current string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM sandbox_execs WHERE exec_id=?`, execID).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("sandbox exec %q is unknown", execID)
+	}
+	if err != nil {
+		return false, err
+	}
+	applied := false
+	if current == "admitted" {
+		result, err := tx.ExecContext(ctx, `UPDATE sandbox_execs SET state=?,updated_at_ns=? WHERE exec_id=? AND state='admitted'`, state, now.UnixNano(), execID)
+		if err != nil {
+			return false, err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		applied = n == 1
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return applied, nil
 }
 
 func sameCode(left, right *string) bool {

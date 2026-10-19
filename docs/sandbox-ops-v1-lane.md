@@ -55,7 +55,15 @@ without this code.
   directory has mode 0555 and holds only the helper, and the helper (opened
   with `O_NOFOLLOW`) is a root-owned regular file of mode exactly 0555 with
   the pinned SHA-256. The pin is verified again before every create; a
-  failure is a miner fault (`runtime_start_failed`).
+  failure is a miner fault (`runtime_start_failed`). The helper pin refuses
+  any extended attribute on the directory and the helper (G1).
+- `EnableOps` refuses before it reads the helper while a property the
+  contract requires of the helper mount is neither requested nor read back.
+  `nosuid` and `nodev` are such properties: the engine cannot request them,
+  and its readback does not name them (XA-09). This refusal holds for every
+  helper and configuration until the contract decision is made, so ops mode
+  cannot be enabled by configuration. The decision, the open choices and the
+  test coverage are in [the backend hardening note](sandbox-ops-backend-hardening.md).
 - Ops mode adds one mount to the create body: bind, the pinned directory,
   target `/.misscomputer`, read-only, `rprivate`. The readback must show
   exactly that mount in both `HostConfig.Mounts` and the container's mounts.
@@ -66,7 +74,28 @@ without this code.
   running after its stream closed; a nonzero exit is `sandbox_op_failed`. A missing or stopped container is
   `ErrSandboxNotRunning` (`sandbox_exited`). An engine call without an answer
   is a miner fault only when a `/_ping` of the same daemon also fails (D1);
-  every engine-answered error is not (the allowlist is empty).
+  every engine-answered error is not (the allowlist is empty). A guest-caused
+  stream violation is a plain error from `RunHelper` with the engine answering,
+  so the miner classifies it as `sandbox_op_failed`, not `op_runtime_failed`.
+  That classification is asserted at the miner boundary; the backend's
+  own return of the plain error needs a hijacked exec, which the unix-socket
+  fake engine provides and this lane has not executed (see Not done).
+- Before every ops-mode create the backend creates, inspects and removes a
+  never-started probe container named `<instance>-image-probe` from the
+  sandbox's create body without the helper mount (D1). The probe carries the
+  sandbox and lease labels. Its archive stat of `/.misscomputer` decides the
+  create: a 404 for a probe that still exists and never started lets the
+  create proceed; any entry is `image_unavailable`, a non-attributed refusal.
+- A non-404 engine answer to that stat, with the probe never started, is also
+  `image_unavailable`, not a miner fault: a customer image the engine cannot
+  stat is indistinguishable from an engine fault in this answer. The code is
+  not converted into a miner fault here (R23-BE-OBS-01); lab evidence of the
+  engine's answers decides.
+- The orphan sweep recognises a probe by the name `miner.SandboxProbeSuffix`
+  and its lease label. It destroys the probe only while no Create of that
+  lease holds the lease lock. An active create's probe is kept; a probe left
+  behind by a lease whose lock is free is destroyed, whatever the lease's
+  state (R23-COMP-04).
 
 ## Miner lane
 
@@ -88,13 +117,68 @@ without this code.
   the helper (B-5), so the cancel and status polls share the grace window as
   their deadline and the forced cancel has `ExecKillGrace`; an `exec_cancel`
   releases its in-flight slot before it waits. An `exec_read` helper call
-  has the 30 s op budget.
+  has the 30 s op budget. The helper turns every `exec_cancel` into SIGTERM
+  to its supervisor, which then reports `cancelled` whoever asked; an end
+  observed after the lane's own deadline cancel, by the kill path or by an
+  `exec_read`, is therefore recorded `timed_out`. A tenant's `exec_cancel`
+  is recorded `cancelled`, and an exec that exited or reached the
+  supervisor's own deadline first keeps that end.
+- A tenant's `exec_cancel` that reached the kill path is the exec's pending
+  cancel until the exec is terminal. When the store fails the kill path's
+  read, or its record of an exec not yet started, the retry every `D_state`
+  runs that cancel, not the deadline (a later deadline does not delay or
+  relabel it), and records `cancelled`. A start owner that has not started
+  the exec yet records it `cancelled` and never starts it; one whose start
+  was already under way kills the exec as soon as its `running` record is
+  applied. A resolution that ends an exec that never ran records
+  `cancelled`, not `failed`. A kill path that signalled the exec before
+  the cancel arrived keeps its own cause. The pending cancel is held in
+  memory only: a restart loses it, and the startup Recover ends every lease
+  and destroys its sandbox, so the exec ends with it; no durable cancel
+  record exists.
+- The end of an exec the kill path reads as admitted is recorded only while
+  the row is still admitted, in one store transaction (`RecordAdmittedExecEnd`).
+  If a start recorded it running first, the write is refused, the kill path
+  reads the exec again, and the running exec is signalled through the helper
+  like any other; its end is recorded after that signal. Before this repair
+  a cancel could record `cancelled` over a running process with no signal
+  (R23-COMP-01).
+- In the opposite order, a `cancelled` receipt does not prove that a process
+  has exited (REV-B-05). When the kill path's `RecordAdmittedExecEnd` commits
+  `cancelled` while the start owner's helper start call is still under way,
+  the tenant's receipt reports that durable decision at once. When the start
+  call returns, the start owner's `running` write is refused and it sends a
+  forced cancel by identity (`killByIdentity`); a start that `D_start` did
+  not confirm is killed by identity the same way. The receipt therefore
+  records that nothing more is to run under the exec, and the process may
+  outlive it for the rest of the start call and the forced cancel. The
+  existing bounds still apply: the start call has `min(D_start, time left
+  to the deadline)`, and the forced cancel has `ExecKillGrace`. No
+  wall-clock bound on process exit is claimed. The forced cancel's outcome
+  is neither checked nor recorded, guest code can stop the helper (B-5), and
+  process-group kill under runsc is still unproven (D5-P3). The receipt, its
+  members and the exec vocabulary are unchanged.
 - The exec deadline is `min(admitted_at + timeout_ms, lease expiry)` on the
   durable clock; renewals move it. When the deadline is the lease expiry and
   the lease reaches it unrenewed, the kill path still runs: the lease is
   past its expiry but still running, its teardown not begun, and the exec
   is SIGTERMed and recorded `timed_out` then, not at teardown. A released,
-  failed or cleaning-up lease is left to its teardown.
+  failed or cleaning-up lease is left to its teardown. A deadline kill
+  decides from its own durable read, the last before the exec is signalled,
+  and re-arms instead when that read shows a later deadline.
+- With ops enabled, a lease renewal is decided inside its own store
+  transaction at the ops store's high-water time, the clock exec deadlines
+  are decided on, and its receipt is observed at that decision time;
+  without ops the lane's clock decides, as before. The store's single
+  connection orders the renewal against the deadline's reads: a renewal
+  ordered before a read that finds the lease at its expiry moved the
+  deadline, which that read sees and re-arms; one ordered after such a read
+  is decided at or after it, so it arrived after the expiry and is not
+  applied (receipt `expired`, expiry unchanged), whatever the lane's clock
+  read when it arrived. This is the lease rule that a renewal arriving
+  after expiry is not applied (`docs/sandbox-lease-v1.md`), decided on the
+  clock the kill uses; a caller must treat that `expired` receipt as the
+  end of the lease. No document, receipt member or code changes.
 - A durable exec-state step that runs out of `D_state` is retried (three
   tries). If the deadline's own read stays unknown, the deadline is tried
   again every `D_state`, until the store answers or lease teardown drops
@@ -106,8 +190,11 @@ without this code.
   committed: its exact replay inside the request window starts it, once;
   when the window closes, the durable row decides: none, the in-memory
   entry is dropped; one that no owner took, it ends `failed`, never
-  started. Each exec has at most one such timer; teardown stops it. A store
-  that never answers again leaves such execs until lease teardown.
+  started. Each exec has at most one such resolution timer, separate from
+  its deadline timer, which a resolution never stops; a resolution that
+  finds a started exec on a lease at its expiry, still running, runs the
+  kill path as the deadline does. Teardown stops both timers. A store that
+  never answers again leaves such execs until lease teardown.
 - An admitted op that fails in a way that is none of the lane's named
   answers is answered `500 sandbox_ops_internal` (retryable) by the agent,
   never a 4xx: it may follow an effect, and a 4xx is a refusal without one.
@@ -141,9 +228,10 @@ without this code.
   API offers no `nosuid`/`nodev` option. Either the guest mount flags are
   observed under runsc (D5-P9), or the delivery mechanism or the contract
   text changes. Not decided here.
-- An image whose rootfs conflicts with `/.misscomputer` (B-11) fails create
-  today with the backend's existing attribution; the non-fault lease code for
-  it is a contract-owner decision.
+- An image with an entry at `/.misscomputer` (B-11) is refused before create
+  by the D1 probe as `image_unavailable`, a non-attributed refusal. Whether
+  the engine's stat reports a final symlink entry itself is unproven, and the
+  non-fault lease code for such an image is a contract-owner decision.
 - `N_ops`, pruning (U7, INT-OPS-01) and restart recovery of op rows (U6):
   op records grow until those land.
 - Advertisement of the helper digest and execution profile with the feature
@@ -151,3 +239,14 @@ without this code.
 - The lane counts an exec as running until its end is observed or its
   deadline passes, so an exec that finished without being read keeps one of
   the 16 running slots until then.
+- Composed-candidate qualification: the backend tests that use the unix-socket
+  fake engine (`pkg/sandboxbackend/gvisor_test.go` `newHost`) were not run by
+  this lane, which executes no listeners. They include the `RunHelper`
+  classification and the create-path sandbox tests. Their fake engine also
+  reports one PID for every scripted container (R23-BE-OBS-02). Owner-boundary
+  assertions added here run without a listener.
+- No live runtime evidence exists for any of these changes: no privileged
+  backend proof, no lab run, no real engine answer to the D1 stat, and no
+  gVisor behaviour beyond the source reading in the hardening note. The pending
+  cancel is held in memory: a restart loses it, and the startup Recover ends
+  the lease and destroys its sandbox, so the exec ends with it.

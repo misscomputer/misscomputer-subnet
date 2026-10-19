@@ -13,11 +13,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -31,7 +33,9 @@ import (
 // carries one read-only directory mount of the pinned helper at
 // /.misscomputer, and RunHelper runs that helper with docker exec. With ops
 // disabled (the default) the create body and its readback are byte-identical
-// to a backend without this file.
+// to a backend without this file. EnableOps refuses while the helper mount
+// cannot carry every property the contract requires (XA-09,
+// docs/sandbox-ops-backend-hardening.md).
 
 // OpsHelper pins the helper delivery directory: a root-owned 0555 directory
 // holding exactly sandboxops.HelperName, a root-owned 0555 regular file whose
@@ -58,11 +62,37 @@ const (
 
 var _ miner.SandboxOpsBackend = (*GVisor)(nil)
 
+// helperMountRequired are the mount properties the contract's delivery
+// requires of the helper mount inside the sandbox (docs/sandbox-ops-v1.md,
+// In-sandbox helper). helperMountProven are the ones this backend both
+// requests of the engine and reads back (helperMount, verifyHelperMount):
+// an Engine API v1.47 bind mount carries ReadOnly and BindOptions.Propagation,
+// and its readback shows RW and Propagation. Nothing in either names nosuid
+// or nodev, dockerd hands runsc only rbind, ro and the propagation for a
+// bind, and the pinned runsc ignores a nodev option. A readback that does
+// not name a property proves nothing about it.
+var (
+	helperMountRequired = []string{"ro", "nosuid", "nodev", "rprivate"}
+	helperMountProven   = map[string]bool{"ro": true, "rprivate": true}
+)
+
 // EnableOps turns on the ops mode with the pinned helper. It verifies the pin
-// now and again before every create. It must run before any Create.
+// now and again before every create. It must run before any Create. It fails
+// closed, before reading the helper, while a property the contract requires
+// of the helper mount is not requested and read back (XA-09).
 func (b *GVisor) EnableOps(helper OpsHelper) error {
 	if !filepath.IsAbs(helper.Dir) || filepath.Clean(helper.Dir) != helper.Dir || helper.Dir == "/" || !sha256Pattern.MatchString(helper.SHA256) {
 		return errors.New("ops helper directory must be a clean absolute path pinned by a lowercase SHA-256")
+	}
+	var unproven []string
+	for _, property := range helperMountRequired {
+		if !helperMountProven[property] {
+			unproven = append(unproven, property)
+		}
+	}
+	if len(unproven) != 0 {
+		return fmt.Errorf("sandbox ops stay off: the contract requires a %s helper mount, which the engine can neither request nor read back (XA-09)",
+			strings.Join(unproven, ", "))
 	}
 	if err := verifyHelper(helper); err != nil {
 		return err
@@ -75,31 +105,55 @@ func (b *GVisor) EnableOps(helper OpsHelper) error {
 // are root-owned and not group- or other-writable, the directory holds only
 // the helper, and the helper, opened without following a symlink, is a
 // root-owned regular file of mode exactly 0555 with the pinned digest.
+// The directory is opened first, without following a symlink, and the
+// checks of the directory, its entries and the helper are made on that
+// descriptor and on the helper opened from it. Neither the opened directory
+// nor the opened helper may carry an extended attribute, such as a file
+// capability or an access ACL, and a descriptor whose attributes cannot be
+// listed fails the pin (G1, MSR-03). The pin holds at the moment it is
+// checked; it does not stop a privileged host process from changing the
+// files afterwards, and it says nothing about what a guest observes.
 func verifyHelper(helper OpsHelper) error {
-	for dir := helper.Dir; ; dir = filepath.Dir(dir) {
+	dirFD, err := unix.Open(helper.Dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("ops helper directory %s: %w", helper.Dir, err)
+	}
+	dir := os.NewFile(uintptr(dirFD), helper.Dir)
+	defer dir.Close()
+	var opened unix.Stat_t
+	if err := unix.Fstat(dirFD, &opened); err != nil {
+		return fmt.Errorf("ops helper directory %s: %w", helper.Dir, err)
+	}
+	for path := helper.Dir; ; path = filepath.Dir(path) {
 		var st unix.Stat_t
-		if err := unix.Lstat(dir, &st); err != nil {
-			return fmt.Errorf("ops helper directory %s: %w", dir, err)
+		if err := unix.Lstat(path, &st); err != nil {
+			return fmt.Errorf("ops helper directory %s: %w", path, err)
 		}
 		if st.Mode&unix.S_IFMT != unix.S_IFDIR || st.Uid != 0 || st.Mode&0o022 != 0 {
-			return fmt.Errorf("ops helper ancestor %s must be a root-owned directory that is not group- or other-writable", dir)
+			return fmt.Errorf("ops helper ancestor %s must be a root-owned directory that is not group- or other-writable", path)
 		}
-		if dir == helper.Dir && st.Mode&0o7777 != 0o555 {
-			return fmt.Errorf("ops helper directory %s must have mode 0555", dir)
+		if path == helper.Dir && (st.Dev != opened.Dev || st.Ino != opened.Ino) {
+			return fmt.Errorf("ops helper directory %s changed while it was checked", path)
 		}
-		if dir == "/" {
+		if path == "/" {
 			break
 		}
 	}
-	entries, err := os.ReadDir(helper.Dir)
+	if opened.Mode&unix.S_IFMT != unix.S_IFDIR || opened.Uid != 0 || opened.Mode&0o7777 != 0o555 {
+		return fmt.Errorf("ops helper directory %s must have mode 0555", helper.Dir)
+	}
+	if err := noExtendedAttributes(dirFD); err != nil {
+		return fmt.Errorf("ops helper directory %s: %w", helper.Dir, err)
+	}
+	names, err := dir.Readdirnames(-1)
 	if err != nil {
 		return fmt.Errorf("ops helper directory: %w", err)
 	}
-	if len(entries) != 1 || entries[0].Name() != sandboxops.HelperName {
+	if len(names) != 1 || names[0] != sandboxops.HelperName {
 		return fmt.Errorf("ops helper directory %s must hold only %s", helper.Dir, sandboxops.HelperName)
 	}
 	path := filepath.Join(helper.Dir, sandboxops.HelperName)
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(dirFD, sandboxops.HelperName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open ops helper: %w", err)
 	}
@@ -112,6 +166,9 @@ func verifyHelper(helper OpsHelper) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Uid != 0 || st.Mode&0o7777 != 0o555 {
 		return errors.New("ops helper must be a root-owned regular file with mode exactly 0555")
 	}
+	if err := noExtendedAttributes(fd); err != nil {
+		return fmt.Errorf("ops helper %s: %w", path, err)
+	}
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return err
@@ -120,6 +177,136 @@ func verifyHelper(helper OpsHelper) error {
 		return errors.New("ops helper does not match its pinned SHA-256")
 	}
 	return nil
+}
+
+// noExtendedAttributes requires the extended-attribute list of the open file
+// fd to be empty: one listxattr call that answers a size of zero. Any other
+// answer fails, including a filesystem that cannot list attributes, since
+// then their absence is not shown. The list holds every namespace the
+// caller may see (security, system and user; trusted only with
+// CAP_SYS_ADMIN), so a host whose security module labels files through
+// extended attributes cannot hold a pinned helper.
+func noExtendedAttributes(fd int) error {
+	size, err := unix.Flistxattr(fd, nil)
+	if err != nil {
+		return fmt.Errorf("cannot show it has no extended attributes: %w", err)
+	}
+	if size != 0 {
+		return errors.New("has extended attributes; the pin allows none")
+	}
+	return nil
+}
+
+// imageProbeSuffix names the image probe container after the sandbox it is
+// made for, so a probe whose create went unanswered can still be removed by
+// name, and one left behind is found by the next probe's create. The probe
+// carries the sandbox labels and the lease label. The lane's orphan sweep
+// recognises it by that name and label, and destroys it only while no Create
+// of its lease holds the lease lock (miner.SandboxProbeSuffix).
+const imageProbeSuffix = miner.SandboxProbeSuffix
+
+// imageConflict is the ops-mode check, before the sandbox is created, that
+// the verified image holds nothing at the helper's mount target (D1; DEC-06,
+// R23-H-01, DR-06, MSR-01). The engine follows a symlink there when it
+// mounts the helper, and an image entry can be re-pointed by the guest once
+// it is not a mount point, so the mount is made only over a path the image
+// does not hold. It creates, and never starts, a container of imageID from
+// the create body of s without the helper mount, and asks the engine's
+// archive stat for sandboxops.MountTarget. The archive stat does not follow
+// a final symlink, and with no mount in the probe it sees the image's own
+// layers. The probe is then removed with its anonymous volumes, under
+// removalTimeout even if ctx was cancelled.
+//
+// It returns nil only when the stat answered 404 and a fresh inspection
+// shows the same probe still exists and never started: a 404 also answers a
+// container that is gone. Any entry, whatever its type, is a
+// *miner.SandboxRefusal image_unavailable: the customer chose the image,
+// and it is refused on every honest miner alike. So is a stat the engine
+// answered with another error, once the probe is shown never started; the
+// engine may fail to stat an image whose layers it cannot mount, which
+// would also have failed the start (contract D23). Everything else is
+// returned as the miner's fault, as the sandbox create's own failures are:
+// a call the engine did not answer, a probe that vanished or started, a
+// probe create the engine refused, and any probe that could not be
+// removed, even after a conflict was found. missing reports that the engine
+// no longer has imageID; the caller pulls it again.
+func (b *GVisor) imageConflict(ctx context.Context, instanceID, imageID string, s spec) (missing bool, err error) {
+	s.helper = nil
+	name := instanceID + imageProbeSuffix
+	create := func() (string, error) {
+		var created struct {
+			ID string `json:"Id"`
+		}
+		err := b.engine.call(ctx, http.MethodPost, "/containers/create", url.Values{"name": {name}, "platform": {"linux/amd64"}}, b.createBody(s, imageID), &created)
+		return created.ID, err
+	}
+	id, err := create()
+	if engineStatus(err) == http.StatusConflict {
+		// An earlier probe of this sandbox was left behind.
+		if err := b.removeProbe(ctx, name); err != nil {
+			return false, fmt.Errorf("sandbox %s image probe %s left behind: %w", instanceID, name, err)
+		}
+		id, err = create()
+	}
+	switch {
+	case engineStatus(err) == http.StatusNotFound:
+		return true, nil
+	case err != nil:
+		return false, errors.Join(fmt.Errorf("sandbox %s image probe: %w", instanceID, err), b.removeProbe(ctx, name))
+	case id == "":
+		return false, errors.Join(fmt.Errorf("sandbox %s image probe was created without an ID", instanceID), b.removeProbe(ctx, name))
+	}
+	verdict := b.probeVerdict(ctx, id)
+	if err := b.removeProbe(ctx, id); err != nil {
+		return false, fmt.Errorf("sandbox %s image probe %s (%s) not removed after %v: %w", instanceID, name, id, verdictText(verdict), err)
+	}
+	slog.Info("sandbox image probe", "sandbox", instanceID, "probe_id", id, "target", sandboxops.MountTarget, "decision", verdictText(verdict))
+	return false, verdict
+}
+
+// probeVerdict asks the engine's archive stat for the helper target in the
+// probe container id and decides as imageConflict describes, before the
+// probe is removed.
+func (b *GVisor) probeVerdict(ctx context.Context, id string) error {
+	statErr := b.engine.call(ctx, http.MethodHead, "/containers/"+url.PathEscape(id)+"/archive", url.Values{"path": {sandboxops.MountTarget}}, nil, nil)
+	status := engineStatus(statErr)
+	switch {
+	case statErr == nil:
+		return &miner.SandboxRefusal{Code: "image_unavailable"}
+	case status == 0:
+		return fmt.Errorf("image probe %s archive stat: %w", id, statErr)
+	}
+	again, found, err := b.inspect(ctx, id)
+	switch {
+	case err != nil:
+		return fmt.Errorf("image probe %s after its archive stat: %w", id, err)
+	case !found || again.ID != id:
+		return fmt.Errorf("image probe %s vanished during its archive stat", id)
+	case !neverStarted(again):
+		return fmt.Errorf("image probe %s was started", id)
+	case status == http.StatusNotFound:
+		return nil
+	}
+	return &miner.SandboxRefusal{Code: "image_unavailable"}
+}
+
+// verdictText is how a probe verdict is logged.
+func verdictText(verdict error) string {
+	var refusal *miner.SandboxRefusal
+	switch {
+	case verdict == nil:
+		return "absent"
+	case errors.As(verdict, &refusal):
+		return "refused: " + refusal.Code
+	}
+	return "fault: " + verdict.Error()
+}
+
+// removeProbe removes the probe container (an ID or the probe's name) and its
+// anonymous volumes, and waits until the engine no longer reports it. It
+// runs even when ctx was cancelled, bounded by removalTimeout.
+func (b *GVisor) removeProbe(ctx context.Context, probe string) error {
+	return b.removeContainer(context.WithoutCancel(ctx), probe)
 }
 
 // helperMount is the one mount an ops-mode sandbox has (B-1).

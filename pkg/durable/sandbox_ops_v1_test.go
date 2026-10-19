@@ -588,3 +588,92 @@ func TestSandboxOpReplayPastLeaseExpiryAnswersLeaseState(t *testing.T) {
 		t.Fatalf("replay at lease expiry %+v %v", replay, err)
 	}
 }
+
+// On an agent that runs ops a renewal is decided inside its own transaction
+// on the ops high-water clock, the clock exec lookups decide on: an applied
+// renewal reports that decision time, and once a decision has reached the
+// lease expiry a renewal is not applied, even with the wall clock stepped
+// back before that expiry. The lease lane's own Renew still decides at the
+// time its caller passes (ops off).
+func TestSandboxRenewalDecidesOnTheOpsHighWaterClock(t *testing.T) {
+	f := newOpsFixture(t)
+	ctx := context.Background()
+	leaseID := protocol.SandboxLeaseIDV1(f.lease)
+	expiry := sandboxT0.Add(10 * time.Minute)
+	decided := expiry.Add(-time.Second)
+	f.clock.set(decided)
+	renewed := expiry.Add(5 * time.Minute)
+	outcome, err := f.ops.RenewLease(ctx, f.parties.renewal(t, f.lease, 1, decided, renewed))
+	wantStage(t, outcome, err, sandbox.StageReady, "")
+	if outcome.RenewalSeq != 1 || !outcome.ObservedAt.Equal(decided) {
+		t.Fatalf("renewal before expiry: seq %d observed %v, want 1 at %v", outcome.RenewalSeq, outcome.ObservedAt, decided)
+	}
+	// A decision past the renewed expiry raises the high-water time.
+	past := renewed.Add(time.Second)
+	f.clock.set(past)
+	if decision, err := f.ops.AdmitOp(ctx, f.op(t, sandbox.OpFileStat, 1, past, nil)); err != nil || decision.Unavailable == nil {
+		t.Fatalf("decision past the renewed expiry %+v %v", decision, err)
+	}
+	stepped := renewed.Add(-10 * time.Second)
+	f.clock.set(stepped)
+	late := f.parties.renewal(t, f.lease, 2, stepped, renewed.Add(5*time.Minute))
+	outcome, err = f.ops.RenewLease(ctx, late)
+	wantStage(t, outcome, err, sandbox.StageExpired, "")
+	if outcome.RenewalSeq != 1 || outcome.ObservedAt.Before(past) {
+		t.Fatalf("renewal after a backward step: seq %d observed %v, want 1 at or after %v", outcome.RenewalSeq, outcome.ObservedAt, past)
+	}
+	if record, _, err := f.leases.Lease(ctx, leaseID); err != nil || !record.LeaseExpiresAt.Equal(renewed) || record.RenewalSeq != 1 {
+		t.Fatalf("lease after a late renewal %+v %v", record, err)
+	}
+	outcome, err = f.leases.Renew(ctx, late, stepped)
+	wantStage(t, outcome, err, sandbox.StageReady, "")
+	if outcome.RenewalSeq != 2 {
+		t.Fatalf("lease lane renewal at its caller's time: seq %d", outcome.RenewalSeq)
+	}
+}
+
+// The end of an admitted exec is recorded only while the exec is still
+// admitted: a start that recorded it running first keeps it running, and the
+// refusal writes nothing. An unknown exec and a state other than cancelled or
+// timed_out are errors.
+func TestSandboxAdmittedExecEndAppliesOnlyWhileAdmitted(t *testing.T) {
+	f := newOpsFixture(t)
+	ctx := context.Background()
+	at := f.clock.read()
+	first := f.op(t, sandbox.OpExecStart, 1, at, nil)
+	if decision, err := f.ops.AdmitOp(ctx, first); err != nil || !decision.Start {
+		t.Fatalf("first admission %+v %v", decision, err)
+	}
+	firstID := protocol.SandboxOpIDV1(first)
+	if err := f.ops.RecordExecState(ctx, firstID, sandbox.ExecStateRunning, nil); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := f.ops.RecordAdmittedExecEnd(ctx, firstID, sandbox.ExecStateCancelled); err != nil || applied {
+		t.Fatalf("end of a running exec applied=%v err=%v, want refused without a write", applied, err)
+	}
+	if lookup, _, err := f.ops.ExecState(ctx, firstID); err != nil || lookup.State != sandbox.ExecStateRunning {
+		t.Fatalf("running exec after the refused end: %+v %v", lookup, err)
+	}
+	second := f.op(t, sandbox.OpExecStart, 2, at, nil)
+	if decision, err := f.ops.AdmitOp(ctx, second); err != nil || !decision.Start {
+		t.Fatalf("second admission %+v %v", decision, err)
+	}
+	secondID := protocol.SandboxOpIDV1(second)
+	if applied, err := f.ops.RecordAdmittedExecEnd(ctx, secondID, sandbox.ExecStateTimedOut); err != nil || !applied {
+		t.Fatalf("end of an admitted exec applied=%v err=%v", applied, err)
+	}
+	if applied, err := f.ops.RecordAdmittedExecEnd(ctx, secondID, sandbox.ExecStateCancelled); err != nil || applied {
+		t.Fatalf("second end of the same exec applied=%v err=%v", applied, err)
+	}
+	if lookup, _, err := f.ops.ExecState(ctx, secondID); err != nil || lookup.State != sandbox.ExecStateTimedOut {
+		t.Fatalf("ended exec %+v %v, want timed_out", lookup, err)
+	}
+	if _, err := f.ops.RecordAdmittedExecEnd(ctx, secondID, sandbox.ExecStateFailed); err == nil {
+		t.Fatal("a failed end was accepted by the admitted-only record")
+	}
+	if _, err := f.ops.RecordAdmittedExecEnd(ctx, leaseIDOf(f)+"-op-"+nonce(99), sandbox.ExecStateCancelled); err == nil {
+		t.Fatal("an unknown exec was accepted")
+	}
+}
+
+func leaseIDOf(f *opsFixture) string { return protocol.SandboxLeaseIDV1(f.lease) }

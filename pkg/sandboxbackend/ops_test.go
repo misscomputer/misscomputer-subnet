@@ -37,6 +37,27 @@ type fakeOpsEngine struct {
 
 func (e *fakeEngine) serveOps(w http.ResponseWriter, r *http.Request) bool {
 	o, p := e.ops, r.URL.Path
+	// The ops-mode image probe (D1) addresses its container by the ID the
+	// create answered, which the engine accepts wherever it accepts a name,
+	// and stats the helper target, which no fake image holds.
+	if id, tail, ok := strings.Cut(strings.TrimPrefix(p, "/containers/"), "/"); strings.HasPrefix(p, "/containers/") && (ok || r.Method == http.MethodDelete) {
+		if !ok {
+			id, tail = strings.TrimPrefix(p, "/containers/"), ""
+		}
+		if r.Method == http.MethodHead && tail == "archive" {
+			reply(w, 404, map[string]string{"message": "Could not find the file " + r.URL.Query().Get("path") + " in container " + id})
+			return true
+		}
+		for name := range e.containers {
+			if containerIDOf(name) == id {
+				r.URL.Path = strings.TrimSuffix("/containers/"+name+"/"+tail, "/")
+				e.mu.Unlock()
+				defer e.mu.Lock()
+				e.serve(w, r)
+				return true
+			}
+		}
+	}
 	switch {
 	case r.Method == http.MethodGet && p == "/_ping":
 		if o == nil || o.pingDown {
@@ -145,6 +166,82 @@ func pinnedHelper(t *testing.T, content string) OpsHelper {
 	return helper
 }
 
+// opsMode puts b in ops mode with a verified pin, as EnableOps will once the
+// helper mount carries every property the contract requires; until then
+// EnableOps refuses (XA-09), so these tests set the mode the same way the
+// pin test below does.
+func opsMode(t *testing.T, b *GVisor, helper OpsHelper) {
+	t.Helper()
+	if err := verifyHelper(helper); err != nil {
+		t.Fatal(err)
+	}
+	b.opsHelper = &helper
+}
+
+// XA-09: the contract requires a nosuid, nodev helper mount, which the
+// engine can neither request nor read back, so EnableOps fails closed, and
+// does so before it reads the helper: the refusal names the missing
+// properties, not the helper directory.
+func TestEnableOpsFailsClosedWhileTheHelperMountIsUnproven(t *testing.T) {
+	b := &GVisor{}
+	err := b.EnableOps(OpsHelper{Dir: "/nonexistent/ops-helper", SHA256: digestOf("helper binary")})
+	if err == nil || !strings.Contains(err.Error(), "nosuid, nodev") {
+		t.Fatalf("EnableOps = %v, want the refusal naming nosuid and nodev", err)
+	}
+	if b.opsHelper != nil {
+		t.Fatal("ops mode was enabled")
+	}
+}
+
+// The ops-mode readback accepts exactly the pinned read-only rprivate bind,
+// as both the requested mount and the container's one mount; the rest of
+// the engine configuration is verifyEngine's.
+func TestHelperMountReadbackIsExactlyThePinnedMount(t *testing.T) {
+	helper := &OpsHelper{Dir: "/srv/mc-ops-helper", SHA256: digestOf("helper binary")}
+	readback := func(change func(requested, mounted map[string]any) []any) inspectedContainer {
+		requested := map[string]any{"Type": "bind", "Source": helper.Dir, "Target": "/.misscomputer", "ReadOnly": true,
+			"BindOptions": map[string]any{"Propagation": "rprivate"}}
+		mounted := map[string]any{"Type": "bind", "Source": helper.Dir, "Destination": "/.misscomputer", "Mode": "", "RW": false,
+			"Propagation": "rprivate"}
+		mounts := []any{mounted}
+		if change != nil {
+			if extra := change(requested, mounted); extra != nil {
+				mounts = extra
+			}
+		}
+		raw, err := json.Marshal(map[string]any{"Name": "/sandbox", "HostConfig": map[string]any{"Mounts": []any{requested}}, "Mounts": mounts})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c inspectedContainer
+		if err := json.Unmarshal(raw, &c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	if err := verifyHelperMount(readback(nil), helper); err != nil {
+		t.Fatalf("the pinned mount was refused: %v", err)
+	}
+	for name, change := range map[string]func(requested, mounted map[string]any) []any{
+		"writable":                  func(_, m map[string]any) []any { m["RW"] = true; return nil },
+		"other source":              func(_, m map[string]any) []any { m["Source"] = "/srv/other"; return nil },
+		"other destination":         func(_, m map[string]any) []any { m["Destination"] = "/"; return nil },
+		"shared":                    func(_, m map[string]any) []any { m["Propagation"] = "rshared"; return nil },
+		"volume":                    func(_, m map[string]any) []any { m["Type"] = "volume"; return nil },
+		"requested writable":        func(r, _ map[string]any) []any { r["ReadOnly"] = false; return nil },
+		"requested without options": func(r, _ map[string]any) []any { delete(r, "BindOptions"); return nil },
+		"requested elsewhere":       func(r, _ map[string]any) []any { r["Target"] = "/usr/bin"; return nil },
+		"no mount":                  func(_, _ map[string]any) []any { return []any{} },
+		"a second mount": func(_, m map[string]any) []any {
+			return []any{m, map[string]any{"Type": "bind", "Source": "/", "Destination": "/host", "RW": false, "Propagation": "rprivate"}}
+		},
+	} {
+		if err := verifyHelperMount(readback(change), helper); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
 // mountAsAsked makes the engine apply the requested helper mount the way
 // dockerd reports it, then lets change alter it.
 func mountAsAsked(change func(map[string]any)) func(*engineContainer) {
@@ -178,34 +275,29 @@ func TestOpsModeMountsOnlyThePinnedHelperDirectory(t *testing.T) {
 	h := newHost(t)
 	h.engine.applied = mountAsAsked(nil)
 	b := h.backend()
-	if err := b.EnableOps(helper); err != nil {
-		t.Fatal(err)
-	}
+	opsMode(t, b, helper)
 	if err := b.Create(context.Background(), instanceOf(testLease(nil)), testLease(nil)); err != nil {
 		t.Fatal(err)
 	}
-	mounts := h.engine.created[0]["HostConfig"].(map[string]any)["Mounts"].([]any)
+	// The first create is the image probe (D1, ops_defenses_test.go), which
+	// carries no mount and is removed again.
+	if len(h.engine.created) != 2 || h.engine.created[0]["HostConfig"].(map[string]any)["Mounts"] != nil || len(h.engine.containers) != 1 {
+		t.Fatalf("ops creates = %v, containers left %d", h.engine.created, len(h.engine.containers))
+	}
+	mounts := h.engine.created[1]["HostConfig"].(map[string]any)["Mounts"].([]any)
 	want := map[string]any{"Type": "bind", "Source": helper.Dir, "Target": "/.misscomputer", "ReadOnly": true, "BindOptions": map[string]any{"Propagation": "rprivate"}}
 	if len(mounts) != 1 || fmt.Sprint(mounts[0]) != fmt.Sprint(want) {
 		t.Fatalf("ops create mounts = %v", mounts)
 	}
 
-	for name, change := range map[string]func(map[string]any){
-		"writable":     func(m map[string]any) { m["RW"] = true },
-		"other source": func(m map[string]any) { m["Source"] = "/srv/other" },
-		"shared":       func(m map[string]any) { m["Propagation"] = "rshared" },
-	} {
-		t.Run(name, func(t *testing.T) {
-			h := newHost(t)
-			h.engine.applied = mountAsAsked(change)
-			b := h.backend()
-			if err := b.EnableOps(helper); err != nil {
-				t.Fatal(err)
-			}
-			if err := b.Create(context.Background(), instanceOf(testLease(nil)), testLease(nil)); err == nil || h.engine.starts != 0 {
-				t.Fatalf("misapplied helper mount: err=%v starts=%d", err, h.engine.starts)
-			}
-		})
+	// A readback that differs from the pinned mount stops the create before
+	// the start (each difference: TestHelperMountReadbackIsExactlyThePinnedMount).
+	h = newHost(t)
+	h.engine.applied = mountAsAsked(func(m map[string]any) { m["RW"] = true })
+	b = h.backend()
+	opsMode(t, b, helper)
+	if err := b.Create(context.Background(), instanceOf(testLease(nil)), testLease(nil)); err == nil || h.engine.starts != 0 {
+		t.Fatalf("misapplied helper mount: err=%v starts=%d", err, h.engine.starts)
 	}
 }
 
@@ -263,9 +355,7 @@ func TestRunHelperExecsTheFixedHelperAndClassifiesFailures(t *testing.T) {
 	h := newHost(t)
 	h.engine.applied = mountAsAsked(nil)
 	b := h.backend()
-	if err := b.EnableOps(helper); err != nil {
-		t.Fatal(err)
-	}
+	opsMode(t, b, helper)
 	lease := testLease(nil)
 	instance := instanceOf(lease)
 	if err := b.Create(context.Background(), instance, lease); err != nil {

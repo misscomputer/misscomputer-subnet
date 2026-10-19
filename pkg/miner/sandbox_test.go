@@ -1125,3 +1125,59 @@ func TestSandboxReleaseRacingCloseNeverEndsInABareCancellation(t *testing.T) {
 	}
 	t.Logf("outcomes %v", outcomes)
 }
+
+// The image probe an ops-mode create makes is a container under the sandbox's
+// labels, named after its instance with the probe suffix (pkg/sandboxbackend,
+// imageProbeSuffix). It exists while the create that made it holds the lease
+// lock, so an orphan sweep must not destroy it then; once the lease is idle,
+// a probe left behind is an orphan like any other.
+func TestSandboxSweepKeepsTheImageProbeOfAnActiveCreate(t *testing.T) {
+	f := newSBFixture(t)
+	ctx := context.Background()
+	f.backend.createGate = make(chan struct{})
+	r := f.reservation(1)
+	receipt, err := f.lane.Reserve(ctx, r, f.request())
+	f.check(receipt, err, protocol.SandboxReservationSchema, r, sandbox.StageHeld, "")
+	l := f.lease(r, nil)
+	leaseID := protocol.SandboxLeaseIDV1(l)
+	probe := SandboxInstanceName(leaseID) + "-image-probe"
+	has := func(name string) bool {
+		f.backend.mu.Lock()
+		defer f.backend.mu.Unlock()
+		return f.backend.live[name]
+	}
+	type result struct {
+		receipt protocol.SandboxReceiptV1
+		err     error
+	}
+	committed := make(chan result, 1)
+	go func() {
+		receipt, err := f.lane.Commit(ctx, l, f.request())
+		committed <- result{receipt, err}
+	}()
+	waitLease(t, f, leaseID, "pending")
+	// The probe as the engine lists it during the create: the lease's label,
+	// under the probe's own name.
+	f.backend.adopt(SandboxInstance{Name: probe, LeaseID: leaseID})
+	if err := f.lane.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !has(probe) {
+		t.Fatal("the sweep destroyed the image probe of a create still in progress")
+	}
+	close(f.backend.createGate)
+	got := <-committed
+	f.check(got.receipt, got.err, protocol.SandboxLeaseSchema, l, sandbox.StageReady, "")
+	// The lease is idle now: a probe still listed for it is leftover and goes,
+	// and the running sandbox of the lease stays.
+	f.backend.adopt(SandboxInstance{Name: probe, LeaseID: leaseID})
+	if err := f.lane.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if has(probe) {
+		t.Fatal("a leftover probe of an idle lease survived the sweep")
+	}
+	if !has(SandboxInstanceName(leaseID)) {
+		t.Fatal("the running sandbox of the lease was destroyed with its probe")
+	}
+}

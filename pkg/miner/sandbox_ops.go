@@ -137,7 +137,20 @@ type opExec struct {
 	observed sandboxops.ExecObservation
 	exitCode *int
 	endedAt  time.Time
-	timer    *time.Timer
+	// deadlineTimer runs the kill path at the exec deadline (armDeadline);
+	// resolveTimer runs a resolution (armResolve). They are separate so a
+	// resolution never displaces the deadline.
+	deadlineTimer *time.Timer
+	resolveTimer  *time.Timer
+	// killTrigger is the trigger of the first kill path that signalled the
+	// exec through the helper.
+	killTrigger string
+	// cancelPending is set, and never cleared, once a tenant's exec_cancel
+	// reached the kill path, before its first durable read. Until the exec
+	// is terminal, retries, start owners and resolutions act on that cancel
+	// (killPath). It lives in memory only: a restart loses it, and Recover
+	// ends every lease and destroys its sandbox, so the exec ends with it.
+	cancelPending bool
 	// owned is set once a start owner was launched for this exec, or once
 	// the lane decided no owner ever will (an orphaned admission).
 	owned bool
@@ -657,10 +670,10 @@ func (l *SandboxLane) launchStart(ops *sandboxOps, opID string, exec *opExec, ad
 		return
 	}
 	exec.owned, exec.admittedAt = true, admittedAt
-	if exec.timer != nil {
+	if exec.resolveTimer != nil {
 		// A resolution armed for a failed admission is moot: this owner
 		// takes the exec.
-		exec.timer.Stop()
+		exec.resolveTimer.Stop()
 	}
 	exec.mu.Unlock()
 	if work, done, err := l.track(l.base); err == nil {
@@ -675,6 +688,12 @@ func (e *opExec) isOwned() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.owned
+}
+
+func (e *opExec) cancelRequested() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cancelPending
 }
 
 // execState reads an exec's durable state, retrying a D_state expiry while
@@ -707,21 +726,25 @@ func (l *SandboxLane) execState(ctx context.Context, ops *sandboxOps, opID strin
 //   - admitted and no start owner took it: a replay may still adopt it
 //     until the window closes; then it ends failed, never started;
 //   - admitted with an owner that could not read or record (nothing was
-//     started, or what started was killed by identity): it ends failed;
-//   - running: the deadline is armed;
-//   - terminal, or the lease no longer runs ops: nothing (teardown).
+//     started, or what started was killed by identity): it ends failed,
+//     or cancelled when a tenant's cancel is pending;
+//   - running: the deadline is armed; at a lease that has just reached its
+//     expiry (leaseExpiring) that is the kill path at once;
+//   - terminal, or the lease no longer runs ops for another reason: nothing
+//     (teardown).
 //
-// One timer per exec; each try runs once per D_state at most.
+// One resolution timer per exec, separate from its deadline timer, which it
+// never stops; each try runs once per D_state at most.
 func (l *SandboxLane) armResolve(ops *sandboxOps, opID string, exec *opExec, delay time.Duration) {
 	if l.base.Err() != nil {
 		return
 	}
 	exec.mu.Lock()
 	defer exec.mu.Unlock()
-	if exec.timer != nil {
-		exec.timer.Stop()
+	if exec.resolveTimer != nil {
+		exec.resolveTimer.Stop()
 	}
-	exec.timer = time.AfterFunc(max(delay, 0), func() {
+	exec.resolveTimer = time.AfterFunc(max(delay, 0), func() {
 		work, done, err := l.track(l.base)
 		if err != nil {
 			return
@@ -746,7 +769,7 @@ func (l *SandboxLane) armResolve(ops *sandboxOps, opID string, exec *opExec, del
 			}
 			ops.mu.Unlock()
 			return
-		case lookup.Unavailable != nil || execTerminal[lookup.State]:
+		case lookup.Unavailable != nil && !leaseExpiring(lookup) || execTerminal[lookup.State]:
 			return
 		case lookup.State == "admitted":
 			exec.mu.Lock()
@@ -762,7 +785,11 @@ func (l *SandboxLane) armResolve(ops *sandboxOps, opID string, exec *opExec, del
 			case !gaveUp:
 				// A start owner is at work and records the outcome itself.
 			default:
-				if _, err := l.recordExec(work, ops, opID, exec, sandbox.ExecStateFailed, failure(sandbox.OpCodeSandboxFailed)); err != nil {
+				state, code := sandbox.ExecStateFailed, failure(sandbox.OpCodeSandboxFailed)
+				if exec.cancelRequested() {
+					state, code = sandbox.ExecStateCancelled, nil
+				}
+				if _, err := l.recordExec(work, ops, opID, exec, state, code); err != nil {
 					l.armResolve(ops, opID, exec, ops.config.StateTimeout)
 				}
 			}
@@ -794,6 +821,12 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 		return
 	}
 	if !lookup.Found || lookup.Unavailable != nil || lookup.State != "admitted" {
+		return
+	}
+	if exec.cancelRequested() {
+		// A tenant cancelled the exec before its start: it is never started;
+		// the kill path records it cancelled.
+		l.killPath(ctx, ops, opID, exec, sandbox.ExecStateCancelled)
 		return
 	}
 	deadline := exec.deadline(leaseExpiry)
@@ -858,6 +891,12 @@ func (l *SandboxLane) startOwner(ctx context.Context, ops *sandboxOps, opID stri
 		l.recordExec(ctx, ops, opID, exec, state, nil)
 		return
 	}
+	if exec.cancelRequested() {
+		// The start was already under way when a tenant cancelled: end it
+		// now, not at its deadline.
+		l.killPath(ctx, ops, opID, exec, sandbox.ExecStateCancelled)
+		return
+	}
 	l.armDeadline(ops, opID, exec, deadline.Sub(lookup.DecidedAt))
 }
 
@@ -870,6 +909,29 @@ func (l *SandboxLane) recordFailed(ctx context.Context, ops *sandboxOps, opID st
 }
 
 func failure(code string) *string { return &code }
+
+// stopTimers stops the exec's deadline and resolution timers; the caller
+// holds e.mu.
+func (e *opExec) stopTimers() {
+	for _, timer := range []*time.Timer{e.deadlineTimer, e.resolveTimer} {
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+}
+
+// endState is the terminal state to record for an end the helper observed.
+// The helper turns every exec_cancel into SIGTERM to its supervisor, which
+// then reports cancelled, whoever asked. Once the lane's own deadline kill
+// signalled the exec, that end is the deadline's: timed_out.
+func (e *opExec) endState(observed string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if observed == sandbox.ExecStateCancelled && e.killTrigger == sandbox.ExecStateTimedOut {
+		return sandbox.ExecStateTimedOut
+	}
+	return observed
+}
 
 // deadline is min(admitted_at + timeout_ms, lease expiry) (R1).
 func (e *opExec) deadline(leaseExpiry time.Time) time.Time {
@@ -923,6 +985,39 @@ func (e *opExec) status(state string, admittedAt, observed time.Time) *sandbox.E
 	return status
 }
 
+// endAdmitted records the end of an exec that has not started, while it is
+// still admitted (durable RecordAdmittedExecEnd), retrying a D_state expiry
+// while the lane is open. It reports false, having written nothing, once the
+// exec's row moved on.
+func (l *SandboxLane) endAdmitted(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, state string) (bool, error) {
+	err := ErrSandboxLaneClosed
+	for attempt := 0; attempt < durableAttempts && l.base.Err() == nil; attempt++ {
+		stateCtx, cancel := ops.state(ctx)
+		var applied bool
+		applied, err = ops.store.RecordAdmittedExecEnd(stateCtx, opID, state)
+		cancel()
+		if err == nil {
+			if applied {
+				l.markEnded(exec)
+			}
+			return applied, nil
+		}
+		slog.Warn("sandbox exec state", "exec_id", opID, "state", state, "attempt", attempt+1, "error", err)
+	}
+	return false, err
+}
+
+// markEnded notes that an exec has ended: its end time is set once, and its
+// deadline and resolution timers stop.
+func (l *SandboxLane) markEnded(exec *opExec) {
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if exec.endedAt.IsZero() {
+		exec.endedAt = later(l.now().UTC(), exec.admittedAt)
+	}
+	exec.stopTimers()
+}
+
 // recordExec stores a transition and reports whether it was applied. A
 // transition the store refuses (the exec is already terminal) is not an
 // error: the first terminal state wins. Any other failure is retried while
@@ -945,28 +1040,26 @@ func (l *SandboxLane) recordExec(ctx context.Context, ops *sandboxOps, opID stri
 		return false, err
 	}
 	if state != sandbox.ExecStateRunning {
-		exec.mu.Lock()
-		if exec.endedAt.IsZero() {
-			exec.endedAt = later(l.now().UTC(), exec.admittedAt)
-		}
-		if exec.timer != nil {
-			exec.timer.Stop()
-		}
-		exec.mu.Unlock()
+		l.markEnded(exec)
 	}
 	return true, nil
 }
 
 // armDeadline schedules the kill path after delay, the time from a durable
 // decision to the exec deadline on the same clock. The wait itself is not
-// tracked; each kill step is.
+// tracked; each kill step is. While a tenant's cancel is pending the kill
+// path is that cancel: it runs after D_state at most, never at the exec's
+// deadline, and a renewal that moved the deadline does not re-arm it.
 func (l *SandboxLane) armDeadline(ops *sandboxOps, opID string, exec *opExec, delay time.Duration) {
 	exec.mu.Lock()
 	defer exec.mu.Unlock()
-	if exec.timer != nil {
-		exec.timer.Stop()
+	if exec.cancelPending {
+		delay = min(delay, ops.config.StateTimeout)
 	}
-	exec.timer = time.AfterFunc(max(delay, 0), func() {
+	if exec.deadlineTimer != nil {
+		exec.deadlineTimer.Stop()
+	}
+	exec.deadlineTimer = time.AfterFunc(max(delay, 0), func() {
 		work, done, err := l.track(l.base)
 		if err != nil {
 			return
@@ -989,7 +1082,7 @@ func (l *SandboxLane) armDeadline(ops *sandboxOps, opID string, exec *opExec, de
 		// A renewal may have moved the lease expiry; the deadline never
 		// passes admitted_at + timeout_ms. A lease past its expiry whose
 		// teardown has not begun is the lease-expiry deadline itself.
-		if next := exec.deadline(leaseExpiry); next.After(lookup.DecidedAt) {
+		if next := exec.deadline(leaseExpiry); next.After(lookup.DecidedAt) && !exec.cancelRequested() {
 			l.armDeadline(ops, opID, exec, next.Sub(lookup.DecidedAt))
 			return
 		}
@@ -1023,24 +1116,82 @@ var execTerminal = map[string]bool{sandbox.ExecStateExited: true, sandbox.ExecSt
 // forced cancel by ExecKillGrace. It acts only on execs of a live lease
 // (U3-L8-1), or of a lease that has just reached its expiry, whose deadline
 // it enforces (leaseExpiring).
+//
+// A deadline kill decides from its own read, the last one before the exec is
+// signalled, and re-arms instead when that read shows a later deadline.
+// Renewals decide on the same ops store clock, ordered against every read by
+// its single connection (SandboxOps.RenewLease): one ordered after a read
+// that found the deadline passed is decided past the expiry and not
+// applied. A helper-observed cancelled after the lane's own deadline cancel
+// is recorded timed_out (endState).
+//
+// A tenant's cancel sets the exec's pending cancel before its first read. A
+// kill path that begins while a cancel is pending is that cancel, whatever
+// its trigger, so a retry after a store failure (armDeadline) runs the
+// cancel, not the deadline, and records cancelled. A kill path that
+// signalled the exec first keeps its own cause (killTrigger).
 func (l *SandboxLane) killPath(ctx context.Context, ops *sandboxOps, opID string, exec *opExec, trigger string) {
+	exec.mu.Lock()
+	switch {
+	case trigger == sandbox.ExecStateCancelled:
+		exec.cancelPending = true
+	case exec.cancelPending:
+		trigger = sandbox.ExecStateCancelled
+	}
+	exec.mu.Unlock()
 	exec.kill.Lock()
 	defer exec.kill.Unlock()
-	lookup, _, err := l.execState(ctx, ops, opID)
+	lookup, leaseExpiry, err := l.execState(ctx, ops, opID)
 	if err != nil {
-		// The store did not answer: try the deadline again after D_state.
+		// The store did not answer: try again after D_state.
 		l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
 		return
 	}
 	if !lookup.Found || lookup.Unavailable != nil && !leaseExpiring(lookup) || execTerminal[lookup.State] {
 		return
 	}
-	if lookup.State == "admitted" {
-		// Not started yet: the start owner sees the terminal row and kills
-		// by identity if its start still succeeds (INT-OPS-02).
-		l.recordExec(ctx, ops, opID, exec, trigger, nil)
-		return
+	if trigger == sandbox.ExecStateTimedOut {
+		if next := exec.deadline(leaseExpiry); next.After(lookup.DecidedAt) {
+			l.armDeadline(ops, opID, exec, next.Sub(lookup.DecidedAt))
+			return
+		}
 	}
+	if lookup.State == "admitted" {
+		// Not started yet: the end is recorded only while the row is still
+		// admitted, so the start owner sees the terminal row and kills by
+		// identity if its start still succeeds (INT-OPS-02). A cancel that
+		// could not be recorded is tried again after D_state; until then no
+		// start owner starts the exec (startOwner).
+		applied, err := l.endAdmitted(ctx, ops, opID, exec, trigger)
+		switch {
+		case err != nil:
+			if trigger == sandbox.ExecStateCancelled {
+				l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
+			}
+			return
+		case applied:
+			return
+		}
+		// A start recorded the exec running first. It is running and signalled
+		// below like any other running exec, so read it again.
+		if lookup, leaseExpiry, err = l.execState(ctx, ops, opID); err != nil {
+			l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
+			return
+		}
+		if !lookup.Found || lookup.Unavailable != nil && !leaseExpiring(lookup) || execTerminal[lookup.State] {
+			return
+		}
+		if lookup.State == "admitted" {
+			// Refused, yet still admitted: not expected, tried again later.
+			l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
+			return
+		}
+	}
+	exec.mu.Lock()
+	if exec.killTrigger == "" {
+		exec.killTrigger = trigger
+	}
+	exec.mu.Unlock()
 	cancelRequest := sandboxops.Request{Op: sandbox.OpExecCancel, ExecID: &opID}
 	grace, endGrace := context.WithTimeout(ctx, sandbox.ExecKillGrace+ops.config.KillGrace)
 	ops.call(grace, exec.instance, cancelRequest)
@@ -1072,7 +1223,7 @@ func (l *SandboxLane) killPath(ctx context.Context, ops *sandboxOps, opID string
 		endForced()
 		observed = trigger
 	}
-	if _, err := l.recordExec(ctx, ops, opID, exec, observed, nil); err != nil {
+	if _, err := l.recordExec(ctx, ops, opID, exec, exec.endState(observed), nil); err != nil {
 		// The store stayed unavailable: try the kill path again later.
 		l.armDeadline(ops, opID, exec, ops.config.StateTimeout)
 	}
@@ -1221,7 +1372,7 @@ func (l *SandboxLane) execRead(ctx context.Context, ops *sandboxOps, r protocol.
 		}
 		exec.observe(*response.Exec)
 		if lookup.State == sandbox.ExecStateRunning && execTerminal[response.Exec.State] && response.Exec.State != sandbox.ExecStateFailed {
-			l.recordExec(ctx, ops, execID, exec, response.Exec.State, nil)
+			l.recordExec(ctx, ops, execID, exec, exec.endState(response.Exec.State), nil)
 		}
 		data = response.Bytes()
 	}
@@ -1260,9 +1411,7 @@ func (l *SandboxLane) forgetOps(leaseID string) {
 	for id, exec := range ops.execs {
 		if exec.leaseID == leaseID {
 			exec.mu.Lock()
-			if exec.timer != nil {
-				exec.timer.Stop()
-			}
+			exec.stopTimers()
 			exec.mu.Unlock()
 			delete(ops.execs, id)
 		}
