@@ -225,6 +225,12 @@ func (l *SandboxLane) Close(ctx context.Context) error {
 // SandboxInstanceName is the deterministic backend name of a lease.
 func SandboxInstanceName(leaseID string) string { return deployruntime.InstanceName(leaseID) }
 
+// SandboxProbeSuffix names the image probe a backend creates ahead of a
+// sandbox, after that sandbox's instance name (pkg/sandboxbackend). The probe
+// carries the sandbox labels, so the backend lists it, and it exists only
+// while the Create of its lease runs under that lease's lock.
+const SandboxProbeSuffix = "-image-probe"
+
 // SandboxRequest is the authenticated request context of one document.
 type SandboxRequest struct {
 	ValidatorKey ed25519.PublicKey
@@ -515,7 +521,11 @@ func (l *SandboxLane) teardown(ctx context.Context, leaseID, instance string, no
 	return l.store.CompleteLeaseCleanup(ctx, leaseID, now)
 }
 
-// Renew applies a verified renewal of a live lease.
+// Renew applies a verified renewal of a live lease. With ops enabled it is
+// decided inside its store transaction on the ops store's clock, the clock
+// exec deadlines are decided on, and its receipt is observed at that
+// decision time (docs/sandbox-ops-v1-lane.md); without ops the lane's clock
+// decides.
 func (l *SandboxLane) Renew(ctx context.Context, r protocol.SandboxRenewalV1, req SandboxRequest) (protocol.SandboxReceiptV1, error) {
 	now := l.now().UTC()
 	if err := protocol.VerifyBoundSandboxRenewalV1(r, req.ValidatorKey, now, req.CurrentBlock, req.Network, req.NetUID, req.CallerHotkey, req.MinerHotkey, req.MinerUID); err != nil {
@@ -523,6 +533,13 @@ func (l *SandboxLane) Renew(ctx context.Context, r protocol.SandboxRenewalV1, re
 	}
 	if err := l.admit(r.Subnet, r.MinerID); err != nil {
 		return protocol.SandboxReceiptV1{}, err
+	}
+	if ops := l.ops; ops != nil {
+		outcome, err := ops.store.RenewLease(ctx, r)
+		if err != nil {
+			return protocol.SandboxReceiptV1{}, err
+		}
+		return l.receipt(protocol.SandboxRenewalSchema, r, r.SandboxID, r.Generation, r.Subnet, outcome, outcome.ObservedAt)
 	}
 	outcome, err := l.store.Renew(ctx, r, now)
 	if err != nil {
@@ -617,7 +634,12 @@ func (l *SandboxLane) destroyOrphans(ctx context.Context) error {
 	var errs []error
 	for _, instance := range instances {
 		key := instance.LeaseID
-		if key == "" || SandboxInstanceName(key) != instance.Name {
+		// A probe is keyed to its own lease, not to the instance: the lease lock
+		// is held by the Create that makes it, so a probe under a busy lease is
+		// skipped. With the lock free no Create is running, and the probe is a
+		// leftover whatever the lease's state.
+		probe := instance.LeaseID != "" && instance.Name == SandboxInstanceName(instance.LeaseID)+SandboxProbeSuffix
+		if !probe && (key == "" || SandboxInstanceName(key) != instance.Name) {
 			// A sandbox the backend cannot tie to a lease is never live.
 			key = "instance:" + instance.Name
 		}
@@ -627,7 +649,7 @@ func (l *SandboxLane) destroyOrphans(ctx context.Context) error {
 			continue
 		}
 		live := false
-		if key == instance.LeaseID {
+		if !probe && key == instance.LeaseID {
 			record, found, err := l.store.Lease(ctx, instance.LeaseID)
 			if err != nil {
 				unlock()

@@ -109,7 +109,8 @@ func (s *Store) EnableSandboxLeases(ctx context.Context) (*SandboxLeases, error)
 // SandboxOutcome is the durable answer to one validator document, the
 // content of the receipt the miner signs.
 type SandboxOutcome struct {
-	// ObservedAt is set by read-only replay at its database snapshot, not at
+	// ObservedAt is set by read-only replay at its database snapshot, and by
+	// SandboxOps.RenewLease at its in-transaction decision time, not at
 	// request arrival or receipt delivery.
 	ObservedAt time.Time
 	Stage      string
@@ -502,8 +503,16 @@ func (l *SandboxLeases) CompleteLeaseCleanup(ctx context.Context, leaseID string
 // Renew applies a strictly newer renewal of a live lease. An exact replay
 // of the latest renewal answers again; a different renewal with the same
 // sequence is ErrSandboxConflict. A lease that is no longer live answers
-// with its durable stage and is not extended.
+// with its durable stage and is not extended. It decides at now, the
+// caller's time.
 func (l *SandboxLeases) Renew(ctx context.Context, r protocol.SandboxRenewalV1, now time.Time) (SandboxOutcome, error) {
+	return l.renew(ctx, r, func(context.Context, *sql.Tx) (time.Time, error) { return now, nil })
+}
+
+// renew is Renew in one transaction that decides at the time decide returns.
+// decide runs first inside that transaction, once it holds the store's
+// single connection.
+func (l *SandboxLeases) renew(ctx context.Context, r protocol.SandboxRenewalV1, decide func(context.Context, *sql.Tx) (time.Time, error)) (SandboxOutcome, error) {
 	if err := r.Validate(); err != nil {
 		return SandboxOutcome{}, err
 	}
@@ -516,6 +525,10 @@ func (l *SandboxLeases) Renew(ctx context.Context, r protocol.SandboxRenewalV1, 
 		return SandboxOutcome{}, err
 	}
 	defer tx.Rollback()
+	now, err := decide(ctx, tx)
+	if err != nil {
+		return SandboxOutcome{}, err
+	}
 	var digest, sandboxID, minerHotkey, validatorHotkey, status string
 	var cleanupStatus, cleanupCode, terminalCode *string
 	var generation, seq uint64

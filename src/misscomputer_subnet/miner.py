@@ -8,11 +8,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Collection
+from collections.abc import AsyncIterator, Collection, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +68,7 @@ from .protocol import (
 from .sandbox_transport import (
     LocalSandboxOpsRequestV1,
     LocalSandboxRequestV1,
+    SandboxDocumentHeader,
     SandboxOpsResponseV1,
     SandboxOpsSynapseV1,
     SandboxResponseV1,
@@ -121,6 +123,51 @@ RUNTIME_FORWARDED_MISS_HEADERS = frozenset(
 MINER_INGRESS_CONCURRENCY = 64
 MINER_KEEP_ALIVE_SECONDS = 5
 MINER_H11_MAX_INCOMPLETE_EVENT = 64 << 10
+
+# Sandbox-ops admission at this hop (docs/sandbox-ops-admission.md). Tenant
+# ops reach the miner from the same validator hotkey as lease renewals and
+# the capability handshake. Every request keeps the same authentication and
+# identity checks; ops differ only in where their rate is counted and in
+# never waiting for a worker.
+#
+# The route a handler serves fixes its rate class. On the ops route only, an
+# authenticated, well-formed exec_cancel without payload from the body's own
+# caller is counted in a separate cancel reserve; every other op request,
+# malformed or not, is an ordinary op. No request member names a class, a
+# bucket or a bound, and every class is counted per validator hotkey.
+RATE_CLASS_DEFAULT = "default"
+RATE_CLASS_SANDBOX_OPS = "sandbox-ops"
+RATE_CLASS_SANDBOX_OPS_CANCEL = "sandbox-ops-cancel"
+# Ops are counted in their own window and never use the shared one. A sync
+# exec polls two exec_read ops per pass with a 500 ms pause, so at most
+# 4 ops/s per exec; 30/s on average sustains several polled execs. These are
+# candidate defaults pending lab measurement, not adopted throughput.
+SANDBOX_OPS_MAX_REQUESTS_PER_WINDOW = 300
+SANDBOX_OPS_WINDOW_SECONDS = 10.0
+# Cancels in the same window length, never spent by ordinary ops and never
+# spending theirs: enough to cancel a full agent in-flight bound (64) once per
+# window, at most 6.4 extra ops/s. A cancel flood is refused like an ops
+# flood. Candidate default pending lab measurement.
+SANDBOX_OPS_CANCEL_MAX_REQUESTS_PER_WINDOW = 64
+# Ops forwarded to the agent at once. Beyond it an op is refused at once:
+# the agent refuses a full in-flight bound immediately, so a queue here would
+# only add stale work and hold ingress.
+SANDBOX_OPS_CONCURRENCY = 32
+# Further admissions for exec_cancel only, so a full ops capacity never
+# keeps a tenant from stopping an exec.
+SANDBOX_OPS_CANCEL_HEADROOM = 4
+# Ingress tasks that ops and the assignment gate together never take:
+# lease lifecycle waiting for the gate, capability handshakes, status,
+# deactivation and the runtime proxy.
+SANDBOX_OPS_INGRESS_RESERVE = 16
+# Definitive refusals before any agent contact (HTTP 429, nothing forwarded).
+SANDBOX_OPS_RATE_EXCEEDED = "sandbox_ops_rate_exceeded"
+SANDBOX_OPS_CAPACITY_EXHAUSTED = "sandbox_ops_capacity_exhausted"
+SANDBOX_OPS_CAPACITY_RETRY_AFTER = 1
+# An agent answer that arrived after dispatch but does not validate. The op or
+# document may already have run, so the tenant sees an upstream failure (>= 500),
+# never a definitive 400 or refusal (R23-PYGAP-01).
+SANDBOX_AGENT_ANSWER_INVALID = "sandbox_agent_answer_invalid"
 
 
 def _connection_tokens(headers: list[tuple[bytes, bytes]]) -> set[str]:
@@ -204,9 +251,19 @@ class AuthorizationPolicy:
         self.max_requests = max_requests_per_window
         self.window_seconds = window_seconds
         self.requests: dict[str, deque[float]] = defaultdict(deque)
+        self.ops_requests: dict[str, deque[float]] = defaultdict(deque)
+        self.cancel_requests: dict[str, deque[float]] = defaultdict(deque)
         self._lock = asyncio.Lock()
 
-    async def authorize(self, hotkey: str) -> Caller:
+    async def authorize(self, hotkey: str, *, rate_class: str = RATE_CLASS_DEFAULT) -> Caller:
+        caller = await self.identify(hotkey)
+        await self.admit(hotkey, rate_class)
+        return caller
+
+    async def identify(self, hotkey: str) -> Caller:
+        """The operator, registration, permit and stake checks every request
+        passes before it is counted in any rate window."""
+
         if hotkey not in self.operator_hotkeys:
             raise HTTPException(status_code=403, detail="caller is not a configured operator")
         snapshot = await self.state.get()
@@ -221,7 +278,24 @@ class AuthorizationPolicy:
             raise HTTPException(status_code=403, detail="caller lacks a validator permit")
         if neuron.tao_stake < self.min_validator_stake:
             raise HTTPException(status_code=403, detail="caller stake is below policy minimum")
+        return Caller(hotkey=hotkey, priority=max(neuron.tao_stake, 0.0))
+
+    async def admit(self, hotkey: str, rate_class: str) -> None:
+        """Count one identified request in its class's window, or refuse it."""
+
         now = time.monotonic()
+        if rate_class == RATE_CLASS_SANDBOX_OPS:
+            await self._admit_op(
+                self.ops_requests, SANDBOX_OPS_MAX_REQUESTS_PER_WINDOW, hotkey, now
+            )
+            return
+        if rate_class == RATE_CLASS_SANDBOX_OPS_CANCEL:
+            await self._admit_op(
+                self.cancel_requests, SANDBOX_OPS_CANCEL_MAX_REQUESTS_PER_WINDOW, hotkey, now
+            )
+            return
+        if rate_class != RATE_CLASS_DEFAULT:
+            raise ValueError(f"unknown rate class {rate_class!r}")
         async with self._lock:
             history = self.requests[hotkey]
             while history and history[0] <= now - self.window_seconds:
@@ -229,7 +303,25 @@ class AuthorizationPolicy:
             if len(history) >= self.max_requests:
                 raise HTTPException(status_code=429, detail="validator request rate exceeded")
             history.append(now)
-        return Caller(hotkey=hotkey, priority=max(neuron.tao_stake, 0.0))
+
+    async def _admit_op(
+        self, windows: dict[str, deque[float]], bound: int, hotkey: str, now: float
+    ) -> None:
+        """Count one op in the caller's window of its op class; a full window
+        is a definitive refusal before any agent contact."""
+
+        async with self._lock:
+            history = windows[hotkey]
+            while history and history[0] <= now - SANDBOX_OPS_WINDOW_SECONDS:
+                history.popleft()
+            if len(history) >= bound:
+                retry_after = max(1, math.ceil(history[0] + SANDBOX_OPS_WINDOW_SECONDS - now))
+                raise HTTPException(
+                    status_code=429,
+                    detail=SANDBOX_OPS_RATE_EXCEEDED,
+                    headers={"Retry-After": str(retry_after)},
+                )
+            history.append(now)
 
 
 class PriorityGate:
@@ -276,6 +368,32 @@ class PriorityGate:
                 next_future.set_result(None)
                 return
         self.active -= 1
+
+
+class OpsAdmission:
+    """Admission of sandbox ops to the agent that never waits.
+
+    Ops do not queue, so no op waits behind another and nothing waits behind
+    an op. An exec_cancel may also use a small headroom beyond the capacity.
+    Admission is decided without an await, so it needs no lock on one loop.
+    """
+
+    def __init__(self, capacity: int, cancel_headroom: int) -> None:
+        self.capacity = capacity
+        self.cancel_headroom = cancel_headroom
+        self.active = 0
+
+    @contextlib.contextmanager
+    def slot(self, *, cancel: bool) -> Iterator[bool]:
+        limit = self.capacity + (self.cancel_headroom if cancel else 0)
+        if self.active >= limit:
+            yield False
+            return
+        self.active += 1
+        try:
+            yield True
+        finally:
+            self.active -= 1
 
 
 class MinerNeuron:
@@ -334,6 +452,18 @@ class MinerNeuron:
             raise ValueError("sandbox reservation replay requires sandbox leases")
         if sandbox_ops and not sandbox_leases:
             raise ValueError("sandbox ops require sandbox leases")
+        if sandbox_ops and (
+            SANDBOX_OPS_CONCURRENCY
+            + SANDBOX_OPS_CANCEL_HEADROOM
+            + max(max_concurrency, 1)
+            + SANDBOX_OPS_INGRESS_RESERVE
+            > MINER_INGRESS_CONCURRENCY
+        ):
+            raise ValueError(
+                "sandbox ops capacity, cancel headroom and --max-concurrency leave too little "
+                f"of the {MINER_INGRESS_CONCURRENCY}-request ingress for lease lifecycle"
+            )
+        self.ops_admission = OpsAdmission(SANDBOX_OPS_CONCURRENCY, SANDBOX_OPS_CANCEL_HEADROOM)
         self.sandbox_leases = sandbox_leases
         self.sandbox_reservation_replay = sandbox_reservation_replay
         self.sandbox_ops = sandbox_ops
@@ -412,6 +542,11 @@ class MinerNeuron:
         )
 
     async def _authenticated(self, request: Request, body: bytes) -> Caller:
+        return await self.authorization.authorize(await self._verified_hotkey(request, body))
+
+    async def _verified_hotkey(self, request: Request, body: bytes) -> str:
+        """The btauth-verified caller of ``body``; nothing counted yet."""
+
         if not self.ready.is_set():
             raise HTTPException(status_code=503, detail="metagraph is not ready")
         target = request.scope["raw_path"].decode()
@@ -428,7 +563,7 @@ class MinerNeuron:
             )
         except bt.http_auth.AuthError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
-        return await self.authorization.authorize(str(verified.hotkey_ss58))
+        return str(verified.hotkey_ss58)
 
     async def _snapshot_for(self, current_block: int) -> MetagraphSnapshot:
         snapshot = await self.state.get()
@@ -557,6 +692,8 @@ class MinerNeuron:
                 )
             except BridgeError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+            except ValidationError as exc:
+                raise HTTPException(status_code=502, detail=SANDBOX_AGENT_ANSWER_INVALID) from exc
         assert isinstance(result, SandboxResponseV1)
         try:
             if result.request_id != synapse.request_id:
@@ -569,20 +706,27 @@ class MinerNeuron:
     async def _sandbox_ops_forward(self, request: Request) -> SandboxOpsResponseV1:
         """Forward one validator-signed op request and its payload to the Go
         agent, after the same btauth and identity checks as a lease document.
-        The agent verifies the document and the payload binding."""
+        The agent verifies the document and the payload binding.
+
+        Ops are counted in their own rate window and admitted without waiting
+        (OpsAdmission), never through the gate lease lifecycle and assignments
+        use. A well-formed exec_cancel is counted in its own bounded reserve
+        instead. A full window or capacity is a definitive 429 before any
+        agent contact; an agent answer keeps its own status, which may be
+        unknown."""
 
         body = await self._body(request)
-        caller = await self._authenticated(request, body)
-        if _envelope_protocol(body) != sandbox_transport.OPS_SYNAPSE_VERSION:
-            raise HTTPException(
-                status_code=422,
-                detail="only subnet-sandbox-ops-synapse.v1 op requests are accepted",
-            )
+        caller = await self.authorization.identify(await self._verified_hotkey(request, body))
         try:
-            synapse = parse_document(body, SandboxOpsSynapseV1)
-            header = sandbox_transport.op_header(synapse.document)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            synapse, header = _ops_request(body)
+        except HTTPException:
+            # Not decodable as an op: always counted as an ordinary op.
+            await self.authorization.admit(caller.hotkey, RATE_CLASS_SANDBOX_OPS)
+            raise
+        cancel = _is_exec_cancel(synapse, caller.hotkey)
+        await self.authorization.admit(
+            caller.hotkey, RATE_CLASS_SANDBOX_OPS_CANCEL if cancel else RATE_CLASS_SANDBOX_OPS
+        )
         if synapse.caller_hotkey != caller.hotkey:
             raise HTTPException(status_code=403, detail="body caller differs from btauth caller")
         await self._verify_assignment_identity(
@@ -598,13 +742,21 @@ class MinerNeuron:
             document=synapse.document,
             payload_b64=synapse.payload_b64,
         )
-        async with self.gate.slot(caller.priority):
+        with self.ops_admission.slot(cancel=cancel) as admitted:
+            if not admitted:
+                raise HTTPException(
+                    status_code=429,
+                    detail=SANDBOX_OPS_CAPACITY_EXHAUSTED,
+                    headers={"Retry-After": str(SANDBOX_OPS_CAPACITY_RETRY_AFTER)},
+                )
             try:
                 result = await self.bridge.request(
                     "POST", "/v1/sandbox/ops", value=local, response_model=SandboxOpsResponseV1
                 )
             except BridgeError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+            except ValidationError as exc:
+                raise HTTPException(status_code=502, detail=SANDBOX_AGENT_ANSWER_INVALID) from exc
         assert isinstance(result, SandboxOpsResponseV1)
         try:
             if result.request_id != synapse.request_id:
@@ -967,6 +1119,36 @@ class MinerNeuron:
             return response
 
 
+def _ops_request(body: bytes) -> tuple[SandboxOpsSynapseV1, SandboxDocumentHeader]:
+    """Decode one op request and its routing header; 422 if it is not one."""
+
+    if _envelope_protocol(body) != sandbox_transport.OPS_SYNAPSE_VERSION:
+        raise HTTPException(
+            status_code=422,
+            detail="only subnet-sandbox-ops-synapse.v1 op requests are accepted",
+        )
+    try:
+        synapse = parse_document(body, SandboxOpsSynapseV1)
+        return synapse, sandbox_transport.op_header(synapse.document)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _is_exec_cancel(synapse: SandboxOpsSynapseV1, caller_hotkey: str) -> bool:
+    """Whether a decoded op request may use the exec_cancel reserves.
+
+    Only the exact op kind from the btauth-verified caller's own document, and
+    never with a payload (the agent refuses a payload on exec_cancel), so no
+    other request can claim the reserve.
+    """
+
+    return (
+        synapse.caller_hotkey == caller_hotkey
+        and synapse.document.get("op") == "exec_cancel"
+        and synapse.payload_b64 is None
+    )
+
+
 def _envelope_protocol(body: bytes) -> str | None:
     """Return a deploy body's protocol member without trusting the rest."""
 
@@ -1091,25 +1273,30 @@ def main() -> None:
     configure_logging(args.log_level)
     secret = load_secret(args.bridge_secret_file)
     chain, hotkey_signer = make_chain(args)
-    neuron = MinerNeuron(
-        chain=chain,
-        hotkey_signer=hotkey_signer,
-        network=args.subtensor_network,
-        netuid=args.netuid,
-        configured_uid=args.uid,
-        bridge=BridgeClient(args.go_agent_url, secret, timeout=120.0, retries=0),
-        nonce_store=SQLiteNonceStore(args.state_db),
-        min_validator_stake=args.min_validator_stake,
-        operator_hotkeys=operator_hotkeys,
-        sync_interval=args.sync_interval,
-        max_concurrency=args.max_concurrency,
-        mock_http=args.allow_insecure_mock_http,
-        tls_config=tls_config,
-        capability_fault_file=args.mock_capability_fault_file,
-        sandbox_leases=args.sandbox_leases == "on",
-        sandbox_reservation_replay=args.sandbox_reservation_replay == "on",
-        sandbox_ops=args.sandbox_ops == "on",
-    )
+    try:
+        neuron = MinerNeuron(
+            chain=chain,
+            hotkey_signer=hotkey_signer,
+            network=args.subtensor_network,
+            netuid=args.netuid,
+            configured_uid=args.uid,
+            bridge=BridgeClient(args.go_agent_url, secret, timeout=120.0, retries=0),
+            nonce_store=SQLiteNonceStore(args.state_db),
+            min_validator_stake=args.min_validator_stake,
+            operator_hotkeys=operator_hotkeys,
+            sync_interval=args.sync_interval,
+            max_concurrency=args.max_concurrency,
+            mock_http=args.allow_insecure_mock_http,
+            tls_config=tls_config,
+            capability_fault_file=args.mock_capability_fault_file,
+            sandbox_leases=args.sandbox_leases == "on",
+            sandbox_reservation_replay=args.sandbox_reservation_replay == "on",
+            sandbox_ops=args.sandbox_ops == "on",
+        )
+    except ValueError as exc:
+        # The neuron refuses this configuration at startup, fail closed. Report
+        # its message as a clean exit, as the other startup refusals do.
+        raise SystemExit(str(exc)) from exc
     if tls_config is None:
         uvicorn.run(
             neuron.app,

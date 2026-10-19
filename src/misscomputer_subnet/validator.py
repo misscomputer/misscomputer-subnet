@@ -116,6 +116,14 @@ CAPABILITY_REFUSAL_CODES = frozenset(
         sandbox_transport.SANDBOX_OPS_CAPABILITY_UNSUPPORTED,
     }
 )
+#: The miner neuron's definitive pre-agent refusals of a sandbox op (HTTP 429,
+#: docs/sandbox-ops-admission.md). Only these codes, only on a 429 from the
+#: ops route, keep their code and a validated Retry-After on the bridge; every
+#: other miner answer keeps the generic mapping and no miner header is relayed.
+OPS_ADMISSION_REFUSAL_CODES = frozenset(
+    {"sandbox_ops_rate_exceeded", "sandbox_ops_capacity_exhausted"}
+)
+OPS_ADMISSION_RETRY_AFTER_MAX = 60
 PUBLICATION_LANE_SCHEMA_VERSION = 1
 PUBLICATION_RECORD_MAC_DOMAIN = "miss.computer/misscomputer-subnet/publication-record/v1"
 MAX_HISTORICAL_PUBLICATIONS = 512
@@ -130,6 +138,25 @@ PUBLIC_AXON_REJECTION = (
 )
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
 DiscoveryIdentity = tuple[str, int, str]
+
+
+def _ops_admission_retry_after(value: str | None) -> str | None:
+    """A miner Retry-After for an ops admission refusal, if it is exactly a
+    decimal number of seconds in 1..OPS_ADMISSION_RETRY_AFTER_MAX.
+
+    No sign, fraction, leading zero, whitespace, HTTP date or non-ASCII digit
+    is accepted; anything else is dropped rather than repaired.
+    """
+
+    if (
+        value is None
+        or not 1 <= len(value) <= 2
+        or not value.isascii()
+        or not value.isdigit()
+        or value[0] == "0"
+    ):
+        return None
+    return value if int(value) <= OPS_ADMISSION_RETRY_AFTER_MAX else None
 
 
 class _AmbiguousMinerRegistration(RuntimeError):
@@ -941,6 +968,16 @@ class ValidatorNeuron:
     async def _http_error(request: Request, exc: Exception) -> JSONResponse:
         assert isinstance(exc, HTTPException)
         message = str(exc.detail)[:512]
+        ops_refusal = (
+            exc.status_code == 429
+            and request.url.path.endswith("/sandbox-ops")
+            and message in OPS_ADMISSION_REFUSAL_CODES
+        )
+        retry_after = (
+            _ops_admission_retry_after((exc.headers or {}).get("Retry-After"))
+            if ops_refusal
+            else None
+        )
         codes = {
             400: "invalid_request",
             401: "unauthorized",
@@ -963,6 +1000,7 @@ class ValidatorNeuron:
                     "code": (
                         message
                         if message in CAPABILITY_REFUSAL_CODES
+                        or ops_refusal
                         or (
                             request.url.path.endswith("/sandbox-reservations/replay")
                             and message in sandbox_transport.REPLAY_REFUSAL_CODES
@@ -973,6 +1011,7 @@ class ValidatorNeuron:
                     "retryable": exc.status_code in {429, 502, 503, 504},
                 }
             },
+            headers=None if retry_after is None else {"Retry-After": retry_after},
         )
 
     @staticmethod
@@ -2673,7 +2712,11 @@ class ValidatorNeuron:
         *,
         timeout: float | None = None,
         certificate_der: bytes | None = None,
+        retries: int | None = None,
     ) -> ResponseT:
+        """Send one signed request, resending the same body up to ``retries``
+        times (default ``dendrite_retries``) after a transport, 5xx or
+        unusable answer. A 3xx/4xx answer is raised at once."""
         parsed_base = urlsplit(base_url)
         if parsed_base.scheme == "https":
             if certificate_der is None:
@@ -2687,7 +2730,8 @@ class ValidatorNeuron:
             raise ValueError("miner requests require pinned HTTPS or explicit mock HTTP")
         body = json.dumps(value.model_dump(mode="json"), separators=(",", ":")).encode()
         last_error: Exception | None = None
-        for attempt in range(self.dendrite_retries + 1):
+        resends = self.dendrite_retries if retries is None else retries
+        for attempt in range(resends + 1):
             try:
                 async with httpx.AsyncClient(
                     base_url=base_url,
@@ -2751,7 +2795,7 @@ class ValidatorNeuron:
                 raise
             except (httpx.HTTPError, ValueError, RuntimeError) as exc:
                 last_error = exc
-            if attempt < self.dendrite_retries:
+            if attempt < resends:
                 await asyncio.sleep(0.15 * (attempt + 1))
         raise RuntimeError("signed miner request failed") from last_error
 
@@ -2765,8 +2809,19 @@ class ValidatorNeuron:
         *,
         timeout: float | None = None,
         certificate_der: bytes | None = None,
+        sandbox_op: bool = False,
     ) -> ResponseT:
-        """Translate remote dendrite failures into the stable local bridge envelope."""
+        """Translate remote dendrite failures into the stable local bridge envelope.
+
+        With ``sandbox_op`` (the sandbox-ops route only) the op is sent exactly
+        once. A resend here would let a later answer (a 429 or any other 4xx)
+        hide an earlier attempt that may have reached the miner, and turn a
+        possibly executed op into a definitive refusal. Any failure after the
+        send therefore stays a 5xx, which the runtime treats as possibly
+        delivered and resolves only by resending the same signed op. A miner
+        429 with an allowlisted admission code also keeps a validated
+        Retry-After.
+        """
         try:
             return await self._signed_post(
                 base_url,
@@ -2776,6 +2831,7 @@ class ValidatorNeuron:
                 response_model,
                 timeout=timeout,
                 certificate_der=certificate_der,
+                retries=0 if sandbox_op else None,
             )
         except httpx.HTTPStatusError as exc:
             detail = "miner rejected the signed request"
@@ -2787,7 +2843,18 @@ class ValidatorNeuron:
                         detail = remote_detail[:512]
             except ValueError:
                 pass
-            raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+            retry_after = (
+                _ops_admission_retry_after(exc.response.headers.get("Retry-After"))
+                if sandbox_op
+                and exc.response.status_code == 429
+                and detail in OPS_ADMISSION_REFUSAL_CODES
+                else None
+            )
+            raise HTTPException(
+                status_code=exc.response.status_code,
+                detail=detail,
+                headers=None if retry_after is None else {"Retry-After": retry_after},
+            ) from exc
         except RuntimeError as exc:
             cause: BaseException | None = exc
             timed_out = False
@@ -3480,6 +3547,7 @@ class ValidatorNeuron:
             synapse,
             SandboxOpsResponseV1,
             certificate_der=remote.certificate_der,
+            sandbox_op=True,
         )
         try:
             if result.request_id != local.request_id:

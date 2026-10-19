@@ -61,6 +61,60 @@ func helperOut(t *testing.T, response sandboxops.Response) []byte {
 	return encoded
 }
 
+// supervisedHelper answers for one exec the way the real helper's supervisor
+// does (cmd/sandbox-ops-helper/exec_linux.go): the exec runs once started,
+// and an exec_cancel, forced or not, SIGTERMs the supervisor, which reports
+// the exec cancelled from then on, whoever asked for the cancel. The cancel
+// itself answers the state it found. While statusGate is set, exec_status
+// calls wait for it to close.
+type supervisedHelper struct {
+	mu         sync.Mutex
+	state      string
+	cancels    int
+	cancelled  chan struct{}
+	statusGate chan struct{}
+}
+
+func newSupervisedHelper() *supervisedHelper {
+	return &supervisedHelper{state: sandbox.ExecStateRunning, cancelled: make(chan struct{})}
+}
+
+func (h *supervisedHelper) answer(t *testing.T) func(context.Context, sandboxops.Request) ([]byte, error) {
+	return func(ctx context.Context, request sandboxops.Request) ([]byte, error) {
+		h.mu.Lock()
+		state, gate := h.state, h.statusGate
+		if request.Op == sandbox.OpExecCancel {
+			h.cancels++
+			if h.state == sandbox.ExecStateRunning {
+				h.state = sandbox.ExecStateCancelled
+				close(h.cancelled)
+			}
+		}
+		h.mu.Unlock()
+		if request.Op == sandboxops.OpExecStatus && gate != nil {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			h.mu.Lock()
+			state = h.state
+			h.mu.Unlock()
+		}
+		response := sandboxops.Response{Exec: &sandboxops.ExecObservation{State: state}}
+		if request.Op == sandbox.OpExecRead {
+			response.Data = sandboxops.EncodeData(nil)
+		}
+		return helperOut(t, response), nil
+	}
+}
+
+func (h *supervisedHelper) cancelCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cancels
+}
+
 // opsClock is a settable clock shared by the lane and the ops store.
 type opsClock struct{ now atomic.Int64 }
 
@@ -241,6 +295,8 @@ func TestSandboxOpsAttributeHelperFailures(t *testing.T) {
 		{"engine unavailable", func() ([]byte, error) { return nil, &SandboxEngineUnavailable{Err: errors.New("no answer")} }, sandbox.OpStageFailed, sandbox.OpCodeRuntimeFailed},
 		{"sandbox stopped", func() ([]byte, error) { return nil, ErrSandboxNotRunning }, sandbox.OpStageRefused, "sandbox_exited"},
 		{"engine error", func() ([]byte, error) { return nil, errors.New("exec create: 500") }, sandbox.OpStageFailed, sandbox.OpCodeSandboxFailed},
+		// A guest-caused stream violation is a plain error from the backend, not an engine fault.
+		{"guest stream over its bound", func() ([]byte, error) { return nil, errors.New("helper stdout over its 1 MiB bound") }, sandbox.OpStageFailed, sandbox.OpCodeSandboxFailed},
 		{"garbage", func() ([]byte, error) { return []byte("not json"), nil }, sandbox.OpStageFailed, sandbox.OpCodeSandboxFailed},
 		{"claims miner fault", func() ([]byte, error) {
 			return []byte(`{"code":"op_runtime_failed","data_b64":null,"eof":false,"exec":null,"file":null,"listing":null,"protocol":"sandbox-ops-helper.v1","size":null}`), nil
@@ -403,24 +459,12 @@ func TestSandboxExecCancelForcesTheKillWhenTheHelperNeverConfirms(t *testing.T) 
 }
 
 // The exec deadline is min(admitted_at + timeout_ms, lease expiry) on the
-// durable clock; the kill path then ends the exec timed_out.
+// durable clock; the kill path then ends the exec timed_out, although the
+// helper reports every exec it was asked to cancel as cancelled.
 func TestSandboxExecDeadlineEndsTimedOut(t *testing.T) {
 	f := newOpsFixture(t, testOpsConfig)
-	var cancelled atomic.Bool
-	f.backend.answer = func(_ context.Context, request sandboxops.Request) ([]byte, error) {
-		state := sandbox.ExecStateRunning
-		if request.Op == sandbox.OpExecCancel {
-			cancelled.Store(true)
-		}
-		if cancelled.Load() {
-			state = sandbox.ExecStateTimedOut
-		}
-		response := sandboxops.Response{Exec: &sandboxops.ExecObservation{State: state}}
-		if request.Op == sandbox.OpExecRead {
-			response.Data = sandboxops.EncodeData(nil)
-		}
-		return helperOut(t, response), nil
-	}
+	helper := newSupervisedHelper()
+	f.backend.answer = helper.answer(t)
 	start := f.execStart(1000)
 	if _, _, err := f.run(start, execPayload); err != nil {
 		t.Fatal(err)

@@ -1398,16 +1398,22 @@ func (b *GVisor) createContainer(budget *createBudget, instanceID string, lease 
 			unlock()
 			return err
 		}
+		s := b.spec(lease, leaseDigest, imageID)
 		if !missing && b.opsHelper != nil {
 			// B-2: the helper pin is re-verified before every create.
 			if err := verifyHelper(*b.opsHelper); err != nil {
 				unlock()
 				return fmt.Errorf("create sandbox %s: %w", instanceID, err)
 			}
+			// D1: the helper is mounted only where the image holds nothing.
+			if missing, err = b.imageConflict(ctx, instanceID, imageID, s); err != nil {
+				unlock()
+				return err
+			}
 		}
 		if !missing {
 			err = b.engine.call(ctx, http.MethodPost, "/containers/create",
-				url.Values{"name": {instanceID}, "platform": {"linux/amd64"}}, b.createBody(b.spec(lease, leaseDigest, imageID), imageID), nil)
+				url.Values{"name": {instanceID}, "platform": {"linux/amd64"}}, b.createBody(s, imageID), nil)
 			missing = engineStatus(err) == http.StatusNotFound
 		}
 		unlock()
