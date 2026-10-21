@@ -508,38 +508,85 @@ func TestSandboxOpsAfterReleaseAnswerLeaseState(t *testing.T) {
 	}
 }
 
-// The agent's in-flight bound (D14): an exec beyond it is refused with a
-// receipt, any other op gets a retryable answer without one.
+// Pre-admission overload cannot prove that an exec never started: the request
+// may be an exact resend after its original receipt was lost. Both resource
+// bounds must answer unsigned busy, leaving the durable replay outcome intact.
 func TestSandboxOpsInFlightBound(t *testing.T) {
-	config := testOpsConfig
-	config.MaxInFlight = 1
-	f := newOpsFixture(t, config)
-	entered, unblock := make(chan struct{}), make(chan struct{})
-	f.backend.answer = func(ctx context.Context, request sandboxops.Request) ([]byte, error) {
-		close(entered)
-		<-unblock
-		return helperOut(t, sandboxops.Response{File: &sandbox.FileInfo{Type: sandbox.FileTypeDirectory}}), nil
-	}
-	stat := f.op(sandbox.OpFileStat, func(r *protocol.SandboxOpRequestV1) { r.Path = text("/") })
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := f.run(stat, nil)
-		done <- err
-	}()
-	<-entered
-	second := f.op(sandbox.OpFileStat, func(r *protocol.SandboxOpRequestV1) { r.Path = text("/") })
-	if _, _, err := f.run(second, nil); !errors.Is(err, ErrSandboxOpsBusy) {
-		t.Fatalf("op beyond the bound: %v", err)
-	}
-	start := f.execStart(60_000)
-	receipt, _, err := f.run(start, execPayload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.verify(receipt, start, nil, sandbox.OpStageRefused, "exec_limit_exceeded")
-	close(unblock)
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	for _, bound := range []string{"slots", "bytes"} {
+		t.Run(bound, func(t *testing.T) {
+			config := testOpsConfig
+			if bound == "slots" {
+				config.MaxInFlight = 1
+			} else {
+				config.MaxInFlightBytes = sandbox.MaxChunkBytes
+			}
+			f := newOpsFixture(t, config)
+			entered, unblock := make(chan struct{}), make(chan struct{})
+			var release sync.Once
+			defer release.Do(func() { close(unblock) })
+			f.backend.answer = func(ctx context.Context, request sandboxops.Request) ([]byte, error) {
+				if request.Op == sandbox.OpExecStart || request.Op == sandboxops.OpExecStatus {
+					return helperOut(t, sandboxops.Response{Exec: &sandboxops.ExecObservation{State: sandbox.ExecStateRunning}}), nil
+				}
+				close(entered)
+				select {
+				case <-unblock:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				return helperOut(t, sandboxops.Response{Data: sandboxops.EncodeData(nil), Size: u64(0)}), nil
+			}
+			start := f.execStart(60_000)
+			first, _, err := f.run(start, execPayload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.verify(first, start, nil, sandbox.OpStageRunning, "")
+			execID := protocol.SandboxOpIDV1(start)
+			waitExecState(t, f, execID, sandbox.ExecStateRunning)
+			read := f.op(sandbox.OpFileRead, func(r *protocol.SandboxOpRequestV1) {
+				r.Path, r.Offset, r.Limit = text("/work/a.txt"), u64(0), u64(sandbox.MaxChunkBytes)
+			})
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := f.run(read, nil)
+				done <- err
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("blocking read did not reach the helper")
+			}
+			stat := f.op(sandbox.OpFileStat, func(r *protocol.SandboxOpRequestV1) { r.Path = text("/") })
+			for _, attempt := range []struct {
+				name    string
+				request protocol.SandboxOpRequestV1
+				payload []byte
+			}{
+				{"admitted replay", start, execPayload},
+				{"fresh start", f.execStart(60_000), execPayload},
+				{"file op", stat, nil},
+			} {
+				receipt, result, err := f.run(attempt.request, attempt.payload)
+				if !errors.Is(err, ErrSandboxOpsBusy) || receipt.Signature != "" || result != nil {
+					t.Errorf("%s under %s saturation: want unsigned busy; stage=%s signature=%q err=%v", attempt.name, bound, receipt.Stage, receipt.Signature, err)
+				}
+			}
+			release.Do(func() { close(unblock) })
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			// Capacity becoming available must not cause the same signed request
+			// to repeat its effect or lose its original exec identity.
+			replay, _, err := f.run(start, execPayload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.verify(replay, start, nil, sandbox.OpStageRunning, "")
+			if replay.Exec == nil || replay.OpID != execID || f.backend.count(sandbox.OpExecStart) != 1 {
+				t.Fatalf("replay lost exec identity or repeated the start: %+v, calls=%d", replay.Exec, f.backend.count(sandbox.OpExecStart))
+			}
+		})
 	}
 }
 

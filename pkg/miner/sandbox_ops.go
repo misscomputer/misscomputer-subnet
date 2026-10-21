@@ -54,7 +54,8 @@ var ErrSandboxOpsDisabled = errors.New("sandbox-ops-v1 is not enabled")
 
 // ErrSandboxOpsBusy is a retryable answer without a receipt: the agent's
 // in-flight bound is reached, or a durable step ran out of D_state while the
-// lane is open (U6-L8-5). Nothing was decided.
+// lane is open (U6-L8-5). This attempt made no definitive outcome decision;
+// an earlier attempt may already have started the operation.
 var ErrSandboxOpsBusy = errors.New("sandbox ops are busy; retry")
 
 // SandboxOpsInternalError is an admitted op's failure that is none of the
@@ -292,12 +293,10 @@ func (l *SandboxLane) Op(ctx context.Context, r protocol.SandboxOpRequestV1, pay
 	}
 	release, ok := ops.reserve(opBytes(r))
 	if !ok {
-		if r.Op == sandbox.OpExecStart {
-			// D14: an exec beyond the in-flight bound is refused with a
-			// receipt; nothing was recorded, so a later replay may start it.
-			receipt, err := l.opReceipt(r, sandbox.OpStageRefused, "exec_limit_exceeded", l.now().UTC())
-			return receipt, nil, err
-		}
+		// No durable replay decision was made. Even an exec_start may be
+		// a resend of an already-running exec whose receipt was lost, so
+		// overload cannot prove refusal without effect. Only AdmitOp may
+		// decide the lease/session limits and sign exec_limit_exceeded.
 		return protocol.SandboxOpReceiptV1{}, nil, ErrSandboxOpsBusy
 	}
 	defer release()
