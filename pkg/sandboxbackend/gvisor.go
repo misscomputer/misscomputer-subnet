@@ -346,6 +346,9 @@ type daemonInfo struct {
 	Runtimes      map[string]struct {
 		Path        string   `json:"path"`
 		RuntimeArgs []string `json:"runtimeArgs"`
+		// Status holds what dockerd caches about the runtime; ops mode
+		// reads its OCI features (ops.go, verifyOpsRuntime).
+		Status map[string]string `json:"status"`
 	} `json:"Runtimes"`
 	RegistryConfig struct {
 		InsecureRegistryCIDRs []string `json:"InsecureRegistryCIDRs"`

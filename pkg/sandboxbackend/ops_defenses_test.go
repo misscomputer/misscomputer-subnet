@@ -129,17 +129,18 @@ func neverStartedProbe(id string) map[string]any {
 
 // G1 (MSR-03): the helper pin refuses any extended attribute on the opened
 // helper directory or helper file, such as a file capability set on the
-// pinned binary, and accepts the same pin without it.
+// pinned binary, and accepts the same pin without it. The attribute is set
+// through the writable source of the read-only pinned directory.
 func TestOpsHelperPinRefusesExtendedAttributes(t *testing.T) {
 	for _, target := range []string{"directory", "helper"} {
 		t.Run(target, func(t *testing.T) {
-			helper := pinnedHelper(t, "helper binary")
+			helper, source := pinnedHelperSource(t, "helper binary")
 			if err := verifyHelper(helper); err != nil {
 				t.Fatalf("pinned helper without attributes refused: %v", err)
 			}
-			path := helper.Dir
+			path := source
 			if target == "helper" {
-				path = filepath.Join(helper.Dir, sandboxops.HelperName)
+				path = filepath.Join(source, sandboxops.HelperName)
 			}
 			if err := unix.Lsetxattr(path, "user.misscomputer-test", []byte("x"), 0); errors.Is(err, unix.ENOTSUP) {
 				t.Skipf("TMPDIR's filesystem has no user extended attributes: %v", err)

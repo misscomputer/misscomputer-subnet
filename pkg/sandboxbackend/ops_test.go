@@ -13,8 +13,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/misscomputer/misscomputer-subnet/pkg/miner"
 	"github.com/misscomputer/misscomputer-subnet/pkg/sandboxops"
@@ -135,41 +138,107 @@ func (e *fakeEngine) serveOps(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // pinnedHelper writes a helper directory the B-2 pin accepts: root-owned
-// 0555 directory and file under root-owned, non-writable ancestors. It is
-// created in the test's temporary directory, never in the checkout, so only
-// a root test run whose TMPDIR has such ancestors can create one (a
+// 0555 directory and file under root-owned, non-writable ancestors, seen
+// through a read-only bind mount (MCR-04). It is created in the test's
+// temporary directory, never in the checkout, so only a root test run that
+// may mount and whose TMPDIR has such ancestors can create one (a
 // world-writable /tmp cannot); every other run skips with the reason.
 func pinnedHelper(t *testing.T, content string) OpsHelper {
+	t.Helper()
+	helper, _ := pinnedHelperSource(t, content)
+	return helper
+}
+
+// pinnedHelperSource is pinnedHelper that also returns the writable source
+// directory the read-only pinned directory binds, so a test can change the
+// pinned files the way a host process can.
+func pinnedHelperSource(t *testing.T, content string) (OpsHelper, string) {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("a root-owned helper pin needs a root test run")
 	}
-	dir, err := os.MkdirTemp(t.TempDir(), "ops-helper-")
-	if err != nil {
+	parent := t.TempDir()
+	requirePrivateMounts(t, parent)
+	source, pinned := filepath.Join(parent, "source"), filepath.Join(parent, "pinned")
+	for _, dir := range []string{source, pinned} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(source, sandboxops.HelperName), content)
+	mustChmod(t, filepath.Join(source, sandboxops.HelperName), 0o555)
+	mustChmod(t, source, 0o555)
+	if err := unix.Mount(source, pinned, "", unix.MS_BIND, ""); err != nil {
+		t.Skipf("a read-only helper mount needs a test run that may mount: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(pinned, unix.MNT_DETACH) })
+	if err := unix.Mount("", pinned, "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_RDONLY, ""); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = os.Chmod(dir, 0o755)
-		_ = os.RemoveAll(dir)
-	})
-	writeFile(t, filepath.Join(dir, sandboxops.HelperName), content)
-	if err := os.Chmod(filepath.Join(dir, sandboxops.HelperName), 0o555); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(dir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	helper := OpsHelper{Dir: dir, SHA256: digestOf(content)}
+	helper := OpsHelper{Dir: pinned, SHA256: digestOf(content)}
 	if err := verifyHelper(helper); err != nil && strings.Contains(err.Error(), "ancestor") {
 		t.Skipf("TMPDIR's ancestors cannot hold a pinned helper (use a root-owned, non-writable TMPDIR): %v", err)
 	}
-	return helper
+	return helper, source
 }
 
-// opsMode puts b in ops mode with a verified pin, as EnableOps will once the
-// helper mount carries every property the contract requires; until then
-// EnableOps refuses (XA-09), so these tests set the mode the same way the
-// pin test below does.
+// requirePrivateMounts skips t unless the bind mounts a test makes under dir
+// stay in a mount namespace of the test process's own and do not propagate
+// out of it. A root run in the host's mount namespace, or under a mount that
+// shares its propagation with it, would leave its mounts on the host if the
+// test died before its cleanup. Run root tests under
+// `unshare -m --propagation private`.
+func requirePrivateMounts(t *testing.T, dir string) {
+	t.Helper()
+	const how = "the helper fixture's bind mounts need a private mount namespace (unshare -m --propagation private)"
+	self, errSelf := os.Readlink("/proc/self/ns/mnt")
+	initial, errInitial := os.Readlink("/proc/1/ns/mnt")
+	if errSelf != nil || errInitial != nil || self == initial {
+		t.Skipf("%s: this test shares the mount namespace of process 1", how)
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountinfo, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		t.Skipf("%s: %v", how, err)
+	}
+	unescape := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+	point, shared := "", false
+	for _, line := range strings.Split(string(mountinfo), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 7 {
+			continue
+		}
+		at := unescape.Replace(fields[4])
+		if (at != "/" && resolved != at && !strings.HasPrefix(resolved, at+"/")) || len(at) < len(point) {
+			continue
+		}
+		// A later line at the same mount point is mounted on top.
+		point, shared = at, false
+		for _, optional := range fields[6:] {
+			if optional == "-" {
+				break
+			}
+			shared = shared || strings.HasPrefix(optional, "shared:")
+		}
+	}
+	if point == "" || shared {
+		t.Skipf("%s: the mount at %q of %s shares its propagation", how, point, resolved)
+	}
+}
+
+func mustChmod(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// opsMode puts b in ops mode with a verified pin, without the runtime check
+// EnableOps makes through the engine (TestEnableOpsChecksTheRuntimeAndTheHelperPin),
+// for tests whose engine scripts no /info answer.
 func opsMode(t *testing.T, b *GVisor, helper OpsHelper) {
 	t.Helper()
 	if err := verifyHelper(helper); err != nil {
@@ -178,19 +247,89 @@ func opsMode(t *testing.T, b *GVisor, helper OpsHelper) {
 	b.opsHelper = &helper
 }
 
-// XA-09: the contract requires a nosuid, nodev helper mount, which the
-// engine can neither request nor read back, so EnableOps fails closed, and
-// does so before it reads the helper: the refusal names the missing
-// properties, not the helper directory.
-func TestEnableOpsFailsClosedWhileTheHelperMountIsUnproven(t *testing.T) {
-	b := &GVisor{}
-	err := b.EnableOps(OpsHelper{Dir: "/nonexistent/ops-helper", SHA256: digestOf("helper binary")})
-	if err == nil || !strings.Contains(err.Error(), "nosuid, nodev") {
-		t.Fatalf("EnableOps = %v, want the refusal naming nosuid and nodev", err)
+// runscMountOptions are the mount options the pinned runsc
+// release-20261005.0 reports in its OCI features (`runsc features`, whose
+// list is KnownMountOptions in runsc/specutils/fs.go at that tag); rro is not
+// among them.
+var runscMountOptions = []string{"acl", "async", "atime", "bind", "defaults", "dev", "diratime", "dirsync", "exec", "iversion", "loud", "mand",
+	"noacl", "noatime", "nodev", "nodiratime", "noexec", "noiversion", "nomand", "norelatime", "nostrictatime", "nosuid", "private", "rbind",
+	"relatime", "remount", "ro", "rprivate", "rslave", "runbindable", "rw", "silent", "slave", "strictatime", "suid", "sync", "unbindable"}
+
+// Amendment A1 (XA-09): the helper mount must be read-only and rprivate,
+// which the backend requests and reads back, so EnableOps no longer refuses
+// for nosuid or nodev. Before it enables ops it reads the daemon's runtime
+// registration once more, refuses a runtime registered with an argument
+// outside the reviewed set (set-ID execution, flag overrides, host-file
+// passthrough) and a runtime whose cached OCI features list rro or are not
+// shown (MCR-03), and then checks the helper pin, its read-only mount
+// included (MCR-04). Each refusal names its own reason and leaves ops off.
+func TestEnableOpsChecksTheRuntimeAndTheHelperPin(t *testing.T) {
+	const runsc = "/opt/mc-sandbox/bin/runsc"
+	reviewed := []string{"--systemd-cgroup", "--overlay2=none"}
+	features := func(options []string) map[string]string {
+		raw, err := json.Marshal(map[string]any{"ociVersionMin": "1.0.0", "ociVersionMax": "1.2.1", "mountOptions": options})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return map[string]string{"org.opencontainers.runtime-spec.features": string(raw)}
 	}
-	if b.opsHelper != nil {
-		t.Fatal("ops mode was enabled")
+	registered := func(args []string, status map[string]string) map[string]any {
+		return map[string]any{"runsc": map[string]any{"path": runsc, "runtimeArgs": args, "status": status}}
 	}
+	backend := func(t *testing.T, status int, runtimes map[string]any) (*GVisor, *scriptedEngine) {
+		e := &scriptedEngine{answer: func(c engineCall) (int, any, http.Header) {
+			if c.Method == http.MethodGet && c.Path == "/info" && status == 200 {
+				return 200, map[string]any{"ID": "SANDBOX-ENGINE-ID", "Runtimes": runtimes}, nil
+			}
+			return 500, map[string]string{"message": "scripted refusal of " + c.String()}, nil
+		}}
+		b := scriptedBackend(t, e)
+		b.config.RunscPath = runsc
+		return b, e
+	}
+	absent := OpsHelper{Dir: "/nonexistent/ops-helper", SHA256: digestOf("helper binary")}
+	for _, tc := range []struct {
+		name     string
+		status   int
+		runtimes map[string]any
+		want     string
+	}{
+		{"features list rro", 200, registered(reviewed, features(append(slices.Clone(runscMountOptions), "rro"))), "rro"},
+		{"no features reported", 200, registered(reviewed, nil), "no OCI features"},
+		{"features do not decode", 200, registered(reviewed, map[string]string{"org.opencontainers.runtime-spec.features": "{"}), "decode"},
+		{"runtime not registered", 200, map[string]any{}, "does not register"},
+		{"set-ID argument", 200, registered(append(slices.Clone(reviewed), "--allow-suid"), features(runscMountOptions)), "unreviewed argument"},
+		{"flag-override argument", 200, registered(append(slices.Clone(reviewed), "--allow-flag-override"), features(runscMountOptions)), "unreviewed argument"},
+		{"host-file passthrough argument", 200, registered(append(slices.Clone(reviewed), "--host-uds=all"), features(runscMountOptions)), "unreviewed argument"},
+		{"daemon info refused", 500, nil, "daemon info"},
+		// The runtime passes with the pinned runsc's features; the pin
+		// refuses next.
+		{"reviewed runtime, no helper", 200, registered(reviewed, features(runscMountOptions)), "ops helper directory " + absent.Dir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _ := backend(t, tc.status, tc.runtimes)
+			if err := b.EnableOps(absent); err == nil || !strings.Contains(err.Error(), tc.want) || b.opsHelper != nil {
+				t.Fatalf("EnableOps = %v (ops on %v), want a refusal containing %q", err, b.opsHelper != nil, tc.want)
+			}
+		})
+	}
+
+	helper, source := pinnedHelperSource(t, "helper binary")
+	t.Run("helper on a writable mount", func(t *testing.T) {
+		b, _ := backend(t, 200, registered(reviewed, features(runscMountOptions)))
+		if err := b.EnableOps(OpsHelper{Dir: source, SHA256: helper.SHA256}); err == nil || !strings.Contains(err.Error(), "writable mount") || b.opsHelper != nil {
+			t.Fatalf("EnableOps = %v, want the writable mount refusal", err)
+		}
+	})
+	t.Run("pinned helper", func(t *testing.T) {
+		b, e := backend(t, 200, registered(reviewed, features(runscMountOptions)))
+		if err := b.EnableOps(helper); err != nil || b.opsHelper == nil || *b.opsHelper != helper {
+			t.Fatalf("EnableOps = %v, want ops on with the pinned helper", err)
+		}
+		if calls := e.log(); len(calls) != 1 || calls[0].String() != "GET /info" {
+			t.Fatalf("engine calls %q, want one GET /info", calls)
+		}
+	})
 }
 
 // The ops-mode readback accepts exactly the pinned read-only rprivate bind,
@@ -302,8 +441,10 @@ func TestOpsModeMountsOnlyThePinnedHelperDirectory(t *testing.T) {
 }
 
 // The B-2 pin refuses a helper that is not exactly the pinned, root-owned,
-// read-only binary alone in its directory, and is checked again before
-// every create.
+// read-only binary alone in its directory on a read-only mount, and is
+// checked again before every create. Each case changes the pinned files
+// through their writable source, as a host process could, or names a view
+// of them that is not read-only.
 func TestOpsHelperPinRefusesAnythingButThePinnedBinary(t *testing.T) {
 	helper := pinnedHelper(t, "helper binary")
 	if err := verifyHelper(helper); err != nil {
@@ -312,34 +453,76 @@ func TestOpsHelperPinRefusesAnythingButThePinnedBinary(t *testing.T) {
 	if err := verifyHelper(OpsHelper{Dir: helper.Dir, SHA256: digestOf("other")}); err == nil {
 		t.Fatal("wrong digest accepted")
 	}
-	file := filepath.Join(helper.Dir, sandboxops.HelperName)
-	for name, mutate := range map[string]func(){
-		"writable helper": func() { _ = os.Chmod(file, 0o755) },
-		"setuid helper":   func() { _ = os.Chmod(file, os.ModeSetuid|0o555) },
-		"writable dir":    func() { _ = os.Chmod(helper.Dir, 0o755) },
-		"extra file": func() {
-			_ = os.Chmod(helper.Dir, 0o755)
-			writeFile(t, filepath.Join(helper.Dir, "extra"), "x")
-			_ = os.Chmod(helper.Dir, 0o555)
-		},
-		"symlinked helper": func() {
-			_ = os.Chmod(helper.Dir, 0o755)
-			_ = os.Rename(file, file+".real")
-			_ = os.Symlink(file+".real", file)
-			_ = os.Chmod(helper.Dir, 0o555)
-		},
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, pinned OpsHelper, source string) OpsHelper
+		want   string
+	}{
+		{"writable helper", func(t *testing.T, p OpsHelper, s string) OpsHelper {
+			mustChmod(t, filepath.Join(s, sandboxops.HelperName), 0o755)
+			return p
+		}, "mode exactly 0555"},
+		{"setuid helper", func(t *testing.T, p OpsHelper, s string) OpsHelper {
+			mustChmod(t, filepath.Join(s, sandboxops.HelperName), os.ModeSetuid|0o555)
+			return p
+		}, "mode exactly 0555"},
+		{"writable dir", func(t *testing.T, p OpsHelper, s string) OpsHelper { mustChmod(t, s, 0o755); return p }, "mode 0555"},
+		{"extra file", func(t *testing.T, p OpsHelper, s string) OpsHelper {
+			mustChmod(t, s, 0o755)
+			writeFile(t, filepath.Join(s, "extra"), "x")
+			mustChmod(t, s, 0o555)
+			return p
+		}, "must hold only"},
+		{"symlinked helper", func(t *testing.T, p OpsHelper, s string) OpsHelper {
+			// The link is the directory's only entry, so only the
+			// O_NOFOLLOW open refuses it.
+			file, real := filepath.Join(s, sandboxops.HelperName), filepath.Join(filepath.Dir(s), "real-helper")
+			mustChmod(t, s, 0o755)
+			if err := os.Rename(file, real); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, file); err != nil {
+				t.Fatal(err)
+			}
+			mustChmod(t, s, 0o555)
+			return p
+		}, "open ops helper"},
+		// MCR-04: the same files on a writable mount.
+		{"directory on a writable mount", func(_ *testing.T, p OpsHelper, s string) OpsHelper {
+			return OpsHelper{Dir: s, SHA256: p.SHA256}
+		}, "writable mount"},
+		{"directory on a writable mount around a read-only helper", func(t *testing.T, p OpsHelper, s string) OpsHelper {
+			helper := filepath.Join(s, sandboxops.HelperName)
+			if err := unix.Mount(helper, helper, "", unix.MS_BIND, ""); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = unix.Unmount(helper, unix.MNT_DETACH) })
+			if err := unix.Mount("", helper, "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_RDONLY, ""); err != nil {
+				t.Fatal(err)
+			}
+			return OpsHelper{Dir: s, SHA256: p.SHA256}
+		}, "writable mount"},
+		{"helper over-mounted from a writable mount", func(t *testing.T, p OpsHelper, _ string) OpsHelper {
+			other := filepath.Join(t.TempDir(), sandboxops.HelperName)
+			writeFile(t, other, "helper binary")
+			mustChmod(t, other, 0o555)
+			target := filepath.Join(p.Dir, sandboxops.HelperName)
+			if err := unix.Mount(other, target, "", unix.MS_BIND, ""); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = unix.Unmount(target, unix.MNT_DETACH) })
+			return p
+		}, "writable mount"},
 	} {
-		t.Run(name, func(t *testing.T) {
-			fresh := pinnedHelper(t, "helper binary")
-			file = filepath.Join(fresh.Dir, sandboxops.HelperName)
-			helper = fresh
-			mutate()
-			if err := verifyHelper(fresh); err == nil {
-				t.Fatalf("%s accepted", name)
+		t.Run(tc.name, func(t *testing.T) {
+			pinned, source := pinnedHelperSource(t, "helper binary")
+			broken := tc.change(t, pinned, source)
+			if err := verifyHelper(broken); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("verifyHelper = %v, want a refusal containing %q", err, tc.want)
 			}
 			h := newHost(t)
 			b := h.backend()
-			b.opsHelper = &fresh
+			b.opsHelper = &broken
 			if err := b.Create(context.Background(), instanceOf(testLease(nil)), testLease(nil)); err == nil || len(h.engine.created) != 0 {
 				t.Fatalf("create proceeded with a broken pin: %v", err)
 			}

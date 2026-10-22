@@ -1056,6 +1056,8 @@ func TestCreateRejectsSandboxesThatDoNotEnforceTheLease(t *testing.T) {
 			c.Host["PortBindings"] = map[string]any{"80/tcp": []any{map[string]any{"HostPort": "8080"}}}
 		}, want: "namespaces, ports"},
 		{name: "engine added a capability", applied: func(c *engineContainer) { c.Host["CapAdd"] = []any{"CAP_NET_ADMIN"} }, want: "capabilities"},
+		{name: "engine kept the default capabilities", applied: func(c *engineContainer) { delete(c.Host, "CapDrop") }, want: "capabilities"},
+		{name: "engine dropped no-new-privileges", applied: func(c *engineContainer) { c.Host["SecurityOpt"] = []any{} }, want: "security options"},
 		{name: "engine added an init process", applied: func(c *engineContainer) { c.Host["Init"] = true }, want: "host settings"},
 		{name: "engine left init to the daemon default", applied: func(c *engineContainer) { delete(c.Host, "Init") }, want: "host settings"},
 		{name: "engine passed runtime annotations", applied: func(c *engineContainer) {
