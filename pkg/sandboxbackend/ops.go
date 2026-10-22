@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,7 +35,7 @@ import (
 // /.misscomputer, and RunHelper runs that helper with docker exec. With ops
 // disabled (the default) the create body and its readback are byte-identical
 // to a backend without this file. EnableOps refuses while the helper mount
-// cannot carry every property the contract requires (XA-09,
+// cannot carry every property the contract requires (XA-09, amendment A1,
 // docs/sandbox-ops-backend-hardening.md).
 
 // OpsHelper pins the helper delivery directory: a root-owned 0555 directory
@@ -67,19 +68,49 @@ var _ miner.SandboxOpsBackend = (*GVisor)(nil)
 // In-sandbox helper). helperMountProven are the ones this backend both
 // requests of the engine and reads back (helperMount, verifyHelperMount):
 // an Engine API v1.47 bind mount carries ReadOnly and BindOptions.Propagation,
-// and its readback shows RW and Propagation. Nothing in either names nosuid
-// or nodev, dockerd hands runsc only rbind, ro and the propagation for a
-// bind, and the pinned runsc ignores a nodev option. A readback that does
-// not name a property proves nothing about it.
+// and its readback shows RW and Propagation. A readback that does not name a
+// property proves nothing about it.
+//
+// The required set is read-only and rprivate under amendment A1 (XA-09),
+// adopted conditionally: the pinned engine can neither request nor report
+// nosuid or nodev on a bind, dockerd hands runsc only rbind, ro and the
+// propagation, and the pinned runsc ignores nodev. A1 replaces the two flags
+// with properties this backend enforces or reads back, none of which this
+// file may weaken. On every create: the pinned directory holds only a
+// root-owned 0555 regular helper, neither carries an extended attribute,
+// both are on a read-only host mount, and every ancestor is root-owned and
+// not group- or other-writable (verifyHelper, also at enable); the readback
+// shows exactly this one bind, read-only and rprivate (verifyHelperMount),
+// every capability dropped with none added and no-new-privileges
+// (verifyEngine). When the backend is opened and when ops are enabled: the
+// runtime is registered with only reviewed arguments, none of which enables
+// set-ID execution, flag overrides or device or host-file passthrough
+// (verifyRuntime). When ops are enabled: the runtime's cached OCI features
+// are shown and list no rro mount option (verifyOpsRuntime). A guest
+// observation (D5-P9) on the pinned Docker and runsc must pass and be
+// reviewed independently before this change merges, and again on every
+// re-pin.
 var (
-	helperMountRequired = []string{"ro", "nosuid", "nodev", "rprivate"}
+	helperMountRequired = []string{"ro", "rprivate"}
 	helperMountProven   = map[string]bool{"ro": true, "rprivate": true}
 )
 
-// EnableOps turns on the ops mode with the pinned helper. It verifies the pin
-// now and again before every create. It must run before any Create. It fails
-// closed, before reading the helper, while a property the contract requires
-// of the helper mount is not requested and read back (XA-09).
+// opsInfoTimeout bounds EnableOps's read of the daemon's runtime
+// registration.
+const opsInfoTimeout = 10 * time.Second
+
+// ociRuntimeFeaturesKey is the runtime status member in which dockerd
+// reports the OCI features it cached for a runtime (daemon/info_unix.go of
+// moby v28.0.4, read as source at the tag).
+const ociRuntimeFeaturesKey = "org.opencontainers.runtime-spec.features"
+
+// EnableOps turns on the ops mode with the pinned helper. It must run before
+// any Create. It fails closed while a property the contract requires of the
+// helper mount is not requested and read back (XA-09, amendment A1), before
+// it asks the daemon anything. It then checks the daemon's runtime
+// registration (verifyOpsRuntime) and verifies the helper pin, which is
+// verified again before every create. No flag, configuration member or lab
+// profile bypasses any of these checks.
 func (b *GVisor) EnableOps(helper OpsHelper) error {
 	if !filepath.IsAbs(helper.Dir) || filepath.Clean(helper.Dir) != helper.Dir || helper.Dir == "/" || !sha256Pattern.MatchString(helper.SHA256) {
 		return errors.New("ops helper directory must be a clean absolute path pinned by a lowercase SHA-256")
@@ -94,10 +125,59 @@ func (b *GVisor) EnableOps(helper OpsHelper) error {
 		return fmt.Errorf("sandbox ops stay off: the contract requires a %s helper mount, which the engine can neither request nor read back (XA-09)",
 			strings.Join(unproven, ", "))
 	}
+	if err := b.verifyOpsRuntime(); err != nil {
+		return fmt.Errorf("sandbox ops stay off: %w", err)
+	}
 	if err := verifyHelper(helper); err != nil {
 		return err
 	}
 	b.opsHelper = &helper
+	return nil
+}
+
+// verifyOpsRuntime checks one fresh /info answer of the daemon. The runtime
+// must still be registered as verifyRuntime requires, with only the
+// reviewed arguments, so none that enables set-ID execution, flag
+// overrides, or device or host-file passthrough. The OCI features dockerd
+// cached for it must be shown, decode, and list no rro mount option
+// (MCR-03, R23-H-03).
+//
+// dockerd turns a read-only bind into rro, not ro, only when those cached
+// features list rro (daemon/oci_linux.go and supportsRecursivelyReadOnly in
+// daemon/daemon_linux.go of moby v28.0.4, the pinned daemon's tag; source
+// at the tag, the binary is assumed to correspond, P6). The reviewed runsc
+// parser applies ro and ignores options it does not know, so a runtime that
+// listed rro could be handed a helper bind it does not make read-only. A
+// runtime whose features dockerd does not report refuses as well: the
+// options it would be handed are then not shown here. That is deliberately
+// stricter than dockerd 28.0.4, which hands such a runtime ro. The features
+// are what the runtime claims to parse; they are never proof of what a
+// guest sees (D5-P9). The check holds when ops are enabled; a daemon
+// reloaded with another runtime afterwards is not seen until the next
+// start.
+func (b *GVisor) verifyOpsRuntime() error {
+	ctx, cancel := context.WithTimeout(context.Background(), opsInfoTimeout)
+	defer cancel()
+	var info daemonInfo
+	if err := b.engine.call(ctx, http.MethodGet, "/info", nil, nil, &info); err != nil {
+		return fmt.Errorf("sandbox docker daemon info: %w", err)
+	}
+	if err := b.verifyRuntime(info); err != nil {
+		return err
+	}
+	raw, ok := info.Runtimes[b.config.Runtime].Status[ociRuntimeFeaturesKey]
+	if !ok {
+		return fmt.Errorf("the daemon reports no OCI features for runtime %q, so the helper bind's read-only option is not shown (MCR-03)", b.config.Runtime)
+	}
+	var features struct {
+		MountOptions []string `json:"mountOptions"`
+	}
+	if err := json.Unmarshal([]byte(raw), &features); err != nil {
+		return fmt.Errorf("cannot decode the OCI features of runtime %q (MCR-03): %w", b.config.Runtime, err)
+	}
+	if slices.Contains(features.MountOptions, "rro") {
+		return fmt.Errorf("runtime %q lists the rro mount option, which dockerd would request for the helper bind and the reviewed runsc does not apply (MCR-03)", b.config.Runtime)
+	}
 	return nil
 }
 
@@ -110,9 +190,12 @@ func (b *GVisor) EnableOps(helper OpsHelper) error {
 // descriptor and on the helper opened from it. Neither the opened directory
 // nor the opened helper may carry an extended attribute, such as a file
 // capability or an access ACL, and a descriptor whose attributes cannot be
-// listed fails the pin (G1, MSR-03). The pin holds at the moment it is
-// checked; it does not stop a privileged host process from changing the
-// files afterwards, and it says nothing about what a guest observes.
+// listed fails the pin (G1, MSR-03). Both must be on a read-only host mount
+// (MCR-04): the helper is checked as well as the directory, since a file
+// mounted over the helper can come from another mount. The pin holds at the
+// moment it is checked; it does not stop a privileged host process from
+// changing the files or the mounts afterwards, and it says nothing about
+// what a guest observes.
 func verifyHelper(helper OpsHelper) error {
 	dirFD, err := unix.Open(helper.Dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -145,6 +228,9 @@ func verifyHelper(helper OpsHelper) error {
 	if err := noExtendedAttributes(dirFD); err != nil {
 		return fmt.Errorf("ops helper directory %s: %w", helper.Dir, err)
 	}
+	if err := readOnlyMount(dirFD); err != nil {
+		return fmt.Errorf("ops helper directory %s: %w", helper.Dir, err)
+	}
 	names, err := dir.Readdirnames(-1)
 	if err != nil {
 		return fmt.Errorf("ops helper directory: %w", err)
@@ -167,6 +253,9 @@ func verifyHelper(helper OpsHelper) error {
 		return errors.New("ops helper must be a root-owned regular file with mode exactly 0555")
 	}
 	if err := noExtendedAttributes(fd); err != nil {
+		return fmt.Errorf("ops helper %s: %w", path, err)
+	}
+	if err := readOnlyMount(fd); err != nil {
 		return fmt.Errorf("ops helper %s: %w", path, err)
 	}
 	hash := sha256.New()
@@ -193,6 +282,21 @@ func noExtendedAttributes(fd int) error {
 	}
 	if size != 0 {
 		return errors.New("has extended attributes; the pin allows none")
+	}
+	return nil
+}
+
+// readOnlyMount requires the open file fd to be on a read-only mount: one
+// fstatfs call on the descriptor, so no path is resolved again, whose mount
+// flags include ST_RDONLY. The flag is set for a read-only mount and for a
+// read-only filesystem alike (MCR-04).
+func readOnlyMount(fd int) error {
+	var fs unix.Statfs_t
+	if err := unix.Fstatfs(fd, &fs); err != nil {
+		return fmt.Errorf("cannot show it is on a read-only mount: %w", err)
+	}
+	if fs.Flags&unix.ST_RDONLY == 0 {
+		return errors.New("is on a writable mount; the pin requires a read-only host mount (statfs ST_RDONLY)")
 	}
 	return nil
 }

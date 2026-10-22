@@ -260,15 +260,33 @@ requirements come from the security design review, and the helper slice
 must meet them:
 
 - **Delivery:** a root-owned, read-only `0555` host **directory** containing
-  only the helper, bind-mounted read-only, `nosuid`, `nodev`, `rprivate`
-  at `/.misscomputer`, and only when ops are enabled. A directory
-  mountpoint cannot be renamed or replaced by guest root (`EBUSY`); a
-  single-file bind is not acceptable without probe evidence. Before every
-  create, the miner opens the source without following symlinks and checks:
-  a regular file owned by uid 0 with mode exactly `0555`; ancestors that are
-  root-owned and not group- or other-writable; and the configured SHA-256.
-  The engine readback must equal exactly that one mount. With ops off,
-  create and readback stay byte-identical (`Mounts == []`).
+  only the helper, on a read-only host mount, bind-mounted read-only and
+  `rprivate` at `/.misscomputer`, and only when ops are enabled. A
+  directory mountpoint cannot be renamed or replaced by guest root
+  (`EBUSY`); a single-file bind is not acceptable without probe evidence.
+  Before every create, the miner opens the source without following
+  symlinks and checks: the directory holds exactly one entry, the helper,
+  a regular file owned by uid 0 with mode exactly `0555`; neither carries
+  an extended attribute; the directory and the helper are on a read-only
+  mount (`fstatfs` `ST_RDONLY`; a read-only bind satisfies it); ancestors
+  that are root-owned and not group- or other-writable; and the configured
+  SHA-256. The engine readback must equal exactly that one mount, read-only
+  and `rprivate`, and must show every capability dropped with none added
+  and `no-new-privileges`. The runtime must be registered with no argument
+  that enables set-ID execution, flag overrides, or device or host-file
+  passthrough. Ops enable refuses unless the engine shows the runtime's
+  cached OCI features and they list no `rro` mount option (MCR-03); an
+  engine that shows none refuses, deliberately stricter than dockerd
+  28.0.4. These properties replace the `nosuid` and `nodev` mount
+  flags, which the pinned engine can neither request nor report and the
+  pinned runtime does not apply (`nodev`): set-ID elevation is disabled for
+  every file in the sandbox, and the mount can hold no device node. Before
+  ops are enabled on a given engine and runtime version, and again on every
+  re-pin, a guest observation (D5-P9) must show `/.misscomputer` read-only
+  and holding exactly the pinned helper, writes, `mknod` and unmount
+  refused there, and a set-ID binary run as a non-root user gaining no
+  privilege. With ops off, create and readback stay byte-identical
+  (`Mounts == []`).
 - **Invocation:** the image default user: the engine `User` is left empty
   and never overridden. If the image's default user is root, the helper
   runs as root inside the sandbox, as the workload does. Not privileged, empty

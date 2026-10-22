@@ -1,18 +1,37 @@
 # Sandbox ops: backend helper-mount hardening (XA-09, XA-08)
 
-Status: **draft, ops off by default, not a contract decision.** This note
-records what the gVisor backend's ops mode (`pkg/sandboxbackend/ops.go`) can
-request of the engine and prove by readback, why it now refuses to enable
-ops mode, and which choices remain with the contract owner. The contract is
+Status: **draft, ops off by default.** This note records what the gVisor
+backend's ops mode (`pkg/sandboxbackend/ops.go`) can request of the engine
+and prove by readback, the delivery amendment it implements (A1, adopted
+conditionally), when it refuses to enable ops mode, and which checks
+remain open. The contract is
 [`sandbox-ops-v1`](sandbox-ops-v1.md); the code map is
 [the lane document](sandbox-ops-v1-lane.md).
 
 ## What the contract requires of the helper mount
 
-The delivery requirement asks for one read-only, `nosuid`, `nodev`,
-`rprivate` bind of a root-owned `0555` directory holding only the pinned
-helper, at `/.misscomputer`, only in ops mode, with an engine readback that
-equals exactly that mount.
+The delivery requirement, as amended by A1 (XA-09, adopted conditionally),
+asks for one read-only, `rprivate` bind of a root-owned `0555` directory
+holding only the pinned helper, on a read-only host mount, at
+`/.misscomputer`, only in ops mode, with an engine readback that equals
+exactly that mount. It replaces the `nosuid` and `nodev` mount flags of the
+earlier text with properties this backend enforces or reads back on every
+create, or, for the runtime registration, when the backend is opened and
+when ops are enabled, and for the runtime's cached OCI features, when ops
+are enabled ([below](#amendment-a1-properties-and-where-they-are-enforced)).
+
+A1 rests on a guest observation (D5-P9) that does not exist yet: on the
+pinned Docker 28.0.4 and runsc `release-20261005.0`, `/.misscomputer`
+read-only and holding exactly the pinned helper, writes, `mknod` and
+unmount refused there, and a set-ID binary run as a non-root user gaining
+no privilege. It must be repeated on every engine or runtime re-pin. A1 is
+adopted conditionally: this change merges, and ops mode is enabled on any
+host, only after that observation passes on Docker 28.0.4 and runsc
+`release-20261005.0` and is reviewed independently; MCR-04 lands in the
+same change; and P6 and the other prerequisites close under their own
+gates. Existing lab records are partial inputs only, not that observation.
+Ops activation and advertisement stay separately gated (KB-1/KB-2,
+fairness, per-host P6 evidence); nothing here activates or advertises ops.
 
 ## What the backend can request and prove
 
@@ -20,6 +39,8 @@ equals exactly that mount.
 | --- | --- | --- | --- |
 | Pinned directory, only the helper, root-owned `0555` file with the pinned SHA-256, root-owned non-writable ancestors, no symlink | n/a (host) | host `lstat` of the ancestors; the directory opened `O_NOFOLLOW` and matched to the checked path; its entries read and the helper opened `O_NOFOLLOW` from that descriptor, then hashed; at enable and before every create | `verifyHelper` |
 | No extended attribute on the helper directory or the helper file | n/a (host) | `flistxattr` of the opened directory and the opened helper answers size 0; any error, including a filesystem that cannot list attributes, refuses | `verifyHelper`, `noExtendedAttributes` |
+| Helper directory and helper on a read-only host mount (MCR-04) | n/a (host) | `fstatfs` of the opened directory and the opened helper shows `ST_RDONLY`; any error refuses | `verifyHelper`, `readOnlyMount` |
+| Runtime registered with reviewed arguments only, cached OCI features shown and without `rro` (MCR-03) | n/a (daemon) | one `/info` answer at enable | `verifyOpsRuntime`, `verifyRuntime` |
 | `/.misscomputer` absent from the image | n/a (image) | archive stat of a never-started, mount-free probe container answers 404 while the probe still exists | `imageConflict` |
 | Exactly one bind of that directory at `/.misscomputer` | `HostConfig.Mounts` | `HostConfig.Mounts` and the container's `Mounts` | `helperMount`, `verifyHelperMount` |
 | Read-only | `ReadOnly: true` | `RW: false` | same |
@@ -63,19 +84,50 @@ versions still need the lab observation below.
 
 ### Fail-closed gate
 
-`EnableOps` therefore refuses, after argument validation and before reading
-the helper: "sandbox ops stay off: the contract requires a nosuid, nodev
-helper mount, which the engine can neither request nor read back (XA-09)".
-The miner agent's `--sandbox-ops on` path calls `EnableOps` and stops
-startup on that error, so ops mode cannot run with a mount that does not
-meet the contract. With ops off, nothing changes: the create body and the
+The gate is declarative (`helperMountRequired`, `helperMountProven`).
+Before amendment A1 the required set named `nosuid` and `nodev`, and
+`EnableOps` always refused: "sandbox ops stay off: the contract requires a
+nosuid, nodev helper mount, which the engine can neither request nor read
+back (XA-09)". This change implements A1: the required set is `ro` and
+`rprivate`, which the backend requests and reads back. The gate still
+refuses, after argument validation and before the daemon is asked
+anything, whenever the required set names a property the backend does not
+request and read back. `EnableOps` then refuses unless one fresh `/info`
+answer shows the runtime registered with only the reviewed arguments and
+its cached OCI features without `rro` (MCR-03), and unless the helper pin
+holds, its read-only mount included (MCR-04). The miner agent's
+`--sandbox-ops on` path calls `EnableOps` and stops startup on any of
+these errors. With ops off, nothing changes: the create body and the
 readback stay byte-identical.
 
-The gate is declarative (`helperMountRequired`, `helperMountProven`). It
-can open only through a reviewed change that delivers and proves the
-missing properties, or that implements a contract amendment that changes
-the required set. It has no flag, configuration member or lab profile that
-bypasses it.
+The required set changes only through a reviewed change that delivers and
+proves a property, or that implements a contract amendment, as this one
+does for A1. Changing it changes it for every deployment. The gate has no
+flag, configuration member or lab profile that bypasses it. While the
+required set equals the proven set, the unproven-property refusal cannot
+fire, and no test executes it; it is a static guard that acts only when a
+later change adds a required property without its proof.
+
+### Amendment A1 properties and where they are enforced
+
+Each property A1 puts in place of `nosuid` and `nodev` is enforced or read
+back in code; none is new except MCR-03 and MCR-04, and no earlier check is
+weakened.
+
+| A1 property | Enforced or read back | When |
+| --- | --- | --- |
+| Directory holds exactly one entry, the helper | `verifyHelper`: `Readdirnames` of the opened directory is exactly `sandbox-ops-helper` | enable and every create |
+| Helper is a regular uid 0 file of mode exactly `0555`, opened without following a symlink | `verifyHelper`: `openat(O_NOFOLLOW)` from the directory descriptor, `fstat` | enable and every create |
+| Directory is uid 0, mode exactly `0555`, opened without following a symlink and matched to the checked path | `verifyHelper` | enable and every create |
+| No extended attribute on the directory or the helper | `verifyHelper`, `noExtendedAttributes` | enable and every create |
+| Directory and helper on a read-only host mount (MCR-04, new) | `verifyHelper`, `readOnlyMount` (`fstatfs` `ST_RDONLY`) | enable and every create |
+| Ancestors root-owned, not group- or other-writable | `verifyHelper` | enable and every create |
+| Configured SHA-256 | `verifyHelper` | enable and every create |
+| Readback: exactly one bind of the pinned directory at `/.misscomputer`, `RW: false`, `rprivate` | `verifyHelperMount` | every create |
+| Readback: `CapDrop: [ALL]`, `CapAdd: []`, `no-new-privileges` | `verifyEngine` (`sandboxCapabilities` is empty) | every create |
+| Runtime arguments within the reviewed allowlist (`--overlay2=none`, `--systemd-cgroup`, one platform): no set-ID, flag-override or passthrough argument | `verifyRuntime` | open (engine checks) and enable (`verifyOpsRuntime`) |
+| Cached runtime OCI features shown and without `rro` (MCR-03, new) | `verifyOpsRuntime` | enable |
+| Guest observation D5-P9 on the pinned Docker 28.0.4 and runsc `release-20261005.0`, repeated on every re-pin | none in code; lab evidence, not yet run | before this change merges and before ops are enabled on any host |
 
 The ops-mode create, readback and exec code stays. Its root-only tests set
 ops mode with a verified pin, as an approved delivery will.
@@ -143,39 +195,81 @@ release binary is reproduced, and no check closes a privileged host's
 change between check and use. This lane implements none of it, and it
 gives no defence against a dishonest root on the host.
 
+## Implemented checks (MCR-03 and MCR-04)
+
+These two gates were listed here as future checks. This change adds them;
+neither is guest evidence.
+
+- Runtime features (MCR-03, R23-H-03). `EnableOps` reads `/info` once
+  more and decodes the OCI features dockerd caches for the runtime
+  (`Runtimes[<runtime>].status["org.opencontainers.runtime-spec.features"]`).
+  It refuses ops if they list `rro`, which the reviewed runsc parser does
+  not apply; if dockerd reports no features for the runtime; or if they do
+  not decode. The same answer must show the runtime registered as the
+  engine checks require. Source, moby `v28.0.4` (commit `6430e49a`), the
+  pinned daemon's tag: dockerd runs `<runtime> features` once per runtime
+  setup and caches the result (`daemon/runtime_unix.go:69-78`); `/info`
+  marshals that cached struct into the member above, and sets the member
+  only when the struct exists (`runtimeStatus`,
+  `daemon/info_unix.go:509-524`); a read-only bind becomes `rro` instead
+  of `ro` only when that struct exists and lists `rro`
+  (`supportsRecursivelyReadOnly`, `daemon/daemon_linux.go:222-239`;
+  `daemon/oci_linux.go:599-617`); the runtime `status` member is stripped
+  below API 1.44 (`api/server/router/system/system_routes.go:93-97`), and
+  the backend uses API 1.47. This is source at the tag; the running binary
+  is assumed to correspond to it (P6). `github.com/docker/docker` v28.4.0
+  has the same code. Refusing when dockerd reports no features is
+  deliberately stricter than dockerd 28.0.4, which then hands the runtime
+  `ro`: without the features, the options the runtime claims to parse are
+  not shown. Limits: the check runs when ops are enabled, not before every
+  create, so a daemon reloaded afterwards with another runtime registration
+  or other features is not seen until the next start. A features entry is
+  never proof of enforcement. The features JSON belongs in the evidence
+  record. The pinned runsc `release-20261005.0` lists no `rro` among its
+  mount options (`KnownMountOptions`, `runsc/specutils/fs.go` at that
+  tag).
+- Host read-only (MCR-04). The pin requires `fstatfs` `ST_RDONLY` on the
+  opened helper directory and on the opened helper, so no path is
+  resolved again. A file mounted over the helper from another mount is
+  refused as well. `ST_RDONLY` is set for a read-only mount and for a
+  read-only filesystem alike, so a read-only bind of the helper directory
+  onto itself satisfies it. With today's `ro`, the reviewed source trace
+  shows the sentry, the gofer and the host gofer mount all apply
+  read-only layers. Losing read-only through a future `rro` is
+  hypothetical, not a demonstrated bypass; this is defence in depth. The
+  pin holds when it is checked; a privileged host process can remount
+  afterwards, which is outside the trust model.
+
 ## Future checks (pending gates, not implemented)
 
-None of these exists in code. Each is a gate that a separately reviewed
-change must add before ops can be enabled:
+None of these exists in code:
 
-- Runtime features (MCR-03, R23-H-03). Decode the runsc features that
-  dockerd caches (`/info`, runtime status) and refuse ops if they list
-  `rro` while the reviewed runsc parser does not apply it. Record the
-  features JSON in the evidence record. A features entry is never proof
-  of enforcement.
 - Bundle options (R23-H-03). In the lab, the OCI bundle's options for
   `/.misscomputer` must contain `ro`, and the guest must see
   `ST_RDONLY`; repeat on every engine or runtime re-pin.
-- Host read-only (MCR-04). With today's `ro`, the reviewed source trace
-  shows the sentry, the gofer and the host gofer mount all apply
-  read-only layers. Losing read-only through a future `rro` is
-  hypothetical, not a demonstrated bypass. As defence in depth, keep the
-  helper directory on a read-only host mount and have the pin require
-  `statfs` `ST_RDONLY` on it.
 - Host-mount and runtime-identity changes (P6) depend on the exec-chain
   record above and are out of this lane's scope.
 
-## Architecture alternatives (decision required, not taken here)
+## Architecture alternatives (alternative 1 adopted, conditionally)
 
-1. **Contract amendment (recommended for review).** Replace `nosuid` and
-   `nodev` with properties this backend proves: the pinned single-file
-   `0555` directory, a read-only `rprivate` bind read back exactly,
-   `no-new-privileges` and no capabilities read back, and no device
-   passthrough on the runtime registration. Add a D5-P9 guest
-   observation of the sentry's mount table for `/.misscomputer`, bound to
-   the pinned runsc and Docker versions. The gate's `helperMountRequired`
-   then changes in the same reviewed change. This is the smallest change.
-   It is a contract decision and must not be made by relabelling.
+Alternative 1 is adopted as amendment A1, conditionally: this change
+merges, and ops mode is enabled on any host, only after the D5-P9 guest
+observation passes on the pinned Docker 28.0.4 and runsc
+`release-20261005.0` and is reviewed independently; MCR-04 lands in the
+same change; and the other prerequisites close under their own gates.
+Alternatives 2 to 4 were not taken.
+
+1. **Contract amendment (adopted as A1, conditionally).** Replace `nosuid`
+   and `nodev` with properties this backend proves: the pinned single-file
+   `0555` directory without extended attributes on a read-only host mount,
+   a read-only `rprivate` bind read back exactly, `no-new-privileges` and
+   no capabilities read back, and only reviewed runtime arguments, so no
+   set-ID, flag-override or passthrough argument. Add a D5-P9 guest
+   observation of `/.misscomputer`, bound to the pinned runsc and Docker
+   versions and repeated on every re-pin. The gate's `helperMountRequired`
+   changes in the same reviewed change, which this is. It is a contract
+   decision, not a relabelling: the contract record's helper condition
+   B-2 and `docs/sandbox-ops-v1.md` change with it.
 2. **Runtime-spec delivery of `nosuid`.** Register a wrapper instead of
    runsc that adds `nosuid` to the `/.misscomputer` mount in `config.json`.
    This breaks the pinned runtime registration and process-identity
@@ -278,31 +372,32 @@ lane. This note changes neither the receipt vocabulary nor the attribution.
 
 | Test | Needs | Proves |
 | --- | --- | --- |
-| `TestEnableOpsFailsClosedWhileTheHelperMountIsUnproven` | nothing | the gate refuses before reading the helper |
-| `TestHelperMountReadbackIsExactlyThePinnedMount` | nothing | the readback refuses every mount but the pinned one |
+| `TestEnableOpsChecksTheRuntimeAndTheHelperPin` | nothing (in-process engine transport); its two pin cases need root and a mount | `EnableOps` refuses a runtime with an unreviewed argument, cached features that list `rro`, are absent or do not decode, an unanswered `/info`, and a pin on a writable mount, each for its own reason with ops left off; it enables ops with the mount options the pinned runsc reports as its features and a pinned helper |
+| `TestHelperMountReadbackIsExactlyThePinnedMount` | nothing | the readback refuses every mount but the pinned read-only `rprivate` one |
+| `TestCreateRejectsSandboxesThatDoNotEnforceTheLease` | unix-socket fake engine | among its cases, the readback refuses a capability added, the default capabilities kept, and `no-new-privileges` dropped |
+| `TestOpenRefusesUnverifiableHosts` | unix-socket fake engine | among its cases, `Open` refuses an unreviewed runtime argument |
 | `TestDemuxBoundsAndFraming` | nothing | exec stream bounds and framing |
 | `TestImageProbeDecidesOnEveryEngineAnswerAndRemovesTheProbe` | nothing (in-process engine transport) | every D1 decision and the probe's removal, also after cancellation |
-| `TestOpsHelperPinRefusesExtendedAttributes` | root, qualifying `TMPDIR` with user extended attributes | the pin refuses an attribute on the directory or the helper |
-| `TestOpsCreateProbesTheHelperTargetBeforeCreating` | root, qualifying `TMPDIR` (in-process engine transport) | `Create` probes before the sandbox create in ops mode only, and refuses every entry type |
-| `TestOpsModeMountsOnlyThePinnedHelperDirectory` | root, qualifying `TMPDIR`, unix-socket fake engine | create body and readback wiring through `Create` |
-| `TestOpsHelperPinRefusesAnythingButThePinnedBinary` | same | the host pin |
+| `TestOpsHelperPinRefusesExtendedAttributes` | root, a mount, qualifying `TMPDIR` with user extended attributes | the pin refuses an attribute on the directory or the helper |
+| `TestOpsCreateProbesTheHelperTargetBeforeCreating` | root, a mount, qualifying `TMPDIR` (in-process engine transport) | `Create` probes before the sandbox create in ops mode only, and refuses every entry type |
+| `TestOpsModeMountsOnlyThePinnedHelperDirectory` | root, a mount, qualifying `TMPDIR`, unix-socket fake engine | create body and readback wiring through `Create` |
+| `TestOpsHelperPinRefusesAnythingButThePinnedBinary` | same | the host pin, read-only mount (MCR-04) included, at the pin and before `Create` |
 | `TestRunHelperExecsTheFixedHelperAndClassifiesFailures` | same | exec request, bounds and attribution |
 
-Every test that needs root skips unless it runs as root with a
-root-owned, non-writable `TMPDIR`. The three that also need the
-unix-socket fake engine have no hosted-CI proof yet.
+Every test that needs root skips unless it runs as root, may mount, runs
+in a mount namespace of its own whose mount of `TMPDIR` does not share
+propagation, and has a root-owned, non-writable `TMPDIR`. Its pinned
+directory is a read-only bind mount of a writable source directory under
+`TMPDIR`, which the test unmounts again; tests change the pinned files
+through that source. The namespace requirement keeps a test that dies
+before its cleanup from leaving a mount on the host. Run them as root
+under `unshare -m --propagation private` with such a `TMPDIR`. The tests
+that also need the unix-socket fake engine have no hosted-CI proof yet,
+and no CI job runs the root-gated tests.
 
-Composed-candidate author run (uid 0, root-owned scratch `TMPDIR`; the
-root-gated tests were not skipped): `TestEnableOpsFailsClosedWhileTheHelperMountIsUnproven`,
-`TestHelperMountReadbackIsExactlyThePinnedMount`, `TestDemuxBoundsAndFraming`,
-`TestOpsHelperPinRefusesExtendedAttributes`,
-`TestOpsCreateProbesTheHelperTargetBeforeCreating` (which now also asserts
-the probe's lease and sandbox labels) and
-`TestImageProbeDecidesOnEveryEngineAnswerAndRemovesTheProbe` passed. The
-three unix-socket tests above were not run, because the author lane executes
-no listeners. Nothing here is a privileged backend proof. Running them, and
-the real-engine probes, belongs to the isolated lab. A CI job that runs
-them as root, or treats their skip as a failure, is a workflow change
-outside this note. The in-process engine tests prove the backend's own
-decisions on scripted engine answers, not Docker's behaviour. No test
-sets `security.capability` or proves a guest view.
+Nothing here is a privileged backend proof.
+Running the real-engine probes belongs to the isolated lab. A CI job that
+runs these tests as root, or treats their skip as a failure, is a workflow
+change outside this note. The in-process and unix-socket engine tests prove
+the backend's own decisions on scripted engine answers, not Docker's
+behaviour. No test sets `security.capability` or proves a guest view.

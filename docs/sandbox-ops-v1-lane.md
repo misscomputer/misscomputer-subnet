@@ -56,14 +56,22 @@ without this code.
   with `O_NOFOLLOW`) is a root-owned regular file of mode exactly 0555 with
   the pinned SHA-256. The pin is verified again before every create; a
   failure is a miner fault (`runtime_start_failed`). The helper pin refuses
-  any extended attribute on the directory and the helper (G1).
-- `EnableOps` refuses before it reads the helper while a property the
-  contract requires of the helper mount is neither requested nor read back.
-  `nosuid` and `nodev` are such properties: the engine cannot request them,
-  and its readback does not name them (XA-09). This refusal holds for every
-  helper and configuration until the contract decision is made, so ops mode
-  cannot be enabled by configuration. The decision, the open choices and the
-  test coverage are in [the backend hardening note](sandbox-ops-backend-hardening.md).
+  any extended attribute on the directory and the helper (G1), and a
+  directory or helper that is not on a read-only mount (`fstatfs`
+  `ST_RDONLY`, MCR-04).
+- `EnableOps` refuses before it asks the daemon anything while a property
+  the contract requires of the helper mount is neither requested nor read
+  back. Under amendment A1 (XA-09, adopted conditionally) the required set
+  is read-only and `rprivate`, which the backend requests and reads back;
+  `nosuid` and `nodev`, which the engine can neither request nor report,
+  are replaced by the properties listed in the delivery text. `EnableOps`
+  then refuses unless one fresh `/info` answer shows the runtime
+  registered with only the reviewed arguments and its cached OCI features
+  without `rro` (MCR-03; absent features refuse as well), and unless the
+  pin holds.
+  No flag, configuration member or lab profile bypasses these checks. The
+  amendment, its conditions and the test coverage are in
+  [the backend hardening note](sandbox-ops-backend-hardening.md).
 - Ops mode adds one mount to the create body: bind, the pinned directory,
   target `/.misscomputer`, read-only, `rprivate`. The readback must show
   exactly that mount in both `HostConfig.Mounts` and the container's mounts.
@@ -223,11 +231,17 @@ without this code.
   mount immutability from guest root, process-group kill, image-controlled
   mount target). Whether a supervisor started by a `docker exec` outlives it
   under runsc is part of these probes.
-- The contract's delivery requires a `nosuid,nodev,rprivate` bind; this
-  draft requests read-only `rprivate` only, because the Docker bind mount
-  API offers no `nosuid`/`nodev` option. Either the guest mount flags are
-  observed under runsc (D5-P9), or the delivery mechanism or the contract
-  text changes. Not decided here.
+- Amendment A1 (XA-09) replaces the delivery's `nosuid` and `nodev` with
+  properties the backend enforces or reads back. It rests on a D5-P9 guest
+  observation on the pinned Docker 28.0.4 and runsc `release-20261005.0`
+  that has not run, and that must be repeated on every re-pin. A1 is
+  adopted conditionally: this change merges, and ops mode is enabled on
+  any host, only after that observation passes and is reviewed
+  independently, with MCR-04 landing in the same change, and after P6 and
+  the other prerequisites close under their own gates. Existing lab
+  records are partial inputs only, each limited by its own disclosures,
+  and none is that observation. Ops activation and advertisement stay
+  separately gated.
 - An image with an entry at `/.misscomputer` (B-11) is refused before create
   by the D1 probe as `image_unavailable`, a non-attributed refusal. Whether
   the engine's stat reports a final symlink entry itself is unproven, and the
